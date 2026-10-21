@@ -13,7 +13,7 @@ function config(ctx) {
         service_init: env_get("TACHYON_OLCRTC_SERVICE_INIT", "/etc/init.d/olcrtc"),
         binary: env_get("TACHYON_OLCRTC_BIN", "/usr/bin/olcrtc"),
         default_socks_host: "127.0.0.1",
-        default_socks_port: "1080",
+        default_socks_port: "1082",
         default_dns: "8.8.8.8:53",
         default_provider: "jitsi",
         default_transport: "datachannel",

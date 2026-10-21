@@ -18,6 +18,7 @@ let core_ip = require("core.ip");
 
 let as_string = common.as_string;
 let option = common.option;
+let option_or_legacy = common.option_or_legacy;
 let list_option = common.list_option;
 let bool_option = common.bool_option;
 let int_option = common.int_option;
@@ -2391,19 +2392,52 @@ function add_byedpi_outbound(config, section, sections) {
     });
 }
 
+function qwdtt_available() {
+    let binary = as_string(getenv("TACHYON_QWDTT_BIN")) || "/usr/bin/qwdtt-client";
+    return fs.stat(binary) != null;
+}
+
 function add_wdtt_outbound(config, section, sections) {
     if (connections && !connections.section_is_active_provider(section, "wdtt"))
         return;
     let index = enabled_action_index(sections, section, "wdtt");
     if (index <= 0)
         ctx.runtime_generate_unsupported("unable to resolve WDTT index for " + section[".name"]);
+    if (qwdtt_available()) {
+        push(config.outbounds, {
+            type: "direct",
+            tag: outbound_tag(section[".name"]),
+            bind_interface: option(section, "tun_name", "qwdtt0"),
+            domain_resolver: {
+                server: as_string(ctx.default_domain_resolver) || runtime_constants.DNS_SERVER_TAG,
+                strategy: "ipv4_only"
+            }
+        });
+        return;
+    }
+    let listen = runtime_constants.WDTT_LISTEN_ADDRESS || "127.0.0.1";
+    let port_base = int(runtime_constants.WDTT_PORT_BASE || 1081);
     push(config.outbounds, {
         type: "socks",
         tag: outbound_tag(section[".name"]),
-        server: runtime_constants.WDTT_LISTEN_ADDRESS,
-        server_port: runtime_constants.WDTT_PORT_BASE + index - 1,
+        server: listen,
+        server_port: port_base + index - 1,
         version: "5"
     });
+}
+
+function olcrtc_host(section) {
+    return option_or_legacy(section, "socks_host", "olcrtc_socks_host",
+        runtime_constants.OLCRTC_LISTEN_ADDRESS || "127.0.0.1");
+}
+
+function olcrtc_port(section, index) {
+    let port_base = int(runtime_constants.OLCRTC_PORT_BASE || 1082);
+    let fallback = as_string(port_base + index - 1);
+    let value = option_or_legacy(section, "socks_port", "olcrtc_socks_port", fallback);
+    if (match(value, /^[0-9]+$/))
+        return int(value, 10);
+    return int(fallback, 10);
 }
 
 function add_olcrtc_outbound(config, section, sections) {
@@ -2415,8 +2449,8 @@ function add_olcrtc_outbound(config, section, sections) {
     push(config.outbounds, {
         type: "socks",
         tag: outbound_tag(section[".name"]),
-        server: runtime_constants.OLCRTC_LISTEN_ADDRESS,
-        server_port: runtime_constants.OLCRTC_PORT_BASE + index - 1,
+        server: olcrtc_host(section),
+        server_port: olcrtc_port(section, index),
         version: "5"
     });
 }

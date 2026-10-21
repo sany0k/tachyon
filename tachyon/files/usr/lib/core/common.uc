@@ -170,6 +170,22 @@ function list_option(section, key) {
     return text == "" ? [] : split(text, /[ \t\r\n]+/);
 }
 
+function option_or_legacy(section, key, legacy_key, fallback) {
+    if (fallback == null)
+        fallback = "";
+    let value = option(section, key, "");
+    if (value != "")
+        return value;
+    return option(section, legacy_key, fallback);
+}
+
+function list_option_or_legacy(section, key, legacy_key) {
+    let values = list_option(section, key);
+    if (length(values) > 0)
+        return values;
+    return list_option(section, legacy_key);
+}
+
 function bool_value(value) {
     value = lc(as_string(value));
     return value == "1" || value == "true" || value == "yes" || value == "on";
@@ -193,6 +209,15 @@ function bool_option(section, key, fallback) {
         fallback = false;
     let value = option(section, key, fallback ? "1" : "0");
     return bool_value(value);
+}
+
+function bool_option_or_legacy(section, key, legacy_key, fallback) {
+    if (fallback == null)
+        fallback = false;
+    let value = option(section, key, "");
+    if (value != "")
+        return bool_value(value);
+    return bool_option(section, legacy_key, fallback);
 }
 
 function int_option(section, key, fallback) {
@@ -917,6 +942,9 @@ return {
     object_key_count,
     option,
     list_option,
+    option_or_legacy,
+    list_option_or_legacy,
+    bool_option_or_legacy,
     bool_option,
     bool_value,
     disable_quic_mode,

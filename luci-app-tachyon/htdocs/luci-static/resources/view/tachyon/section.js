@@ -78,6 +78,53 @@ function normalizeOptionValues(value) {
     .filter(Boolean);
 }
 
+function useLegacyOption(option, legacyKey, legacyValueMap) {
+  const key = option.option;
+  const load = option.load;
+  const write = option.write;
+
+  option.load = function (section_id) {
+    const value = uci.get(UCI_PACKAGE, section_id, key);
+    const empty =
+      value == null ||
+      value === "" ||
+      (Array.isArray(value) && value.length === 0);
+
+    if (!empty) {
+      return value;
+    }
+
+    const legacy = uci.get(UCI_PACKAGE, section_id, legacyKey);
+    const legacyEmpty =
+      legacy == null ||
+      legacy === "" ||
+      (Array.isArray(legacy) && legacy.length === 0);
+
+    if (!legacyEmpty) {
+      return (legacyValueMap && legacyValueMap[legacy]) || legacy;
+    }
+
+    if (load) {
+      return load.call(this, section_id);
+    }
+
+    return value == null ? option.default : value;
+  };
+
+  option.write = function (section_id, value) {
+    const normalized =
+      typeof value === "boolean" ? (value ? "1" : "0") : value;
+    const result = write
+      ? write.call(this, section_id, normalized)
+      : uci.set(UCI_PACKAGE, section_id, key, normalized);
+
+    uci.unset(UCI_PACKAGE, section_id, legacyKey);
+    return result;
+  };
+
+  return option;
+}
+
 function getUciSectionName(section) {
   return section && section[".name"] ? section[".name"] : "";
 }
@@ -10023,116 +10070,110 @@ function createSectionContent(section) {
   o = section.taboption(
     "settings",
     form.Value,
-    "warp_flow_uri",
-    _("WDTT URI"),
-    _("WDTT connection URI (wdtt://...)"),
+    "uri",
+    _("WDTT/qWDTT URI"),
+    _("qwdtt://config?... URI (legacy wdtt://... is also accepted)"),
   );
   o.depends("action", "wdtt");
+  o.placeholder = "qwdtt://config?peer=host:port&pass=...&hashes=...";
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_uri");
 
   o = section.taboption(
     "settings",
     form.ListValue,
-    "warp_flow_mode",
+    "mode",
     _("WDTT Mode"),
   );
   o.depends("action", "wdtt");
   o.value("", _("Default"));
-  o.value("freedom", _("Freedom"));
-  o.value("captive", _("Captive"));
-  o.value("camou", _("Camou"));
+  o.value("selective", _("Selective"));
+  o.value("lan-all", _("LAN all"));
+  o.value("full", _("Full"));
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_mode", {
+    freedom: "selective",
+    captive: "lan-all",
+    camou: "full",
+  });
 
   o = section.taboption(
     "settings",
     form.Value,
-    "warp_flow_device_id",
+    "device_id",
     _("WDTT Device ID"),
   );
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_device_id");
 
   o = section.taboption(
     "settings",
     form.Value,
-    "warp_flow_workers",
-    _("WDTT Workers"),
-  );
-  o.depends("action", "wdtt");
-  o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
-    form.Value,
-    "warp_flow_max_hashes",
+    "max_hashes",
     _("WDTT Max Hashes"),
   );
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_max_hashes");
 
-  o = section.taboption("settings", form.Value, "warp_flow_mtu", _("WDTT MTU"));
+  o = section.taboption("settings", form.Value, "mtu", _("WDTT MTU"));
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_mtu");
 
   o = section.taboption(
     "settings",
     form.Value,
-    "warp_flow_refresh",
+    "refresh",
     _("WDTT Refresh"),
   );
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_refresh");
 
   o = section.taboption(
     "settings",
     form.Flag,
-    "warp_flow_auto_update",
+    "auto_update",
     _("WDTT Auto Update"),
   );
   o.default = "1";
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_auto_update");
 
   o = section.taboption(
     "settings",
     form.Flag,
-    "warp_flow_block_doh",
+    "block_doh",
     _("WDTT Block DoH"),
   );
   o.default = "0";
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_block_doh");
 
   o = section.taboption(
     "settings",
     form.Flag,
-    "warp_flow_block_ipv6",
+    "block_ipv6",
     _("WDTT Block IPv6"),
   );
   o.default = "0";
   o.depends("action", "wdtt");
   o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
-    form.ListValue,
-    "warp_flow_qwdtt_mode",
-    _("WDTT QWDTT Mode"),
-  );
-  o.depends("action", "wdtt");
-  o.value("", _("Default"));
-  o.value("client", _("Client"));
-  o.value("server", _("Server"));
-  o.modalonly = true;
+  useLegacyOption(o, "warp_flow_block_ipv6");
 
   o = section.taboption(
     "settings",
     form.DynamicList,
-    "warp_flow_subscription_links",
+    "subscription_links",
     _("WDTT Subscription Links"),
   );
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_subscription_links");
 
   o = section.taboption(
     "settings",
@@ -10146,93 +10187,58 @@ function createSectionContent(section) {
   o = section.taboption(
     "settings",
     form.DynamicList,
-    "warp_flow_remote_domain_list",
+    "remote_domain_list",
     _("WDTT Remote Domain List"),
   );
   o.depends("action", "wdtt");
   o.modalonly = true;
+  useLegacyOption(o, "warp_flow_remote_domain_list");
 
   // ─── OlcRTC Fields ────────────────────────────────────────────────────
 
   o = section.taboption(
     "settings",
-    form.ListValue,
-    "olcrtc_provider",
-    _("OlcRTC Provider"),
-  );
-  o.depends("action", "olcrtc");
-  o.value("jitsi", _("Jitsi"));
-  o.value("wrt", _("WRT"));
-  o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
-    form.ListValue,
-    "olcrtc_transport",
-    _("OlcRTC Transport"),
-  );
-  o.depends("action", "olcrtc");
-  o.value("whep", _("WHEP"));
-  o.value("whip", _("WHIP"));
-  o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
     form.Value,
-    "olcrtc_room_id",
-    _("OlcRTC Room ID"),
-  );
-  o.depends("action", "olcrtc");
-  o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
-    form.Value,
-    "olcrtc_crypto_key",
-    _("OlcRTC Crypto Key"),
-  );
-  o.depends("action", "olcrtc");
-  o.password = true;
-  o.modalonly = true;
-
-  o = section.taboption(
-    "settings",
-    form.Value,
-    "olcrtc_socks_host",
+    "socks_host",
     _("OlcRTC SOCKS Host"),
   );
   o.depends("action", "olcrtc");
   o.default = "127.0.0.1";
   o.modalonly = true;
+  useLegacyOption(o, "olcrtc_socks_host");
 
   o = section.taboption(
     "settings",
     form.Value,
-    "olcrtc_socks_port",
+    "socks_port",
     _("OlcRTC SOCKS Port"),
   );
   o.depends("action", "olcrtc");
-  o.default = "1082";
+  o.placeholder = "1082";
   o.modalonly = true;
+  useLegacyOption(o, "olcrtc_socks_port");
 
   o = section.taboption(
     "settings",
     form.Value,
-    "olcrtc_dns_server",
+    "dns_server",
     _("OlcRTC DNS Server"),
   );
   o.depends("action", "olcrtc");
   o.default = "8.8.8.8:53";
   o.modalonly = true;
+  useLegacyOption(o, "olcrtc_dns_server");
 
   o = section.taboption(
     "settings",
     form.DynamicList,
-    "olcrtc_subscription_links",
-    _("OlcRTC Subscription Links"),
+    "subscription_links",
+    _("OlcRTC Links"),
+    _("olcrtc:// URI or HTTP subscription URL"),
   );
   o.depends("action", "olcrtc");
   o.modalonly = true;
+  useLegacyOption(o, "olcrtc_subscription_links");
 
   // ─── FPTN Fields ───────────────────────────────────────────────────────
 

@@ -540,6 +540,28 @@ export namespace Tachyon {
     byedpi_cmd_opts?: string;
     cmd_opts?: string;
 
+    uri?: string;
+    mode?: string;
+    device_id?: string;
+    workers?: string;
+    max_hashes?: string;
+    mtu?: string;
+    refresh?: string;
+    auto_update?: boolean;
+    block_doh?: boolean;
+    block_ipv6?: boolean;
+    subscription_links?: string[];
+    community_lists?: string[];
+    remote_domain_list?: string[];
+
+    provider?: string;
+    transport?: string;
+    room_id?: string;
+    crypto_key?: string;
+    socks_host?: string;
+    socks_port?: string;
+    dns_server?: string;
+
     warp_flow_uri?: string;
     warp_flow_mode?: string;
     warp_flow_device_id?: string;

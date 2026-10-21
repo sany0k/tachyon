@@ -27,8 +27,10 @@ let command_output = common.command_output;
 let command_output_from_args = common.command_output_from_args;
 let command_success_from_args = common.command_success_from_args;
 let option = common.option;
+let option_or_legacy = common.option_or_legacy;
 let bool_option = common.bool_option;
 let list_option = common.list_option;
+let list_option_or_legacy = common.list_option_or_legacy;
 let section_name = common.section_name;
 let read_json_file = common.read_json_file;
 let write_json = common.write_json;
@@ -110,11 +112,15 @@ function first_uri_from_subscription(data) {
 }
 
 function resolve_connection(section) {
-    let links = list_option(section, "subscription_links");
+    let links = list_option_or_legacy(section, "subscription_links", "olcrtc_subscription_links");
     let resolved = null;
     let used_link = "";
     let subscription_name = "";
     let subscription_refresh = "";
+    let provider = option_or_legacy(section, "provider", "olcrtc_provider", "");
+    let transport = option_or_legacy(section, "transport", "olcrtc_transport", "");
+    let room_id = option_or_legacy(section, "room_id", "olcrtc_room_id", "");
+    let crypto_key = option_or_legacy(section, "crypto_key", "olcrtc_crypto_key", "");
 
     for (let link in links) {
         link = trim(as_string(link));
@@ -161,21 +167,30 @@ function resolve_connection(section) {
         }
     }
 
-    if (resolved == null)
-        return { valid: false, reason: "No valid connection found in subscription links" };
-
-    let provider = option(section, "provider", "");
-    if (provider == "")
+    if (resolved == null) {
+        if (room_id == "" || provider == "" || transport == "")
+            return { valid: false, reason: "No valid connection found: set an olcrtc:// link or provider, transport and room_id" };
+        if (index(olcrtc_validator.providers, provider) < 0)
+            return { valid: false, reason: "provider must be one of: " + join(", ", olcrtc_validator.providers) };
+        if (index(olcrtc_validator.transports, transport) < 0)
+            return { valid: false, reason: "transport must be one of: " + join(", ", olcrtc_validator.transports) };
+        if (!olcrtc_validator.valid_hex_key(crypto_key))
+            return { valid: false, reason: "crypto_key must be 64 hex characters" };
+        resolved = {
+            provider: provider,
+            transport: transport,
+            room_id: room_id,
+            crypto_key: crypto_key,
+            mimo: "",
+            payload: ""
+        };
+    }
+    else {
         provider = resolved.provider;
-    let transport = option(section, "transport", "");
-    if (transport == "")
         transport = resolved.transport;
-    let room_id = option(section, "room_id", "");
-    if (room_id == "")
         room_id = resolved.room_id;
-    let crypto_key = option(section, "crypto_key", "");
-    if (crypto_key == "")
         crypto_key = resolved.crypto_key;
+    }
 
     return {
         valid: true,
@@ -232,9 +247,9 @@ function write_olcrtc_config(section, connection) {
         "uci set olcrtc.config.transport=" + yaml_quote(connection.transport),
         "uci set olcrtc.config.room_id=" + yaml_quote(connection.room_id),
         "uci set olcrtc.config.key=" + yaml_quote(connection.crypto_key),
-        "uci set olcrtc.config.socks_host=" + yaml_quote(option(section, "socks_host", cfg.default_socks_host)),
-        "uci set olcrtc.config.socks_port=" + yaml_quote(option(section, "socks_port", cfg.default_socks_port)),
-        "uci set olcrtc.config.dns=" + yaml_quote(option(section, "dns_server", cfg.default_dns))
+        "uci set olcrtc.config.socks_host=" + yaml_quote(option_or_legacy(section, "socks_host", "olcrtc_socks_host", cfg.default_socks_host)),
+        "uci set olcrtc.config.socks_port=" + yaml_quote(option_or_legacy(section, "socks_port", "olcrtc_socks_port", cfg.default_socks_port)),
+        "uci set olcrtc.config.dns=" + yaml_quote(option_or_legacy(section, "dns_server", "olcrtc_dns_server", cfg.default_dns))
     ];
 
     let socks_user = option(section, "socks_user", "");
@@ -265,10 +280,10 @@ function write_olcrtc_yaml_config(section, connection) {
     yaml += "  key: " + yaml_quote(connection.crypto_key) + "\n";
     yaml += "net:\n";
     yaml += "  transport: " + yaml_quote(connection.transport) + "\n";
-    yaml += "  dns: " + yaml_quote(option(section, "dns_server", cfg.default_dns)) + "\n";
+    yaml += "  dns: " + yaml_quote(option_or_legacy(section, "dns_server", "olcrtc_dns_server", cfg.default_dns)) + "\n";
     yaml += "socks:\n";
-    yaml += "  host: " + yaml_quote(option(section, "socks_host", cfg.default_socks_host)) + "\n";
-    yaml += "  port: " + yaml_quote(option(section, "socks_port", cfg.default_socks_port)) + "\n";
+    yaml += "  host: " + yaml_quote(option_or_legacy(section, "socks_host", "olcrtc_socks_host", cfg.default_socks_host)) + "\n";
+    yaml += "  port: " + yaml_quote(option_or_legacy(section, "socks_port", "olcrtc_socks_port", cfg.default_socks_port)) + "\n";
 
     let socks_user = option(section, "socks_user", "");
     if (socks_user != "") {

@@ -290,6 +290,7 @@ const SENSITIVE_UCI_OPTIONS = {
     selector_proxy_links_text: true,
     outbound_json: true,
     outbound_jsons: true,
+    uri: true,
     warp_flow_uri: true
 };
 

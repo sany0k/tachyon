@@ -24,6 +24,8 @@ let command_from_args = common.command_from_args;
 let command_output = common.command_output;
 let command_output_from_args = common.command_output_from_args;
 let read_json_file = common.read_json_file;
+let option_or_legacy = common.option_or_legacy;
+let list_option_or_legacy = common.list_option_or_legacy;
 let bool_value = common.bool_value;
 let bool_flag = bool_value;
 
@@ -1477,49 +1479,42 @@ function validate_provider_strategy(kind, section, context) {
 
 function validate_wdtt_section(section, context) {
     let name = section_name(section);
-    let uri = option(section, "warp_flow_uri", "");
+    let uri = option_or_legacy(section, "uri", "warp_flow_uri", "");
+    let links = list_option_or_legacy(section, "subscription_links", "warp_flow_subscription_links");
 
-    if (uri == "") {
-        fail_validation("WDTT rule '" + name + "' has empty URI. Aborted.");
+    if (uri == "" && length(links) == 0 && option(section, "peer", "") == "") {
+        fail_validation("WDTT rule '" + name + "' has no connection URI or subscription link. Aborted.");
         return;
     }
 
-    let result = wdtt_validator().parse_wdtt_uri(uri);
-    if (!result.valid)
-        fail_validation("Invalid WDTT URI for rule '" + name + "': " + result.message + ". Aborted.");
-
-    let mode = option(section, "warp_flow_mode", "");
-    if (mode != "" && !contains(["freedom", "captive", "camou"], mode))
-        fail_validation("Invalid WDTT mode '" + mode + "' in rule '" + name + "'. Aborted.");
-
-    let device_id = option(section, "warp_flow_device_id", "");
-    if (device_id != "" && !wdtt_validator().validate_device_id(device_id))
-        fail_validation("Invalid WDTT device ID '" + device_id + "' in rule '" + name + "'. Aborted.");
+    let result = wdtt_validator().validate_section(section);
+    if (length(result) > 0)
+        fail_validation("Invalid WDTT rule '" + name + "': " + join("; ", result) + ". Aborted.");
 }
 
 function validate_olcrtc_section(section, context) {
     let name = section_name(section);
-    let provider = option(section, "olcrtc_provider", "");
+    let provider = option_or_legacy(section, "provider", "olcrtc_provider", "");
+    let room_id = option_or_legacy(section, "room_id", "olcrtc_room_id", "");
+    let links = list_option_or_legacy(section, "subscription_links", "olcrtc_subscription_links");
 
-    if (provider == "") {
-        fail_validation("OlcRTC rule '" + name + "' has empty provider. Aborted.");
+    if (length(links) == 0 && (provider == "" || room_id == "")) {
+        fail_validation("OlcRTC rule '" + name + "' has no subscription link and no provider with room ID. Aborted.");
         return;
     }
 
-    if (!contains(["livekit", "wrt"], provider))
-        fail_validation("Invalid OlcRTC provider '" + provider + "' in rule '" + name + "'. Aborted.");
-
-    let transport = option(section, "olcrtc_transport", "whep");
-    if (!contains(["whep", "whip"], transport))
-        fail_validation("Invalid OlcRTC transport '" + transport + "' in rule '" + name + "'. Aborted.");
-
-    let room_id = option(section, "olcrtc_room_id", "");
-    if (room_id == "")
-        fail_validation("OlcRTC rule '" + name + "' has empty room ID. Aborted.");
-
-    let crypto_key = option(section, "olcrtc_crypto_key", "");
-    if (crypto_key == "")
-        fail_validation("OlcRTC rule '" + name + "' has empty crypto key. Aborted.");
+    let normalized = {
+        provider: provider,
+        transport: option_or_legacy(section, "transport", "olcrtc_transport", ""),
+        room_id: room_id,
+        crypto_key: option_or_legacy(section, "crypto_key", "olcrtc_crypto_key", ""),
+        socks_port: option_or_legacy(section, "socks_port", "olcrtc_socks_port", ""),
+        dns_server: option_or_legacy(section, "dns_server", "olcrtc_dns_server", ""),
+        subscription_links: links
+    };
+    let result = olcrtc_validator().validate_section(normalized);
+    if (length(result) > 0)
+        fail_validation("Invalid OlcRTC rule '" + name + "': " + join("; ", result) + ". Aborted.");
 }
 
 function dns_action_inline_domains(section) {

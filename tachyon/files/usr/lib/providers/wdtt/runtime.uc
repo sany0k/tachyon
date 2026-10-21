@@ -25,10 +25,15 @@ function log_message(msg, level) {
 let command_from_args = common.command_from_args;
 let command_output = common.command_output;
 let command_output_from_args = common.command_output_from_args;
+let command_status = common.command_status;
 let command_success_from_args = common.command_success_from_args;
+let shell_quote = common.shell_quote;
 let option = common.option;
+let option_or_legacy = common.option_or_legacy;
 let bool_option = common.bool_option;
+let bool_option_or_legacy = common.bool_option_or_legacy;
 let list_option = common.list_option;
+let list_option_or_legacy = common.list_option_or_legacy;
 let section_name = common.section_name;
 let read_json_file = common.read_json_file;
 let write_json_file = common.write_json_file;
@@ -65,6 +70,16 @@ function active_service_init() {
     if (qwdtt_installed())
         return cfg.qwdtt_service_init;
     return cfg.service_init;
+}
+
+function set_wdtt_state_enabled(enabled) {
+    let section = MODE + ".wdtt_state";
+
+    if (!uci_core.exists(section) && !uci_core.set_section(section, "wdtt_state"))
+        return false;
+    if (!uci_core.set(section + ".enabled", enabled ? "1" : "0"))
+        return false;
+    return uci_core.commit(MODE);
 }
 
 function service_init_exists() {
@@ -117,10 +132,98 @@ function first_local_file(values) {
 function first_wdtt_link(values) {
     for (let v in values) {
         v = trim(as_string(v));
-        if (substr(v, 0, 7) == "wdtt://")
+        if (substr(v, 0, 8) == "qwdtt://" && wdtt_validator.parse_wdtt_uri(v).valid)
+            return v;
+    }
+    for (let v in values) {
+        v = trim(as_string(v));
+        if (wdtt_validator.is_wdtt_uri(v) && wdtt_validator.parse_wdtt_uri(v).valid)
             return v;
     }
     return "";
+}
+
+function wdtt_mode(section) {
+    let mode = option_or_legacy(section, "mode", "warp_flow_mode", cfg.default_mode);
+    if (mode == "freedom")
+        return "selective";
+    if (mode == "captive")
+        return "lan-all";
+    if (mode == "camou")
+        return "full";
+    return mode;
+}
+
+function wdtt_sources(section) {
+    let values = list_option_or_legacy(section, "subscription_links", "warp_flow_subscription_links");
+    let uri = trim(option_or_legacy(section, "uri", "warp_flow_uri", ""));
+    let result = [];
+    let seen = {};
+    for (let value in values) {
+        value = trim(as_string(value));
+        if (value != "" && !seen[value]) {
+            seen[value] = true;
+            push(result, value);
+        }
+    }
+    if (uri != "" && !seen[uri])
+        push(result, uri);
+    return result;
+}
+
+function qwdtt_lan_interface(section) {
+    return option(section, "lan_iface", cfg.qwdtt_lan_interface);
+}
+
+function remove_qwdtt_iif_rule(lan) {
+    lan = trim(as_string(lan));
+    if (lan == "")
+        return;
+    for (let i = 0; i < 5; i++) {
+        if (command_status("ip rule del iif " + shell_quote(lan) + " lookup " + cfg.qwdtt_route_table + " priority 10000 2>/dev/null") != 0)
+            break;
+    }
+}
+
+function remove_qwdtt_mark_rule() {
+    let mark_spec = cfg.qwdtt_fwmark + "/" + cfg.qwdtt_mark_mask;
+    for (let i = 0; i < 5; i++) {
+        if (command_status("ip rule del fwmark " + mark_spec + " table " + cfg.qwdtt_route_table + " priority " + cfg.qwdtt_rule_priority + " 2>/dev/null") != 0)
+            break;
+    }
+}
+
+function cleanup_qwdtt_routing(section) {
+    let lan = section == null ? cfg.qwdtt_lan_interface : qwdtt_lan_interface(section);
+    remove_qwdtt_iif_rule(lan);
+    if (lan != "br-lan")
+        remove_qwdtt_iif_rule("br-lan");
+    remove_qwdtt_mark_rule();
+}
+
+function qwdtt_interface_ready(section) {
+    let tun_name = option(section, "tun_name", "qwdtt0");
+    return command_status("ip link show " + shell_quote(tun_name) + " >/dev/null 2>&1") == 0;
+}
+
+function install_qwdtt_routing(section) {
+    let lan = qwdtt_lan_interface(section);
+
+    remove_qwdtt_iif_rule(lan);
+    if (lan != "br-lan")
+        remove_qwdtt_iif_rule("br-lan");
+    remove_qwdtt_mark_rule();
+
+    return qwdtt_interface_ready(section);
+}
+
+function wait_qwdtt_routing(section) {
+    for (let i = 0; i < 10; i++) {
+        if (install_qwdtt_routing(section))
+            return true;
+        command_success_from_args([ "sleep", "1" ]);
+    }
+    return false;
 }
 
 function write_wdtt_hashes_file(hashes_value) {
@@ -153,7 +256,7 @@ function write_wdtt_hashes_file(hashes_value) {
 
 function qwdtt_hashes_list(section) {
     let hashes = [];
-    let links = list_option(section, "subscription_links");
+    let links = wdtt_sources(section);
     let wdtt_link = first_wdtt_link(links);
     if (wdtt_link != "") {
         let parsed = wdtt_validator.parse_wdtt_uri(wdtt_link);
@@ -184,29 +287,29 @@ function qwdtt_hashes_list(section) {
 }
 
 function write_qwdtt_json_config(section, name) {
-    let links = list_option(section, "subscription_links");
+    let links = wdtt_sources(section);
     let wdtt_link = first_wdtt_link(links);
     let parsed = null;
     if (wdtt_link != "")
         parsed = wdtt_validator.parse_wdtt_uri(wdtt_link);
 
-    let peer = option(section, "peer", "");
-    if (peer == "" && parsed != null && parsed.valid)
-        peer = parsed.peer;
+    let peer = parsed != null && parsed.valid && parsed.peer != ""
+        ? parsed.peer
+        : option(section, "peer", "");
     if (peer == "")
         peer = cfg.default_peer;
 
-    let password = option(section, "password", "");
-    if (password == "" && parsed != null && parsed.valid)
-        password = parsed.pass;
+    let password = parsed != null && parsed.valid && parsed.pass != ""
+        ? parsed.pass
+        : option(section, "password", "");
 
-    let device_id = option(section, "device_id", "");
+    let device_id = option_or_legacy(section, "device_id", "warp_flow_device_id", "");
     if (device_id == "")
         device_id = lan_mac_address();
 
-    let workers = option(section, "workers", "");
-    if (workers == "" && parsed != null && parsed.valid && parsed.workers != "")
-        workers = parsed.workers;
+    let workers = parsed != null && parsed.valid && parsed.workers != ""
+        ? parsed.workers
+        : option_or_legacy(section, "workers", "warp_flow_workers", "");
     if (workers == "")
         workers = cfg.default_workers_qwdtt;
 
@@ -214,8 +317,6 @@ function write_qwdtt_json_config(section, name) {
     let hashes_file = first_local_file(links);
     if (hashes_file != "" && length(hashes) == 0)
         write_wdtt_hashes_file([]);
-
-    let qwdtt_mode = option(section, "qwdtt_mode", "rawtun");
 
     let config = {
         peer: peer,
@@ -230,8 +331,7 @@ function write_qwdtt_json_config(section, name) {
         no_dtls: bool_option(section, "no_dtls", false),
         turn_tcp: bool_option(section, "turn_tcp", false),
         tun_name: option(section, "tun_name", "qwdtt0"),
-        lan_interface: option(section, "lan_iface", "br-lan"),
-        mode: qwdtt_mode
+        lan_interface: qwdtt_lan_interface(section)
     };
 
     if (password != "")
@@ -243,49 +343,39 @@ function write_qwdtt_json_config(section, name) {
     else if (hashes_file != "")
         config.hashes_file = hashes_file;
 
-    if (qwdtt_mode == "socks") {
-        let socks_port = option(section, "socks_port", "");
-        if (socks_port == "" && parsed != null && parsed.valid && parsed.port != "")
-            socks_port = parsed.port;
-        if (socks_port == "")
-            socks_port = as_string(cfg.default_socks_port_base);
-        config.socks = option(section, "socks_addr", "127.0.0.1:" + socks_port);
-    }
-
     let result = write_json_file(cfg.qwdtt_config_path, config);
     if (result)
         system("chmod 0600 " + common.shell_quote(cfg.qwdtt_config_path));
 
-    system("uci set " + MODE + ".wdtt_state.enabled=" + (result ? "1" : "0"));
-    system("uci commit " + MODE);
+    set_wdtt_state_enabled(result);
 
     return result;
 }
 
 function write_wdtt_uci_config(section) {
-    let links = list_option(section, "subscription_links");
+    let links = wdtt_sources(section);
     let wdtt_link = first_wdtt_link(links);
     let parsed = null;
     if (wdtt_link != "")
         parsed = wdtt_validator.parse_wdtt_uri(wdtt_link);
 
-    let peer = option(section, "peer", "");
-    if (peer == "" && parsed != null && parsed.valid)
-        peer = parsed.peer;
+    let peer = parsed != null && parsed.valid && parsed.peer != ""
+        ? parsed.peer
+        : option(section, "peer", "");
     if (peer == "")
         peer = cfg.default_peer;
 
-    let password = option(section, "password", "");
-    if (password == "" && parsed != null && parsed.valid)
-        password = parsed.pass;
+    let password = parsed != null && parsed.valid && parsed.pass != ""
+        ? parsed.pass
+        : option(section, "password", "");
 
-    let device_id = option(section, "device_id", "");
+    let device_id = option_or_legacy(section, "device_id", "warp_flow_device_id", "");
     if (device_id == "")
         device_id = lan_mac_address();
 
-    let workers = option(section, "workers", "");
-    if (workers == "" && parsed != null && parsed.valid && parsed.workers != "")
-        workers = parsed.workers;
+    let workers = parsed != null && parsed.valid && parsed.workers != ""
+        ? parsed.workers
+        : option_or_legacy(section, "workers", "warp_flow_workers", "");
     if (workers == "")
         workers = cfg.default_workers_wdtt;
 
@@ -298,13 +388,13 @@ function write_wdtt_uci_config(section) {
         "uci set wdtt.settings.password='" + password + "'",
         "uci set wdtt.settings.device_id='" + device_id + "'",
         "uci set wdtt.settings.workers='" + workers + "'",
-        "uci set wdtt.settings.max_hashes='" + option(section, "max_hashes", cfg.default_max_hashes) + "'",
-        "uci set wdtt.settings.mode='" + option(section, "mode", cfg.default_mode) + "'",
-        "uci set wdtt.settings.mtu='" + option(section, "mtu", cfg.default_mtu) + "'",
-        "uci set wdtt.settings.refresh='" + option(section, "refresh", cfg.default_refresh) + "'",
-        "uci set wdtt.settings.auto_update='" + (bool_option(section, "auto_update", true) ? "1" : "0") + "'",
-        "uci set wdtt.settings.block_doh='" + (bool_option(section, "block_doh", false) ? "1" : "0") + "'",
-        "uci set wdtt.settings.block_ipv6='" + (bool_option(section, "block_ipv6", false) ? "1" : "0") + "'"
+        "uci set wdtt.settings.max_hashes='" + option_or_legacy(section, "max_hashes", "warp_flow_max_hashes", cfg.default_max_hashes) + "'",
+        "uci set wdtt.settings.mode='" + wdtt_mode(section) + "'",
+        "uci set wdtt.settings.mtu='" + option_or_legacy(section, "mtu", "warp_flow_mtu", cfg.default_mtu) + "'",
+        "uci set wdtt.settings.refresh='" + option_or_legacy(section, "refresh", "warp_flow_refresh", cfg.default_refresh) + "'",
+        "uci set wdtt.settings.auto_update='" + (bool_option_or_legacy(section, "auto_update", "warp_flow_auto_update", true) ? "1" : "0") + "'",
+        "uci set wdtt.settings.block_doh='" + (bool_option_or_legacy(section, "block_doh", "warp_flow_block_doh", false) ? "1" : "0") + "'",
+        "uci set wdtt.settings.block_ipv6='" + (bool_option_or_legacy(section, "block_ipv6", "warp_flow_block_ipv6", false) ? "1" : "0") + "'"
     ];
 
     if (hashes_url != "")
@@ -325,29 +415,6 @@ function write_wdtt_uci_config(section) {
     return true;
 }
 
-function udp_port_in_use(port) {
-    let hex_port = sprintf("%04X", port);
-    for (let proc_file in ["/proc/net/udp", "/proc/net/udp6"]) {
-        let data = fs.readfile(proc_file);
-        if (data == null)
-            continue;
-        let lines = split(data, "\n");
-        for (let i = 1; i < length(lines); i++) {
-            let parts = split(trim(lines[i]), " \t");
-            if (length(parts) >= 2) {
-                let local = parts[1];
-                let colon_idx = index(local, ":");
-                if (colon_idx >= 0) {
-                    let port_hex = substr(local, colon_idx + 1);
-                    if (port_hex == hex_port)
-                        return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
 function restart_qwdtt_service() {
     command_success_from_args([cfg.qwdtt_service_init, "stop"]);
 
@@ -355,31 +422,22 @@ function restart_qwdtt_service() {
     while (wait_ms < 5000) {
         if (command_output_from_args(["pidof", "qwdtt-client"]) == "")
             break;
-        system("sleep 0.1");
-        wait_ms += 100;
+        system("sleep 1");
+        wait_ms += 1000;
     }
     if (wait_ms >= 5000)
         system("killall -9 qwdtt-client 2>/dev/null || true");
 
-    let port = cfg.default_socks_port_base;
-    wait_ms = 0;
-    while (wait_ms < 10000) {
-        if (!udp_port_in_use(port))
-            break;
-        system("sleep 0.5");
-        wait_ms += 500;
-    }
-
-    system("sleep 0.5");
+    system("sleep 1");
     return command_success_from_args([cfg.qwdtt_service_init, "start"]);
 }
 
 function start_runtime() {
     let sections = enabled_sections();
     if (length(sections) == 0) {
+        cleanup_qwdtt_routing(null);
         if (qwdtt_installed()) {
-            system("uci set " + MODE + ".wdtt_state.enabled='0' 2>/dev/null || true");
-            system("uci commit " + MODE + " 2>/dev/null || true");
+            set_wdtt_state_enabled(false);
             if (fs.stat(cfg.qwdtt_service_init) != null)
                 command_success_from_args([cfg.qwdtt_service_init, "stop"]);
         }
@@ -412,10 +470,13 @@ function start_runtime() {
             log_message("Failed to write qwdtt config", "fatal");
             return false;
         }
+        cleanup_qwdtt_routing(section);
         if (!restart_qwdtt_service()) {
             log_message("Failed to start qwdtt service", "fatal");
             return false;
         }
+        if (!wait_qwdtt_routing(section))
+            log_message("qwdtt routing is not ready yet; status polling will retry", "warn");
     }
     else {
         if (!write_wdtt_uci_config(section)) {
@@ -438,9 +499,10 @@ function start_runtime() {
 }
 
 function stop_runtime() {
+    let sections = enabled_sections();
+    cleanup_qwdtt_routing(length(sections) > 0 ? sections[0] : null);
     if (qwdtt_installed()) {
-        system("uci set " + MODE + ".wdtt_state.enabled='0' 2>/dev/null || true");
-        system("uci commit " + MODE + " 2>/dev/null || true");
+        set_wdtt_state_enabled(false);
         if (fs.stat(cfg.qwdtt_service_init) != null)
             command_success_from_args([cfg.qwdtt_service_init, "stop"]);
         log_message("WDTT provider stopped");
@@ -463,6 +525,21 @@ function status_json() {
     let client = qwdtt_installed() ? "qwdtt" : "wdtt-openwrt";
     let config_path = qwdtt_installed() ? cfg.qwdtt_config_path : cfg.config_path;
     let version = package_version();
+    let routes_ready = true;
+
+    if (qwdtt_installed() && running && rule_count > 0) {
+        let sections = enabled_sections();
+        if (length(sections) > 0) {
+            install_qwdtt_routing(sections[0]);
+            routes_ready = qwdtt_interface_ready(sections[0]);
+        }
+    }
+
+    let status_message = "wdtt provider status is normal";
+    if (!running)
+        status_message = installed ? "wdtt service is not running" : "wdtt is not installed";
+    else if (!routes_ready)
+        status_message = "wdtt is running (degraded: qwdtt interface missing)";
 
     write_json({
         installed: installed,
@@ -474,8 +551,9 @@ function status_json() {
         service_init: active_service_init(),
         client: client,
         package_version: version,
-        ready: installed && running && rule_count > 0,
-        status_message: running ? "wdtt provider status is normal" : (installed ? "wdtt service is not running" : "wdtt is not installed")
+        routing_ready: routes_ready,
+        ready: installed && running && rule_count > 0 && routes_ready,
+        status_message: status_message
     });
     return true;
 }

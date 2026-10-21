@@ -1031,6 +1031,7 @@ for (let inbound in dns_config.inbounds)
 
     runtime_context.dns_health_inbounds = dns_config.sniff_inbounds;
     runtime_context.default_domain_resolver = runtime_dns.default_domain_resolver(settings);
+    ctx.default_domain_resolver = runtime_context.default_domain_resolver;
 
     let dns_section = {
         servers: dns_servers,

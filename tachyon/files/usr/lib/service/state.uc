@@ -2128,19 +2128,19 @@ function wdtt_runtime_signature_body(sections) {
         let name = section_name(section);
         body = signature_add_value(body, "wdtt." + name + ".peer", option(section, "peer", ""));
         body = signature_add_value(body, "wdtt." + name + ".password", option(section, "password", ""));
-        body = signature_add_value(body, "wdtt." + name + ".device_id", option(section, "device_id", ""));
-        body = signature_add_value(body, "wdtt." + name + ".mode", option(section, "mode", ""));
-        body = signature_add_value(body, "wdtt." + name + ".workers", option(section, "workers", ""));
-        body = signature_add_value(body, "wdtt." + name + ".max_hashes", option(section, "max_hashes", ""));
-        body = signature_add_value(body, "wdtt." + name + ".mtu", option(section, "mtu", ""));
-        body = signature_add_value(body, "wdtt." + name + ".refresh", option(section, "refresh", ""));
-        body = signature_add_value(body, "wdtt." + name + ".auto_update", bool_option(section, "auto_update", true) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".block_doh", bool_option(section, "block_doh", false) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".block_ipv6", bool_option(section, "block_ipv6", false) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".subscription_links", join(" ", list_option(section, "subscription_links")));
-        body = signature_add_value(body, "wdtt." + name + ".community_lists", join(" ", list_option(section, "community_lists")));
-        body = signature_add_value(body, "wdtt." + name + ".remote_domain_list", join(" ", list_option(section, "remote_domain_list")));
-        body = signature_add_value(body, "wdtt." + name + ".qwdtt_mode", option(section, "qwdtt_mode", ""));
+        body = signature_add_value(body, "wdtt." + name + ".device_id", common.option_or_legacy(section, "device_id", "warp_flow_device_id", ""));
+        body = signature_add_value(body, "wdtt." + name + ".mode", common.option_or_legacy(section, "mode", "warp_flow_mode", ""));
+        body = signature_add_value(body, "wdtt." + name + ".workers", common.option_or_legacy(section, "workers", "warp_flow_workers", ""));
+        body = signature_add_value(body, "wdtt." + name + ".max_hashes", common.option_or_legacy(section, "max_hashes", "warp_flow_max_hashes", ""));
+        body = signature_add_value(body, "wdtt." + name + ".mtu", common.option_or_legacy(section, "mtu", "warp_flow_mtu", ""));
+        body = signature_add_value(body, "wdtt." + name + ".refresh", common.option_or_legacy(section, "refresh", "warp_flow_refresh", ""));
+        body = signature_add_value(body, "wdtt." + name + ".auto_update", common.bool_option_or_legacy(section, "auto_update", "warp_flow_auto_update", true) ? "1" : "0");
+        body = signature_add_value(body, "wdtt." + name + ".block_doh", common.bool_option_or_legacy(section, "block_doh", "warp_flow_block_doh", false) ? "1" : "0");
+        body = signature_add_value(body, "wdtt." + name + ".block_ipv6", common.bool_option_or_legacy(section, "block_ipv6", "warp_flow_block_ipv6", false) ? "1" : "0");
+        body = signature_add_value(body, "wdtt." + name + ".uri", common.option_or_legacy(section, "uri", "warp_flow_uri", ""));
+        body = signature_add_value(body, "wdtt." + name + ".subscription_links", join(" ", common.list_option_or_legacy(section, "subscription_links", "warp_flow_subscription_links")));
+        body = signature_add_value(body, "wdtt." + name + ".community_lists", join(" ", common.list_option_or_legacy(section, "community_lists", "warp_flow_community_lists")));
+        body = signature_add_value(body, "wdtt." + name + ".remote_domain_list", join(" ", common.list_option_or_legacy(section, "remote_domain_list", "warp_flow_remote_domain_list")));
     }
 
     return body;
@@ -2155,14 +2155,14 @@ function olcrtc_runtime_signature_body(sections) {
             continue;
 
         let name = section_name(section);
-        body = signature_add_value(body, "olcrtc." + name + ".provider", option(section, "provider", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".transport", option(section, "transport", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".room_id", option(section, "room_id", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".crypto_key", option(section, "crypto_key", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".socks_host", option(section, "socks_host", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".socks_port", option(section, "socks_port", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".dns_server", option(section, "dns_server", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".subscription_links", join(" ", list_option(section, "subscription_links")));
+        body = signature_add_value(body, "olcrtc." + name + ".provider", common.option_or_legacy(section, "provider", "olcrtc_provider", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".transport", common.option_or_legacy(section, "transport", "olcrtc_transport", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".room_id", common.option_or_legacy(section, "room_id", "olcrtc_room_id", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".crypto_key", common.option_or_legacy(section, "crypto_key", "olcrtc_crypto_key", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".socks_host", common.option_or_legacy(section, "socks_host", "olcrtc_socks_host", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".socks_port", common.option_or_legacy(section, "socks_port", "olcrtc_socks_port", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".dns_server", common.option_or_legacy(section, "dns_server", "olcrtc_dns_server", ""));
+        body = signature_add_value(body, "olcrtc." + name + ".subscription_links", join(" ", common.list_option_or_legacy(section, "subscription_links", "olcrtc_subscription_links")));
     }
 
     return body;
