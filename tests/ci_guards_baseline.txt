@@ -1,7 +1,6 @@
 direct_uci_commit|tachyon/files/usr/lib/diagnostics/doctor.uc|2
 direct_uci_commit|tachyon/files/usr/lib/diagnostics/repairs.uc|3
 direct_uci_commit|tachyon/files/usr/lib/providers/fptn/runtime.uc|1
-direct_uci_commit|tachyon/files/usr/lib/providers/olcrtc/runtime.uc|1
 direct_uci_commit|tachyon/files/usr/lib/providers/wdtt/runtime.uc|6
 direct_uci_commit|tachyon/files/usr/lib/service/lifecycle.uc|1
 direct_uci_commit|tachyon/files/usr/lib/service/watchdog.uc|5
@@ -41,7 +40,7 @@ raw_system|tachyon/files/usr/lib/diagnostics/service_check.uc|5
 raw_system|tachyon/files/usr/lib/dns/apply.uc|1
 raw_system|tachyon/files/usr/lib/nft/apply.uc|3
 raw_system|tachyon/files/usr/lib/providers/fptn/runtime.uc|6
-raw_system|tachyon/files/usr/lib/providers/olcrtc/runtime.uc|3
+raw_system|tachyon/files/usr/lib/providers/olcrtc/runtime.uc|1
 raw_system|tachyon/files/usr/lib/providers/tailscale/runtime.uc|2
 raw_system|tachyon/files/usr/lib/providers/wdtt/runtime.uc|21
 raw_system|tachyon/files/usr/lib/server/service.uc|1

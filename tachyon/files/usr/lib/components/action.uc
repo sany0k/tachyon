@@ -1091,6 +1091,10 @@ function install_olcrtc(action, target_tag) {
         action_fail("olcrtc", action, "Failed to install OlcRTC package", current_version, pkg.version);
 
     disable_standalone_service("olcrtc");
+    // The standalone bundle can also enable olcrtc-tun, which grabs traffic
+    // through its own TUN. Tachyon dials the SOCKS listener instead, so the
+    // two must not run together (see the upstream sing-box integration doc).
+    disable_standalone_service("olcrtc-tun");
     restart_tachyon_after_successful_change();
     clear_version_caches();
     current_version = provider_package_version(runtime_module);

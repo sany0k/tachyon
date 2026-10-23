@@ -216,6 +216,7 @@ define Package/tachyon/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/tachyon $(1)/etc/init.d/tachyon
 	$(INSTALL_BIN) ./files/etc/init.d/tachyon-torrserver-direct $(1)/etc/init.d/tachyon-torrserver-direct
+	$(INSTALL_BIN) ./files/etc/init.d/olcrtc-yaml $(1)/etc/init.d/olcrtc-yaml
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/tachyon $(1)/etc/config/tachyon

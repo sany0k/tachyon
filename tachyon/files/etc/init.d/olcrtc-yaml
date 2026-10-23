@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# TACHYON_MANAGED_OLCRTC_YAML_INIT
+#
+# The openlibrecommunity olcrtc build reads exactly one YAML path and rejects
+# the flag-based interface used by the feed package. Tachyon starts this
+# service and disables /etc/init.d/olcrtc so the old flags never reach it.
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/bin/olcrtc
+CONFIG=/etc/olcrtc/client.yaml
+
+start_service() {
+	[ -x "$PROG" ] || return 0
+	[ -s "$CONFIG" ] || return 0
+
+	procd_open_instance
+	procd_set_param command "$PROG" "$CONFIG"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG"
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}

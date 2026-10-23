@@ -16,15 +16,6 @@ function array_contains(arr, val) {
 const OLCRTC_PROVIDERS = [ "jitsi", "telemost", "wbstream" ];
 const OLCRTC_TRANSPORTS = [ "datachannel", "vp8channel", "seichannel", "videochannel" ];
 
-function yaml_quote(value) {
-    value = as_string(value);
-    if (value == "")
-        return "''";
-    if (match(value, /^[a-zA-Z0-9_./:-]+$/) != null)
-        return value;
-    return "'" + replace(value, "'", "''") + "'";
-}
-
 function parse_uri(value) {
     value = trim(as_string(value));
     if (substr(value, 0, 9) != "olcrtc://")
@@ -33,17 +24,18 @@ function parse_uri(value) {
     let rest = substr(value, 9);
 
     let dollar_idx = rindex(rest, "$");
-    let mimo = "";
-    if (dollar_idx >= 0) {
-        mimo = substr(rest, dollar_idx + 1);
+    if (dollar_idx >= 0)
         rest = substr(rest, 0, dollar_idx);
-    }
 
     let hash_idx = rindex(rest, "#");
     let crypto_key = "";
     if (hash_idx >= 0) {
         crypto_key = substr(rest, hash_idx + 1);
         rest = substr(rest, 0, hash_idx);
+
+        let percent_idx = index(crypto_key, "%");
+        if (percent_idx >= 0)
+            crypto_key = substr(crypto_key, 0, percent_idx);
     }
 
     let at_idx = index(rest, "@");
@@ -86,7 +78,6 @@ function parse_uri(value) {
         transport: transport,
         room_id: room_id,
         crypto_key: crypto_key,
-        mimo: mimo,
         payload: payload
     };
 }

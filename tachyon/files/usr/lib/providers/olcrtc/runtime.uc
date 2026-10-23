@@ -2,12 +2,9 @@
 
 let fs = require("fs");
 let common = require("core.common");
-let uci_core = require("core.uci");
 let connections = require("config.connections");
 
 let as_string = common.as_string;
-let bool_value = common.bool_value;
-let object_or_empty = common.object_or_empty;
 
 const MODE = as_string(getenv("TACHYON_CONFIG_NAME")) || "tachyon";
 const LIB_DIR = as_string(getenv("TACHYON_LIB_DIR")) || "/usr/lib/tachyon";
@@ -22,30 +19,24 @@ function log_message(msg, level) {
     system("logger -t " + MODE + " -p " + (level == "fatal" ? "user.err" : level == "warn" ? "user.warning" : "user.info") + " '" + msg + "'");
 }
 
-let command_from_args = common.command_from_args;
-let command_output = common.command_output;
-let command_output_from_args = common.command_output_from_args;
 let command_success_from_args = common.command_success_from_args;
 let option = common.option;
 let option_or_legacy = common.option_or_legacy;
-let bool_option = common.bool_option;
-let list_option = common.list_option;
 let list_option_or_legacy = common.list_option_or_legacy;
 let section_name = common.section_name;
-let read_json_file = common.read_json_file;
 let write_json = common.write_json;
-
-function yaml_quote(value) {
-    value = as_string(value);
-    if (value == "")
-        return "''";
-    if (match(value, /^[a-zA-Z0-9_./:-]+$/) != null)
-        return value;
-    return "'" + replace(value, "'", "''") + "'";
-}
 
 function enabled_sections() {
     return connections.olcrtc_sections();
+}
+
+// The generator only emits an outbound for the active providers (a section
+// with routing matchers or match_all), and numbers their ports in that order.
+// Pick the same section here, otherwise the service is configured from one
+// section while sing-box dials the port computed for another.
+function runtime_sections() {
+    let active = connections.active_provider_sections("olcrtc");
+    return length(active) > 0 ? active : enabled_sections();
 }
 
 function enabled_rule_count() {
@@ -57,16 +48,60 @@ function provider_available() {
     return fs.stat(cfg.binary) != null;
 }
 
-function service_init_exists() {
-    return fs.stat(cfg.service_init) != null;
+function service_init_exists(path) {
+    return fs.stat(as_string(path)) != null;
 }
 
 function service_running() {
-    return command_success_from_args([cfg.service_init, "status"]);
+    return command_success_from_args([ cfg.service_init, "status" ]);
+}
+
+function wait_service_running(attempts) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        if (service_running())
+            return true;
+        if (attempt + 1 < attempts)
+            sleep(1000);
+    }
+    return false;
 }
 
 function service_enabled() {
-    return command_success_from_args([cfg.service_init, "enabled"]);
+    return command_success_from_args([ cfg.service_init, "enabled" ]);
+}
+
+function stop_service(path) {
+    if (!service_init_exists(path))
+        return false;
+    return command_success_from_args([ as_string(path), "stop" ]);
+}
+
+// The standalone bundle can also enable olcrtc-tun, which routes traffic
+// through its own TUN. Tachyon dials the SOCKS listener instead, so the two
+// must not run together (see the upstream sing-box integration doc).
+function stop_standalone_tunnel() {
+    let init = cfg.tun_service_init;
+    if (fs.stat(init) == null)
+        return;
+    command_success_from_args([ init, "stop" ]);
+    command_success_from_args([ init, "disable" ]);
+}
+
+// The YAML binary replaces the feed build, but the feed init script and the
+// standalone TUN service may still be installed and enabled. Stop and disable
+// them so only the YAML init owns /usr/bin/olcrtc.
+function stop_legacy_services() {
+    let legacy = cfg.legacy_service_init;
+    if (service_init_exists(legacy)) {
+        command_success_from_args([ legacy, "stop" ]);
+        command_success_from_args([ legacy, "disable" ]);
+    }
+    stop_standalone_tunnel();
+}
+
+function stop_all_services() {
+    stop_service(cfg.service_init);
+    stop_legacy_services();
 }
 
 function package_version() {
@@ -181,7 +216,6 @@ function resolve_connection(section) {
             transport: transport,
             room_id: room_id,
             crypto_key: crypto_key,
-            mimo: "",
             payload: ""
         };
     }
@@ -198,7 +232,6 @@ function resolve_connection(section) {
         transport: transport,
         room_id: room_id,
         crypto_key: crypto_key,
-        mimo: resolved.mimo,
         payload: resolved.payload,
         used_link: used_link,
         subscription_name: subscription_name,
@@ -212,9 +245,13 @@ function payload_option_mapping() {
         "vp8-batch": "vp8_batch",
         "fps": "sei_fps",
         "batch": "sei_batch",
+        "frag": "sei_frag",
+        "ack-ms": "sei_ack_ms",
         "video-w": "video_w",
         "video-h": "video_h",
         "video-fps": "video_fps",
+        "video-bitrate": "video_bitrate",
+        "video-hw": "video_hw",
         "video-codec": "video_codec",
         "video-qr-size": "video_qr_size",
         "video-qr-recovery": "video_qr_recovery",
@@ -223,98 +260,147 @@ function payload_option_mapping() {
     };
 }
 
-function payload_uci_commands(payload) {
-    let cmds = [];
+function payload_options(payload) {
+    let options = {};
     if (payload == "" || payload == null)
-        return cmds;
+        return options;
     let mapping = payload_option_mapping();
-    let pairs = split(payload, "&");
-    for (let pair in pairs) {
+    for (let pair in split(payload, "&")) {
         let kv = split(pair, "=", 2);
-        if (length(kv) == 2) {
-            let key = kv[0];
-            let val = kv[1];
-            if (mapping[key] != null)
-                push(cmds, "uci set olcrtc.config." + mapping[key] + "=" + yaml_quote(val));
-        }
+        if (length(kv) == 2 && mapping[kv[0]] != null)
+            options[mapping[kv[0]]] = kv[1];
     }
-    return cmds;
+    return options;
 }
 
-function write_olcrtc_config(section, connection) {
-    let uci_cmds = [
-        "uci set olcrtc.config.carrier=" + yaml_quote(connection.provider),
-        "uci set olcrtc.config.transport=" + yaml_quote(connection.transport),
-        "uci set olcrtc.config.room_id=" + yaml_quote(connection.room_id),
-        "uci set olcrtc.config.key=" + yaml_quote(connection.crypto_key),
-        "uci set olcrtc.config.socks_host=" + yaml_quote(option_or_legacy(section, "socks_host", "olcrtc_socks_host", cfg.default_socks_host)),
-        "uci set olcrtc.config.socks_port=" + yaml_quote(option_or_legacy(section, "socks_port", "olcrtc_socks_port", cfg.default_socks_port)),
-        "uci set olcrtc.config.dns=" + yaml_quote(option_or_legacy(section, "dns_server", "olcrtc_dns_server", cfg.default_dns))
+// The YAML build uses a strict schema: unknown keys are fatal, so every field
+// below is one the loader actually knows. Strings are always quoted to keep
+// room IDs such as "yes" from being parsed as booleans; numeric fields stay
+// unquoted because yaml.v3 does not coerce quoted strings into ints.
+function yaml_string(value) {
+    return "'" + replace(as_string(value), /'/g, "''") + "'";
+}
+
+function yaml_number(value) {
+    value = trim(as_string(value));
+    if (match(value, /^[0-9]+$/) == null)
+        return null;
+    return value;
+}
+
+function push_yaml_string(lines, key, value) {
+    if (as_string(value) != "")
+        push(lines, "  " + key + ": " + yaml_string(value));
+}
+
+function push_yaml_number(lines, key, value) {
+    let number = yaml_number(value);
+    if (number != null)
+        push(lines, "  " + key + ": " + number);
+}
+
+function yaml_payload_blocks(payload) {
+    let options = payload_options(payload);
+    let blocks = [];
+
+    let video = [];
+    push_yaml_number(video, "width", options.video_w);
+    push_yaml_number(video, "height", options.video_h);
+    push_yaml_number(video, "fps", options.video_fps);
+    push_yaml_string(video, "codec", options.video_codec);
+    push_yaml_number(video, "qr_size", options.video_qr_size);
+    push_yaml_string(video, "qr_recovery", options.video_qr_recovery);
+    push_yaml_number(video, "tile_module", options.video_tile_module);
+    push_yaml_number(video, "tile_rs", options.video_tile_rs);
+    if (length(video) > 0) {
+        push(blocks, "video:");
+        for (let line in video)
+            push(blocks, line);
+    }
+
+    let vp8 = [];
+    push_yaml_number(vp8, "fps", options.vp8_fps);
+    push_yaml_number(vp8, "batch_size", options.vp8_batch);
+    if (length(vp8) > 0) {
+        push(blocks, "vp8:");
+        for (let line in vp8)
+            push(blocks, line);
+    }
+
+    let sei = [];
+    push_yaml_number(sei, "fps", options.sei_fps);
+    push_yaml_number(sei, "batch_size", options.sei_batch);
+    push_yaml_number(sei, "fragment_size", options.sei_frag);
+    push_yaml_number(sei, "ack_timeout_ms", options.sei_ack_ms);
+    if (length(sei) > 0) {
+        push(blocks, "sei:");
+        for (let line in sei)
+            push(blocks, line);
+    }
+
+    return blocks;
+}
+
+function yaml_config_text(section, connection) {
+    let socks_port = yaml_number(option_or_legacy(section, "socks_port", "olcrtc_socks_port", cfg.default_socks_port));
+    if (socks_port == null)
+        socks_port = yaml_number(cfg.default_socks_port);
+
+    let lines = [
+        "mode: cnc",
+        "auth:",
+        "  provider: " + yaml_string(connection.provider),
+        "room:",
+        "  id: " + yaml_string(connection.room_id),
+        "crypto:",
+        "  key: " + yaml_string(connection.crypto_key),
+        "net:",
+        "  transport: " + yaml_string(connection.transport),
+        "  dns: " + yaml_string(option_or_legacy(section, "dns_server", "olcrtc_dns_server", cfg.default_dns)),
+        "socks:",
+        "  host: " + yaml_string(option_or_legacy(section, "socks_host", "olcrtc_socks_host", cfg.default_socks_host)),
+        "  port: " + socks_port
     ];
 
     let socks_user = option(section, "socks_user", "");
-    if (socks_user != "")
-        push(uci_cmds, "uci set olcrtc.config.socks_user=" + yaml_quote(socks_user));
-    let socks_pass = option(section, "socks_pass", "");
-    if (socks_pass != "")
-        push(uci_cmds, "uci set olcrtc.config.socks_pass=" + yaml_quote(socks_pass));
+    if (socks_user != "") {
+        push(lines, "  user: " + yaml_string(socks_user));
+        push(lines, "  pass: " + yaml_string(option(section, "socks_pass", "")));
+    }
 
-    let payload_cmds = payload_uci_commands(connection.payload);
-    for (let cmd in payload_cmds)
-        push(uci_cmds, cmd);
+    for (let line in yaml_payload_blocks(connection.payload))
+        push(lines, line);
 
-    for (let cmd in uci_cmds)
-        system(cmd);
-    system("uci commit olcrtc");
-
-    return true;
+    return join("\n", lines) + "\n";
 }
 
 function write_olcrtc_yaml_config(section, connection) {
-    let yaml = "mode: cnc\n";
-    yaml += "auth:\n";
-    yaml += "  provider: " + yaml_quote(connection.provider) + "\n";
-    yaml += "room:\n";
-    yaml += "  id: " + yaml_quote(connection.room_id) + "\n";
-    yaml += "crypto:\n";
-    yaml += "  key: " + yaml_quote(connection.crypto_key) + "\n";
-    yaml += "net:\n";
-    yaml += "  transport: " + yaml_quote(connection.transport) + "\n";
-    yaml += "  dns: " + yaml_quote(option_or_legacy(section, "dns_server", "olcrtc_dns_server", cfg.default_dns)) + "\n";
-    yaml += "socks:\n";
-    yaml += "  host: " + yaml_quote(option_or_legacy(section, "socks_host", "olcrtc_socks_host", cfg.default_socks_host)) + "\n";
-    yaml += "  port: " + yaml_quote(option_or_legacy(section, "socks_port", "olcrtc_socks_port", cfg.default_socks_port)) + "\n";
+    let path = cfg.config_path;
+    let slash = rindex(path, "/");
+    if (slash > 0)
+        common.ensure_dir(substr(path, 0, slash));
 
-    let socks_user = option(section, "socks_user", "");
-    if (socks_user != "") {
-        yaml += "  username: " + yaml_quote(socks_user) + "\n";
-        yaml += "  password: " + yaml_quote(option(section, "socks_pass", "")) + "\n";
-    }
-
-    let tmp = cfg.config_path + ".tmp";
-    let f = fs.open(tmp, "w");
-    if (!f)
+    let tmp = path + ".tmp";
+    if (fs.writefile(tmp, yaml_config_text(section, connection)) == null)
         return false;
-    f.write(yaml);
-    f.close();
-    return fs.rename(tmp, cfg.config_path);
+    fs.chmod(tmp, 0600);
+    if (!fs.rename(tmp, path)) {
+        fs.unlink(tmp);
+        return false;
+    }
+    fs.chmod(path, 0600);
+    return true;
 }
 
 function start_runtime() {
-    let sections = enabled_sections();
+    let sections = runtime_sections();
     if (length(sections) == 0) {
-        if (service_init_exists())
-            command_success_from_args([cfg.service_init, "stop"]);
+        stop_all_services();
         return true;
     }
 
     if (!provider_available()) {
         log_message("OlcRTC provider not available (binary not found: " + cfg.binary + ")", "fatal");
-        return false;
-    }
-
-    if (!service_init_exists()) {
-        log_message("OlcRTC service init script not found: " + cfg.service_init, "fatal");
         return false;
     }
 
@@ -324,27 +410,36 @@ function start_runtime() {
     let section = sections[0];
     let connection = resolve_connection(section);
     if (!connection.valid) {
-        log_message("OlcRTC rule '" + section_name(section) + "': " + connection.reason, "fatal");
+        log_message("OlcRTC rule " + section_name(section) + ": " + connection.reason, "fatal");
         return false;
     }
 
-    let config_type = fs.stat("/etc/olcrtc/client.yaml") != null ? "yaml" : "uci";
-
-    if (config_type == "yaml") {
-        if (!write_olcrtc_yaml_config(section, connection)) {
-            log_message("Failed to write OlcRTC YAML config", "fatal");
-            return false;
-        }
-    }
-    else {
-        if (!write_olcrtc_config(section, connection)) {
-            log_message("Failed to write OlcRTC UCI config", "fatal");
-            return false;
-        }
+    // The binary refuses to start without a key, so a keyless connection
+    // would otherwise look "started" while no tunnel exists.
+    if (as_string(connection.crypto_key) == "") {
+        log_message("OlcRTC rule " + section_name(section) + ": crypto_key is required by the olcrtc service", "fatal");
+        return false;
     }
 
-    if (!command_success_from_args([cfg.service_init, "restart"])) {
+    if (!service_init_exists(cfg.service_init)) {
+        log_message("OlcRTC service init script not found: " + cfg.service_init, "fatal");
+        return false;
+    }
+
+    if (!write_olcrtc_yaml_config(section, connection)) {
+        log_message("Failed to write OlcRTC YAML config: " + cfg.config_path, "fatal");
+        return false;
+    }
+
+    stop_legacy_services();
+
+    if (!command_success_from_args([ cfg.service_init, "restart" ])) {
         log_message("Failed to restart OlcRTC service", "fatal");
+        return false;
+    }
+
+    if (!wait_service_running(5)) {
+        log_message("OlcRTC service reported no running instance after restart; check " + cfg.config_path + " and logread -e olcrtc", "fatal");
         return false;
     }
 
@@ -353,10 +448,8 @@ function start_runtime() {
 }
 
 function stop_runtime() {
-    if (service_init_exists()) {
-        command_success_from_args([cfg.service_init, "stop"]);
-        log_message("OlcRTC provider stopped");
-    }
+    stop_all_services();
+    log_message("OlcRTC provider stopped");
     return true;
 }
 

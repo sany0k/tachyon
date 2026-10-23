@@ -271,6 +271,8 @@ build_backend_root() {
   install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon" "$output_root/etc/init.d/tachyon"
   install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon-torrserver-direct" \
     "$output_root/etc/init.d/tachyon-torrserver-direct"
+  install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/olcrtc-yaml" \
+    "$output_root/etc/init.d/olcrtc-yaml"
   install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon-steer-zapret" \
     "$output_root/etc/init.d/tachyon-steer-zapret"
   install -m 0644 "$ROOT_DIR/tachyon/files/etc/config/tachyon" "$output_root/etc/config/tachyon"
@@ -320,6 +322,7 @@ build_backend_root() {
   chmod 0755 "$output_root/etc/init.d/tachyon" "$output_root/usr/bin/tachyon" \
     "$output_root/usr/bin/tachyon-read" \
     "$output_root/etc/init.d/tachyon-torrserver-direct" \
+    "$output_root/etc/init.d/olcrtc-yaml" \
     "$output_root/etc/init.d/tachyon-steer-zapret" \
     "$output_root/etc/hotplug.d/iface/99-tachyon-wan-monitor" \
     "$output_root/usr/share/tachyon/steer-nfqws" \
