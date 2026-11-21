@@ -911,6 +911,35 @@ function parse_wdtt_query_string(query) {
     return params;
 }
 
+function wdtt_authority_host_port(authority, allow_colon_format) {
+    authority = trim(as_string(authority || ""));
+    let slash = index(authority, "/");
+    if (slash >= 0)
+        authority = substr(authority, 0, slash);
+    let at = rindex(authority, "@");
+    if (at >= 0)
+        authority = substr(authority, at + 1);
+    if (authority == "")
+        return { host: "", port: "" };
+    if (substr(authority, 0, 1) == "[") {
+        let close = index(authority, "]");
+        if (close > 0) {
+            let port = "";
+            if (substr(authority, close + 1, 1) == ":")
+                port = substr(authority, close + 2);
+            return { host: substr(authority, 1, close - 1), port: port };
+        }
+        return { host: authority, port: "" };
+    }
+    let first = index(authority, ":");
+    let last = rindex(authority, ":");
+    if (allow_colon_format && first > 0 && first != last)
+        return { host: substr(authority, 0, first), port: "" };
+    if (last > 0 && match(substr(authority, last + 1), /^[0-9]+$/))
+        return { host: substr(authority, 0, last), port: substr(authority, last + 1) };
+    return { host: authority, port: "" };
+}
+
 function parse_wdtt_uri(value) {
     value = trim(as_string(value));
     let lower = lc(value);
@@ -930,19 +959,28 @@ function parse_wdtt_uri(value) {
         return { valid: true, peer: "", hashes: "", pass: "", workers: "", port: "", label: label };
 
     let qpos = index(rest, "?");
+    let authority = qpos >= 0 ? substr(rest, 0, qpos) : rest;
     let query_part = qpos >= 0 ? substr(rest, qpos + 1) : rest;
     let params = parse_wdtt_query_string(query_part);
     let peer = params.peer || params.host || params.ip || params.server || "";
     let hashes = params.hashes || params.hash || "";
     let pass = params.pass || params.password || "";
     let workers = params.workers || params.streams || "";
-    let port = params.port || params.dtls || "";
+    let port = params.port || params.dtls || params.dtls_port || params.server_port || "";
 
-    if (peer == "" && substr(lower, 0, 7) == "wdtt://" && index(rest, ":") < 0 && index(rest, "?") < 0)
+    if (peer == "" && substr(lower, 0, 8) != "qwdtt://") {
+        let parsed_authority = wdtt_authority_host_port(authority, qpos < 0);
+        if (parsed_authority.host != "" && parsed_authority.host != "config" && parsed_authority.host != "connect") {
+            peer = parsed_authority.host;
+            if (port == "")
+                port = parsed_authority.port;
+        }
+    }
+
+    if (peer == "" && substr(lower, 0, 8) == "qwdtt://" &&
+        (substr(trim(rest), 0, 1) == "{" ||
+         (qpos < 0 && index(rest, "&") < 0 && index(rest, "=") < 0 && index(rest, ":") < 0 && length(rest) >= 16)))
         return { valid: true, peer: "", hashes: hashes, pass: pass, workers: workers, port: port, label: label };
-
-    if (peer == "" && index(rest, ":") >= 0 && index(rest, "?") < 0)
-        peer = split(rest, ":")[0] || "";
 
     if (peer == "")
         return { valid: false, reason: "wdtt/csqtt URI must contain peer or host parameter" };

@@ -230,4 +230,43 @@ must(get("src_csqtt_sec_qwdtt", "csqtt_device_id") == "dev-1",
 UCODE
   fail "migrated legacy qwdtt state failed assertions"
 
+# A standard upstream wdtt:// URI keeps the host in the authority, not in
+# ?peer=/?host=. The quarantine validator must not reject it.
+cat >"$WORK_DIR/validator_fixture.json" <<'EOF'
+{
+  "settings": {
+    ".name": "settings",
+    ".type": "settings",
+    "engine": "tachyon-core",
+    "dns_type": "udp",
+    "dns_server": [ "1.1.1.1" ],
+    "bootstrap_dns_server": [ "1.1.1.1" ]
+  },
+  "section": [
+    {
+      ".name": "qwdtt",
+      ".type": "section",
+      "enabled": "1",
+      "action": "csqtt",
+      "csqtt_uri": "wdtt://153.80.41.121:56000?hashes=hash1,hash2&workers=18&pass=pass#qwdtt",
+      "domain_suffix": [ "example.com" ]
+    }
+  ]
+}
+EOF
+
+mkdir -p "$WORK_DIR/validator-state"
+printf '0.5.9\n' >"$WORK_DIR/validator-state/version"
+quarantine="$(
+  TACHYON_CORE_VERSION_FILE="$WORK_DIR/validator-state/version" \
+  TACHYON_VALIDATOR_QUARANTINED_FILE="$WORK_DIR/validator-quarantined.json" \
+  TACHYON_SECTION_ERRORS_FILE="$WORK_DIR/validator-errors.json" \
+    ucode -L "$TACHYON_LIB" "$TACHYON_LIB/config/validator.uc" \
+      validate-runtime-quarantine-fixture "$WORK_DIR/validator_fixture.json" \
+      "{\"tachyon_core_version_state_file\":\"$WORK_DIR/validator-state/version\"}" \
+      "0.5.9"
+)"
+printf '%s' "$quarantine" | grep -Eq '"qwdtt"[[:space:]]*:' &&
+  fail "standard wdtt:// URI must not be quarantined: $quarantine"
+
 printf 'legacy qwdtt URI compatibility checks passed\n'
