@@ -25,11 +25,12 @@ function core_url_module_or_null() {
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const BIN_PATH = getenv("TACHYON_BIN") || "/usr/bin/tachyon";
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || "/tmp/tachyon-core";
-const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || TMP_SING_BOX_FOLDER + "/rulesets";
-const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || TMP_SING_BOX_FOLDER + "/subscriptions";
+const TMP_TACHYON_CORE_FOLDER = getenv("TMP_TACHYON_CORE_FOLDER") || "/tmp/tachyon-core";
+const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || TMP_TACHYON_CORE_FOLDER + "/rulesets";
+const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || TMP_TACHYON_CORE_FOLDER + "/subscriptions";
 const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
 const LIST_UPDATE_STATE_FILE = getenv("TACHYON_LIST_UPDATE_STATE_FILE") || RUNTIME_STATE_DIR + "/list-update.timestamp";
+const LIST_UPDATE_BACKOFF_FILE = getenv("TACHYON_LIST_UPDATE_BACKOFF_FILE") || RUNTIME_STATE_DIR + "/list-update.backoff";
 const LIST_UPDATE_PID_FILE = getenv("TACHYON_LIST_UPDATE_PID_FILE") || "/var/run/tachyon_list_update.pid";
 const LIST_UPDATE_STATUS_FILE = getenv("TACHYON_LIST_UPDATE_STATUS_FILE") || RUNTIME_STATE_DIR + "/list-update.status";
 const SUBSCRIPTION_UPDATE_STATE_DIR = getenv("TACHYON_SUBSCRIPTION_UPDATE_STATE_DIR") || RUNTIME_STATE_DIR + "/subscription-update";
@@ -40,10 +41,10 @@ const SUBSCRIPTION_METADATA_DIR = getenv("TACHYON_SUBSCRIPTION_METADATA_DIR") ||
 const OUTBOUND_METADATA_DIR = getenv("TACHYON_OUTBOUND_METADATA_DIR") || RUNTIME_STATE_DIR + "/outbound-metadata";
 const SECTION_CACHE_DIR = getenv("TACHYON_SECTION_CACHE_DIR") || RUNTIME_STATE_DIR + "/section-cache";
 const RUNTIME_CACHE_FORMAT_FILE = getenv("TACHYON_RUNTIME_CACHE_FORMAT_FILE") || RUNTIME_STATE_DIR + "/cache-format";
-const RUNTIME_CACHE_FORMAT = getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "8";
+const RUNTIME_CACHE_FORMAT = getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "9";
 const PERSISTENT_SUBSCRIPTION_CACHE_DIR = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR") || "/etc/tachyon/subscription-cache";
 const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE") || PERSISTENT_SUBSCRIPTION_CACHE_DIR + "/cache-format";
-const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "7";
+const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "8";
 const PENDING_RELOAD_FILE = getenv("TACHYON_PENDING_RELOAD_FILE") || RUNTIME_STATE_DIR + "/reload.pending";
 const RELOAD_STATE_FILE = getenv("TACHYON_RELOAD_STATE_FILE") || RUNTIME_STATE_DIR + "/reload-state";
 const RELOAD_STATE_FORMAT = getenv("TACHYON_RELOAD_STATE_FORMAT") || "1";
@@ -53,6 +54,8 @@ const SERVICE_INIT = getenv("TACHYON_SERVICE_INIT") || "/etc/init.d/tachyon";
 const PRIORITY_UC = getenv("TACHYON_PRIORITY_UC") || LIB_DIR + "/tachyon_core/priority.uc";
 const DNS_FAILOVER_UC = getenv("TACHYON_DNS_FAILOVER_UC") || LIB_DIR + "/tachyon_core/dns_failover.uc";
 const COMPONENT_JOB_DIR = getenv("UPDATES_JOB_DIR") || getenv("TACHYON_UI_COMPONENT_ACTION_DIR") || "/var/run/tachyon/component-actions";
+const AUTO_UPDATE_PENDING_FILE = COMPONENT_JOB_DIR + "/.auto-update-pending";
+const COMPONENT_AUTO_UPDATE_LAST_RUN_FILE = getenv("TACHYON_COMPONENT_AUTO_UPDATE_LAST_RUN_FILE") || RUNTIME_STATE_DIR + "/component-auto-update.last-run";
 const COMPONENT_UPDATE_CHECK_CACHE_DIR = getenv("TACHYON_COMPONENT_UPDATE_CHECK_CACHE_DIR") || RUNTIME_STATE_DIR + "/component-update-checks";
 const COMPONENT_UPDATE_CHECK_STATE_FILE = getenv("TACHYON_COMPONENT_UPDATE_CHECK_STATE_FILE") || RUNTIME_STATE_DIR + "/component-update-check.timestamp";
 const COMPONENT_UPDATE_CHECK_LOCK_DIR = getenv("TACHYON_COMPONENT_UPDATE_CHECK_LOCK_DIR") || RUNTIME_STATE_DIR + "/component-update-check.lock";
@@ -72,25 +75,51 @@ const NFT_DISCORD_SET_NAME = getenv("NFT_DISCORD_SET_NAME") || "tachyon_discord_
 const NFT_DISCORD6_SET_NAME = getenv("NFT_DISCORD6_SET_NAME") || "tachyon_discord_subnets6";
 const NFT_INTERFACE_SET_NAME = getenv("NFT_INTERFACE_SET_NAME") || "tachyon_interfaces";
 const NFT_FAKEIP_MARK = getenv("NFT_FAKEIP_MARK") || "0x04000000";
-const SB_SERVICE_MIXED_INBOUND_ADDRESS = getenv("SB_SERVICE_MIXED_INBOUND_ADDRESS") || "127.0.0.1";
-const SB_SERVICE_MIXED_INBOUND_PORT = getenv("SB_SERVICE_MIXED_INBOUND_PORT") || "4534";
-const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-const GITHUB_RAW_URL = getenv("GITHUB_RAW_URL") || "https://raw.githubusercontent.com/itdoginfo/allow-domains/main";
+const CORE_SERVICE_MIXED_INBOUND_ADDRESS = getenv("TACHYON_CORE_SERVICE_MIXED_INBOUND_ADDRESS") || "127.0.0.1";
+const CORE_SERVICE_MIXED_INBOUND_PORT = getenv("TACHYON_CORE_SERVICE_MIXED_INBOUND_PORT") || "4534";
+const GITHUB_RAW_URL = getenv("GITHUB_RAW_URL") || "https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release";
+const TACHYON_LISTS_SUBNETS_BASE = getenv("TACHYON_LISTS_SUBNETS_URL") || "https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release/subnets";
 const BUILTIN_SUBNET_URLS = {
-    twitter: [ getenv("SUBNETS_TWITTER") || GITHUB_RAW_URL + "/Subnets/IPv4/twitter.lst", getenv("SUBNETS_TWITTER6") || GITHUB_RAW_URL + "/Subnets/IPv6/twitter.lst" ],
-    meta: [ getenv("SUBNETS_META") || GITHUB_RAW_URL + "/Subnets/IPv4/meta.lst", getenv("SUBNETS_META6") || GITHUB_RAW_URL + "/Subnets/IPv6/meta.lst" ],
-    discord: [ getenv("SUBNETS_DISCORD") || GITHUB_RAW_URL + "/Subnets/IPv4/discord.lst", getenv("SUBNETS_DISCORD6") || GITHUB_RAW_URL + "/Subnets/IPv6/discord.lst" ],
-    roblox: [ getenv("SUBNETS_ROBLOX") || GITHUB_RAW_URL + "/Subnets/IPv4/roblox.lst" ],
-    telegram: [ getenv("SUBNETS_TELEGRAM") || GITHUB_RAW_URL + "/Subnets/IPv4/telegram.lst", getenv("SUBNETS_TELEGRAM6") || GITHUB_RAW_URL + "/Subnets/IPv6/telegram.lst" ],
-    cloudflare: [ getenv("SUBNETS_CLOUDFLARE") || GITHUB_RAW_URL + "/Subnets/IPv4/cloudflare.lst", getenv("SUBNETS_CLOUDFLARE6") || GITHUB_RAW_URL + "/Subnets/IPv6/cloudflare.lst" ],
-    hetzner: [ getenv("SUBNETS_HETZNER") || GITHUB_RAW_URL + "/Subnets/IPv4/hetzner.lst", getenv("SUBNETS_HETZNER6") || GITHUB_RAW_URL + "/Subnets/IPv6/hetzner.lst" ],
-    ovh: [ getenv("SUBNETS_OVH") || GITHUB_RAW_URL + "/Subnets/IPv4/ovh.lst", getenv("SUBNETS_OVH6") || GITHUB_RAW_URL + "/Subnets/IPv6/ovh.lst" ],
-    digitalocean: [ getenv("SUBNETS_DIGITALOCEAN") || GITHUB_RAW_URL + "/Subnets/IPv4/digitalocean.lst", getenv("SUBNETS_DIGITALOCEAN6") || GITHUB_RAW_URL + "/Subnets/IPv6/digitalocean.lst" ],
-    cloudfront: [ getenv("SUBNETS_CLOUDFRONT") || GITHUB_RAW_URL + "/Subnets/IPv4/cloudfront.lst", getenv("SUBNETS_CLOUDFRONT6") || GITHUB_RAW_URL + "/Subnets/IPv6/cloudfront.lst" ]
+    twitter: getenv("SUBNETS_TWITTER6") ? [ getenv("SUBNETS_TWITTER") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/twitter.lst", getenv("SUBNETS_TWITTER6") ] : [ getenv("SUBNETS_TWITTER") || TACHYON_LISTS_SUBNETS_BASE + "/twitter.lst" ],
+    meta: getenv("SUBNETS_META6") ? [ getenv("SUBNETS_META") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/meta.lst", getenv("SUBNETS_META6") ] : [ getenv("SUBNETS_META") || TACHYON_LISTS_SUBNETS_BASE + "/meta.lst" ],
+    discord: getenv("SUBNETS_DISCORD6") ? [ getenv("SUBNETS_DISCORD") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/discord.lst", getenv("SUBNETS_DISCORD6") ] : [ getenv("SUBNETS_DISCORD") || TACHYON_LISTS_SUBNETS_BASE + "/discord.lst" ],
+    roblox: [ getenv("SUBNETS_ROBLOX") || TACHYON_LISTS_SUBNETS_BASE + "/roblox.lst" ],
+    telegram: getenv("SUBNETS_TELEGRAM6") ? [ getenv("SUBNETS_TELEGRAM") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/telegram.lst", getenv("SUBNETS_TELEGRAM6") ] : [ getenv("SUBNETS_TELEGRAM") || TACHYON_LISTS_SUBNETS_BASE + "/telegram.lst" ],
+    cloudflare: getenv("SUBNETS_CLOUDFLARE6") ? [ getenv("SUBNETS_CLOUDFLARE") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/cloudflare.lst", getenv("SUBNETS_CLOUDFLARE6") ] : [ getenv("SUBNETS_CLOUDFLARE") || TACHYON_LISTS_SUBNETS_BASE + "/cloudflare.lst" ],
+    hetzner: getenv("SUBNETS_HETZNER6") ? [ getenv("SUBNETS_HETZNER") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/hetzner.lst", getenv("SUBNETS_HETZNER6") ] : [ getenv("SUBNETS_HETZNER") || TACHYON_LISTS_SUBNETS_BASE + "/hetzner.lst" ],
+    ovh: getenv("SUBNETS_OVH6") ? [ getenv("SUBNETS_OVH") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/ovh.lst", getenv("SUBNETS_OVH6") ] : [ getenv("SUBNETS_OVH") || TACHYON_LISTS_SUBNETS_BASE + "/ovh.lst" ],
+    digitalocean: getenv("SUBNETS_DIGITALOCEAN6") ? [ getenv("SUBNETS_DIGITALOCEAN") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/digitalocean.lst", getenv("SUBNETS_DIGITALOCEAN6") ] : [ getenv("SUBNETS_DIGITALOCEAN") || TACHYON_LISTS_SUBNETS_BASE + "/digitalocean.lst" ],
+    cloudfront: getenv("SUBNETS_CLOUDFRONT6") ? [ getenv("SUBNETS_CLOUDFRONT") || TACHYON_LISTS_SUBNETS_BASE + "/ipv4/cloudfront.lst", getenv("SUBNETS_CLOUDFRONT6") ] : [ getenv("SUBNETS_CLOUDFRONT") || TACHYON_LISTS_SUBNETS_BASE + "/cloudfront.lst" ],
+    google_meet: [ getenv("SUBNETS_GOOGLE_MEET") || TACHYON_LISTS_SUBNETS_BASE + "/google_meet.lst" ],
+    zoom_teams: [ getenv("SUBNETS_ZOOM_TEAMS") || TACHYON_LISTS_SUBNETS_BASE + "/zoom_teams.lst" ],
+    discord_voice: [ getenv("SUBNETS_DISCORD_VOICE") || TACHYON_LISTS_SUBNETS_BASE + "/discord_voice.lst" ],
+    callofduty: [ getenv("SUBNETS_CALLOFDUTY") || TACHYON_LISTS_SUBNETS_BASE + "/callofduty.lst" ],
+    game_backends: [ getenv("SUBNETS_GAME_BACKENDS") || TACHYON_LISTS_SUBNETS_BASE + "/game_backends.lst" ],
+    cs2_dota2: [ getenv("SUBNETS_CS2_DOTA2") || TACHYON_LISTS_SUBNETS_BASE + "/cs2_dota2.lst" ],
+    doh_dot_dns: [ getenv("SUBNETS_DOH_DOT_DNS") || TACHYON_LISTS_SUBNETS_BASE + "/doh_dot_dns.lst" ],
+    vps_clouds: [ getenv("SUBNETS_VPS_CLOUDS") || TACHYON_LISTS_SUBNETS_BASE + "/vps_clouds.lst" ],
+    et_spamhaus_block: [ getenv("SUBNETS_ET_SPAMHAUS_BLOCK") || TACHYON_LISTS_SUBNETS_BASE + "/et_spamhaus_block.lst" ],
+    hagezi_tif_ip_block: [ getenv("SUBNETS_HAGEZI_TIF_IP_BLOCK") || TACHYON_LISTS_SUBNETS_BASE + "/hagezi_tif_ip_block.lst" ],
+    botnet_attackers_ip_block: [ getenv("SUBNETS_BOTNET_ATTACKERS_IP_BLOCK") || TACHYON_LISTS_SUBNETS_BASE + "/botnet_attackers_ip_block.lst" ],
+    antifilter: [ getenv("SUBNETS_ANTIFILTER") || TACHYON_LISTS_SUBNETS_BASE + "/antifilter.lst" ],
+    refilter: [ getenv("SUBNETS_REFILTER") || TACHYON_LISTS_SUBNETS_BASE + "/refilter.lst" ],
+    ru_blocked: [ getenv("SUBNETS_RU_BLOCKED") || TACHYON_LISTS_SUBNETS_BASE + "/ru_blocked.lst" ],
+    ru_blocked_all: [ getenv("SUBNETS_RU_BLOCKED_ALL") || TACHYON_LISTS_SUBNETS_BASE + "/ru_blocked_all.lst" ],
+    ru_domains: [ getenv("SUBNETS_RU_DOMAINS") || TACHYON_LISTS_SUBNETS_BASE + "/ru_domains.lst" ],
+    ru_whitelist: [ getenv("SUBNETS_RU_WHITELIST") || TACHYON_LISTS_SUBNETS_BASE + "/ru_whitelist.lst" ],
+    fastly: [ getenv("SUBNETS_FASTLY") || TACHYON_LISTS_SUBNETS_BASE + "/fastly.lst" ],
+    games_all: [ getenv("SUBNETS_GAMES_ALL") || TACHYON_LISTS_SUBNETS_BASE + "/games_all.lst" ],
+    geoip_cn: [ getenv("SUBNETS_GEOIP_CN") || TACHYON_LISTS_SUBNETS_BASE + "/geoip_cn.lst" ],
+    geoip_ru: [ getenv("SUBNETS_GEOIP_RU") || TACHYON_LISTS_SUBNETS_BASE + "/geoip_ru.lst" ],
+    geoip_us: [ getenv("SUBNETS_GEOIP_US") || TACHYON_LISTS_SUBNETS_BASE + "/geoip_us.lst" ],
+    netflix: [ getenv("SUBNETS_NETFLIX") || TACHYON_LISTS_SUBNETS_BASE + "/netflix.lst" ],
+    origin: [ getenv("SUBNETS_ORIGIN") || TACHYON_LISTS_SUBNETS_BASE + "/origin.lst" ],
+    pubg: [ getenv("SUBNETS_PUBG") || TACHYON_LISTS_SUBNETS_BASE + "/pubg.lst" ],
+    tor: [ getenv("SUBNETS_TOR") || TACHYON_LISTS_SUBNETS_BASE + "/tor.lst" ]
 };
 let rule_config = null;
 let routing_rulesets_module_value = null;
-let singbox_rulesets_module_value = null;
+let core_rulesets_module_value = null;
 
 function routing_rulesets_module() {
     if (routing_rulesets_module_value == null)
@@ -98,10 +127,10 @@ function routing_rulesets_module() {
     return routing_rulesets_module_value;
 }
 
-function singbox_rulesets_module() {
-    if (singbox_rulesets_module_value == null)
-        singbox_rulesets_module_value = require("tachyon_core.rulesets");
-    return singbox_rulesets_module_value;
+function core_rulesets_module() {
+    if (core_rulesets_module_value == null)
+        core_rulesets_module_value = require("tachyon_core.rulesets");
+    return core_rulesets_module_value;
 }
 
 let as_string = common.as_string;
@@ -113,6 +142,7 @@ let command_status = common.command_status;
 let command_success = common.command_success;
 let command_success_from_args = common.command_success_from_args;
 let read_json_file = common.read_json_file;
+let read_file = components_helpers.read_file;
 let write_json = common.write_json;
 let write_json_file = common.write_json_file;
 let write_file = common.write_file;
@@ -122,6 +152,21 @@ let array_or_empty = common.array_or_empty;
 let option = common.option;
 let bool_option = common.bool_option;
 let list_option = common.list_option;
+
+function builtin_subnet_urls_for_service(service) {
+    let key = as_string(service);
+    let direct = BUILTIN_SUBNET_URLS[key];
+    if (type(direct) == "array")
+        return direct;
+    if (rule_config == null)
+        rule_config = require("config.rule");
+    if (type(rule_config.canonical_community_subnet_service) == "function") {
+        let canonical = rule_config.canonical_community_subnet_service(key);
+        if (canonical != "" && canonical != key && type(BUILTIN_SUBNET_URLS[canonical]) == "array")
+            return BUILTIN_SUBNET_URLS[canonical];
+    }
+    return null;
+}
 
 function read_stdin() {
     let data = fs.readfile("/dev/stdin");
@@ -151,22 +196,43 @@ function command_exists(name) {
 }
 
 // curl --dns-servers requires libcurl built with c-ares (not available on all OpenWrt builds).
-// Fall back to --doh-url https://1.1.1.1/dns-query if --dns-servers is unsupported.
+// When c-ares is absent, use the system resolver first so an unreachable DoH provider
+// (e.g. 1.1.1.1; issue #387) never blocks list or component updates. Fall back to DoH
+// resolvers only when host resolution via system DNS fails.
+const CURL_DOH_FALLBACK_URLS = [
+    "https://dns.google/dns-query",
+    "https://common.dot.dns.yandex.net/dns-query",
+    "https://1.1.1.1/dns-query"
+];
 let _curl_has_dns_servers = null;
 let _curl_has_doh_url = null;
-function curl_push_dns_servers(args) {
-    if (_curl_has_dns_servers === null)
-        _curl_has_dns_servers = (system("curl --dns-servers 8.8.8.8 -V >/dev/null 2>&1") == 0);
+let _curl_working_doh_url = "";
+function curl_push_dns_servers(args, doh_fallback_index) {
+    if (_curl_has_dns_servers === null) {
+        let cap = common.command_capture(command_from_args([ "curl", "--dns-servers", "8.8.8.8", "-V" ]) + " 2>/dev/null");
+        _curl_has_dns_servers = (cap != null && int(cap.status) == 0);
+    }
     if (_curl_has_dns_servers) {
-        push(args, "--dns-servers", "8.8.8.8,1.1.1.1");
-        return;
+        push(args, "--dns-servers", "8.8.8.8,77.88.8.8,1.1.1.1");
+        return "";
     }
 
-    if (_curl_has_doh_url === null)
-        _curl_has_doh_url = (system("curl --doh-url https://1.1.1.1/dns-query -V >/dev/null 2>&1") == 0);
-    if (_curl_has_doh_url) {
-        push(args, "--doh-url", "https://1.1.1.1/dns-query");
+    let idx = int(doh_fallback_index || 0);
+    if (idx <= 0 && _curl_working_doh_url == "")
+        return "";
+
+    if (_curl_has_doh_url === null) {
+        let cap = common.command_capture(command_from_args([ "curl", "--doh-url", "https://dns.google/dns-query", "-V" ]) + " 2>/dev/null");
+        _curl_has_doh_url = (cap != null && int(cap.status) == 0);
     }
+    if (!_curl_has_doh_url)
+        return "";
+
+    let chosen = (_curl_working_doh_url != "" && idx <= 0)
+        ? _curl_working_doh_url
+        : CURL_DOH_FALLBACK_URLS[(idx > 0 ? idx - 1 : 0) % length(CURL_DOH_FALLBACK_URLS)];
+    push(args, "--doh-url", chosen);
+    return chosen;
 }
 
 function now_seconds() {
@@ -298,10 +364,7 @@ function file_nonempty(path) {
 }
 
 function copy_file(source, target) {
-    let data = fs.readfile(as_string(source));
-    if (data == null)
-        return false;
-    return write_file(target, data);
+    return common.copy_file(source, target);
 }
 
 function ensure_parent_dir(path) {
@@ -351,6 +414,7 @@ function list_option_values(section, key) {
 }
 
 function uci_sections(type_name) {
+    connections.set_item_sections_from_cursor(uci_core.cursor(), CONFIG_NAME);
     return uci_core.section_objects(CONFIG_NAME, as_string(type_name));
 }
 
@@ -377,11 +441,20 @@ function module_output(args) {
     return command_output(module_command(args));
 }
 
+let list_nft_batch = "";
+let list_nft_batch_failed = false;
+
 function nft_module_success(args) {
     let command_args = [ LIB_DIR + "/nft/apply.uc" ];
     for (let arg in args)
         push(command_args, arg);
-    return module_success(command_args);
+    let command = module_command(command_args);
+    if (list_nft_batch != "")
+        command = "env " + shell_quote("TACHYON_NFT_BATCH_FILE=" + list_nft_batch) + " " + command;
+    let ok = command_status(command) == 0;
+    if (!ok && list_nft_batch != "")
+        list_nft_batch_failed = true;
+    return ok;
 }
 
 function service_state_success(args) {
@@ -562,7 +635,7 @@ function rule_has_list_update_source(section) {
     if (!bool_option(section, "enabled", true))
         return false;
     if (option(section, "action", "") == "dns")
-        return list_has_remote_references(option(section, "domain_ip_lists", ""));
+        return list_has_remote_references(connections.domain_ip_lists_value(section));
     if (option(section, "action", "") == "hosts")
         return false;
 
@@ -571,7 +644,8 @@ function rule_has_list_update_source(section) {
         option(section, "remote_domain_lists", "") != "" ||
         option(section, "remote_subnet_lists", "") != "" ||
         length(connections.rule_sets_with_subnets(section)) > 0 ||
-        list_has_remote_references(option(section, "domain_ip_lists", ""))
+        list_has_remote_references(connections.rule_sets_value(section)) ||
+        list_has_remote_references(connections.domain_ip_lists_value(section))
     );
 }
 
@@ -592,7 +666,12 @@ function settings_update_interval(settings) {
     if (!bool_option(settings, "list_update_enabled", true))
         return "";
 
-    let value = option(settings, "update_interval", "1d");
+    if (index([ "0", "off", "never", "disabled" ], lc(trim(as_string(option(settings, "list_update_interval", ""))))) >= 0)
+        return "";
+
+    let value = trim(option(settings, "update_interval", "1d"));
+    if (index([ "0", "off", "never", "disabled" ], lc(value)) >= 0)
+        return "";
     return value != "" ? value : "1d";
 }
 
@@ -608,17 +687,18 @@ function settings_component_update_check_interval(settings) {
 
 function normalize_component_name(component) {
     component = as_string(component);
-    if (component == "sing-box" || component == "singbox")
-        return "sing_box";
+    if (component == "tachyon-core" || component == "tachyon_core" || component == "tachyoncore")
+        return "tachyon-core";
     if (component == "tachyon")
         return "tachyon";
+    if (component == "torrserver_direct" || component == "torrserver-direct" || component == "torrserver")
+        return "torrserver_direct";
     return component;
 }
 
 function valid_component_name(component) {
     component = normalize_component_name(component);
-    return component == "tachyon" || component == "sing_box" || component == "zapret" ||
-        component == "zapret2" || component == "byedpi" || component == "wdtt" || component == "olcrtc" || component == "fptn" || component == "tailscale";
+    return component == "tachyon" || component == "tachyon-core" || component == "torrserver_direct";
 }
 
 function settings_component_auto_update_enabled(settings) {
@@ -636,6 +716,191 @@ function settings_component_auto_update_time(settings) {
     settings = object_or_empty(settings);
     let time = trim(as_string(option(settings, "component_auto_update_time", "04:00")));
     return match(time, /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/) != null ? time : "04:00";
+}
+
+function parse_hhmm_to_minutes(value, fallback) {
+    let m = match(trim(as_string(value)), /^([01]?[0-9]|2[0-3]):([0-5][0-9])$/);
+    if (m == null)
+        return fallback;
+    return int(m[1]) * 60 + int(m[2]);
+}
+
+function format_minutes_hhmm(minutes) {
+    minutes = int(minutes) % 1440;
+    if (minutes < 0)
+        minutes += 1440;
+    return sprintf("%02d:%02d", int(minutes / 60), minutes % 60);
+}
+
+// Scheduled updates run inside a window instead of at a single minute: the exact
+// minute may be the moment a game download saturates the WAN, and a missed minute
+// used to mean "no update today". An end earlier than the start means the window
+// crosses midnight (22:00-06:00).
+function settings_component_auto_update_window(settings) {
+    settings = object_or_empty(settings);
+    let fallback_start = parse_hhmm_to_minutes(option(settings, "component_auto_update_time", "04:00"), 4 * 60);
+    let start = parse_hhmm_to_minutes(option(settings, "component_auto_update_window_start", ""), fallback_start);
+    let end = parse_hhmm_to_minutes(option(settings, "component_auto_update_window_end", ""), (start + 60) % 1440);
+    return { start: start, end: end };
+}
+
+function auto_update_window_contains(start, end, minute) {
+    if (minute == null)
+        return true;
+    if (start == end)
+        return true;
+    if (start < end)
+        return minute >= start && minute < end;
+    return minute >= start || minute < end;
+}
+
+function settings_auto_update_threshold(settings, name) {
+    let raw = trim(as_string(option(object_or_empty(settings), name, "0")));
+    if (!match(raw, /^[0-9]+$/))
+        return 0;
+    return int(raw);
+}
+
+function auto_update_clash_api_endpoint(settings) {
+    let env_url = trim(as_string(getenv("TACHYON_CLASH_API_URL") || ""));
+    if (env_url != "") {
+        return {
+            url: replace(env_url, /\/+$/, "") + "/connections",
+            secret: trim(as_string(option(object_or_empty(settings), "clash_api_secret", "")))
+        };
+    }
+
+    settings = object_or_empty(settings);
+    let candidates = [];
+    let cfg_opt = trim(as_string(option(settings, "config_path", "")));
+    if (cfg_opt != "")
+        push(candidates, cfg_opt);
+    push(candidates, "/etc/tachyon-core/config.json");
+
+    for (let path in candidates) {
+        let cfg = read_json_file(path);
+        if (type(cfg) != "object")
+            continue;
+        let api = cfg.experimental && cfg.experimental.clash_api;
+        if (type(api) != "object")
+            continue;
+        let address = trim(as_string(api.external_controller || ""));
+        if (address == "")
+            continue;
+        if (substr(address, 0, 1) == ":")
+            address = "127.0.0.1" + address;
+        address = replace(address, /^0\.0\.0\.0:/, "127.0.0.1:");
+        address = replace(address, /^\[::\]:/, "[::1]:");
+        return {
+            url: "http://" + address + "/connections",
+            secret: trim(as_string(api.secret || option(settings, "clash_api_secret", "")))
+        };
+    }
+
+    let ctrl = trim(as_string(option(settings, "clash_api_controller", "127.0.0.1:9090")));
+    if (ctrl == "")
+        ctrl = "127.0.0.1:9090";
+    if (substr(ctrl, 0, 1) == ":")
+        ctrl = "127.0.0.1" + ctrl;
+    ctrl = replace(ctrl, /^0\.0\.0\.0:/, "127.0.0.1:");
+    ctrl = replace(ctrl, /^\[::\]:/, "[::1]:");
+    return {
+        url: "http://" + ctrl + "/connections",
+        secret: trim(as_string(option(settings, "clash_api_secret", "")))
+    };
+}
+
+// Current load from the core's own connection table. Both counters are optional,
+// 0 disables the check, and without connection data the update is allowed: a
+// broken stats endpoint must not silently disable updates forever.
+function auto_update_load_snapshot(settings) {
+    let endpoint = auto_update_clash_api_endpoint(settings);
+    let out = null;
+    if (endpoint.secret != "") {
+        let request_config = temp_path();
+        if (request_config != "") {
+            let content = "silent\nheader = " + sprintf("%J", "Authorization: Bearer " + endpoint.secret) + "\n";
+            if (write_file(request_config, content)) {
+                try { fs.chmod(request_config, 0600); } catch (e) {}
+                out = command_output_from_args([
+                    "curl", "--config", request_config, "--fail", "--noproxy", "*",
+                    "--connect-timeout", "1", "--max-time", "2", endpoint.url
+                ]);
+            }
+            remove_file(request_config);
+        }
+    } else {
+        out = command_output_from_args([
+            "curl", "-s", "--fail", "--noproxy", "*",
+            "--connect-timeout", "1", "--max-time", "2", endpoint.url
+        ]);
+    }
+    if (out == null || out == "")
+        return null;
+    try {
+        let parsed = json(out);
+        let conns = parsed != null ? parsed.connections : null;
+        if (type(conns) != "array")
+            return null;
+        let clients = {};
+        for (let conn in conns) {
+            let ip = conn != null && conn.metadata != null ? trim(as_string(conn.metadata.sourceIP)) : "";
+            if (ip != "" && ip != "127.0.0.1" && ip != "::1")
+                clients[ip] = true;
+        }
+        let client_count = 0;
+        for (let ip in clients)
+            client_count++;
+        return { connections: length(conns), clients: client_count };
+    } catch (e) {
+        return null;
+    }
+}
+
+function auto_update_load_allows(settings) {
+    let max_connections = settings_auto_update_threshold(settings, "component_auto_update_max_connections");
+    let max_clients = settings_auto_update_threshold(settings, "component_auto_update_max_clients");
+    if (max_connections <= 0 && max_clients <= 0)
+        return true;
+    let snapshot = auto_update_load_snapshot(settings);
+    if (snapshot == null)
+        return true;
+    if (max_connections > 0 && snapshot.connections > max_connections)
+        return false;
+    if (max_clients > 0 && snapshot.clients > max_clients)
+        return false;
+    return true;
+}
+
+function auto_update_window_stamp(window, now_ts, minute) {
+    let ref_ts = now_ts != null ? int(now_ts) : now_seconds();
+    if (window != null && window.start > window.end && minute != null && minute < window.end) {
+        // Post-midnight half of an overnight window (e.g. 22:00-06:00 at 01:30):
+        // anchor the stamp to noon of the calendar day when this window opened so
+        // crossing 00:00 does not trigger a second update in the same night.
+        ref_ts -= (int(minute) + 12 * 60) * 60;
+    }
+    let tm = localtime(ref_ts);
+    if (tm == null)
+        return "";
+    return sprintf("%04d-%02d-%02d", int(tm.year), int(tm.mon), int(tm.mday));
+}
+
+// One update cycle per window, at the first quiet moment inside the window
+// instead of a fixed minute. The marker survives cron ticks; a crash mid-cycle
+// leaves no marker and the next tick retries.
+function auto_update_attempted_in_window(window, now_ts, minute) {
+    let stamp = trim(as_string(fs.readfile(COMPONENT_AUTO_UPDATE_LAST_RUN_FILE)));
+    if (stamp == "")
+        return false;
+    let current = auto_update_window_stamp(window, now_ts, minute);
+    return current != "" && stamp == current;
+}
+
+function mark_auto_update_attempted_in_window(window, now_ts, minute) {
+    let current = auto_update_window_stamp(window, now_ts, minute);
+    if (current != "")
+        write_file(COMPONENT_AUTO_UPDATE_LAST_RUN_FILE, current + "\n");
 }
 
 function settings_component_auto_update_targets(settings) {
@@ -675,6 +940,53 @@ function section_subscription_update_interval(section) {
     }
 
     return result;
+}
+
+function section_subscription_update_jitter(section) {
+    if (type(connections.subscription_update_jitter) != "function")
+        return "";
+    for (let entry in connections.subscription_urls(section)) {
+        if (!connections.subscription_update_enabled(section, entry))
+            continue;
+        let jit = trim(as_string(connections.subscription_update_jitter(section, entry) || ""));
+        if (jit != "")
+            return jit;
+    }
+    return trim(as_string(connections.subscription_update_jitter(section, "") || ""));
+}
+
+function apply_subscription_jitter_seconds(base_seconds, jitter_spec, section_name_val, last_run_val) {
+    base_seconds = int(base_seconds || 0);
+    jitter_spec = trim(as_string(jitter_spec || ""));
+    if (base_seconds <= 1 || jitter_spec == "" || jitter_spec == "0" || lc(jitter_spec) == "disabled")
+        return base_seconds;
+    let max_delta = 0;
+    let pct_match = match(jitter_spec, /^([0-9]+)%$/);
+    if (pct_match != null) {
+        let pct = int(pct_match[1], 10);
+        if (pct > 80)
+            pct = 80;
+        if (pct > 0)
+            max_delta = int((base_seconds * pct) / 100.0 + 0.5);
+    } else {
+        let dur = duration_to_seconds_value(jitter_spec);
+        if (dur != null && dur > 0)
+            max_delta = dur > int(base_seconds * 0.8) ? int(base_seconds * 0.8) : dur;
+        else
+            max_delta = int(base_seconds * 0.15 + 0.5);
+    }
+    if (max_delta <= 0)
+        return base_seconds;
+    let seed = as_string(section_name_val || "") + ":" + as_string(last_run_val || "0");
+    let h = 2166136261;
+    for (let i = 0; i < length(seed); i++)
+        h = ((h ^ ord(seed, i)) * 16777619) & 0x7fffffff;
+    let span = max_delta * 2 + 1;
+    let offset = (h % span) - max_delta;
+    if (offset == 0)
+        offset = (h & 1) ? 1 : -1;
+    let eff = base_seconds + offset;
+    return eff < 60 ? 60 : eff;
 }
 
 function section_is_subscription_proxy(section) {
@@ -742,6 +1054,7 @@ function cron_refresh_plan_rows(settings, sections, bin, list_marker, subscripti
 
     let min_interval = 0;
     let subscription_source_count = 0;
+    let has_subscription_jitter = false;
     for (let section in sections) {
         section = object_or_empty(section);
         if (!section_is_subscription_proxy(section))
@@ -758,6 +1071,9 @@ function cron_refresh_plan_rows(settings, sections, bin, list_marker, subscripti
             continue;
         }
 
+        if (section_subscription_update_jitter(section) != "")
+            has_subscription_jitter = true;
+
         if (min_interval == 0 || seconds < min_interval)
             min_interval = seconds;
     }
@@ -765,8 +1081,10 @@ function cron_refresh_plan_rows(settings, sections, bin, list_marker, subscripti
     if (subscription_source_count > 0) {
         if (min_interval <= 0)
             status = 1;
-        else
-            push(rows, "subscription\t" + due_check_cron_schedule_text(min_interval) + " " + as_string(bin) + " subscription_update_if_due " + as_string(subscription_marker));
+        else {
+            let cron_seconds = (has_subscription_jitter && min_interval > 300) ? 300 : min_interval;
+            push(rows, "subscription\t" + due_check_cron_schedule_text(cron_seconds) + " " + as_string(bin) + " subscription_update_if_due " + as_string(subscription_marker));
+        }
     }
 
     let component_interval = settings_component_update_check_interval(settings);
@@ -783,12 +1101,10 @@ function cron_refresh_plan_rows(settings, sections, bin, list_marker, subscripti
 
     if (settings_component_auto_update_enabled(settings) &&
         settings_component_auto_update_mode(settings) == "schedule") {
-        let time_str = settings_component_auto_update_time(settings);
-        let parts = split(time_str, ":");
-        let hour = int(parts[0] || "4");
-        let minute = int(parts[1] || "0");
-        let cron_time = sprintf("%d %d * * *", minute, hour);
-        push(rows, "component-auto-update\t" + cron_time + " " + as_string(bin) + " component_auto_update_apply " + as_string(component_marker));
+        // The window and the load limits are evaluated by the command itself, so
+        // tick often and let it decide: it exits immediately outside the window,
+        // waits for a quiet moment inside it and runs at most once per day.
+        push(rows, "component-auto-update\t*/10 * * * * " + as_string(bin) + " component_auto_update_apply " + as_string(component_marker));
     }
 
     return {
@@ -983,7 +1299,12 @@ function subscription_update_section_due_status(section, timestamp_path, now) {
         exit(2);
     }
 
-    exit(update_due_status(now, file_first_line_value(timestamp_path), seconds));
+    let last_run = file_first_line_value(timestamp_path);
+    let jitter = section_subscription_update_jitter(section);
+    if (jitter != "")
+        seconds = apply_subscription_jitter_seconds(seconds, jitter, section_name(section), last_run);
+
+    exit(update_due_status(now, last_run, seconds));
 }
 
 function stdin_first_ipv4_line() {
@@ -1004,10 +1325,18 @@ function json_length(path) {
         print("0\n");
 }
 
+function job_pid_from_state(path, value) {
+    let pid = type(value) == "object" && value.pid != null ? as_string(value.pid) : "";
+    if (pid == "")
+        pid = file_first_line_value(as_string(path) + ".pid");
+    return pid;
+}
+
 function job_pid(path) {
     let value = read_json_file(path);
-    if (type(value) == "object" && value.pid != null)
-        print(as_string(value.pid), "\n");
+    let pid = job_pid_from_state(path, value);
+    if (pid != "")
+        print(pid, "\n");
 }
 
 function subscription_job_state_path(job_dir, job_id) {
@@ -1068,13 +1397,15 @@ function set_subscription_running_job_pid(path, pid) {
     if (!job_pid_valid(pid))
         return false;
 
-    let value = object_or_empty(read_json_file(path));
-    if (value.running === true) {
-        value.pid = pid;
-        return write_state_file(path, value);
-    }
+    if (!write_file(as_string(path) + ".pid", pid + "\n"))
+        return false;
 
-    return false;
+    let value = read_json_file(path);
+    if (type(value) == "object" && value.running === true && value.pid == null) {
+        value.pid = arg_number(pid);
+        write_state_file(path, value);
+    }
+    return true;
 }
 
 function subscription_job_refresh_plan(path, now, grace_seconds) {
@@ -1085,7 +1416,7 @@ function subscription_job_refresh_plan(path, now, grace_seconds) {
     }
 
     let within_grace = job_started_at_within_grace(value.started_at, now, grace_seconds);
-    let pid = as_string(value.pid || "");
+    let pid = job_pid_from_state(path, value);
     if (!job_pid_valid(pid)) {
         print(within_grace ? "skip\n" : "stale\n");
         return;
@@ -1166,7 +1497,7 @@ function ensure_subscription_runtime_dirs() {
     let command = command_env({
         TACHYON_CONFIG_NAME: CONFIG_NAME,
         TACHYON_LIB: LIB_DIR,
-        TMP_SING_BOX_FOLDER,
+        TMP_TACHYON_CORE_FOLDER,
         TMP_RULESET_FOLDER,
         TMP_SUBSCRIPTION_FOLDER,
         TACHYON_RUNTIME_STATE_DIR: RUNTIME_STATE_DIR,
@@ -1201,8 +1532,32 @@ function subscription_job_output_path_from_state(path) {
     return path + ".out";
 }
 
+function job_dir_old_files(dir) {
+    let entries = fs.lsdir(dir);
+    if (type(entries) != "array")
+        return [];
+    let out = [];
+    let now = time();
+    for (let name in entries) {
+        if (name == "." || name == "..")
+            continue;
+        let full = dir + "/" + name;
+        let st = fs.stat(full);
+        if (st != null && st.type == "file")
+            push(out, { name: name, path: full, age: now - int(st.mtime || 0) });
+    }
+    return out;
+}
+
+function filename_ends_with(name, suffix) {
+    let nlen = length(name);
+    let slen = length(suffix);
+    return nlen >= slen && substr(name, nlen - slen) == suffix;
+}
+
 function remove_subscription_job_state(path) {
     remove_file(path);
+    remove_file(as_string(path) + ".pid");
     remove_file(subscription_job_output_path_from_state(path));
 }
 
@@ -1215,27 +1570,15 @@ function subscription_job_running_is(path, expected) {
 function subscription_cleanup_jobs() {
     ensure_dir(SUBSCRIPTION_JOB_DIR);
 
-    command_success_from_args([
-        "find",
-        SUBSCRIPTION_JOB_DIR,
-        "-type", "f",
-        "-name", "*.out",
-        "-mmin", "+" + as_string(SUBSCRIPTION_JOB_ORPHAN_OUTPUT_TTL_MINUTES),
-        "-delete"
-    ]);
-
-    let old = command_output_from_args([
-        "find",
-        SUBSCRIPTION_JOB_DIR,
-        "-type", "f",
-        "-name", "*.json",
-        "-mmin", "+" + as_string(SUBSCRIPTION_JOB_FINISHED_TTL_MINUTES)
-    ]);
-
-    for (let path in split(old, "\n")) {
-        path = trim(as_string(path));
-        if (path != "" && subscription_job_running_is(path, false))
-            remove_subscription_job_state(path);
+    let orphan_ttl = int(SUBSCRIPTION_JOB_ORPHAN_OUTPUT_TTL_MINUTES) * 60;
+    let finished_ttl = int(SUBSCRIPTION_JOB_FINISHED_TTL_MINUTES) * 60;
+    for (let entry in job_dir_old_files(SUBSCRIPTION_JOB_DIR)) {
+        if (filename_ends_with(entry.name, ".out") && entry.age >= orphan_ttl) {
+            remove_file(entry.path);
+        } else if (filename_ends_with(entry.name, ".json") && entry.age >= finished_ttl) {
+            if (subscription_job_running_is(entry.path, false))
+                remove_subscription_job_state(entry.path);
+        }
     }
 }
 
@@ -1272,7 +1615,7 @@ function refresh_subscription_running_job_state(path) {
 
     let now = now_seconds();
     let within_grace = job_started_at_within_grace(value.started_at, now, SUBSCRIPTION_JOB_STALE_GRACE_SECONDS);
-    let pid = as_string(value.pid || "");
+    let pid = as_string(value.pid || trim(as_string(fs.readfile(as_string(path) + ".pid") || "")) || "");
 
     if (!job_pid_valid(pid)) {
         if (!within_grace)
@@ -1322,7 +1665,7 @@ function subscription_worker_env() {
         TACHYON_CONFIG_NAME: CONFIG_NAME,
         TACHYON_LIB: LIB_DIR,
         TACHYON_BIN: BIN_PATH,
-        TMP_SING_BOX_FOLDER,
+        TMP_TACHYON_CORE_FOLDER,
         TMP_RULESET_FOLDER,
         TMP_SUBSCRIPTION_FOLDER,
         TACHYON_RUNTIME_STATE_DIR: RUNTIME_STATE_DIR,
@@ -1602,7 +1945,7 @@ function component_update_check_cache() {
     let results = [];
 
     if (enabled) {
-        for (let component in [ "tachyon", "sing_box", "zapret", "zapret2", "byedpi", "wdtt", "olcrtc", "fptn" ]) {
+        for (let component in [ "tachyon", "tachyon-core" ]) {
             let value = read_json_file(component_update_check_cache_path(component));
             if (component_update_check_result_cacheable(value))
                 push(results, value);
@@ -1645,9 +1988,15 @@ function component_job_output_path_from_state(path) {
 
 function remove_component_job_state(path) {
     let output_path = component_job_output_path_from_state(path);
+    let stem = as_string(path);
+    if (length(stem) >= 5 && substr(stem, length(stem) - 5) == ".json")
+        stem = substr(stem, 0, length(stem) - 5);
     remove_file(path);
+    remove_file(as_string(path) + ".pid");
     remove_file(output_path);
+    remove_file(output_path + ".stderr");
     remove_file(output_path + ".json");
+    remove_file(stem + ".log");
 }
 
 function component_job_running_is(path, expected) {
@@ -1680,7 +2029,7 @@ function refresh_component_running_job_state(path) {
 
     let now = now_seconds();
     let within_grace = job_started_at_within_grace(value.started_at, now, COMPONENT_JOB_STALE_GRACE_SECONDS);
-    let pid = as_string(value.pid || "");
+    let pid = as_string(value.pid || trim(as_string(fs.readfile(as_string(path) + ".pid") || "")) || "");
 
     // Heartbeat freshness: if the job has been running longer than the hard deadline
     // and no heartbeat was recorded, the worker is likely stuck.
@@ -1739,59 +2088,25 @@ function component_cleanup_jobs() {
         }
     }
 
-    command_success_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.out",
-        "-mmin", "+" + as_string(COMPONENT_JOB_ORPHAN_OUTPUT_TTL_MINUTES),
-        "-delete"
-    ]);
-    command_success_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.out.stderr",
-        "-mmin", "+" + as_string(COMPONENT_JOB_ORPHAN_OUTPUT_TTL_MINUTES),
-        "-delete"
-    ]);
-    command_success_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.log",
-        "-mmin", "+" + as_string(COMPONENT_JOB_ORPHAN_OUTPUT_TTL_MINUTES),
-        "-delete"
-    ]);
-    command_success_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.out.json",
-        "-mmin", "+" + as_string(COMPONENT_JOB_ORPHAN_OUTPUT_TTL_MINUTES),
-        "-delete"
-    ]);
-    command_success_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.json.*",
-        "-mmin", "+10",
-        "-delete"
-    ]);
-
-    let old = command_output_from_args([
-        "find",
-        COMPONENT_JOB_DIR,
-        "-type", "f",
-        "-name", "*.json",
-        "-mmin", "+" + as_string(COMPONENT_JOB_FINISHED_TTL_MINUTES)
-    ]);
-
-    for (let path in split(old, "\n")) {
-        path = trim(as_string(path));
-        if (path != "" && component_job_running_is(path, false))
-            remove_component_job_state(path);
+    let orphan_ttl = int(COMPONENT_JOB_ORPHAN_OUTPUT_TTL_MINUTES) * 60;
+    let finished_ttl = int(COMPONENT_JOB_FINISHED_TTL_MINUTES) * 60;
+    let orphan_globs = [ "*.out", "*.out.stderr", "*.log", "*.out.json" ];
+    for (let entry in job_dir_old_files(COMPONENT_JOB_DIR)) {
+        let is_orphan_ext = false;
+        for (let pat in orphan_globs) {
+            if (filename_ends_with(entry.name, substr(pat, 1))) {
+                is_orphan_ext = true;
+                break;
+            }
+        }
+        if (is_orphan_ext && entry.age >= orphan_ttl) {
+            remove_file(entry.path);
+        } else if (index(entry.name, ".json.") >= 0 && entry.age >= 600) {
+            remove_file(entry.path);
+        } else if (filename_ends_with(entry.name, ".json") && entry.age >= finished_ttl) {
+            if (component_job_running_is(entry.path, false))
+                remove_component_job_state(entry.path);
+        }
     }
 }
 
@@ -1800,13 +2115,15 @@ function set_component_running_job_pid(path, pid) {
     if (!job_pid_valid(pid))
         return false;
 
-    let value = object_or_empty(read_json_file(path));
-    if (value.running === true) {
-        value.pid = pid;
-        return write_state_file(path, value);
-    }
+    if (!write_file(as_string(path) + ".pid", pid + "\n"))
+        return false;
 
-    return false;
+    let value = read_json_file(path);
+    if (type(value) == "object" && value.running === true && value.pid == null) {
+        value.pid = arg_number(pid);
+        write_state_file(path, value);
+    }
+    return true;
 }
 
 function output_json_object(path) {
@@ -1860,46 +2177,7 @@ function component_fallback_job_state(component, action, message, exit_code, upd
     };
 }
 
-function finish_component_job(path, component, action, exit_code, output_file) {
-    let updated_at = now_seconds();
-    let value = output_json_object(output_file);
-    let ok;
 
-    if (type(value) == "object") {
-        value.running = false;
-        value.kind = "component";
-        value.exit_code = arg_number(exit_code);
-        value.updated_at = updated_at;
-        update_component_check_cache_from_action(value);
-        ok = write_state_file(path, value);
-    }
-    else {
-        // No JSON at all means the worker really did die before printing its
-        // result. Its stderr, kept out of the result channel above, holds the
-        // reason; fall back to the result file only if stderr is empty.
-        let raw_output = file_last_nonblank_line_value(output_file + ".stderr", "", 240);
-        if (raw_output == "")
-            raw_output = file_last_nonblank_line_value(output_file, "", 240);
-        let log_file = substr(output_file, 0, length(output_file) - 4) + ".log";
-        if (raw_output == "" && file_exists_value(log_file))
-            raw_output = file_last_nonblank_line_value(log_file, "", 240);
-        let is_success = arg_number(exit_code) == 0;
-        if (raw_output == "")
-            raw_output = is_success ? sprintf("%s %s completed successfully", component, action) : "Failed to execute";
-        let state = component_fallback_job_state(component, action, raw_output, exit_code, updated_at);
-        if (is_success) {
-            state.success = true;
-            state.status = "latest";
-            state.changed = 1;
-        }
-        ok = write_state_file(path, state);
-    }
-
-    remove_file(output_file);
-    remove_file(output_file + ".stderr");
-    remove_file(output_file + ".json");
-    return ok;
-}
 
 function component_worker_env() {
     let env = {
@@ -1939,32 +2217,7 @@ function launch_component_worker(args) {
     return trim(command_output("sh -c " + shell_quote(command)));
 }
 
-function component_action_worker(state_file, output_file, component, action, extra) {
-    component = normalize_component_name(component);
-    // stderr gets its own file instead of being merged into the result channel.
-    // Merging put apk/opkg warnings and init-script chatter into the same file as
-    // the JSON result - the whole-file parse then failed, the line scan found no
-    // object, and a successful action was reported to the UI as "Failed to
-    // execute" with the tail of a log as its message.
-    let worker_env = component_worker_env();
-    worker_env.UPDATES_JOB_LOG = substr(output_file, 0, length(output_file) - 4) + ".log";
-    worker_env.UPDATES_JOB_STATE_FILE = state_file;
-    let action_args = [
-        "ucode",
-        "-L", LIB_DIR,
-        LIB_DIR + "/components/action.uc",
-        "component-action",
-        as_string(component),
-        as_string(action)
-    ];
-    if (as_string(extra || "") != "")
-        push(action_args, as_string(extra));
-    let command = command_env(worker_env) + " " +
-        command_from_args(action_args) + " >" + shell_quote(output_file) + " 2>" + shell_quote(output_file + ".stderr");
-    let status = command_status(command);
 
-    finish_component_job(state_file, component, action, status, output_file);
-}
 
 function component_action_async_job(component, action, extra) {
     component = normalize_component_name(component);
@@ -2062,19 +2315,7 @@ function automatic_component_check_names() {
     let result = [ "tachyon" ];
 
     if (fs.stat("/usr/bin/tachyon-core") != null)
-        push(result, "sing_box");
-    if (module_success([ LIB_DIR + "/providers/zapret/runtime.uc", "installed" ]))
-        push(result, "zapret");
-    if (module_success([ LIB_DIR + "/providers/zapret2/runtime.uc", "installed" ]))
-        push(result, "zapret2");
-    if (module_success([ LIB_DIR + "/providers/byedpi/runtime.uc", "installed" ]))
-        push(result, "byedpi");
-    if (module_success([ LIB_DIR + "/providers/wdtt/runtime.uc", "installed" ]))
-        push(result, "wdtt");
-    if (module_success([ LIB_DIR + "/providers/olcrtc/runtime.uc", "installed" ]))
-        push(result, "olcrtc");
-    if (module_success([ LIB_DIR + "/providers/fptn/runtime.uc", "installed" ]))
-        push(result, "fptn");
+        push(result, "tachyon-core");
 
     return result;
 }
@@ -2097,10 +2338,33 @@ function run_automatic_component_update_check(component) {
     let value = output_json_object(output_file);
     remove_file(output_file);
 
-    if (status != 0 || !component_update_check_result_cacheable(value))
+    if (status != 0 || !component_update_check_result_cacheable(value)) {
+        remove_file(component_update_check_cache_path(component));
         return false;
+    }
 
     return cache_component_update_check_result(value, true);
+}
+
+function mark_job_as_auto_update(job_id, component, target_version, prev_version) {
+    let pending_data = {
+        job_id: as_string(job_id),
+        component: as_string(component),
+        previous_version: as_string(prev_version || ""),
+        target_version: as_string(target_version || ""),
+        timestamp: now_seconds()
+    };
+    write_file(AUTO_UPDATE_PENDING_FILE, sprintf("%J\n", pending_data));
+
+    let state_file = component_job_state_path_value(job_id);
+    if (state_file != "") {
+        let st = object_or_empty(read_json_file(state_file));
+        st.is_auto_update = true;
+        st.previous_version = as_string(prev_version || "");
+        if (as_string(target_version || "") != "")
+            st.target_version = as_string(target_version);
+        write_state_file(state_file, st);
+    }
 }
 
 function trigger_component_auto_update(component, target_version) {
@@ -2111,34 +2375,249 @@ function trigger_component_auto_update(component, target_version) {
     }
 
     log_message("[auto-update] Initiating automatic update for " + component + (target_version != "" ? " to version " + target_version : ""), "info");
+    let cached = object_or_empty(read_json_file(component_update_check_cache_path(component)));
+    let prev_version = cached.current_version || "";
     let res = component_action_async_job(component, "install");
     if (!res.success) {
         log_message("[auto-update] Failed to start auto-update for " + component + ": " + res.message, "error");
         return false;
     }
+    mark_job_as_auto_update(res.job_id, component, target_version, prev_version);
     return true;
 }
 
-function component_auto_update_apply() {
+function notify_component_auto_updated(component, prev_version, new_version) {
+    let cmd = command_from_args([
+        BIN_PATH,
+        "telegram",
+        "notify-auto-update",
+        as_string(component),
+        as_string(prev_version || ""),
+        as_string(new_version || "")
+    ]);
+    command_status(common.background_command(cmd));
+}
+
+function notify_component_auto_update_failed(component, prev_version, err_msg) {
+    let cmd = command_from_args([
+        BIN_PATH,
+        "telegram",
+        "notify-auto-update-failed",
+        as_string(component),
+        as_string(prev_version || ""),
+        as_string(err_msg || "")
+    ]);
+    command_status(common.background_command(cmd));
+}
+
+function continue_component_auto_update(completed_component) {
     let settings = uci_settings();
-    if (!settings_component_auto_update_enabled(settings)) {
-        log_message("[auto-update] Automatic component updates are disabled", "info");
-        exit(0);
+    if (!settings_component_auto_update_enabled(settings))
+        return;
+
+    let norm_completed = normalize_component_name(completed_component);
+    let checked_components = automatic_component_check_names();
+    let start_idx = 0;
+    for (let i = 0; i < length(checked_components); i++) {
+        if (normalize_component_name(checked_components[i]) == norm_completed) {
+            start_idx = i + 1;
+            break;
+        }
     }
 
-    let checked_components = automatic_component_check_names();
-    for (let component in checked_components) {
-        if (!component_is_auto_update_target(settings, component))
+    for (let i = start_idx; i < length(checked_components); i++) {
+        let comp = checked_components[i];
+        if (!component_is_auto_update_target(settings, comp))
             continue;
 
-        run_automatic_component_update_check(component);
-        let cached = object_or_empty(read_json_file(component_update_check_cache_path(component)));
+        let ok = run_automatic_component_update_check(comp);
+        if (!ok) {
+            log_message("[auto-update] Fresh update check failed for " + comp + ", skipping", "warn");
+            continue;
+        }
+        let cached = object_or_empty(read_json_file(component_update_check_cache_path(comp)));
         if (cached.status == "outdated" || cached.status == "outdated_same_release") {
-            if (trigger_component_auto_update(component, cached.latest_version)) {
+            log_message("[auto-update] Continuing auto-update cycle for next component: " + comp, "info");
+            if (trigger_component_auto_update(comp, cached.latest_version)) {
                 break;
             }
         }
     }
+}
+
+function finish_component_job(path, component, action, exit_code, output_file) {
+    let updated_at = now_seconds();
+    let value = output_json_object(output_file);
+    let ok;
+
+    let prior_state = object_or_empty(read_json_file(path));
+    let pending = object_or_empty(read_json_file(AUTO_UPDATE_PENDING_FILE));
+    let is_auto_update = (prior_state.is_auto_update === true) || (pending.component == component);
+    let prev_version = prior_state.previous_version || pending.previous_version || "";
+    if (pending.component == component)
+        remove_file(AUTO_UPDATE_PENDING_FILE);
+
+    if (type(value) == "object") {
+        value.running = false;
+        value.kind = "component";
+        value.exit_code = arg_number(exit_code);
+        value.updated_at = updated_at;
+        if (is_auto_update) {
+            value.is_auto_update = true;
+            if (prev_version != "")
+                value.previous_version = prev_version;
+        }
+        update_component_check_cache_from_action(value);
+        ok = write_state_file(path, value);
+    }
+    else {
+        // No JSON at all means the worker really did die before printing its
+        // result. Its stderr, kept out of the result channel above, holds the
+        // reason; fall back to the result file only if stderr is empty.
+        let raw_output = file_last_nonblank_line_value(output_file + ".stderr", "", 240);
+        if (raw_output == "")
+            raw_output = file_last_nonblank_line_value(output_file, "", 240);
+        let log_file = substr(output_file, 0, length(output_file) - 4) + ".log";
+        if (raw_output == "" && file_exists_value(log_file))
+            raw_output = file_last_nonblank_line_value(log_file, "", 240);
+        let is_success = arg_number(exit_code) == 0;
+        if (raw_output == "")
+            raw_output = is_success ? sprintf("%s %s completed successfully", component, action) : "Failed to execute";
+        let state = component_fallback_job_state(component, action, raw_output, exit_code, updated_at);
+        if (is_success) {
+            state.success = true;
+            state.status = "latest";
+            state.changed = 1;
+        }
+        if (is_auto_update) {
+            state.is_auto_update = true;
+            if (prev_version != "")
+                state.previous_version = prev_version;
+        }
+        ok = write_state_file(path, state);
+    }
+
+    remove_file(output_file);
+    remove_file(output_file + ".stderr");
+    remove_file(output_file + ".json");
+
+    let is_job_success = (type(value) == "object" && value.success === true && arg_number(exit_code) == 0) ||
+        (type(value) != "object" && arg_number(exit_code) == 0);
+
+    if (is_auto_update && is_job_success) {
+        let new_ver = "";
+        if (type(value) == "object")
+            new_ver = as_string(value.current_version || value.latest_version || "");
+        if (new_ver == "") {
+            let cached = object_or_empty(read_json_file(component_update_check_cache_path(component)));
+            new_ver = as_string(cached.current_version || cached.latest_version || "");
+        }
+        notify_component_auto_updated(component, prev_version, new_ver);
+        continue_component_auto_update(component);
+    }
+    else if (is_auto_update && !is_job_success) {
+        let err_msg = "";
+        if (type(value) == "object")
+            err_msg = as_string(value.message || "");
+        if (err_msg == "")
+            err_msg = "Package operation failed (exit code " + arg_number(exit_code) + ")";
+        notify_component_auto_update_failed(component, prev_version, err_msg);
+    }
+
+    return ok;
+}
+
+function component_action_worker(state_file, output_file, component, action, extra) {
+    component = normalize_component_name(component);
+    // stderr gets its own file instead of being merged into the result channel.
+    // Merging put apk/opkg warnings and init-script chatter into the same file as
+    // the JSON result - the whole-file parse then failed, the line scan found no
+    // object, and a successful action was reported to the UI as "Failed to
+    // execute" with the tail of a log as its message.
+    let worker_env = component_worker_env();
+    worker_env.UPDATES_JOB_LOG = substr(output_file, 0, length(output_file) - 4) + ".log";
+    worker_env.UPDATES_JOB_STATE_FILE = state_file;
+    let action_args = [
+        "ucode",
+        "-L", LIB_DIR,
+        LIB_DIR + "/components/action.uc",
+        "component-action",
+        as_string(component),
+        as_string(action)
+    ];
+    if (as_string(extra || "") != "")
+        push(action_args, as_string(extra));
+    let command = command_env(worker_env) + " " +
+        command_from_args(action_args) + " >" + shell_quote(output_file) + " 2>" + shell_quote(output_file + ".stderr");
+    let status = command_status(command);
+
+    finish_component_job(state_file, component, action, status, output_file);
+}
+
+function component_auto_update_apply(force) {
+    let settings = uci_settings();
+    let is_forced = trim(as_string(force)) == "force";
+    if (!settings_component_auto_update_enabled(settings)) {
+        if (is_forced)
+            log_message("[auto-update] Automatic component updates are disabled", "info");
+        exit(0);
+    }
+
+    let now = now_seconds();
+    let window = null;
+    let minute = null;
+
+    // "force" is for manual runs (CLI/tests): skip the schedule gates but keep
+    // the rest of the cycle identical.
+    if (!is_forced) {
+        window = settings_component_auto_update_window(settings);
+        let tm = localtime(now);
+        minute = tm != null ? (int(tm.hour) * 60 + int(tm.min)) : null;
+        if (!auto_update_window_contains(window.start, window.end, minute))
+            exit(0);
+
+        if (auto_update_attempted_in_window(window, now, minute))
+            exit(0);
+
+        if (!auto_update_load_allows(settings)) {
+            log_message("[auto-update] Router is busy (active connections/clients above the configured limit), deferring inside window " +
+                format_minutes_hhmm(window.start) + "-" + format_minutes_hhmm(window.end), "info");
+            exit(0);
+        }
+
+        if (component_has_running_job())
+            exit(0);
+    }
+
+    let checked_components = automatic_component_check_names();
+    let had_check_failure = false;
+    let triggered = false;
+    for (let component in checked_components) {
+        if (!component_is_auto_update_target(settings, component))
+            continue;
+
+        let cached = object_or_empty(read_json_file(component_update_check_cache_path(component)));
+        let cache_age = now - int(cached.updated_at || 0);
+        if (cached.status == null || cached.status == "" || cache_age < 0 || cache_age >= 900) {
+            let ok = run_automatic_component_update_check(component);
+            if (!ok) {
+                had_check_failure = true;
+                log_message("[auto-update] Fresh update check failed for " + component + ", skipping", "warn");
+                continue;
+            }
+            cached = object_or_empty(read_json_file(component_update_check_cache_path(component)));
+        }
+        if (cached.status == "outdated" || cached.status == "outdated_same_release") {
+            if (trigger_component_auto_update(component, cached.latest_version)) {
+                triggered = true;
+                break;
+            }
+            had_check_failure = true;
+        }
+    }
+
+    if (!is_forced && (triggered || !had_check_failure))
+        mark_auto_update_attempted_in_window(window, now, minute);
 
     exit(0);
 }
@@ -2252,75 +2731,258 @@ function download_via_proxy_section(settings, purpose) {
 }
 
 function service_proxy_port_for_purpose(purpose) {
-    return int(SB_SERVICE_MIXED_INBOUND_PORT) + (as_string(purpose || "lists") == "components" ? 1 : 0);
+    return int(CORE_SERVICE_MIXED_INBOUND_PORT) + (as_string(purpose || "lists") == "components" ? 1 : 0);
 }
 
 function service_proxy_address(settings, purpose) {
     return download_via_proxy_section(settings, purpose) != "" ?
-        SB_SERVICE_MIXED_INBOUND_ADDRESS + ":" + service_proxy_port_for_purpose(purpose) : "";
+        CORE_SERVICE_MIXED_INBOUND_ADDRESS + ":" + service_proxy_port_for_purpose(purpose) : "";
 }
 
-function download_to_file(url, filepath, proxy_address) {
+let _mirror_fail_counts = {};
+let _preferred_mirror_host = "";
+let _batch_network_fail_streak = 0;
+let _batch_download_aborted = false;
+let _download_batch_had_network_failures = false;
+let _download_dead_hosts = {};
+const CURL_NETWORK_FAILURES = [ 5, 6, 7, 28, 35, 52, 56 ];
+
+function reset_download_batch_state() {
+    _mirror_fail_counts = {};
+    _preferred_mirror_host = "";
+    _batch_network_fail_streak = 0;
+    _batch_download_aborted = false;
+    _download_batch_had_network_failures = false;
+    _download_dead_hosts = {};
+}
+
+function list_update_backoff_seconds(streak) {
+    let s = int(streak || 1);
+    if (s < 1) s = 1;
+    let shift = s - 1;
+    if (shift > 4) shift = 4;
+    let delay = 3600 * (1 << shift);
+    return delay > 86400 ? 86400 : delay;
+}
+
+function read_list_update_backoff() {
+    let raw = trim(as_string(fs.readfile(LIST_UPDATE_BACKOFF_FILE) || ""));
+    if (raw == "")
+        return null;
+    let parts = split(raw, "\t");
+    let ts = int(parts[0] || "0");
+    let streak = int(parts[1] || "1");
+    if (ts <= 0)
+        return null;
+    if (streak < 1)
+        streak = 1;
+    return { ts: ts, streak: streak, reason: as_string(parts[2] || "") };
+}
+
+function write_list_update_backoff(now, reason) {
+    ensure_dir(RUNTIME_STATE_DIR);
+    let prev = read_list_update_backoff();
+    let streak = prev ? (prev.streak + 1) : 1;
+    write_file(LIST_UPDATE_BACKOFF_FILE, as_string(now) + "\t" + as_string(streak) + "\t" + as_string(reason || "network") + "\n");
+    return streak;
+}
+
+function clear_list_update_backoff() {
+    remove_file(LIST_UPDATE_BACKOFF_FILE);
+}
+
+function list_update_in_backoff(now) {
+    let info = read_list_update_backoff();
+    if (!info)
+        return false;
+    let wait_sec = list_update_backoff_seconds(info.streak);
+    let elapsed = int(now) - info.ts;
+    return elapsed >= 0 && elapsed < wait_sec;
+}
+
+function download_to_file(url, filepath, proxy_address, allow_empty) {
     let core_url_mod = core_url_module_or_null();
-    let candidates = core_url_mod && type(core_url_mod.download_candidates) == "function" ? core_url_mod.download_candidates(url) : [ url ];
+    let raw_candidates = core_url_mod && type(core_url_mod.download_candidates) == "function" ? core_url_mod.download_candidates(url) : [ url ];
+    let existing_stat = fs.stat(filepath);
+    // mktemp creates an empty placeholder, not a usable download fallback.
+    let had_existing = existing_stat != null && int(existing_stat.size || 0) > 0;
+    let backup_path = as_string(filepath) + ".dlbak";
+    remove_file(backup_path);
+    if (had_existing && !fs.rename(filepath, backup_path))
+        had_existing = false;
+
+    function finish_download_ok() {
+        remove_file(backup_path);
+        return true;
+    }
+
+    if (_batch_download_aborted) {
+        if (had_existing && fs.rename(backup_path, filepath))
+            return true;
+        remove_file(backup_path);
+        remove_file(filepath);
+        return false;
+    }
+
+    function candidate_host(candidate_url) {
+        if (core_url_mod && type(core_url_mod.host) == "function")
+            return lc(as_string(core_url_mod.host(candidate_url)));
+        return "";
+    }
+
+    let candidates = [];
+    if (length(raw_candidates) > 0)
+        push(candidates, raw_candidates[0]);
+    if (_preferred_mirror_host != "" && length(raw_candidates) > 1) {
+        for (let i = 1; i < length(raw_candidates); i++) {
+            if (candidate_host(raw_candidates[i]) == _preferred_mirror_host)
+                push(candidates, raw_candidates[i]);
+        }
+        for (let i = 1; i < length(raw_candidates); i++) {
+            if (candidate_host(raw_candidates[i]) != _preferred_mirror_host)
+                push(candidates, raw_candidates[i]);
+        }
+    } else {
+        for (let i = 1; i < length(raw_candidates); i++)
+            push(candidates, raw_candidates[i]);
+    }
 
     // download_one: try url via the given proxy (or direct if proxy=="")
     function download_one(target_url, proxy_addr) {
+        remove_file(filepath);
         if (command_exists("curl")) {
-            let curl_args = [ "curl", "--connect-timeout", "5", "-m", "15", "-y", "6", "-Y", "32768", "-fsSL" ];
-            if (as_string(proxy_addr) != "") {
-                push(curl_args, "-x", "http://" + as_string(proxy_addr));
-            } else {
-                // Bootstrap DNS: use public resolvers in case Tachyon DNS isn't
-                // active yet (e.g., during startup before sing-box is running)
-                curl_push_dns_servers(curl_args);
+            let max_dns_tries = as_string(proxy_addr) == "" ? (1 + length(CURL_DOH_FALLBACK_URLS)) : 1;
+            let last_rc = 1;
+            for (let dns_try = 0; dns_try < max_dns_tries; dns_try++) {
+                remove_file(filepath);
+                let curl_args = [ "curl", "--connect-timeout", "3", "-m", "10", "-y", "5", "-Y", "32768", "-fsSL" ];
+                let active_doh = "";
+                if (as_string(proxy_addr) != "") {
+                    push(curl_args, "-x", "http://" + as_string(proxy_addr));
+                } else {
+                    active_doh = curl_push_dns_servers(curl_args, dns_try);
+                    if (dns_try > 0 && active_doh == "")
+                        break;
+                }
+                push(curl_args, target_url, "-o", filepath);
+                let cap = common.command_capture(command_from_args(curl_args));
+                let rc = cap == null ? 1 : int(cap.status);
+                last_rc = rc;
+                if (rc == 0 && (allow_empty ? file_exists_value(filepath) : file_nonempty(filepath))) {
+                    if (active_doh != "")
+                        _curl_working_doh_url = active_doh;
+                    return { ok: true, rc: 0 };
+                }
+                // Retry via fallback DoH resolvers only when host resolution failed (exit 6)
+                // or when a previously cached DoH endpoint timed out before connecting.
+                if (rc != 6 && !(active_doh != "" && rc == 28))
+                    break;
+                if (active_doh != "" && _curl_working_doh_url == active_doh)
+                    _curl_working_doh_url = "";
             }
-            push(curl_args, target_url, "-o", filepath);
-            return command_success_from_args(curl_args) && file_nonempty(filepath);
+            return { ok: false, rc: last_rc };
         } else {
             let command = command_from_args([ "wget", "-q", "-T", "15", "-O", filepath, target_url ]);
             if (as_string(proxy_addr) != "")
                 command = "http_proxy=" + shell_quote("http://" + as_string(proxy_addr)) +
                     " https_proxy=" + shell_quote("http://" + as_string(proxy_addr)) + " " + command;
-            return command_success(command) && file_nonempty(filepath);
+            let wok = command_success(command) && (allow_empty ? file_exists_value(filepath) : file_nonempty(filepath));
+            return { ok: wok, rc: wok ? 0 : 1 };
         }
     }
 
+    function try_candidate(target_url, proxy_addr) {
+        let h = candidate_host(target_url);
+        let key = as_string(proxy_addr) + "|" + (h != "" ? h : as_string(target_url));
+        if (_download_dead_hosts[key])
+            return { ok: false, rc: 28, skipped: true };
+        let res = download_one(target_url, proxy_addr);
+        if (res.ok)
+            return { ok: true, rc: 0, skipped: false };
+        if (index(CURL_NETWORK_FAILURES, res.rc) >= 0) {
+            _download_dead_hosts[key] = true;
+            log_message("Download: " + (h != "" ? h : as_string(target_url)) + " unreachable" +
+                (as_string(proxy_addr) != "" ? " via proxy section" : "") + " (curl " + res.rc + "); skipping it for the rest of this run", "warn");
+        }
+        return { ok: false, rc: res.rc, skipped: false };
+    }
+
+    let saw_http_only = false;
+
     // 1. Through the configured proxy section first if available
     if (as_string(proxy_address) != "") {
-        if (download_one(url, proxy_address)) {
+        let pres = try_candidate(url, proxy_address);
+        if (pres.ok) {
+            _batch_network_fail_streak = 0;
             log_message("Successfully downloaded " + as_string(url) + " via proxy section", "info");
-            return true;
+            return finish_download_ok();
         }
-        log_message("Download via proxy section failed for " + as_string(url) + "; retrying direct and mirrors", "warn");
+        if (pres.rc == 22) saw_http_only = true;
+        if (!pres.skipped)
+            log_message("Download via proxy section failed for " + as_string(url) + "; retrying direct and mirrors", "warn");
     }
 
     for (let i = 0; i < length(candidates); i++) {
         let candidate = candidates[i];
-        let label = i == 0 ? "" : " via mirror " + candidate;
+        let is_mirror = (i > 0);
+        let chost = candidate_host(candidate);
+        if (is_mirror && chost != "" && (_mirror_fail_counts[chost] || 0) >= 2)
+            continue;
+
+        let label = !is_mirror ? "" : " via mirror " + candidate;
 
         // 2. Direct fallback
-        if (download_one(candidate, "")) {
+        let dres = try_candidate(candidate, "");
+        if (dres.ok) {
+            _batch_network_fail_streak = 0;
+            if (is_mirror && chost != "")
+                _preferred_mirror_host = chost;
             if (candidate != url)
                 log_message("Successfully downloaded " + as_string(url) + label, "info");
-            return true;
+            return finish_download_ok();
         }
+        if (dres.rc == 22) saw_http_only = true;
 
         // 3. Through the configured proxy section for mirrors if direct failed
-        if (as_string(proxy_address) != "" && i > 0) {
-            log_message("Download direct failed for " + as_string(candidate) + "; retrying via proxy section", "warn");
-            if (download_one(candidate, proxy_address)) {
+        let mirror_transport_failed = (dres.rc != 22);
+        if (as_string(proxy_address) != "" && is_mirror) {
+            if (!dres.skipped)
+                log_message("Download direct failed for " + as_string(candidate) + "; retrying via proxy section", "warn");
+            let mres = try_candidate(candidate, proxy_address);
+            if (mres.ok) {
+                _batch_network_fail_streak = 0;
+                if (chost != "")
+                    _preferred_mirror_host = chost;
                 log_message("Successfully downloaded " + as_string(url) + label + " (via proxy section)", "info");
-                return true;
+                return finish_download_ok();
             }
-            log_message("Download via proxy section also failed for " + as_string(candidate), "warn");
+            if (mres.rc == 22) {
+                saw_http_only = true;
+                mirror_transport_failed = false;
+            }
+            if (!mres.skipped)
+                log_message("Download via proxy section also failed for " + as_string(candidate), "warn");
+        }
+
+        if (is_mirror && chost != "" && mirror_transport_failed)
+            _mirror_fail_counts[chost] = (_mirror_fail_counts[chost] || 0) + 1;
+    }
+
+    if (!saw_http_only) {
+        _batch_network_fail_streak++;
+        _download_batch_had_network_failures = true;
+        if (_batch_network_fail_streak >= 3) {
+            _batch_download_aborted = true;
+            log_message("Multiple consecutive list downloads failed across origin and mirrors; aborting remaining remote fetches and using cached lists", "warn");
         }
     }
 
-    if (file_nonempty(filepath)) {
+    remove_file(filepath);
+    if (had_existing && fs.rename(backup_path, filepath)) {
         log_message("Failed to download " + as_string(url) + " (tried direct and mirrors); keeping existing cached file on disk", "warn");
         return true;
     }
+    remove_file(backup_path);
 
     return false;
 }
@@ -2419,14 +3081,20 @@ function ensure_ruleset_source(path) {
     return ruleset_module_success([ "create-source", path ]);
 }
 
-function cleanup_empty_ruleset(path) {
+function cleanup_empty_ruleset(path, empty_is_valid) {
     let slash = rindex(path, "/");
     let filename = slash >= 0 ? substr(path, slash + 1) : path;
-    let persistent_path = "/etc/tachyon/rulesets/" + filename;
-    if (routing_rulesets_module().has_rules(path)) {
+    let persistent_path = PERSISTENT_RULESET_DIR + "/" + filename;
+    if (empty_is_valid || routing_rulesets_module().has_rules(path)) {
         if (filename != "") {
-            ensure_dir("/etc/tachyon/rulesets");
-            copy_file(path, persistent_path);
+            let st_p = fs.stat(path);
+            let sz_p = st_p != null ? int(st_p.size || 0) : 0;
+            if (sz_p > 0 && sz_p <= 524288) {
+                ensure_dir(PERSISTENT_RULESET_DIR);
+                return copy_file(path, persistent_path);
+            }
+            if (sz_p > 524288)
+                remove_file(persistent_path);
         }
         return true;
     }
@@ -2440,7 +3108,28 @@ function cleanup_empty_ruleset(path) {
     return false;
 }
 
+function valid_plain_list_source(filepath, allow_domains) {
+    let data = fs.readfile(as_string(filepath));
+    if (data == null) return false;
+    let parser = routing_rulesets_module();
+    for (let line in split(as_string(data), "\n")) {
+        let slash_comment = index(line, "//");
+        if (slash_comment >= 0) line = substr(line, 0, slash_comment);
+        let hash_comment = index(line, "#");
+        if (hash_comment >= 0) line = substr(line, 0, hash_comment);
+        line = trim(line);
+        if (line == "" || substr(line, 0, 1) == ";") continue;
+        if (parser.normalize_plain_ruleset_value(line, "subnets") != null) continue;
+        if (allow_domains && parser.normalize_plain_ruleset_value(line, "domains") != null) continue;
+        log_message("Invalid plain list source " + as_string(filepath) + "; keeping active rules", "warn");
+        return false;
+    }
+    return true;
+}
+
 function add_plain_subnet_file_to_nft_for_section(section, filepath) {
+    if (list_nft_batch != "" && !valid_plain_list_source(filepath, true))
+        return false;
     if (!file_nonempty(filepath))
         return true;
 
@@ -2485,7 +3174,9 @@ function add_json_ruleset_subnets_to_nft_for_section(section, json_file, label) 
 
 function import_domain_ip_list_file_into_rulesets(filepath, section) {
     if (!file_exists_value(filepath))
-        return true;
+        return list_nft_batch == "";
+    if (!valid_plain_list_source(filepath, true))
+        return false;
 
     let domains_tmpfile = temp_path();
     let subnets_tmpfile = temp_path();
@@ -2515,6 +3206,8 @@ function apply_domain_ip_list_subnets_to_nft_from_rule(section) {
         return true;
     if (option(section, "action", "") == "dns")
         return true;
+    if (length(connections.domain_ip_lists(section)) == 0)
+        return true;
 
     let ruleset_path = domain_ip_list_ruleset_path(section);
     if (!file_exists_value(ruleset_path))
@@ -2523,22 +3216,36 @@ function apply_domain_ip_list_subnets_to_nft_from_rule(section) {
     return add_json_ruleset_subnets_to_nft_for_section(section, ruleset_path, "domain-ip-list");
 }
 
+function invalidate_domain_ip_reference_cache(reference) {
+    // Startup can also fall back to the per-reference cache after reading the
+    // section's bundle. Drop that older view only after a successful read.
+    let tag = "inline-custom-" + core_rulesets_module().hash12(reference) + "-ruleset";
+    let paths = [ TMP_RULESET_FOLDER + "/" + tag + ".json", TMP_RULESET_FOLDER + "/" + tag + ".srs",
+        PERSISTENT_RULESET_DIR + "/" + tag + ".json", PERSISTENT_RULESET_DIR + "/" + tag + ".srs" ];
+    remove_files(paths);
+    for (let path in paths)
+        if (file_exists_value(path)) return false;
+    return true;
+}
+
 function import_domain_ip_list_reference_into_rulesets(reference, section, settings) {
     reference = as_string(reference);
     if (match(reference, /^https?:\/\//) == null)
-        return import_domain_ip_list_file_into_rulesets(reference, section);
+        return import_domain_ip_list_file_into_rulesets(reference, section) && invalidate_domain_ip_reference_cache(reference);
 
     let tmpfile = temp_path();
     if (tmpfile == "")
         return false;
 
     let ok = true;
-    if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists")) && file_nonempty(tmpfile)) {
+    if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists"), true) && file_exists_value(tmpfile)) {
         convert_crlf_to_lf(tmpfile);
         ok = import_domain_ip_list_file_into_rulesets(tmpfile, section);
+        if (ok) ok = invalidate_domain_ip_reference_cache(reference);
     }
     else {
         log_message("Failed to download remote domain/IP list " + reference + "; skipping it until the next successful update", "warn");
+        ok = list_nft_batch == "";
     }
 
     remove_file(tmpfile);
@@ -2549,9 +3256,14 @@ function rebuild_domain_ip_lists_from_rule(section, settings) {
     if (!bool_option(section, "enabled", true))
         return true;
 
-    let references = list_option_values(section, "domain_ip_lists");
-    if (length(references) == 0)
+    let references = connections.domain_ip_lists(section);
+    let path = domain_ip_list_ruleset_path(section);
+    let filename = substr(path, rindex(path, "/") + 1);
+    let persistent_path = PERSISTENT_RULESET_DIR + "/" + filename;
+    if (length(references) == 0) {
+        remove_files([ path, persistent_path ]);
         return true;
+    }
 
     if (!reset_domain_ip_list_ruleset(section))
         return false;
@@ -2561,43 +3273,133 @@ function rebuild_domain_ip_lists_from_rule(section, settings) {
         if (!import_domain_ip_list_reference_into_rulesets(reference, section, settings))
             ok = false;
 
-    cleanup_empty_ruleset(domain_ip_list_ruleset_path(section));
+    if (ok) {
+        // An empty successfully read list is authoritative, not a cache miss.
+        ok = cleanup_empty_ruleset(path, true);
+    } else if (file_exists_value(persistent_path)) {
+        copy_file(persistent_path, path);
+    } else {
+        remove_file(path);
+    }
     return ok;
 }
 
-function import_community_srs_file(service, settings) {
+function import_community_srs_file(service, settings, skip_flash_persist) {
     service = as_string(service);
-    if (!singbox_rulesets_module().is_community(service))
+    if (!core_rulesets_module().is_community(service))
         return true;
 
-    let url = singbox_rulesets_module().community_url(service);
+    let url = core_rulesets_module().community_url(service);
+    let persistent_dir = getenv("TACHYON_PERSISTENT_RULESETS_DIR") || "/etc/tachyon/rulesets";
     let cached_file = TMP_RULESET_FOLDER + "/community-" + service + ".srs";
-    let persistent_file = "/etc/tachyon/rulesets/community-" + service + ".srs";
+    let persistent_file = persistent_dir + "/community-" + service + ".srs";
+    let cached_trs_file = TMP_RULESET_FOLDER + "/community-" + service + ".trs";
+    let persistent_trs_file = persistent_dir + "/community-" + service + ".trs";
     let tmpfile = temp_path();
     if (tmpfile == "")
         return false;
 
     let core_url_mod = core_url_module_or_null();
-    let candidates = core_url_mod && type(core_url_mod.download_candidates) == "function" ?
-        core_url_mod.download_candidates(url) : [ url ];
+    let use_trs = type(core_rulesets_module().supports_trs) == "function" &&
+        core_rulesets_module().supports_trs();
+
+    let trs_base_urls = (use_trs && type(core_rulesets_module().community_trs_urls) == "function")
+        ? core_rulesets_module().community_trs_urls(service) : [];
+    if (type(trs_base_urls) == "array" && length(trs_base_urls) > 0) {
+        let trs_candidates = [];
+        for (let tu in trs_base_urls) {
+            let expanded = (core_url_mod && type(core_url_mod.download_candidates) == "function")
+                ? core_url_mod.download_candidates(tu) : [ tu ];
+            for (let ex in expanded)
+                if (!(ex in trs_candidates))
+                    push(trs_candidates, ex);
+        }
+        for (let trs_url in trs_candidates) {
+            if (download_to_file(trs_url, tmpfile, service_proxy_address(settings, "lists")) &&
+                file_nonempty(tmpfile) &&
+                core_rulesets_module().is_usable_trs_file(tmpfile)) {
+                let st = fs.stat(tmpfile);
+                let sz = st != null ? int(st.size || 0) : 0;
+                ensure_dir(TMP_RULESET_FOLDER);
+                if (!skip_flash_persist && sz > 0 && sz <= 524288) {
+                    ensure_dir(persistent_dir);
+                    copy_file(tmpfile, persistent_trs_file);
+                } else if (sz > 524288) {
+                    remove_file(persistent_trs_file);
+                }
+                if (!fs.rename(tmpfile, cached_trs_file)) {
+                    copy_file(tmpfile, cached_trs_file);
+                    remove_file(tmpfile);
+                }
+                remove_file(cached_file);
+                remove_file(persistent_file);
+                log_message("Successfully cached preset ruleset " + service + " (.trs) from " + trs_url, "info");
+                return true;
+            }
+            remove_file(tmpfile);
+        }
+        if (type(core_rulesets_module().is_referenceable_trs_file) == "function" &&
+            core_rulesets_module().is_referenceable_trs_file(persistent_trs_file)) {
+            ensure_dir(TMP_RULESET_FOLDER);
+            copy_file(persistent_trs_file, cached_trs_file);
+            remove_file(cached_file);
+            log_message("Using persistent cached .trs ruleset for " + service + " after download failure", "warn");
+            return true;
+        }
+        if (type(core_rulesets_module().is_referenceable_trs_file) == "function" &&
+            core_rulesets_module().is_referenceable_trs_file(cached_trs_file)) {
+            remove_file(cached_file);
+            remove_file(persistent_file);
+            log_message("Keeping existing .trs ruleset in /tmp for " + service + " after download failure", "warn");
+            return true;
+        }
+        remove_file(cached_file);
+        remove_file(persistent_file);
+        remove_file(tmpfile);
+        log_message("Failed to download .trs preset ruleset " + service + "; leaving remote .trs reference until next update", "warn");
+        return false;
+    }
+
+    let srs_base_urls = [ url ];
+    let fallback_url = type(core_rulesets_module().fallback_community_url) == "function" ?
+        core_rulesets_module().fallback_community_url(service) : "";
+    if (fallback_url != "" && fallback_url != url)
+        push(srs_base_urls, fallback_url);
+    let srs_urls = [];
+    for (let su in srs_base_urls) {
+        let expanded = (core_url_mod && type(core_url_mod.download_candidates) == "function")
+            ? core_url_mod.download_candidates(su) : [ su ];
+        for (let ex in expanded)
+            if (!(ex in srs_urls))
+                push(srs_urls, ex);
+    }
     let downloaded = false;
 
-    for (let candidate in candidates) {
-        if (download_to_file(candidate, tmpfile, service_proxy_address(settings, "lists")) &&
+    for (let srs_url in srs_urls) {
+        if (download_to_file(srs_url, tmpfile, service_proxy_address(settings, "lists")) &&
             file_nonempty(tmpfile) &&
-            helpers.file_is_usable(tmpfile, 100)) {
-            let raw = fs.readfile(tmpfile);
+            helpers.file_is_usable(tmpfile, 18)) {
+            let st_tmp = fs.stat(tmpfile);
+            let sz_tmp = st_tmp != null ? int(st_tmp.size || 0) : 0;
+            let raw = sz_tmp <= 524288 ? fs.readfile(tmpfile) : null;
             let unchanged_verified = raw != null &&
                 common.content_unchanged(cached_file, raw) &&
-                singbox_rulesets_module().srs_file_already_verified(cached_file);
-            if (unchanged_verified || singbox_rulesets_module().is_usable_srs_file(tmpfile)) {
+                core_rulesets_module().srs_file_already_verified(cached_file);
+            if (unchanged_verified || core_rulesets_module().is_usable_srs_file(tmpfile)) {
                 ensure_dir(TMP_RULESET_FOLDER);
-                copy_file(tmpfile, cached_file);
-                singbox_rulesets_module().remember_srs_file_verified(cached_file);
-                ensure_dir("/etc/tachyon/rulesets");
-                copy_file(tmpfile, persistent_file);
-                singbox_rulesets_module().remember_srs_file_verified(persistent_file);
-                log_message("Successfully cached preset ruleset " + service + (candidate != url ? " via mirror " + candidate : ""), "info");
+                if (!skip_flash_persist && sz_tmp > 0 && sz_tmp <= 524288) {
+                    ensure_dir("/etc/tachyon/rulesets");
+                    copy_file(tmpfile, persistent_file);
+                    core_rulesets_module().remember_srs_file_verified(persistent_file);
+                } else if (sz_tmp > 524288) {
+                    remove_file(persistent_file);
+                }
+                if (!fs.rename(tmpfile, cached_file)) {
+                    common.copy_file_stream(tmpfile, cached_file);
+                    remove_file(tmpfile);
+                }
+                core_rulesets_module().remember_srs_file_verified(cached_file);
+                log_message("Successfully cached preset ruleset " + service + (srs_url != url ? " via fallback " + srs_url : ""), "info");
                 downloaded = true;
                 break;
             }
@@ -2609,16 +3411,22 @@ function import_community_srs_file(service, settings) {
     if (downloaded) {
         // Cached successfully
     }
-    else if (singbox_rulesets_module().is_adoptable_srs_file(persistent_file) && helpers.file_is_usable(persistent_file, 100)) {
+    else if (use_trs && type(core_rulesets_module().is_referenceable_trs_file) == "function" &&
+             core_rulesets_module().is_referenceable_trs_file(persistent_trs_file)) {
+        ensure_dir(TMP_RULESET_FOLDER);
+        copy_file(persistent_trs_file, cached_trs_file);
+        log_message("Using persistent cached .trs ruleset for " + service + " after download failure", "warn");
+    }
+    else if (core_rulesets_module().is_adoptable_srs_file(persistent_file) && helpers.file_is_usable(persistent_file, 18)) {
         ensure_dir(TMP_RULESET_FOLDER);
         copy_file(persistent_file, cached_file);
-        singbox_rulesets_module().remember_srs_file_verified(cached_file);
+        core_rulesets_module().remember_srs_file_verified(cached_file);
         log_message("Using persistent cached ruleset for " + service + " after download failure", "warn");
     }
     else {
         remove_file(persistent_file);
-        if (!singbox_rulesets_module().is_valid_srs_file(cached_file))
-            singbox_rulesets_module().ensure_empty_srs_stub(cached_file);
+        if (!core_rulesets_module().is_valid_srs_file(cached_file))
+            core_rulesets_module().ensure_empty_srs_stub(cached_file);
         log_message("Failed to download preset ruleset " + service + "; preserving fallback stub until next update", "warn");
         ok = false;
     }
@@ -2654,7 +3462,7 @@ function import_subnets_from_remote_json_file(url, section, settings) {
     if (!download_to_file(url, json_tmpfile, service_proxy_address(settings, "lists")) || !file_nonempty(json_tmpfile)) {
         log_message("Failed to download remote JSON subnet list " + as_string(url) + "; skipping it until the next successful update", "warn");
         remove_file(json_tmpfile);
-        return true;
+        return list_nft_batch == "";
     }
 
     let ok = add_json_ruleset_subnets_to_nft_for_section(section, json_tmpfile, "Remote JSON rule set " + as_string(url));
@@ -2675,7 +3483,7 @@ function import_subnets_from_remote_srs_file(url, section, settings) {
     if (!download_to_file(url, binary_tmpfile, service_proxy_address(settings, "lists")) || !file_nonempty(binary_tmpfile)) {
         log_message("Failed to download remote SRS subnet list " + as_string(url) + "; skipping it until the next successful update", "warn");
         remove_files([ binary_tmpfile, json_tmpfile ]);
-        return true;
+        return list_nft_batch == "";
     }
 
     let ok = command_success_from_args([ "tachyon-core", "rule-set", "decompile", binary_tmpfile, "-o", json_tmpfile ]);
@@ -2695,13 +3503,17 @@ function import_subnets_from_remote_plain_file(url, section, settings) {
     if (tmpfile == "")
         return false;
 
-    if (!download_to_file(url, tmpfile, service_proxy_address(settings, "lists")) || !file_nonempty(tmpfile)) {
+    if (!download_to_file(url, tmpfile, service_proxy_address(settings, "lists"), true) || !file_exists_value(tmpfile)) {
         log_message("Failed to download remote plain subnet list " + as_string(url) + "; skipping it until the next successful update", "warn");
         remove_file(tmpfile);
-        return true;
+        return list_nft_batch == "";
     }
 
     convert_crlf_to_lf(tmpfile);
+    if (list_nft_batch != "" && !valid_plain_list_source(tmpfile, false)) {
+        remove_file(tmpfile);
+        return false;
+    }
     let ruleset_path = remote_ruleset_path(section, "subnets");
     let ok = ensure_ruleset_source(ruleset_path) &&
         ruleset_module_success([ "import-plain-list", tmpfile, ruleset_path, "ip_cidr", "subnets", "5000" ]);
@@ -2721,9 +3533,9 @@ function import_remote_lists_from_all_sections(settings) {
         if (length(domain_refs) > 0)
             log_message("Pre-caching remote domain lists from section '" + section_name(section) + "'", "info");
         for (let url in domain_refs) {
-            let extension = singbox_rulesets_module().file_extension(url);
+            let extension = core_rulesets_module().file_extension(url);
             if (extension == "json" || extension == "srs") {
-                log_message("Skipping " + extension + " remote domain list (sing-box manages it): " + as_string(url), "debug");
+                log_message("Skipping " + extension + " remote domain list (tachyon-core manages it): " + as_string(url), "debug");
                 continue;
             }
             if (!import_domains_from_remote_plain_file(url, section, settings))
@@ -2734,7 +3546,7 @@ function import_remote_lists_from_all_sections(settings) {
         if (length(subnet_refs) > 0)
             log_message("Pre-caching remote subnet lists from section '" + section_name(section) + "'", "info");
         for (let url in subnet_refs) {
-            let extension = singbox_rulesets_module().file_extension(url);
+            let extension = core_rulesets_module().file_extension(url);
             if (extension == "json") {
                 if (!import_subnets_from_remote_json_file(url, section, settings))
                     ok = false;
@@ -2756,13 +3568,14 @@ function import_all_preset_lists(settings) {
     let ok = true;
 
     for (let service, urls in BUILTIN_SUBNET_URLS) {
+        if (as_string(service) == "geoip_us")
+            continue;
         if (type(urls) != "array")
             continue;
 
         let cached_file = TMP_RULESET_FOLDER + "/community-subnets-" + as_string(service) + ".lst";
         let persistent_file = "/etc/tachyon/rulesets/community-subnets-" + as_string(service) + ".lst";
         let combined_lines = [];
-
         for (let url in urls) {
             let tmpfile = temp_path();
             if (tmpfile == "") {
@@ -2810,9 +3623,14 @@ function import_all_preset_lists(settings) {
                 }
             }
 
+            if (list_nft_batch != "" && !valid_plain_list_source(tmpfile, false)) {
+                if (downloaded) remove_file(tmpfile);
+                ok = false;
+                continue;
+            }
             let lines = split(as_string(fs.readfile(tmpfile)), "\n");
             for (let l in lines) {
-                l = trim(replace(as_string(l), /\r/g, ""));
+                l = trim(as_string(l));
                 if (l != "" && substr(l, 0, 1) != "#")
                     push(combined_lines, l);
             }
@@ -2824,15 +3642,17 @@ function import_all_preset_lists(settings) {
         if (length(combined_lines) > 0) {
             ensure_dir(TMP_RULESET_FOLDER);
             write_file(cached_file, join("\n", combined_lines) + "\n");
-            ensure_dir("/etc/tachyon/rulesets");
-            write_file(persistent_file, join("\n", combined_lines) + "\n");
+            if (type(list_update_seen_builtin_subnets) == "object")
+                list_update_seen_builtin_subnets[as_string(service)] = true;
         }
     }
 
-    let community_services = keys(singbox_rulesets_module().COMMUNITY_SERVICES);
+    let community_services = keys(core_rulesets_module().COMMUNITY_SERVICES);
     for (let service in community_services) {
-        if (!import_community_srs_file(service, settings))
+        if (!import_community_srs_file(service, settings, true))
             ok = false;
+        else if (type(list_update_seen_community_srs) == "object")
+            list_update_seen_community_srs[as_string(service)] = true;
     }
 
     // Pre-cache remote domain/subnet lists from all sections so they are
@@ -2851,26 +3671,88 @@ function import_all_preset_lists(settings) {
 // restart - while this update was holding the very lock that is supposed to
 // serialise them.
 let builtin_subnets_need_reload = false;
+let list_update_seen_community_srs = null;
+let list_update_seen_builtin_subnets = null;
 
-function import_builtin_subnets_from_rule(section, settings) {
+function section_community_subnets_enabled(section) {
+    let raw = lc(trim(option(section, "community_subnets", "1")));
+    return raw != "0" && raw != "false" && raw != "no" && raw != "off";
+}
+
+function import_builtin_subnets_from_rule(section, settings, apply_nft) {
     if (!bool_option(section, "enabled", true))
         return true;
     if (option(section, "action", "") == "dns" || option(section, "action", "") == "hosts")
         return true;
 
+    let should_apply_nft = apply_nft == null ? true : (apply_nft != false);
     let ok = true;
-    for (let service in connections.community_lists(section)) {
-        if (!singbox_rulesets_module().is_community(service))
+    let section_services = [];
+    let subnet_services = {};
+    let subnets_enabled = section_community_subnets_enabled(section);
+    for (let s in connections.community_lists(section)) {
+        if (!(s in section_services)) push(section_services, s);
+        if (subnets_enabled) subnet_services[s] = true;
+    }
+    for (let s in connections.rule_sets(section))
+        if (core_rulesets_module().is_community(s) && !(s in section_services)) push(section_services, s);
+    for (let s in connections.rule_sets_with_subnets(section)) {
+        if (core_rulesets_module().is_community(s)) {
+            if (!(s in section_services)) push(section_services, s);
+            subnet_services[s] = true;
+        }
+    }
+    for (let cc in connections.geoip_country_list(section)) {
+        let ip_list = "geoip_" + as_string(cc);
+        if (core_rulesets_module().is_community(ip_list) && !(ip_list in section_services))
+            push(section_services, ip_list);
+        if (as_string(cc) == "ru" && core_rulesets_module().is_community("geosite_ru") && !("geosite_ru" in section_services))
+            push(section_services, "geosite_ru");
+    }
+
+    for (let service in section_services) {
+        service = as_string(service);
+        if (!core_rulesets_module().is_community(service))
             continue;
 
-        import_community_srs_file(service, settings);
+        if (type(list_update_seen_community_srs) != "object" || list_update_seen_community_srs[service] != true) {
+            if (!import_community_srs_file(service, settings) && list_nft_batch != "")
+                ok = false;
+            if (type(list_update_seen_community_srs) == "object")
+                list_update_seen_community_srs[service] = true;
+        }
 
-        let urls = BUILTIN_SUBNET_URLS[as_string(service)];
+        if (subnet_services[service] != true)
+            continue;
+        let urls = builtin_subnet_urls_for_service(service);
         if (type(urls) != "array")
             continue;
 
-        let cached_file = TMP_RULESET_FOLDER + "/community-subnets-" + as_string(service) + ".lst";
-        let persistent_file = "/etc/tachyon/rulesets/community-subnets-" + as_string(service) + ".lst";
+        let cached_file = TMP_RULESET_FOLDER + "/community-subnets-" + service + ".lst";
+        let persistent_file = "/etc/tachyon/rulesets/community-subnets-" + service + ".lst";
+
+        if (type(list_update_seen_builtin_subnets) == "object" && list_update_seen_builtin_subnets[service] == true) {
+            if (should_apply_nft && file_exists_value(cached_file)) {
+                nft_module_success([
+                    "nft-add-community-subnet-file-for-uci-section",
+                    section_name(section),
+                    service,
+                    cached_file,
+                    NFT_TABLE_NAME,
+                    NFT_COMMON_SET_NAME,
+                    NFT_IP_PORT_SET_NAME,
+                    NFT_INTERFACE_SET_NAME,
+                    NFT_DISCORD_SET_NAME,
+                    NFT_FAKEIP_MARK,
+                    "5000",
+                    NFT_COMMON6_SET_NAME,
+                    NFT_IP_PORT6_SET_NAME,
+                    NFT_DISCORD6_SET_NAME
+                ]);
+            }
+            continue;
+        }
+
         let combined_lines = [];
         for (let url in urls) {
             let tmpfile = temp_path();
@@ -2909,51 +3791,54 @@ function import_builtin_subnets_from_rule(section, settings) {
                     continue;
                 } else {
                     log_message("Failed to download built-in " + as_string(service) + " subnet list; skipping it until next update", "warn");
+                    if (list_nft_batch != "") ok = false;
                     continue;
                 }
             }
 
+            if (list_nft_batch != "" && !valid_plain_list_source(tmpfile, false)) {
+                if (downloaded) remove_file(tmpfile);
+                ok = false;
+                continue;
+            }
             let lines = split(as_string(fs.readfile(tmpfile)), "\n");
             for (let l in lines) {
-                l = trim(replace(as_string(l), /\r/g, ""));
+                l = trim(as_string(l));
                 if (l != "" && substr(l, 0, 1) != "#")
                     push(combined_lines, l);
             }
-
-            nft_module_success([
-                "nft-add-community-subnet-file-for-uci-section",
-                section_name(section),
-                service,
-                tmpfile,
-                NFT_TABLE_NAME,
-                NFT_COMMON_SET_NAME,
-                NFT_IP_PORT_SET_NAME,
-                NFT_INTERFACE_SET_NAME,
-                NFT_DISCORD_SET_NAME,
-                NFT_FAKEIP_MARK,
-                "5000",
-                NFT_COMMON6_SET_NAME,
-                NFT_IP_PORT6_SET_NAME,
-                NFT_DISCORD6_SET_NAME
-            ]);
 
             if (downloaded)
                 remove_file(tmpfile);
         }
 
-        if (length(combined_lines) > 0) {
+        if (length(combined_lines) > 0 || (list_nft_batch != "" && ok)) {
             let data = join("\n", combined_lines) + "\n";
             // A list that came back byte-identical to what is already on disk is
             // not worth waking the core for: that content is already loaded, and
             // every reload costs a config regeneration plus a core restart.
             let changed = !common.content_unchanged(cached_file, data) ||
-                !common.content_unchanged(persistent_file, data);
+                (length(data) <= 524288 && !common.content_unchanged(persistent_file, data));
             ensure_dir(TMP_RULESET_FOLDER);
             write_file(cached_file, data);
-            ensure_dir("/etc/tachyon/rulesets");
-            write_file(persistent_file, data);
+            if (length(data) <= 524288) {
+                ensure_dir("/etc/tachyon/rulesets");
+                write_file(persistent_file, data);
+            } else {
+                remove_file(persistent_file);
+            }
+            if (type(list_update_seen_builtin_subnets) == "object")
+                list_update_seen_builtin_subnets[service] = true;
             if (changed)
                 builtin_subnets_need_reload = true;
+            if (should_apply_nft && !nft_module_success([
+                    "nft-add-community-subnet-file-for-uci-section", section_name(section), service, cached_file,
+                    NFT_TABLE_NAME, NFT_COMMON_SET_NAME, NFT_IP_PORT_SET_NAME, NFT_INTERFACE_SET_NAME,
+                    NFT_DISCORD_SET_NAME, NFT_FAKEIP_MARK, "5000", NFT_COMMON6_SET_NAME,
+                    NFT_IP_PORT6_SET_NAME, NFT_DISCORD6_SET_NAME ]))
+                ok = false;
+        } else if (!should_apply_nft && type(list_update_seen_builtin_subnets) == "object") {
+            list_update_seen_builtin_subnets[service] = true;
         }
     }
 
@@ -3000,7 +3885,7 @@ function import_custom_ruleset_subnets_from_remote(url, format, section, label, 
     if (!download_to_file(url, remote_tmpfile, service_proxy_address(settings, "lists")) || !file_nonempty(remote_tmpfile)) {
         log_message("Failed to download remote rule set " + as_string(url) + "; skipping it until the next successful update", "warn");
         remove_files([ remote_tmpfile, json_tmpfile ]);
-        return true;
+        return list_nft_batch == "";
     }
 
     let ok = true;
@@ -3022,6 +3907,58 @@ function import_custom_ruleset_subnets_from_remote(url, format, section, label, 
     return ok;
 }
 
+function cache_refreshed_plain_ruleset(reference, plain_path) {
+    if (!valid_plain_list_source(plain_path, true))
+        return null;
+    let tag = "inline-custom-" + core_rulesets_module().hash12(reference) + "-ruleset";
+    let srs_path = TMP_RULESET_FOLDER + "/" + tag + ".srs";
+    let json_path = TMP_RULESET_FOLDER + "/" + tag + ".json";
+    let etc_srs = PERSISTENT_RULESET_DIR + "/" + tag + ".srs";
+    let etc_json = PERSISTENT_RULESET_DIR + "/" + tag + ".json";
+    ensure_dir(TMP_RULESET_FOLDER);
+    ensure_dir(PERSISTENT_RULESET_DIR);
+    let result = routing_rulesets_module().compile_plain_list(plain_path, srs_path, json_path);
+    if (!result.has_domains && !result.has_ips) {
+        // compile_plain_list's fallback deliberately retains valid old SRS.
+        // Here a successful empty download must replace that cache instead.
+        if (!write_file(json_path, '{"version":3,"rules":[]}\n'))
+            return null;
+        result.format = "source";
+        result.path = json_path;
+    }
+    if (result.format == "binary") {
+        let st_s = fs.stat(srs_path);
+        let sz_s = st_s != null ? int(st_s.size || 0) : 0;
+        if (sz_s > 0 && sz_s <= 524288) {
+            if (!copy_file(srs_path, etc_srs)) return null;
+        } else if (sz_s > 524288) {
+            remove_file(etc_srs);
+        }
+        if (file_exists_value(json_path)) {
+            let st_j = fs.stat(json_path);
+            let sz_j = st_j != null ? int(st_j.size || 0) : 0;
+            if (sz_j > 0 && sz_j <= 524288) {
+                if (!copy_file(json_path, etc_json)) return null;
+            } else if (sz_j > 524288) {
+                remove_file(etc_json);
+                remove_file(json_path);
+            }
+        }
+    } else {
+        let st_j = fs.stat(json_path);
+        let sz_j = st_j != null ? int(st_j.size || 0) : 0;
+        if (sz_j > 0 && sz_j <= 524288) {
+            if (!copy_file(json_path, etc_json)) return null;
+        } else if (sz_j > 524288) {
+            remove_file(etc_json);
+        }
+        // An older binary takes precedence over fresh JSON in cache lookup.
+        remove_files([ srs_path, etc_srs ]);
+        if (file_exists_value(srs_path) || file_exists_value(etc_srs)) return null;
+    }
+    return result;
+}
+
 function import_rule_sets_with_subnets_from_rule(section, settings) {
     if (!bool_option(section, "enabled", true))
         return true;
@@ -3029,6 +3966,17 @@ function import_rule_sets_with_subnets_from_rule(section, settings) {
         return true;
 
     let references = connections.rule_sets_with_subnets(section);
+    // Match startup: only plain regular rule sets contribute IPs to nft.
+    // JSON/SRS/TRS may contain domain/source/logical restrictions owned by core.
+    if (list_nft_batch != "") {
+        for (let ref in connections.rule_sets(section)) {
+            if (!core_rulesets_module().is_plain_list_reference(ref)) continue;
+            // Remote plain lists were already collected in phase 1.
+            if (match(as_string(ref), /^https?:\/\//) != null &&
+                core_rulesets_module().is_plain_list_reference(ref)) continue;
+            if (!(ref in references)) push(references, ref);
+        }
+    }
     if (length(references) == 0)
         return true;
 
@@ -3039,7 +3987,7 @@ function import_rule_sets_with_subnets_from_rule(section, settings) {
         reference = as_string(reference);
         log_message("Importing subnets from rule set reference for '" + section_name(section) + "': " + reference, "info");
 
-        let extension = singbox_rulesets_module().file_extension(reference);
+        let extension = core_rulesets_module().file_extension(reference);
         if (match(reference, /^\/.*\.srs$/) != null) {
             if (!import_custom_ruleset_subnets_from_local(reference, "binary", section, "Rule set " + reference))
                 ok = false;
@@ -3049,39 +3997,35 @@ function import_rule_sets_with_subnets_from_rule(section, settings) {
                 ok = false;
         }
         else if (match(reference, /^\/.*\.(lst|txt)$/) != null) {
-            if (!add_plain_subnet_file_to_nft_for_section(section, reference))
+            if (!add_plain_subnet_file_to_nft_for_section(section, reference) ||
+                cache_refreshed_plain_ruleset(reference, reference) == null)
                 ok = false;
         }
         else if (match(reference, /^https?:\/\//) != null) {
-            if (extension == "lst" || extension == "txt" || singbox_rulesets_module().is_plain_list_reference(reference)) {
+            if (extension == "lst" || extension == "txt" || core_rulesets_module().is_plain_list_reference(reference)) {
                 let tmpfile = temp_path();
                 if (tmpfile == "") {
                     ok = false;
                 } else {
-                    if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists")) && file_nonempty(tmpfile)) {
+                    if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists"), true) && file_exists_value(tmpfile)) {
                         convert_crlf_to_lf(tmpfile);
-                        if (!add_plain_subnet_file_to_nft_for_section(section, tmpfile))
+                        if (!add_plain_subnet_file_to_nft_for_section(section, tmpfile)) {
+                            log_message("Failed to populate nftables set from remote plain list " + reference + " for '" + section_name(section) + "'", "warn");
                             ok = false;
-                        let tag_name = "inline-custom-" + singbox_rulesets_module().hash12(reference) + "-ruleset";
-                        let srs_path = TMP_RULESET_FOLDER + "/" + tag_name + ".srs";
-                        let json_path = TMP_RULESET_FOLDER + "/" + tag_name + ".json";
-                        let etc_srs = "/etc/tachyon/rulesets/" + tag_name + ".srs";
-                        let etc_json = "/etc/tachyon/rulesets/" + tag_name + ".json";
-                        common.ensure_dir("/etc/tachyon/rulesets");
-                        common.ensure_dir(TMP_RULESET_FOLDER);
-                        let res = routing_rulesets_module().compile_plain_list(tmpfile, srs_path, json_path);
-                        if (res.format == "binary")
-                            common.copy_file(srs_path, etc_srs);
-                        else
-                            common.copy_file(json_path, etc_json);
+                        }
+                        if (cache_refreshed_plain_ruleset(reference, tmpfile) == null) {
+                            log_message("Failed to compile or cache remote plain list " + reference, "warn");
+                            ok = false;
+                        }
                     } else {
                         log_message("Failed to download remote plain list " + reference + "; keeping existing cache", "warn");
+                        if (list_nft_batch != "") ok = false;
                     }
                     remove_file(tmpfile);
                 }
             }
             else {
-                let format = extension == "json" ? "source" : (extension == "srs" ? "binary" : singbox_rulesets_module().remote_format(reference));
+                let format = extension == "json" ? "source" : (extension == "srs" ? "binary" : core_rulesets_module().remote_format(reference));
                 if (!import_custom_ruleset_subnets_from_remote(reference, format, section, "Rule set " + reference, settings))
                     ok = false;
             }
@@ -3108,7 +4052,7 @@ function update_remote_plain_rulesets_from_rule(section, settings) {
         reference = as_string(reference);
         if (match(reference, /^https?:\/\//) == null)
             continue;
-        if (!singbox_rulesets_module().is_plain_list_reference(reference))
+        if (!core_rulesets_module().is_plain_list_reference(reference))
             continue;
 
         log_message("Updating remote plain rule set for '" + section_name(section) + "': " + reference, "info");
@@ -3118,23 +4062,21 @@ function update_remote_plain_rulesets_from_rule(section, settings) {
             continue;
         }
 
-        if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists")) && file_nonempty(tmpfile)) {
+        if (download_to_file(reference, tmpfile, service_proxy_address(settings, "lists"), true) && file_exists_value(tmpfile)) {
             convert_crlf_to_lf(tmpfile);
-            let tag_name = "inline-custom-" + singbox_rulesets_module().hash12(reference) + "-ruleset";
-            let srs_path = TMP_RULESET_FOLDER + "/" + tag_name + ".srs";
-            let json_path = TMP_RULESET_FOLDER + "/" + tag_name + ".json";
-            let etc_srs = "/etc/tachyon/rulesets/" + tag_name + ".srs";
-            let etc_json = "/etc/tachyon/rulesets/" + tag_name + ".json";
-            common.ensure_dir("/etc/tachyon/rulesets");
-            common.ensure_dir(TMP_RULESET_FOLDER);
-            let res = routing_rulesets_module().compile_plain_list(tmpfile, srs_path, json_path);
-            if (res.format == "binary")
-                common.copy_file(srs_path, etc_srs);
-            else
-                common.copy_file(json_path, etc_json);
+            let res = cache_refreshed_plain_ruleset(reference, tmpfile);
+            if (res == null) {
+                log_message("Failed to compile or cache remote plain rule set " + reference, "warn");
+                ok = false;
+            }
+            else if (res.has_ips && !add_plain_subnet_file_to_nft_for_section(section, tmpfile)) {
+                log_message("Failed to populate nftables set from remote plain rule set " + reference + " for '" + section_name(section) + "'", "warn");
+                ok = false;
+            }
         }
         else {
             log_message("Failed to download remote plain rule set " + reference + "; keeping existing cache", "warn");
+            if (list_nft_batch != "") ok = false;
         }
         remove_file(tmpfile);
     }
@@ -3153,10 +4095,10 @@ function import_domains_from_remote_domain_lists(section, settings) {
     let ok = true;
     for (let url in references) {
         log_message("Importing domains from URL: " + as_string(url), "info");
-        let extension = singbox_rulesets_module().file_extension(url);
+        let extension = core_rulesets_module().file_extension(url);
         log_message("Detected file extension: '" + extension + "'", "debug");
         if (extension == "json" || extension == "srs") {
-            log_message("No update needed - sing-box manages updates automatically.", "info");
+            log_message("No update needed - tachyon-core manages updates automatically.", "info");
             continue;
         }
         log_message("Import domains from a remote plain-text list", "info");
@@ -3172,14 +4114,23 @@ function import_subnets_from_remote_subnet_lists(section, settings) {
         return true;
 
     let references = list_option_values(section, "remote_subnet_lists");
-    if (length(references) == 0)
+    let path = remote_ruleset_path(section, "subnets");
+    let persistent = PERSISTENT_RULESET_DIR + "/" + substr(path, rindex(path, "/") + 1);
+    if (length(references) == 0) {
+        remove_files([ path, persistent ]);
         return true;
+    }
+    let previous = fs.readfile(path);
+    ensure_dir(TMP_RULESET_FOLDER);
+    remove_file(path);
+    if (!ruleset_module_success([ "create-source", path ]))
+        return false;
 
     log_message("Importing subnets from remote subnet lists for '" + section_name(section) + "' section", "info");
     let ok = true;
     for (let url in references) {
         log_message("Importing subnets from URL: " + as_string(url), "info");
-        let extension = singbox_rulesets_module().file_extension(url);
+        let extension = core_rulesets_module().file_extension(url);
         log_message("Detected file extension: '" + extension + "'", "debug");
         if (extension == "json") {
             log_message("Import subnets from a remote JSON list", "info");
@@ -3197,7 +4148,12 @@ function import_subnets_from_remote_subnet_lists(section, settings) {
                 ok = false;
         }
     }
-    cleanup_empty_ruleset(remote_ruleset_path(section, "subnets"));
+    if (ok)
+        ok = cleanup_empty_ruleset(path, true);
+    else if (previous != null)
+        write_file(path, previous);
+    else
+        remove_file(path);
     return ok;
 }
 
@@ -3221,7 +4177,7 @@ function list_update_pid_end() {
 function service_proxy_is_ready(proxy_address) {
     // Probe the service proxy by attempting a connection through it to a
     // well-known public IP (no DNS resolution required). If the port is not
-    // yet open — e.g., sing-box is still starting after a component update —
+    // yet open — e.g., tachyon-core is still starting after a component update —
     // curl returns exit 7 (CURLE_COULDNT_CONNECT) or 28 (timeout).
     // Any other result means the port is accepting connections.
     let status = command_status(
@@ -3237,7 +4193,7 @@ function service_proxy_is_ready(proxy_address) {
 function dns_probe_passed(proxy_address) {
     if (as_string(proxy_address) != "") {
         // When a service proxy is configured, verify it is actually accepting
-        // TCP connections before proceeding — sing-box may still be starting
+        // TCP connections before proceeding — tachyon-core may still be starting
         // up after a component update or restart and the proxy port may not be
         // ready even though the process is already running.
         let attempt = 1;
@@ -3318,7 +4274,7 @@ function subscription_cache_env() {
     return {
         TACHYON_CONFIG_NAME: CONFIG_NAME,
         TACHYON_LIB: LIB_DIR,
-        TMP_SING_BOX_FOLDER,
+        TMP_TACHYON_CORE_FOLDER,
         TMP_RULESET_FOLDER,
         TMP_SUBSCRIPTION_FOLDER,
         TACHYON_RUNTIME_STATE_DIR: RUNTIME_STATE_DIR,
@@ -3334,9 +4290,8 @@ function subscription_cache_env() {
         TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT: PERSISTENT_SUBSCRIPTION_CACHE_FORMAT,
         TACHYON_PENDING_RELOAD_FILE: PENDING_RELOAD_FILE,
         TACHYON_SERVICE_INIT: SERVICE_INIT,
-        SB_SERVICE_MIXED_INBOUND_ADDRESS,
-        SB_SERVICE_MIXED_INBOUND_PORT,
-        SB_VARIANT_STATE_FILE
+        TACHYON_CORE_SERVICE_MIXED_INBOUND_ADDRESS: CORE_SERVICE_MIXED_INBOUND_ADDRESS,
+        TACHYON_CORE_SERVICE_MIXED_INBOUND_PORT: CORE_SERVICE_MIXED_INBOUND_PORT
     };
 }
 
@@ -3373,14 +4328,14 @@ function log_file_lines_from_text(text, level, prefix) {
             log_message(as_string(prefix) + as_string(line), level);
 }
 
-function singbox_runtime_success(args) {
+function tachyon_core_runtime_success(args) {
     let command_args = [ LIB_DIR + "/tachyon_core/runtime.uc" ];
     for (let arg in args)
         push(command_args, arg);
 
     let result = module_env_capture(subscription_cache_env(), command_args);
     if (result.output != "")
-        log_file_lines_from_text(result.output, "debug", "sing-box runtime: ");
+        log_file_lines_from_text(result.output, "debug", "tachyon-core runtime: ");
     return result.status == 0;
 }
 
@@ -3393,77 +4348,183 @@ function write_current_reload_state_clean() {
     ]);
 }
 
-function reload_singbox_after_list_update() {
-    let sing_box_pid = trim(module_output([ LIB_DIR + "/service/state.uc", "tachyon-core-service-runtime-pid" ]));
-    if (sing_box_pid == "" || int(sing_box_pid) <= 0)
-        return true;
-    let sing_box_config_path = option(uci_settings(), "config_path", "") || "/etc/tachyon-core/config.json";
-    let sing_box_config_hash_before = file_md5(sing_box_config_path);
-    if (!singbox_runtime_success([ "init-config", "0", "1", "1" ]))
+function config_has_local_rulesets(config_path) {
+    let cfg = common.read_json_file(config_path);
+    if (type(cfg) != "object" || type(cfg.route) != "object" || type(cfg.route.rule_set) != "array")
         return false;
-    let sing_box_config_hash_after = file_md5(sing_box_config_path);
-    if (sing_box_config_hash_before != sing_box_config_hash_after) {
-        log_message("Rulesets updated on disk; reloading sing-box with new configuration", "info");
+    for (let rs in cfg.route.rule_set) {
+        if (type(rs) == "object" && as_string(rs.type || "") == "local" && trim(as_string(rs.path || "")) != "")
+            return true;
+    }
+    return false;
+}
+
+let list_update_local_rulesets_fp_before = null;
+
+function local_rulesets_fingerprint(config_path) {
+    let cfg = common.read_json_file(config_path);
+    if (type(cfg) != "object" || type(cfg.route) != "object" || type(cfg.route.rule_set) != "array")
+        return "";
+    let fp = "";
+    for (let rs in cfg.route.rule_set) {
+        if (type(rs) != "object" || as_string(rs.type || "") != "local")
+            continue;
+        let path = trim(as_string(rs.path || ""));
+        if (path != "")
+            fp += path + ":" + file_md5(path) + "\n";
+    }
+    return fp;
+}
+
+function ruleset_cache_fingerprint(folder) {
+    let dir_path = as_string(folder || TMP_RULESET_FOLDER);
+    let entries = fs.lsdir(dir_path);
+    if (type(entries) != "array")
+        return "";
+    sort(entries);
+    let parts = [];
+    for (let entry in entries) {
+        if (!match(entry, /\.(trs|srs)$/))
+            continue;
+        let st = fs.stat(dir_path + "/" + entry);
+        push(parts, entry + ":" + (st ? (as_string(st.size) + ":" + as_string(st.mtime)) : "missing"));
+    }
+    return join("\n", parts);
+}
+
+function ruleset_api_tag(value) {
+    let encoded = "";
+    for (let i = 0; i < length(value); i++) {
+        let c = substr(value, i, 1);
+        encoded += match(c, /^[A-Za-z0-9_.~-]$/) ? c : sprintf("%%%02X", ord(c));
+    }
+    return encoded;
+}
+
+function refresh_remote_rulesets(config_path) {
+    let cfg = read_json_file(config_path);
+    if (type(cfg) != "object")
+        return false;
+    let tags = [];
+    let seen = {};
+    for (let rs in array_or_empty(cfg.route && cfg.route.rule_set)) {
+        if (type(rs) != "object" || rs.type != "remote" || as_string(rs.tag || "") == "" || seen[rs.tag])
+            continue;
+        seen[rs.tag] = true;
+        push(tags, rs.tag);
+    }
+    if (length(tags) == 0)
+        return true;
+
+    let api = cfg.experimental && cfg.experimental.clash_api;
+    let address = as_string(api && api.external_controller || "");
+    if (address == "") {
+        log_message("Cannot refresh remote rule sets: Clash API is not configured", "error");
+        return false;
+    }
+    address = replace(address, /^0\.0\.0\.0:/, "127.0.0.1:");
+    address = replace(address, /^\[::\]:/, "[::1]:");
+
+    // Keep the controller secret out of process arguments. mktemp creates a
+    // private file; curl's config parser unescapes the JSON-quoted header.
+    let request_config = temp_path();
+    if (request_config == "")
+        return false;
+    let content = "silent\n";
+    if (as_string(api.secret || "") != "")
+        content += "header = " + sprintf("%J", "Authorization: Bearer " + api.secret) + "\n";
+    let ok = true;
+    try {
+        if (fs.writefile(request_config, content) == null)
+            ok = false;
+        else for (let tag in tags) {
+            let url = "http://" + address + "/providers/rules/" + ruleset_api_tag(tag);
+            if (!command_success_from_args([
+                "curl", "--config", request_config, "--fail", "--noproxy", "*",
+                "--connect-timeout", "3", "--max-time", "30", "--request", "PUT",
+                "--output", "/dev/null", "--url", url
+            ])) {
+                log_message("Could not refresh remote rule set '" + tag + "' via Clash API; core will retry on schedule", "warn");
+                ok = false;
+            }
+        }
+    }
+    catch (e) {
+        log_message("Could not refresh remote rule sets", "error");
+        ok = false;
+    }
+    remove_file(request_config);
+    return ok;
+}
+
+function reload_core_after_list_update(allow_deferred_remote_refresh) {
+    let core_pid = trim(module_output([ LIB_DIR + "/service/state.uc", "tachyon-core-service-runtime-pid" ]));
+    if (core_pid == "" || int(core_pid) <= 0)
+        return true;
+    let core_config_path = option(uci_settings(), "config_path", "") || "/etc/tachyon-core/config.json";
+    let core_config_hash_before = file_md5(core_config_path);
+    if (!tachyon_core_runtime_success([ "init-config", "0", "1", "1" ]))
+        return false;
+    let core_config_hash_after = file_md5(core_config_path);
+    let has_local_rulesets = config_has_local_rulesets(core_config_path);
+    let local_rulesets_changed = list_update_local_rulesets_fp_before != null
+        ? (has_local_rulesets && local_rulesets_fingerprint(core_config_path) != list_update_local_rulesets_fp_before)
+        : has_local_rulesets;
+    if (core_config_hash_before != core_config_hash_after || local_rulesets_changed) {
+        if (core_config_hash_before != core_config_hash_after)
+            log_message("Rulesets updated on disk; reloading tachyon-core with new configuration", "info");
+        else
+            log_message("Local rulesets refreshed on disk; reloading core runtime to apply updated rules", "info");
         module_success([ DNS_FAILOVER_UC, "stop-runtime" ]);
         module_success([ PRIORITY_UC, "stop-runtime" ]);
         let ok = service_state_success([
             "reload-core-runtime",
-            sing_box_pid,
-            sing_box_config_hash_before,
-            sing_box_config_hash_after,
+            core_pid,
+            core_config_hash_before,
+            core_config_hash_after,
             "1"
         ]);
         module_success([ PRIORITY_UC, "start-runtime" ]);
         module_success([ DNS_FAILOVER_UC, "start-runtime" ]);
         write_current_reload_state_clean();
-        return ok;
+        if (!ok)
+            return false;
     }
-    return true;
-}
-
-function list_update_steer_catalog(settings) {
-    // steer reads plain-text lists, not sing-box rule-sets. When steer is the
-    // active engine, refresh the plain-text catalog it points at.
-    let active = "tachyon-core";
-    try {
-        active = require("core.engine").get_active();
-    }
-    catch (e) {
-        active = "tachyon-core";
-    }
-    if (active == "tachyon-core")
-        return true;
-
-    let catalog;
-    try {
-        catalog = require("steer.lists");
-    }
-    catch (e) {
-        log_message("steer list catalog module unavailable: " + as_string(e), "warn");
-        return true;
-    }
-
-    let wanted_categories = list_option_values(settings, "steer_list_categories");
-    let wanted_domains = list_option_values(settings, "steer_list_domains");
-    let result = catalog.sync({ categories: wanted_categories, domains: wanted_domains });
-    if (!result.ok) {
-        log_message("steer list catalog refresh failed: " + as_string(result.reason), "warn");
-        return false;
-    }
-    log_message("steer list catalog refreshed (" + length(result.prefixes) + " prefix lists, " + length(result.domains) + " domain lists)", "info");
-    return true;
+    // Remote .srs/.trs/.json sets are owned by the core, not the plain-list importer.
+    // Refresh after reload: reloading can restart the core's interval timer,
+    // indefinitely postponing downloads when configuration changes frequently.
+    let refreshed = refresh_remote_rulesets(core_config_path);
+    return allow_deferred_remote_refresh ? true : refreshed;
 }
 
 function list_update() {
+    // When spawned by start_main() while start_impl() is still finalizing DNS,
+    // reload-state, and system-info warmup, wait for startup to finish and
+    // settle so list downloads and nft compilation do not contend with postinst
+    // or the first LuCI load.
+    if (fs.stat("/var/run/tachyon/starting") != null) {
+        let wait_ticks = 0;
+        while (fs.stat("/var/run/tachyon/starting") != null && wait_ticks < 20) {
+            command_success_from_args([ "sleep", "1" ]);
+            wait_ticks++;
+        }
+        command_success_from_args([ "sleep", "5" ]);
+    }
+
     log_message("Starting lists update", "info");
     if (!list_update_pid_begin())
         exit(0);
 
+    reset_download_batch_state();
     update_list_status(true, null, "starting", "Starting lists update");
 
     let settings = uci_settings();
+    let core_config_path_initial = option(settings, "config_path", "") || "/etc/tachyon-core/config.json";
+    list_update_local_rulesets_fp_before = local_rulesets_fingerprint(core_config_path_initial);
+    let ruleset_cache_fp_before = ruleset_cache_fingerprint(TMP_RULESET_FOLDER);
     let proxy_address = service_proxy_address(settings, "lists");
     if (!dns_probe_passed(proxy_address)) {
+        write_list_update_backoff(now_seconds(), "dns_probe_failed");
         update_list_status(false, false, "error", "DNS probe failed");
         list_update_pid_end();
         exit(0);
@@ -3475,6 +4536,20 @@ function list_update() {
     let sections = uci_sections("section");
     let ok = true;
 
+    let config_path = getenv("TACHYON_UCI_STATE_FILE") || "/etc/config/" + CONFIG_NAME;
+    let config_hash = file_sha256(config_path);
+    let nft_additions = temp_path();
+    let nft_prefix = temp_path();
+    if (nft_additions == "" || nft_prefix == "") {
+        remove_files([ nft_additions, nft_prefix ]);
+        update_list_status(false, false, "error", "Could not prepare nft transaction");
+        list_update_pid_end();
+        return;
+    }
+    list_nft_batch = nft_additions;
+    list_nft_batch_failed = false;
+    list_update_seen_community_srs = {};
+    list_update_seen_builtin_subnets = {};
     // Фаза 1: скачивание файлов (без блокировки, не трогает nft)
     if (bool_option(settings, "download_all_presets", false)) {
         if (!import_all_preset_lists(settings))
@@ -3498,11 +4573,9 @@ function list_update() {
     for (let section in sections)
         if (!update_remote_plain_rulesets_from_rule(section, settings))
             ok = false;
-
-    // steer needs its own plain-text list catalog; refresh it alongside the
-    // sing-box lists so a later engine switch has current files.
-    if (!list_update_steer_catalog(settings))
-        ok = false;
+    for (let section in sections)
+        if (!import_builtin_subnets_from_rule(section, settings, false))
+            ok = false;
 
     // Фаза 2: применение к nft (захватываем лок reload, чтобы не конфликтовать
     // с reload-firewall, который пересоздаёт таблицы и сеты nftables)
@@ -3524,13 +4597,24 @@ function list_update() {
         if (!marker_written)
             log_message("Failed to save pending nft marker, this list update will not be re-applied", "err");
         update_list_status(false, false, "error", "Could not acquire reload lock for nft apply");
+        list_nft_batch = "";
+        list_update_seen_community_srs = null;
+        list_update_seen_builtin_subnets = null;
+        remove_files([ nft_additions, nft_prefix ]);
         list_update_pid_end();
         exit(1);
     }
 
+    list_nft_batch = nft_prefix;
+    if (!nft_module_success([ "nft-prepare-list-refresh", NFT_TABLE_NAME,
+            NFT_COMMON_SET_NAME, NFT_COMMON6_SET_NAME, NFT_IP_PORT_SET_NAME, NFT_IP_PORT6_SET_NAME ]))
+        ok = false;
+    list_nft_batch = nft_additions;
     for (let section in sections)
-        if (!import_builtin_subnets_from_rule(section, settings))
+        if (!import_builtin_subnets_from_rule(section, settings, true))
             ok = false;
+    list_update_seen_community_srs = null;
+    list_update_seen_builtin_subnets = null;
     for (let section in sections)
         if (!import_subnets_from_remote_subnet_lists(section, settings))
             ok = false;
@@ -3542,24 +4626,43 @@ function list_update() {
         if (!apply_domain_ip_list_subnets_to_nft_from_rule(section))
             ok = false;
 
-    // Exactly one reload for the whole update, and only if something on disk
-    // actually changed. It used to sit inside the per-community loop above, so
-    // it fired S*N times - concurrently, while this update still held the
-    // reload lock - and a run whose lists came back identical reloaded anyway.
-    if (builtin_subnets_need_reload) {
-        builtin_subnets_need_reload = false;
-        system(common.background_command("/etc/init.d/tachyon reload"));
+    list_nft_batch = "";
+    if (list_nft_batch_failed)
+        ok = false;
+    if (config_hash != "" && file_sha256(config_path) != config_hash) {
+        log_message("Routing settings changed during list update; keeping the previous nft sets until retry", "warn");
+        ok = false;
     }
+    if (ok && !nft_module_success([ "nft-commit-list-refresh", nft_prefix, nft_additions ]))
+        ok = false;
+    remove_files([ nft_additions, nft_prefix ]);
+
+    // Do not rebuild the firewall or reload the core from partial downloads
+    // after an aborted transaction. The next successful update will retry them.
+    builtin_subnets_need_reload = false;
 
     release_runtime_lock(RELOAD_LOCK_DIR);
 
+    let ruleset_cache_changed = local_rulesets_fingerprint(core_config_path_initial) != list_update_local_rulesets_fp_before ||
+        ruleset_cache_fingerprint(TMP_RULESET_FOLDER) != ruleset_cache_fp_before;
+    if ((ok || ruleset_cache_changed) && !reload_core_after_list_update(true))
+        ok = false;
+
     if (ok) {
         write_list_update_timestamp(now_seconds());
-        log_message("Lists update completed successfully", "info");
-        reload_singbox_after_list_update();
-        update_list_status(false, true, "done", "Lists and rule sets successfully updated");
+        try { require("service.config_plan").refresh_conflict_diagnostics(); } catch (e) {}
+        if (_download_batch_had_network_failures) {
+            write_list_update_backoff(now_seconds(), "remote_unreachable");
+            log_message("Lists update finished using cached lists after remote download failures", "warn");
+            update_list_status(false, true, "cached", "Remote list sources unreachable; using cached lists");
+        } else {
+            clear_list_update_backoff();
+            log_message("Lists update completed successfully", "info");
+            update_list_status(false, true, "done", "Lists and rule sets successfully updated");
+        }
     }
     else {
+        write_list_update_backoff(now_seconds(), "failed");
         log_message("Lists update failed", "info");
         update_list_status(false, false, "failed", "Lists update failed");
     }
@@ -3621,6 +4724,12 @@ function list_update_status() {
 }
 
 function list_update_if_due() {
+    let now = now_seconds();
+    if (list_update_in_backoff(now)) {
+        log_message("Skipping scheduled list update during failure backoff; cached lists active", "debug");
+        exit(0);
+    }
+
     let interval = settings_update_interval(uci_settings());
     if (interval == "")
         exit(1);
@@ -3631,7 +4740,7 @@ function list_update_if_due() {
         exit(1);
     }
 
-    let status = update_due_status(now_seconds(), file_first_line_value(LIST_UPDATE_STATE_FILE), seconds);
+    let status = update_due_status(now, file_first_line_value(LIST_UPDATE_STATE_FILE), seconds);
     if (status == 0)
         list_update();
     if (status == 1)
@@ -3658,14 +4767,14 @@ function run_pending_reload_if_requested() {
 }
 
 // Regenerate config.json from the freshly rewritten subscription caches and put
-// the new config in front of sing-box. Shared by the scheduled subscription
+// the new config in front of tachyon-core. Shared by the scheduled subscription
 // update and by the deferred-recovery bootstrap retry, which used to escalate
 // to a full `tachyon reload` (issue #119): the full reload walks
-// validate -> capture-state -> plan -> zapret -> nft -> sing-box, tears down
-// both helper workers and restarts them again, which is exactly the churn that
+// validate -> capture-state -> plan -> nft -> tachyon-core, tears down
+// helper workers and restarts them again, which is exactly the churn that
 // dropped live connections after a subscription update.
 function subscription_runtime_apply_changed(context) {
-    log_message("Reloading sing-box to apply " + context, "info");
+    log_message("Reloading tachyon-core to apply " + context, "info");
     if (!module_success([ LIB_DIR + "/server/service.uc", "prepare-all-defaults" ]))
         return false;
     if (!module_success([ LIB_DIR + "/config/validator.uc", "validate-runtime" ])) {
@@ -3673,30 +4782,30 @@ function subscription_runtime_apply_changed(context) {
         return false;
     }
 
-    if (!singbox_runtime_success([ "configure-service" ]))
+    if (!tachyon_core_runtime_success([ "configure-service" ]))
         return false;
-    let sing_box_config_path = option(uci_settings(), "config_path", "");
-    let sing_box_config_hash_before = file_md5(sing_box_config_path);
-    let sing_box_pid_before = trim(module_output([ LIB_DIR + "/service/state.uc", "tachyon-core-service-runtime-pid" ]));
-    if (!singbox_runtime_success([ "init-config", "0", "1", "1" ])) {
-        log_message("Failed to rebuild sing-box configuration after " + context, "error");
+    let core_config_path = option(uci_settings(), "config_path", "");
+    let core_config_hash_before = file_md5(core_config_path);
+    let core_pid_before = trim(module_output([ LIB_DIR + "/service/state.uc", "tachyon-core-service-runtime-pid" ]));
+    if (!tachyon_core_runtime_success([ "init-config", "0", "1", "1" ])) {
+        log_message("Failed to rebuild tachyon-core configuration after " + context, "error");
         return false;
     }
 
-    // Graceful in-place reload via SIGHUP first: sing-box 1.10+ hot-swaps its
+    // Graceful in-place reload via SIGHUP first: tachyon-core hot-swaps its
     // config without tearing down the process, so active TCP sessions
     // (Telegram, etc.) are preserved. Only a failed SIGHUP escalates to a full
     // restart, and only there do the helper workers have to stand down.
-    let sighup_ok = service_state_success([ "sighup-core-runtime", sing_box_pid_before ]);
+    let sighup_ok = service_state_success([ "sighup-core-runtime", core_pid_before ]);
     if (!sighup_ok) {
-        log_message("SIGHUP reload failed; falling back to full sing-box restart", "warn");
+        log_message("SIGHUP reload failed; falling back to full tachyon-core restart", "warn");
         module_success([ PRIORITY_UC, "stop-runtime" ]);
         module_success([ DNS_FAILOVER_UC, "stop-runtime" ]);
         if (!service_state_success([
             "reload-core-runtime",
-            sing_box_pid_before,
-            sing_box_config_hash_before,
-            file_md5(sing_box_config_path)
+            core_pid_before,
+            core_config_hash_before,
+            file_md5(core_config_path)
         ])) {
             module_success([ PRIORITY_UC, "start-runtime" ]);
             module_success([ DNS_FAILOVER_UC, "start-runtime" ]);
@@ -3711,7 +4820,7 @@ function subscription_runtime_apply_changed(context) {
     // Priority reads the section cache once per worker start, and the cache was
     // just rewritten, so it always has to be restarted after an apply. Its
     // start-runtime stops the previous worker itself. DNS failover is left
-    // alone on the SIGHUP path: it probes the sing-box DNS listener, which
+    // alone on the SIGHUP path: it probes the tachyon-core DNS listener, which
     // stays bound across an in-place reload, and it re-normalizes its state
     // every probe cycle.
     if (!module_success([ PRIORITY_UC, "start-runtime" ])) {
@@ -3762,6 +4871,7 @@ function subscription_update_common_locked(force, target_section, target_source_
     let failed = arg_number(fields[1] || "0");
     let unchanged = arg_number(fields[2] || "0");
     let superseded = arg_number(fields[3] || "0");
+    let pool_updated = arg_number(fields[4] || "0");
 
     if (updated == 0) {
         if (superseded > 0) {
@@ -3779,8 +4889,18 @@ function subscription_update_common_locked(force, target_section, target_source_
         return true;
     }
 
+    if (pool_updated >= updated) {
+        if (failed > 0)
+            log_message("Subscription cache update applied for standalone source(s); failed sources kept their previous cache", "info");
+        else
+            log_message("Subscription cache update completed for standalone source(s)", "info");
+        return true;
+    }
+
     if (!subscription_runtime_apply_changed("updated subscriptions"))
         return false;
+
+    try { require("service.config_plan").refresh_conflict_diagnostics(); } catch (e) {}
 
     if (failed > 0)
         log_message("Subscription update applied for changed rules; failed rules kept their previous cache", "info");
@@ -3928,7 +5048,7 @@ function fixture_subscription_update_section_due_status(path, section_name_value
 }
 
 function print_builtin_subnet_urls(service) {
-    for (let url in array_or_empty(BUILTIN_SUBNET_URLS[as_string(service)]))
+    for (let url in array_or_empty(builtin_subnet_urls_for_service(as_string(service))))
         print(url, "\n");
 }
 
@@ -3962,6 +5082,37 @@ else if (mode == "remove-cron-jobs")
     remove_cron_jobs(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "list-update")
     list_update();
+else if (mode == "download-to-file-fixture") {
+    let got = 0;
+    for (let i = 3; i < length(ARGV); i++)
+        if (download_to_file(ARGV[i], ARGV[1] + "/file" + i, ARGV[2] || "", false))
+            got++;
+    print(got, "\n");
+}
+else if (mode == "rebuild-domain-ip-lists-fixture") {
+    let data = object_or_empty(read_json_file(ARGV[1]));
+    connections.set_item_sections_from_data(data);
+    list_nft_batch = ARGV[3] || "";
+    exit(rebuild_domain_ip_lists_from_rule(fixture_section_by_name(data, ARGV[2]), object_or_empty(data.settings)) ? 0 : 1);
+}
+else if (mode == "import-list-subnets-fixture") {
+    let data = object_or_empty(read_json_file(ARGV[1]));
+    connections.set_item_sections_from_data(data);
+    list_nft_batch = ARGV[3] || "";
+    exit(import_rule_sets_with_subnets_from_rule(fixture_section_by_name(data, ARGV[2]), object_or_empty(data.settings)) ? 0 : 1);
+}
+else if (mode == "refresh-plain-rulesets-fixture") {
+    let data = object_or_empty(read_json_file(ARGV[1]));
+    connections.set_item_sections_from_data(data);
+    list_nft_batch = ARGV[3] || "";
+    exit(update_remote_plain_rulesets_from_rule(fixture_section_by_name(data, ARGV[2]), object_or_empty(data.settings)) ? 0 : 1);
+}
+else if (mode == "refresh-remote-subnets-fixture") {
+    let data = object_or_empty(read_json_file(ARGV[1]));
+    connections.set_item_sections_from_data(data);
+    list_nft_batch = ARGV[3] || "";
+    exit(import_subnets_from_remote_subnet_lists(fixture_section_by_name(data, ARGV[2]), object_or_empty(data.settings)) ? 0 : 1);
+}
 else if (mode == "list-update-async")
     list_update_async();
 else if (mode == "list-update-status")
@@ -3970,8 +5121,8 @@ else if (mode == "list-update-if-due")
     list_update_if_due();
 else if (mode == "stop-list-update")
     stop_list_update();
-else if (mode == "reload-singbox-after-list-update")
-    exit(reload_singbox_after_list_update() ? 0 : 1);
+else if (mode == "reload-core-after-list-update")
+    exit(reload_core_after_list_update() ? 0 : 1);
 else if (mode == "list-update-due-status")
     uci_list_update_due_status(ARGV[1], ARGV[2]);
 else if (mode == "list-update-due-status-fixture")
@@ -4027,9 +5178,11 @@ else if (mode == "component-action-log")
 else if (mode == "component-updates-if-due")
     component_updates_if_due();
 else if (mode == "component-auto-update-apply")
-    component_auto_update_apply();
+    component_auto_update_apply(ARGV[1]);
 else if (mode == "component-update-check-cache")
     component_update_check_cache();
+else if (mode == "import-community-ruleset-fixture")
+    exit(import_community_srs_file(ARGV[1] || "", uci_settings(), arg_bool(ARGV[2] || "0")) ? 0 : 1);
 else {
     warn("Usage: components/updates.uc <operation> ...\n");
     exit(1);

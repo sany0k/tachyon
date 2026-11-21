@@ -9,6 +9,8 @@ const context={E:(tag,attrs,text)=>({tag,attrs,text}),TextEncoder, btoa:value=>B
  atob:value=>Buffer.from(value,'base64').toString('binary'), _:text=>text,
  main:{supportsVpnUrl:()=>supported,validateProxyUrl:link=>({valid:link.startsWith('vpn://')})},
  normalizeDynamicListItems:value=>Array.isArray(value)?value:value?[value]:[],
+ configureLiveDynamicListChoices(){},
+ uci:{sections:()=>[]},
  form:{TextValue:'TextValue'}, ButtonAddSettingsDynamicList:'NamedConfigs',
  outboundNameSourceOptions:new Map(), refreshDashboardFilterChoiceWidgets(){},
  showAmneziaConfigSettingsModal(){},
@@ -17,7 +19,7 @@ const context={E:(tag,attrs,text)=>({tag,attrs,text}),TextEncoder, btoa:value=>B
 vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf('function parseAmneziaConfig('),source.indexOf('function showAmneziaConfigSettingsModal('))+
  source.slice(source.indexOf('function validateAmneziaConfigsBeforeSave('),source.indexOf('function showOutboundJsonSettingsModal(')),context);
-const start=source.indexOf('  o = section.taboption(',source.indexOf('  outboundNameSourceOptions.set("selector_proxy_links", o);'));
+const start=source.lastIndexOf('  o = section.taboption(',source.indexOf('"selector_amnezia_configs",'));
 const end=source.indexOf('  outboundNameSourceOptions.set("selector_amnezia_configs", o);',start);
 vm.runInContext('let o;'+source.slice(start,end)+'outboundNameSourceOptions.set("selector_amnezia_configs",o);',context);
 const option=options.selector_amnezia_configs;
@@ -50,4 +52,30 @@ const ru=fs.readFileSync(new URL('../luci-app-tachyon/po/ru/tachyon.po',import.m
 for(const title of [option.title,option.description]) assert(ru.includes('msgid '+JSON.stringify(title)+'\nmsgstr "') && !ru.includes('msgid '+JSON.stringify(title)+'\nmsgstr ""'));
 assert(source.indexOf('"selector_proxy_links",\n    _("Connection URL")') < start);
 assert(end < source.indexOf('"selector_proxy_links_text",',end));
+
+// Verify that manual AWG fields become optional when selector_amnezia_configs has items
+let currentAmneziaConfigs = [];
+const awgContext = {
+  currentSourceOptionValues: (_id, opt) => opt === 'selector_amnezia_configs' ? currentAmneziaConfigs : [],
+  validateRequiredText: (_id, val) => (val && String(val).trim() ? true : 'Required'),
+  section: {
+    taboption(tab, type, name, title) {
+      return options[name] = { tab, type, name, title, depends() {} };
+    }
+  },
+  form: { Value: 'Value' },
+  _: text => text,
+};
+vm.createContext(awgContext);
+const awgStart = source.indexOf('  const validateAwgManualRequiredText = function');
+const awgEnd = source.indexOf('  o = section.taboption(\n    "awg_manual",\n    form.Value,\n    "awg_preshared_key"', awgStart);
+assert(awgStart > 0 && awgEnd > awgStart, 'validateAwgManualRequiredText block must exist');
+vm.runInContext('let o;\n' + source.slice(awgStart, awgEnd), awgContext);
+for (const field of ['awg_local_address', 'awg_private_key', 'awg_peer_public_key', 'awg_server_address', 'awg_server_port']) {
+  assert.equal(options[field].rmempty, true, `${field} must have rmempty=true`);
+  currentAmneziaConfigs = [];
+  assert.equal(options[field].validate('sec1', ''), 'Required', `${field} must require value when no imported .conf files exist`);
+  currentAmneziaConfigs = [JSON.stringify({ name: 'cfg1', config: base })];
+  assert.equal(options[field].validate('sec1', ''), true, `${field} must allow empty value when imported .conf files exist`);
+}
 console.log('PASS: named Amnezia UI, UTF-8, AWG fields, size limits, duplicate names, capability gate and localization');

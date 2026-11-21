@@ -7,8 +7,7 @@ let fs = require("fs");
 let common = require("core.common");
 let uci_core = require("core.uci");
 let core_url = require("core.url");
-let constants_module = require("core.constants");
-let singbox_constants_module = require("tachyon_core.constants");
+let core_constants_module = require("tachyon_core.constants");
 let domain_config = require("config.domain");
 let rule_config = require("config.rule");
 let subscription_share_link = require("subscription.share_link");
@@ -34,9 +33,9 @@ const TACHYON_SECTION_CACHE_DIR = getenv("TACHYON_SECTION_CACHE_DIR") || TACHYON
 const TACHYON_RUNTIME_CACHE_FORMAT_FILE = getenv("TACHYON_RUNTIME_CACHE_FORMAT_FILE") || TACHYON_RUNTIME_STATE_DIR + "/cache-format";
 const TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR") || "/etc/tachyon/subscription-cache";
 const TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE") || TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR + "/cache-format";
-const TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "7";
+const TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "8";
 const TACHYON_INTERNAL_CONFIG_TRIGGER_GUARD = getenv("TACHYON_INTERNAL_CONFIG_TRIGGER_GUARD") || "/var/run/tachyon.internal-config-change";
-const TACHYON_RUNTIME_CACHE_FORMAT = getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "8";
+const TACHYON_RUNTIME_CACHE_FORMAT = getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "9";
 const CONFIG_VERSION_OPTION = "config_version";
 const APPLIED_MIGRATIONS_OPTION = "applied_migrations";
 const SERVER_COUNTRY_METHOD_FLAG_EMOJI = "flag_emoji";
@@ -46,7 +45,11 @@ const CHILD_ITEM_TYPES = [
     "section_interface",
     "urltest",
     "priority_group",
-    "priority_level"
+    "priority_level",
+    "condition",
+    "outbound_source",
+    "outbound_group",
+    "balancer"
 ];
 
 
@@ -68,16 +71,30 @@ function run(command) {
 }
 
 function constants_context() {
-    let constants = object_or_empty(constants_module);
     return {
-        zapret_legacy_default_nfqws_opt: as_string(constants.ZAPRET_LEGACY_DEFAULT_NFQWS_OPT),
-        zapret_default_nfqws_opt: as_string(constants.ZAPRET_DEFAULT_NFQWS_OPT),
-        urltest_default_idle_timeout: as_string(object_or_empty(singbox_constants_module).URLTEST_DEFAULT_IDLE_TIMEOUT || "30m")
+        urltest_default_idle_timeout: as_string(object_or_empty(core_constants_module).URLTEST_DEFAULT_IDLE_TIMEOUT || "30m")
     };
 }
 
 function section_name(section) {
     return option(section, ".name", "");
+}
+
+function raw_list_option(section, key) {
+    let value = object_or_empty(section)[key];
+    if (value == null)
+        return [];
+    if (type(value) == "array") {
+        let out = [];
+        for (let item in value) {
+            let s = trim(as_string(item));
+            if (s != "")
+                push(out, s);
+        }
+        return out;
+    }
+    let s = trim(as_string(value));
+    return s == "" ? [] : [ s ];
 }
 
 function clone_section(section) {
@@ -103,7 +120,8 @@ function model_from_fixture(path) {
     let model = {
         settings: clone_section(object_or_empty(data.settings)),
         rules: [],
-        sections: []
+        sections: [],
+        server: []
     };
     for (let type_name in CHILD_ITEM_TYPES)
         model[type_name] = [];
@@ -117,6 +135,8 @@ function model_from_fixture(path) {
         push(model.rules, clone_section(section));
     for (let section in fixture_section_list(data, "section"))
         push(model.sections, clone_section(section));
+    for (let section in fixture_section_list(data, "server"))
+        push(model.server, clone_section(section));
     for (let type_name in CHILD_ITEM_TYPES)
         for (let section in fixture_section_list(data, type_name))
             push(model[type_name], clone_section(section));
@@ -128,7 +148,8 @@ function model_from_uci(cursor) {
     let model = {
         settings: clone_section(object_or_empty(cursor.get_all(CONFIG_NAME, "settings"))),
         rules: [],
-        sections: []
+        sections: [],
+        server: []
     };
     for (let type_name in CHILD_ITEM_TYPES)
         model[type_name] = [];
@@ -138,6 +159,9 @@ function model_from_uci(cursor) {
     });
     cursor.foreach(CONFIG_NAME, "section", function(section) {
         push(model.sections, clone_section(section));
+    });
+    cursor.foreach(CONFIG_NAME, "server", function(section) {
+        push(model.server, clone_section(section));
     });
     for (let type_name in CHILD_ITEM_TYPES) {
         cursor.foreach(CONFIG_NAME, type_name, function(section) {
@@ -155,6 +179,8 @@ function export_model(model) {
     };
     if (length(model.rules) > 0)
         result.rule = model.rules;
+    if (length(model.server || []) > 0)
+        result.server = model.server;
     for (let type_name in CHILD_ITEM_TYPES)
         if (length(model[type_name] || []) > 0)
             result[type_name] = model[type_name];
@@ -285,6 +311,23 @@ function create_child_for_section(ctx, parent, type_name) {
     let child = create_child_section(ctx, type_name);
     set_option(ctx, child, "section", section_name(parent));
     return child;
+}
+
+function create_named_section(ctx, type_name, section_id) {
+    section_id = as_string(section_id);
+    if (ctx.model[type_name] == null)
+        ctx.model[type_name] = [];
+    for (let existing in ctx.model[type_name]) {
+        if (section_name(existing) == section_id)
+            return existing;
+    }
+    let section = {
+        ".name": section_id,
+        ".type": type_name
+    };
+    push(ctx.model[type_name], section);
+    record_operation(ctx, { op: "create", section: section_id, type: type_name, anonymous: false });
+    return section;
 }
 
 function option_list_values(section, key) {
@@ -603,7 +646,6 @@ function migrate_proxy_rule(ctx, section, proxy_config_type) {
     delete_option(ctx, section, "proxy_config_type");
 }
 
-// Podkop Plus -> Tachyon source migration.
 function migrated_rule_action(section) {
     let action = option(section, "action", "");
     let proxy_config_type = option(section, "proxy_config_type", "");
@@ -667,51 +709,6 @@ function legacy_rule_connection_kind(section) {
     if (option(section, "outbound_json", "") != "")
         return "outbound";
     return "proxy";
-}
-
-function migrate_byedpi_cmd_opts(ctx, section) {
-    let cmd_opts = option(section, "cmd_opts", "");
-    if (cmd_opts == "")
-        return;
-
-    if (option(section, "byedpi_cmd_opts", "") == "")
-        set_option(ctx, section, "byedpi_cmd_opts", cmd_opts);
-    delete_option(ctx, section, "cmd_opts");
-}
-
-function migrate_ctrack_timeouts(ctx, section) {
-    let action = migrated_rule_action(section);
-    let opt_name = action == "zapret2" ? "nfqws2_opt" : (action == "zapret" ? "nfqws_opt" : "");
-    if (opt_name == "")
-        return;
-    let opt = option(section, opt_name, "");
-    if (opt == "" || index(opt, "--ctrack-timeouts=") < 0)
-        return;
-    let normalized = replace(opt, /--ctrack-timeouts=([0-9,]+)/g, function(full, numbers) {
-        if (index(numbers, ",") < 0)
-            return full;
-        let parts = split(numbers, ",");
-        if (length(parts) >= 8 && parts[0] == "30" && parts[2] == "600")
-            return "--ctrack-timeouts=30:600:30:30";
-        if (length(parts) >= 4)
-            return "--ctrack-timeouts=" + parts[0] + ":" + parts[1] + ":" + parts[2] + ":" + parts[3];
-        if (length(parts) >= 3)
-            return "--ctrack-timeouts=" + parts[0] + ":" + parts[1] + ":" + parts[2];
-        return "--ctrack-timeouts=30:600:30:30";
-    });
-    if (normalized != opt)
-        set_option(ctx, section, opt_name, normalized);
-}
-
-function migrate_zapret_nfqws_default(ctx, section, constants) {
-    if (migrated_rule_action(section) != "zapret")
-        return;
-
-    let nfqws_opt = option(section, "nfqws_opt", "");
-    if (nfqws_opt == "" || nfqws_opt != constants.zapret_legacy_default_nfqws_opt)
-        return;
-
-    set_option(ctx, section, "nfqws_opt", constants.zapret_default_nfqws_opt);
 }
 
 function migrate_subscription_url_item_settings(ctx, section) {
@@ -802,6 +799,9 @@ function migrate_interface_item_settings(ctx, section) {
     let seen_values = {};
 
     for (let child in ctx.model.section_interface || []) {
+        let child_id = section_name(child);
+        if (child_id != "")
+            seen_values[child_id] = true;
         if (option(child, "section", "") != owner)
             continue;
 
@@ -862,7 +862,7 @@ function migrate_legacy_outbound_json_detour(ctx, section, legacy_connection_kin
         return;
 
     if (as_string(outbound.detour || "") == "")
-        outbound.detour = singbox_constants_module.outbound_tag(detour_section);
+        outbound.detour = core_constants_module.outbound_tag(detour_section);
     set_option(ctx, section, "outbound_json", sprintf("%J", outbound));
     delete_option(ctx, section, "outbound_detour_enabled");
     delete_option(ctx, section, "outbound_detour_section");
@@ -898,7 +898,7 @@ function migrate_outbound_json_list(ctx, section, legacy_connection_kind) {
                 }
             }
 
-            let base = singbox_constants_module.outbound_tag(
+            let base = core_constants_module.outbound_tag(
                 section_name(section) + "-json-" + (length(existing) + 1)
             );
             let tag_name = base;
@@ -1082,7 +1082,9 @@ function migrate_combined_domain_conditions(ctx, section) {
         }
     }
 
-    add_domain_values_with_prefix(values, seen, section, "domain", "full:", "domains");
+    // Tachyon 1.0.5+ already stores combined bare/full/keyword/regex entries.
+    // Earlier formats use separate domain/domain_suffix fields.
+    add_domain_values_with_prefix(values, seen, section, "domain", ctx.combined_domain_conditions ? "" : "full:", "domains");
     add_domain_values_with_prefix(values, seen, section, "domain_keyword", "keyword:", "generic");
     add_domain_values_with_prefix(values, seen, section, "domain_regex", "regex:", "generic");
 
@@ -1134,31 +1136,6 @@ function migrate_rule(ctx, section, converted_from_rule, constants) {
     delete_option(ctx, section, "subscription_group_prefix_len");
     delete_option(ctx, section, "global_proxy");
 
-    // Migrate legacy domain_list_urls and subnet_list_urls (early Podkop)
-    if (option_exists(section, "domain_list_urls")) {
-        for (let entry in option_list_values(section, "domain_list_urls")) {
-            entry = trim(as_string(entry));
-            if (entry == "") continue;
-            if (match(entry, /\.srs$/i))
-                add_list_unique(ctx, section, "rule_set", entry);
-            else
-                add_list_unique(ctx, section, "remote_domain_lists", entry);
-        }
-        delete_option(ctx, section, "domain_list_urls");
-    }
-
-    if (option_exists(section, "subnet_list_urls")) {
-        for (let entry in option_list_values(section, "subnet_list_urls")) {
-            entry = trim(as_string(entry));
-            if (entry == "") continue;
-            if (match(entry, /\.srs$/i) || match(entry, /\.json$/i))
-                add_list_unique(ctx, section, "rule_set_with_subnets", entry);
-            else
-                add_list_unique(ctx, section, "remote_subnet_lists", entry);
-        }
-        delete_option(ctx, section, "subnet_list_urls");
-    }
-
     if (action == "connection") {
         migrate_urltest_filter_mode(ctx, section);
         migrate_detect_server_country(ctx, section);
@@ -1178,7 +1155,7 @@ function migrate_rule(ctx, section, converted_from_rule, constants) {
             delete_subscription_cache(ctx, section_name(section));
     }
     else if (action == "block" ||
-        action == "bypass" || action == "zapret" || action == "zapret2" || action == "byedpi") {
+        action == "bypass" || action == "desync" || action == "zapret" || action == "zapret2" || action == "byedpi") {
         delete_option(ctx, section, "proxy_config_type");
         delete_option(ctx, section, "proxy_string");
         delete_option(ctx, section, "urltest_proxy_links");
@@ -1190,10 +1167,6 @@ function migrate_rule(ctx, section, converted_from_rule, constants) {
 
     if (action != "connection")
         delete_legacy_urltest_options(ctx, section);
-
-    migrate_byedpi_cmd_opts(ctx, section);
-    migrate_zapret_nfqws_default(ctx, section, constants);
-    migrate_ctrack_timeouts(ctx, section);
 }
 
 function migrate_rule_section(ctx, section, constants) {
@@ -1201,101 +1174,6 @@ function migrate_rule_section(ctx, section, constants) {
     migrate_rule(ctx, section, true, constants);
     migrate_combined_domain_conditions(ctx, section);
     migrate_text_condition(ctx, section, "ip_cidr", "subnets");
-}
-
-function migrate_list_update_enabled(ctx) {
-    let settings = ctx.model.settings;
-    if (option_exists(settings, "list_update_enabled")) {
-        if (bool_option(settings, "list_update_enabled", true) &&
-            option(settings, "update_interval", "") == "") {
-            set_option(ctx, settings, "update_interval", "1d");
-        }
-        return;
-    }
-
-    if (option(settings, "update_interval", "") != "") {
-        set_option(ctx, settings, "list_update_enabled", "1");
-    }
-    else {
-        set_option(ctx, settings, "list_update_enabled", "0");
-        set_option(ctx, settings, "update_interval", "1d");
-    }
-}
-
-function normalize_existing_list_option(ctx, section, key) {
-    let current = object_or_empty(section)[key];
-    if (current == null)
-        return;
-
-    let values = [];
-    if (type(current) == "array") {
-        for (let item in current) {
-            item = trim(as_string(item));
-            if (item != "")
-                push(values, item);
-        }
-    }
-    else {
-        let text = trim(as_string(current));
-        if (text != "") {
-            for (let item in split(text, /[ \t\r\n,]+/)) {
-                item = trim(item);
-                if (item != "")
-                    push(values, item);
-            }
-        }
-    }
-
-    if (type(current) == "array" && length(values) == length(current))
-        return;
-
-    section[key] = values;
-    record_operation(ctx, { op: "set_list", section: section_name(section), option: key, values });
-}
-
-function migrate_dns_server_lists(ctx) {
-    normalize_existing_list_option(ctx, ctx.model.settings, "dns_server");
-    normalize_existing_list_option(ctx, ctx.model.settings, "bootstrap_dns_server");
-}
-
-function migrate_download_via_proxy_flags(ctx) {
-    let settings = ctx.model.settings;
-    let legacy_section = option(settings, "download_lists_via_proxy_section", "");
-    let lists_enabled = bool_option(settings, "download_lists_via_proxy", false);
-    let components_enabled = option_exists(settings, "download_components_via_proxy")
-        ? bool_option(settings, "download_components_via_proxy", false)
-        : lists_enabled;
-
-    set_option(ctx, settings, "download_lists_via_proxy", lists_enabled ? "1" : "0");
-    if (!lists_enabled)
-        delete_option(ctx, settings, "download_lists_via_proxy_section");
-
-    set_option(ctx, settings, "download_components_via_proxy", components_enabled ? "1" : "0");
-    if (components_enabled) {
-        if (option(settings, "download_components_via_proxy_section", "") == "" && legacy_section != "")
-            set_option(ctx, settings, "download_components_via_proxy_section", legacy_section);
-    }
-    else {
-        delete_option(ctx, settings, "download_components_via_proxy_section");
-    }
-}
-
-function migrate_subscription_download_via_proxy_settings(ctx) {
-    let settings_section = ctx.model.settings;
-    let enabled = bool_option(settings_section, "download_subscriptions_via_proxy", false);
-    let target_section = option(settings_section, "download_lists_via_proxy_section", "");
-
-    if (enabled && target_section != "") {
-        for (let child in ctx.model.subscription_url || []) {
-            let name = option(child, "section", "");
-            if (name == "" || name == target_section)
-                continue;
-            set_option(ctx, child, "download_via_proxy_enabled", "1");
-            set_option(ctx, child, "download_via_proxy_section", target_section);
-        }
-    }
-
-    delete_option(ctx, settings_section, "download_subscriptions_via_proxy");
 }
 
 function migrate_rule_set_settings(ctx, section) {
@@ -1462,9 +1340,9 @@ function migrate_http_connection_urls(ctx) {
 }
 
 // Ensure both main and bootstrap DNS server lists have at least one entry.
-// forkop/podkop did not require bootstrap_dns_server, so it is often absent after
-// migration. The validator refuses to start Tachyon when either list is empty.
-// The default "77.88.8.8" matches the runtime fallback in singbox/dns.uc.
+// Older configs may omit bootstrap_dns_server or dns_server, while the
+// validator refuses to start Tachyon when either list is empty.
+// The default "77.88.8.8" matches the runtime fallback in tachyon_core/dns.uc.
 function migrate_ensure_dns_server_defaults(ctx) {
     let settings = ctx.model.settings;
     let dns_server = list_option(settings, "dns_server");
@@ -1488,48 +1366,6 @@ function migrate_ensure_dns_server_defaults(ctx) {
     }
     if (!has_bootstrap)
         set_list_option(ctx, settings, "bootstrap_dns_server", [ "77.88.8.8" ]);
-}
-
-// Record that this configuration targets steer spec v2, and say so once if the
-// installed steer cannot read it.
-//
-// No UCI data is rewritten here, and that is the finding rather than an
-// omission: contract-v1's `prefer`, `latency_interval_s` and
-// `latency_tolerance_ms` were never stored. They were computed at generate time
-// from the `config urltest` child options, which are still named the same and
-// now feed a v2 `pick: latency` group. So the options carry over untouched and
-// anything that renamed them would have broken sing-box as well.
-//
-// What genuinely does not carry over is the kernel. Spec v2 is a different
-// document, only steer 2.0+ reads it, and the failure is a refusal rather than a
-// degradation - so an upgrading router on a 1.x steer is told here rather than
-// discovering it when the proxy refuses to come up.
-function migrate_steer_spec_v2(ctx) {
-    let settings = ctx.model.settings;
-    set_option(ctx, settings, "steer_spec_format", "2");
-
-    let engine_id = as_string(option(settings, "engine", ""));
-    if (engine_id != "steer" && engine_id != "steer-extended")
-        return;
-
-    let engine = null;
-    try {
-        engine = require("core.engine");
-    }
-    catch (e) {
-        return;
-    }
-    if (engine == null || !engine.binary_present(engine.ENGINE_STEER))
-        return;
-
-    if (engine.steer_supports_spec_v2())
-        return;
-
-    let parts = engine.steer_version_parts();
-    warn("Tachyon now writes steer spec v2, which needs steer 2.0 or newer" +
-        (parts != null ? " (installed: " + as_string(parts[0]) + "." + as_string(parts[1]) +
-            "." + as_string(parts[2]) + ")" : " (installed version could not be read)") +
-        ". Update steer before switching to it, or stay on sing-box.\n");
 }
 
 function migrate_dns_hosts_to_option(ctx) {
@@ -1653,7 +1489,9 @@ function migrate_orphan_section_interfaces(ctx) {
             ctx.model[type_name] = kept;
     }
 }
-function migrate_cleanup_accidental_full_domain_prefixes(ctx) {
+function migrate_normalize_domain_lists(ctx) {
+    // Explicit full: entries must survive normalization. Without provenance,
+    // they cannot be distinguished from prefixes added by a broken import.
     let targets = [];
     for (let s in ctx.model.sections) push(targets, s);
     for (let r in ctx.model.rules) push(targets, r);
@@ -1676,11 +1514,6 @@ function migrate_cleanup_accidental_full_domain_prefixes(ctx) {
                     for (let sub in text_list_values(line, "comma-space")) {
                         sub = trim(sub);
                         if (sub == "") continue;
-                        if (substr(sub, 0, 5) == "full:") {
-                            let rest = trim(substr(sub, 5));
-                            if (rest != "" && domain_config.suffix_to_ascii(rest) != null)
-                                sub = rest;
-                        }
                         if (!seen[sub]) {
                             seen[sub] = true;
                             push(new_lines, sub);
@@ -1688,13 +1521,6 @@ function migrate_cleanup_accidental_full_domain_prefixes(ctx) {
                         changed = true;
                     }
                     continue;
-                }
-                if (substr(line, 0, 5) == "full:") {
-                    let rest = trim(substr(line, 5));
-                    if (rest != "" && domain_config.suffix_to_ascii(rest) != null) {
-                        line = rest;
-                        changed = true;
-                    }
                 }
                 if (!seen[line]) {
                     seen[line] = true;
@@ -1710,12 +1536,252 @@ function migrate_cleanup_accidental_full_domain_prefixes(ctx) {
     }
 }
 
+function migrate_tailscale_entity_to_tachyon_core(ctx, obj, is_server) {
+    let ts_mode = lc(trim(option(obj, "tailscale_mode", "")));
+    let has_native_fields = length(list_option(obj, "tailscale_advertise_routes")) > 0;
+    if (!has_native_fields) {
+        for (let key in [
+            "tailscale_auth_key",
+            "tailscale_control_url",
+            "tailscale_exit_node",
+            "tailscale_hostname",
+            "tailscale_advertise_exit_node",
+            "tailscale_relay_server_port",
+            "tailscale_system_interface",
+            "tailscale_system_interface_name",
+            "tailscale_accept_routes"
+        ]) {
+            if (trim(option(obj, key, "")) != "") {
+                has_native_fields = true;
+                break;
+            }
+        }
+    }
+    let has_iface_only = !has_native_fields && trim(option(obj, "interface_name", "")) != "";
+
+    if (ts_mode == "native" || (ts_mode != "tachyon-core" && ts_mode != "embedded" && ts_mode != "singbox" && has_iface_only)) {
+        set_option(ctx, obj, "enabled", "0");
+        // Clear the migration trigger after the one-shot disable so re-enabling
+        // the server/section manually stays enabled across future upgrades.
+        if (ts_mode == "native") {
+            if (is_server)
+                set_option(ctx, obj, "tailscale_mode", "tachyon-core");
+            else
+                delete_option(ctx, obj, "tailscale_mode");
+        }
+        if (has_iface_only) {
+            delete_option(ctx, obj, "interface_name");
+            if (is_server && ts_mode != "tachyon-core")
+                set_option(ctx, obj, "tailscale_mode", "tachyon-core");
+        }
+        return;
+    }
+
+    if (is_server || ts_mode == "tachyon-core" || ts_mode == "embedded" || ts_mode == "singbox" || has_native_fields) {
+        if (ts_mode != "tachyon-core")
+            set_option(ctx, obj, "tailscale_mode", "tachyon-core");
+    }
+}
+
+function first_native_wdtt_uri(values) {
+    for (let value in values) {
+        let link = lc(trim(as_string(value)));
+        if (substr(link, 0, 7) == "wdtt://" || substr(link, 0, 8) == "csqtt://" || substr(link, 0, 8) == "qwdtt://")
+            return trim(as_string(value));
+    }
+    return "";
+}
+
+function migrate_wdtt_entity_to_tachyon_core(ctx, obj, kind_key) {
+    let cur_kind = lc(trim(option(obj, kind_key, "")));
+    if (cur_kind == "csqtt") {
+        delete_option(ctx, obj, "wdtt_native");
+        return;
+    }
+    if (cur_kind != "wdtt")
+        return;
+
+    let is_native = bool_option(obj, "wdtt_native", false);
+    // Older Tachyon builds stored the qwdtt/wdtt URI under a generic `uri`
+    // option (and sometimes only in `subscription_links`). Treat those as a
+    // native tachyon-core target instead of disabling the section on upgrade.
+    let generic_uri = trim(option(obj, "uri", ""));
+    if (generic_uri == "")
+        generic_uri = first_native_wdtt_uri(list_option(obj, "subscription_links"));
+    let warp_uri = trim(option(obj, "warp_flow_uri", ""));
+    let has_csqtt_target = trim(option(obj, "csqtt_server", "")) != "" ||
+        trim(option(obj, "csqtt_uri", "")) != "" || generic_uri != "" || warp_uri != "";
+
+    if (is_native || has_csqtt_target) {
+        set_option(ctx, obj, kind_key, "csqtt");
+        if (trim(option(obj, "csqtt_uri", "")) == "") {
+            let target_uri = generic_uri != "" ? generic_uri : warp_uri;
+            if (target_uri != "")
+                set_option(ctx, obj, "csqtt_uri", target_uri);
+        }
+        if (kind_key == "action") {
+            let w_workers = trim(option(obj, "wdtt_workers", option(obj, "warp_flow_workers", option(obj, "workers", ""))));
+            if (trim(option(obj, "csqtt_workers", "")) == "" && w_workers != "")
+                set_option(ctx, obj, "csqtt_workers", w_workers);
+            let w_mtu = trim(option(obj, "wdtt_mtu", option(obj, "warp_flow_mtu", option(obj, "mtu", ""))));
+            if (trim(option(obj, "csqtt_mtu", "")) == "" && w_mtu != "")
+                set_option(ctx, obj, "csqtt_mtu", w_mtu);
+            let w_dev = trim(option(obj, "warp_flow_device_id", option(obj, "wdtt_device_id", option(obj, "device_id", ""))));
+            if (trim(option(obj, "csqtt_device_id", "")) == "" && w_dev != "")
+                set_option(ctx, obj, "csqtt_device_id", w_dev);
+        }
+        delete_option(ctx, obj, "wdtt_native");
+    } else {
+        set_option(ctx, obj, "enabled", "0");
+        delete_option(ctx, obj, "wdtt_native");
+    }
+}
+
+function migrate_unify_tachyon_core_providers(ctx) {
+    let model = object_or_empty(ctx.model);
+    let removed_strategy_keys = [ "nfqws_opt", "nfqws2_opt", "byedpi_cmd_opts", "byedpi_opts", "cmd_opts" ];
+
+    for (let sec in (model.sections || [])) {
+        let act = lc(trim(option(sec, "action", "")));
+        if (act == "byedpi" || act == "zapret" || act == "zapret2") {
+            set_option(ctx, sec, "action", "desync");
+            set_option(ctx, sec, "desync_preset", "auto");
+            for (let k in removed_strategy_keys)
+                delete_option(ctx, sec, k);
+        } else if (act == "olcrtc") {
+            set_option(ctx, sec, "enabled", "0");
+        } else if (act == "wdtt" || act == "csqtt") {
+            migrate_wdtt_entity_to_tachyon_core(ctx, sec, "action");
+        } else if (act == "tailscale") {
+            migrate_tailscale_entity_to_tachyon_core(ctx, sec, false);
+        }
+    }
+
+    for (let src in (model.outbound_source || [])) {
+        let st = lc(trim(option(src, "source_type", "")));
+        if (st == "byedpi" || st == "zapret" || st == "zapret2") {
+            set_option(ctx, src, "source_type", "desync");
+            set_option(ctx, src, "desync_preset", "auto");
+            for (let k in removed_strategy_keys)
+                delete_option(ctx, src, k);
+        } else if (st == "olcrtc") {
+            set_option(ctx, src, "enabled", "0");
+        } else if (st == "wdtt" || st == "csqtt") {
+            migrate_wdtt_entity_to_tachyon_core(ctx, src, "source_type");
+        } else if (st == "tailscale") {
+            migrate_tailscale_entity_to_tachyon_core(ctx, src, false);
+        }
+    }
+
+    for (let srv in (model.server || [])) {
+        let proto = lc(trim(option(srv, "protocol", "")));
+        if (proto == "olcrtc") {
+            set_option(ctx, srv, "enabled", "0");
+        } else if (proto == "tailscale") {
+            migrate_tailscale_entity_to_tachyon_core(ctx, srv, true);
+        }
+    }
+}
+
+/// Silently normalize any legacy engine / component / tailscale_mode values
+/// to `tachyon-core` in the UCI model.
+function normalize_tachyon_core_uci(ctx) {
+    let settings = object_or_empty(object_or_empty(ctx.model).settings);
+    let cur_engine = option(settings, "engine", "");
+    if (cur_engine != "" && cur_engine != "tachyon-core")
+        set_option(ctx, settings, "engine", "tachyon-core");
+    if (option_exists(settings, "engine_previous"))
+        delete_option(ctx, settings, "engine_previous");
+
+    let targets = list_option(settings, "component_auto_update_targets");
+    if (length(targets) > 0) {
+        let next_targets = [];
+        let changed_targets = false;
+        let seen_targets = {};
+        let removed_targets = {
+            zapret: true, zapret2: true, byedpi: true,
+            wdtt: true, olcrtc: true, tailscale: true
+        };
+        for (let t in targets) {
+            let item = as_string(t);
+            if (removed_targets[item]) {
+                changed_targets = true;
+                continue;
+            }
+            let mapped = (item == "sing_box" || item == "sing-box") ? "tachyon-core" : item;
+            if (mapped != item)
+                changed_targets = true;
+            if (mapped != "" && !seen_targets[mapped]) {
+                seen_targets[mapped] = true;
+                push(next_targets, mapped);
+            } else if (mapped != "" && seen_targets[mapped]) {
+                changed_targets = true;
+            }
+        }
+        if (changed_targets) {
+            if (length(next_targets) == 0)
+                next_targets = [ "all" ];
+            set_list_option(ctx, settings, "component_auto_update_targets", next_targets);
+        }
+    }
+
+    migrate_unify_tachyon_core_providers(ctx);
+}
+
+function legacy_cleanup_root() {
+    return replace(as_string(getenv("TACHYON_LEGACY_CLEANUP_ROOT") || ""), /\/+$/, "");
+}
+
+function legacy_path(path) {
+    return legacy_cleanup_root() + as_string(path);
+}
+
+function legacy_cleanup_host_enabled() {
+    if (legacy_cleanup_root() != "")
+        return true;
+    if (getenv("TACHYON_UCI_STATE_FILE") != null || getenv("UCI_STATE") != null)
+        return false;
+    return TARGET_CONFIG == "/etc/config/" + CONFIG_NAME && getenv("TACHYON_CONFIG_FILE") == null;
+}
+
+function backup_file_non_destructive(src, dst) {
+    let st = fs.stat(src);
+    if (st == null || st.type == "directory")
+        return false;
+    if (fs.stat(dst) != null)
+        return true;
+    return common.copy_file(src, dst);
+}
+
+function backup_external_singbox_configs() {
+    let backup_dir = legacy_path("/etc/tachyon/external-configs-backup/sing-box");
+    backup_file_non_destructive(legacy_path("/etc/sing-box/config.json"), backup_dir + "/config.json");
+    backup_file_non_destructive(legacy_path("/etc/config/sing-box"), backup_dir + "/sing-box");
+}
+
+function has_tachyon_managed_singbox_marker() {
+    let init_path = legacy_path("/etc/init.d/sing-box");
+    if (fs.stat(init_path) != null) {
+        let init_txt = as_string(fs.readfile(init_path) || "");
+        if (index(init_txt, "Tachyon managed") >= 0)
+            return true;
+    }
+    for (let marker_path in [
+        "/etc/tachyon/sing-box-version",
+        "/etc/tachyon/sing-box-variant",
+        "/etc/tachyon/component-backups/sing_box"
+    ]) {
+        if (fs.stat(legacy_path(marker_path)) != null)
+            return true;
+    }
+    return false;
+}
+
 /// The engine became a product of its own: binary, service, config directory
 /// and UCI package all carry `tachyon-core` now. An upgrade from the previous
 /// release has to land on the new names without losing the running config, so
-/// this migration rewrites what UCI stores, moves the config file when the new
-/// path is still empty, and leaves the old file in place — a downgrade still
-/// finds a working setup.
+/// this migration rewrites what UCI stores and copies managed configs
+/// non-destructively after saving external config backups.
 function migrate_engine_identity(ctx) {
     let settings = object_or_empty(object_or_empty(ctx.model).settings);
     const OLD_CONFIG_DIR = "/etc/sing-box";
@@ -1725,22 +1791,19 @@ function migrate_engine_identity(ctx) {
     const OLD_SHARE_DIR = "/usr/share/sing-box";
     const NEW_SHARE_DIR = "/usr/share/tachyon-core";
 
-    if (option(settings, "engine", "") == "sing-box")
-        set_option(ctx, settings, "engine", "tachyon-core");
-    if (option(settings, "engine_previous", "") == "sing-box")
-        set_option(ctx, settings, "engine_previous", "tachyon-core");
+    normalize_tachyon_core_uci(ctx);
+
+    let can_touch_host = !ctx.fixture_mode && legacy_cleanup_host_enabled();
+    if (can_touch_host)
+        backup_external_singbox_configs();
+    let managed_singbox = can_touch_host ? has_tachyon_managed_singbox_marker() : false;
 
     for (let key in [ "config_path", "cache_path" ]) {
         if (!option_exists(settings, key))
             continue;
         let value = option(settings, key, "");
         let updated = "";
-        if (key == "cache_path" && (value == "/tmp/sing-box/cache.db" ||
-                                    value == "/tmp/tachyon-core/cache.db" ||
-                                    value == "/usr/share/sing-box/cache.db")) {
-            updated = NEW_SHARE_DIR + "/cache.db";
-        }
-        else if (index(value, OLD_CONFIG_DIR + "/") == 0) {
+        if (index(value, OLD_CONFIG_DIR + "/") == 0) {
             updated = NEW_CONFIG_DIR + "/" + substr(value, length(OLD_CONFIG_DIR + "/"));
         }
         else if (index(value, OLD_SHARE_DIR + "/") == 0) {
@@ -1751,81 +1814,1732 @@ function migrate_engine_identity(ctx) {
         }
         if (updated == "" || updated == value)
             continue;
-        // the file itself follows the option, so an upgrade keeps the proxy's
-        // own configuration instead of silently starting from an empty one
-        if (fs.stat(updated) == null && fs.stat(value) != null) {
-            let slash = rindex(updated, "/");
-            if (slash > 0) {
-                let dir = substr(updated, 0, slash);
-                try {
-                    fs.mkdir(dir, 0755);
-                }
-                catch (e) {
-                }
-            }
-            let moved = false;
-            try {
-                moved = fs.rename(value, updated) == true;
-            }
-            catch (e) {
-            }
-            if (!moved) {
-                try {
-                    let raw = fs.readfile(value);
-                    if (raw != null && fs.writefile(updated, raw) != null)
-                        fs.unlink(value);
-                }
-                catch (e) {
-                }
+        // Copy non-destructively so standalone files are never moved/unlinked here.
+        if (can_touch_host) {
+            let src_path = legacy_path(value);
+            let dst_path = legacy_path(updated);
+            if (fs.stat(dst_path) == null && fs.stat(src_path) != null) {
+                let dir = common.parent_dir(dst_path);
+                if (dir != "")
+                    common.ensure_dir(dir);
+                if (index(updated, NEW_TMP_DIR + "/") == 0 || key == "cache_path")
+                    common.copy_file_stream(src_path, dst_path);
+                else
+                    common.copy_file(src_path, dst_path);
             }
         }
         set_option(ctx, settings, key, updated);
     }
 
-    // the engine's own UCI package
-    if (uci_core.exists("sing-box.main") && !uci_core.exists("tachyon-core.main")) {
-        uci_core.rename_package("sing-box", "tachyon-core");
-        uci_core.commit("tachyon-core");
-    }
+    if (can_touch_host && managed_singbox) {
+        // Copy the engine's own UCI package only when Tachyon-managed.
+        if (legacy_cleanup_root() == "" && uci_core.exists("sing-box.main") && !uci_core.exists("tachyon-core.main")) {
+            let sb_cfg = fs.readfile("/etc/config/sing-box");
+            if (sb_cfg != null) {
+                let tc_cfg = replace(as_string(sb_cfg), "config sing-box ", "config tachyon-core ");
+                tc_cfg = replace(tc_cfg, "config sing-box\t", "config tachyon-core\t");
+                common.write_file("/etc/config/tachyon-core", tc_cfg);
+                uci_core.reload("tachyon-core");
+            }
+        }
 
-    // the managed init script reads conffile and workdir from the engine
-    // package, so a renamed package carrying the old paths would start the
-    // core on a file this migration just moved away
-    if (uci_core.exists("tachyon-core.main")) {
-        for (let pair in [
-            [ "conffile", OLD_CONFIG_DIR + "/", NEW_CONFIG_DIR + "/" ],
-            [ "workdir", "/usr/share/sing-box", "/usr/share/tachyon-core" ]
-        ]) {
-            let value = uci_core.get("tachyon-core", "main", pair[0]);
-            if (value == "" || index(value, pair[1]) != 0)
+        // the managed init script reads conffile and workdir from the engine
+        // package, so a copied package carrying the old paths would start the
+        // core on a legacy path
+        if (legacy_cleanup_root() == "" && uci_core.exists("tachyon-core.main")) {
+            for (let pair in [
+                [ "conffile", OLD_CONFIG_DIR + "/", NEW_CONFIG_DIR + "/" ],
+                [ "workdir", "/usr/share/sing-box", "/usr/share/tachyon-core" ]
+            ]) {
+                let value = uci_core.get("tachyon-core", "main", pair[0]);
+                if (value == "" || index(value, pair[1]) != 0)
+                    continue;
+                uci_core.set("tachyon-core", "main", pair[0], pair[2] + substr(value, length(pair[1])));
+            }
+            uci_core.commit("tachyon-core");
+        }
+
+        // preserve version state non-destructively across upgrade
+        let old_ver = legacy_path("/etc/tachyon/sing-box-version");
+        let new_ver = legacy_path("/etc/tachyon/tachyon-core-version");
+        if (fs.stat(new_ver) == null && fs.stat(old_ver) != null)
+            common.copy_file(old_ver, new_ver);
+    }
+}
+
+const CYRILLIC_PAIRS = [
+    [ "щ", "shch" ], [ "Щ", "Shch" ],
+    [ "ё", "yo" ], [ "Ё", "Yo" ],
+    [ "ж", "zh" ], [ "Ж", "Zh" ],
+    [ "х", "kh" ], [ "Х", "Kh" ],
+    [ "ц", "ts" ], [ "Ц", "Ts" ],
+    [ "ч", "ch" ], [ "Ч", "Ch" ],
+    [ "ш", "sh" ], [ "Ш", "Sh" ],
+    [ "ю", "yu" ], [ "Ю", "Yu" ],
+    [ "я", "ya" ], [ "Я", "Ya" ],
+    [ "а", "a" ], [ "А", "A" ],
+    [ "б", "b" ], [ "Б", "B" ],
+    [ "в", "v" ], [ "В", "V" ],
+    [ "г", "g" ], [ "Г", "G" ],
+    [ "д", "d" ], [ "Д", "D" ],
+    [ "е", "e" ], [ "Е", "E" ],
+    [ "з", "z" ], [ "З", "Z" ],
+    [ "и", "i" ], [ "И", "I" ],
+    [ "й", "y" ], [ "Й", "Y" ],
+    [ "к", "k" ], [ "К", "K" ],
+    [ "л", "l" ], [ "Л", "L" ],
+    [ "м", "m" ], [ "М", "M" ],
+    [ "н", "n" ], [ "Н", "N" ],
+    [ "о", "o" ], [ "О", "O" ],
+    [ "п", "p" ], [ "П", "P" ],
+    [ "р", "r" ], [ "Р", "R" ],
+    [ "с", "s" ], [ "С", "S" ],
+    [ "т", "t" ], [ "Т", "T" ],
+    [ "у", "u" ], [ "У", "U" ],
+    [ "ф", "f" ], [ "Ф", "F" ],
+    [ "ъ", "" ], [ "Ъ", "" ],
+    [ "ы", "y" ], [ "Ы", "Y" ],
+    [ "ь", "" ], [ "Ь", "" ],
+    [ "э", "e" ], [ "Э", "E" ]
+];
+
+function transliterate_cyrillic(str) {
+    let s = as_string(str);
+    for (let pair in CYRILLIC_PAIRS)
+        s = replace(s, pair[0], pair[1]);
+    return s;
+}
+
+function sanitize_uci_id(raw) {
+    let clean = replace(as_string(raw), /[^A-Za-z0-9_]/g, "_");
+    clean = replace(clean, /^_+/, "");
+    clean = replace(clean, /_+$/, "");
+    return clean != "" ? clean : "item";
+}
+
+function condition_list_tokens(section, key) {
+    let raw = object_or_empty(section)[key];
+    if (raw == null)
+        return [];
+    let lines = type(raw) == "array" ? raw : split(as_string(raw), /[\r\n]+/);
+    let out = [];
+    for (let line in lines) {
+        line = replace(as_string(line), /(^|[ \t]+)\/\/.*$/, "");
+        line = replace(line, /(^|[ \t]+)#.*$/, "");
+        line = trim(line);
+        if (line == "")
+            continue;
+        for (let tok in split(line, /[ \t,]+/)) {
+            tok = trim(as_string(tok));
+            if (tok != "")
+                push(out, tok);
+        }
+    }
+    return out;
+}
+
+function extract_proxy_links_from_text_and_list(list_items, text_value) {
+    let result = [];
+    let seen = {};
+    for (let item in (list_items || [])) {
+        let s = trim(as_string(item));
+        if (s == "" || substr(s, 0, 1) == "#" || substr(s, 0, 2) == "//" || seen[s])
+            continue;
+        seen[s] = true;
+        push(result, s);
+    }
+    for (let line in trim_lines(text_value || "")) {
+        if (substr(line, 0, 1) == "#" || substr(line, 0, 2) == "//" || seen[line])
+            continue;
+        seen[line] = true;
+        push(result, line);
+    }
+    return result;
+}
+
+function priority_level_list_option(section, key) {
+    let value = object_or_empty(section)[key];
+    if (value == null)
+        return [];
+    if (type(value) == "array") {
+        let out = [];
+        for (let item in value) {
+            let s = trim(as_string(item));
+            if (s != "")
+                push(out, s);
+        }
+        return out;
+    }
+    let s = trim(as_string(value));
+    if (s == "")
+        return [];
+    if (substr(s, 0, 4) == "srv:")
+        return [ s ];
+    return list_option(section, key);
+}
+
+function normalize_condition_sig_values(val) {
+    let items = [];
+    if (type(val) == "array") {
+        for (let item in val) {
+            let text = trim(as_string(item));
+            if (text != "")
+                push(items, text);
+        }
+    } else if (type(val) == "bool") {
+        push(items, val ? "1" : "0");
+    } else if (type(val) == "int" || type(val) == "double") {
+        push(items, "" + val);
+    } else {
+        let raw = as_string(val);
+        if (raw != "") {
+            for (let part in split(raw, /\r?\n/)) {
+                let text = trim(part);
+                if (text != "")
+                    push(items, text);
+            }
+        }
+    }
+    if (length(items) <= 1)
+        return items;
+    let sorted = sort(items);
+    let out = [];
+    let prev = null;
+    for (let item in sorted) {
+        if (prev == null || item != prev) {
+            push(out, item);
+            prev = item;
+        }
+    }
+    return out;
+}
+
+function condition_rule_signature(cond) {
+    if (type(cond) != "object")
+        return "";
+    let ctype = lc(trim(option(cond, "condition_type", option(cond, "type", "atomic"))));
+    if (ctype == "")
+        ctype = "atomic";
+    if (ctype == "composite" ||
+        length(whitespace_list_values(cond, "members")) > 0 ||
+        length(whitespace_list_values(cond, "conditions")) > 0 ||
+        trim(option(cond, "expression", "")) != "")
+        return "";
+
+    let enabled_sig = bool_option(cond, "enabled", true) ? "1" : "0";
+    let rule_keys = [];
+    for (let k in keys(cond)) {
+        if (substr(k, 0, 1) == ".")
+            continue;
+        if (k == "name" || k == "label" || k == "enabled" ||
+            k == "condition_type" || k == "type" ||
+            k == "members" || k == "conditions" || k == "expression" || k == "operator")
+            continue;
+        push(rule_keys, k);
+    }
+    rule_keys = sort(rule_keys);
+
+    let field_entries = [];
+    let has_rule_content = false;
+    for (let k in rule_keys) {
+        let vals = normalize_condition_sig_values(cond[k]);
+        if (length(vals) == 0)
+            continue;
+        if (k == "invert" || k == "match_all" || k == "community_subnets" || k == "rule_set_with_subnets") {
+            let bv = lc(vals[0]);
+            let norm_b = (bv == "1" || bv == "true" || bv == "yes" || bv == "on") ? "1" : "0";
+            if (norm_b == "0")
                 continue;
-            uci_core.set("tachyon-core", "main", pair[0], pair[2] + substr(value, length(pair[1])));
+            vals = [norm_b];
         }
-        uci_core.commit("tachyon-core");
+        has_rule_content = true;
+        push(field_entries, [k, vals]);
     }
 
-    // the variant and version markers decide what the UI shows and which
-    // engine the config generator targets; losing them would make a working
-    // install look like it has no core at all
-    for (let pair in [
-        [ "/etc/tachyon/sing-box-variant", "/etc/tachyon/tachyon-core-variant" ],
-        [ "/etc/tachyon/sing-box-version", "/etc/tachyon/tachyon-core-version" ]
-    ]) {
-        if (fs.stat(pair[1]) == null && fs.stat(pair[0]) != null) {
-            try {
-                fs.rename(pair[0], pair[1]);
+    if (!has_rule_content)
+        return "";
+
+    return "enabled=" + enabled_sig + "|type=" + ctype + "|" + sprintf("%J", field_entries);
+}
+
+function condition_clone_base_id(cid) {
+    let base = trim(as_string(cid));
+    if (substr(base, 0, 5) != "cond_")
+        return base;
+    while (true) {
+        let m = match(base, /^(cond_.+)(_copy[0-9]*|_[2-9][0-9]*)$/);
+        if (!m)
+            break;
+        base = m[1];
+    }
+    return base;
+}
+
+function is_cond_expr_ident_char(ch) {
+    return (ch >= "a" && ch <= "z") ||
+        (ch >= "A" && ch <= "Z") ||
+        (ch >= "0" && ch <= "9") ||
+        ch == "_" ||
+        ch == "-";
+}
+
+function replace_condition_expression_ids(expr, replace_map) {
+    let raw = as_string(expr);
+    if (raw == "" || type(replace_map) != "object")
+        return raw;
+    let n = length(raw);
+    let out = "";
+    let i = 0;
+    while (i < n) {
+        let ch = substr(raw, i, 1);
+        if (is_cond_expr_ident_char(ch)) {
+            let start = i;
+            i++;
+            while (i < n && is_cond_expr_ident_char(substr(raw, i, 1)))
+                i++;
+            let tok = substr(raw, start, i - start);
+            out += (replace_map[tok] != null ? replace_map[tok] : tok);
+        } else {
+            let start = i;
+            i++;
+            while (i < n && !is_cond_expr_ident_char(substr(raw, i, 1)))
+                i++;
+            out += substr(raw, start, i - start);
+        }
+    }
+    return out;
+}
+
+function cond_uf_find(parent, idx) {
+    while (parent[idx] != idx) {
+        parent[idx] = parent[parent[idx]];
+        idx = parent[idx];
+    }
+    return idx;
+}
+
+function cond_uf_union(parent, a, b) {
+    let ra = cond_uf_find(parent, a);
+    let rb = cond_uf_find(parent, b);
+    if (ra == rb)
+        return;
+    if (ra < rb)
+        parent[rb] = ra;
+    else
+        parent[ra] = rb;
+}
+
+function remap_cond_ref_list(ctx, obj, key, replace_map) {
+    let refs = whitespace_list_values(obj, key);
+    if (length(refs) == 0)
+        return false;
+    let new_refs = [];
+    let seen_refs = {};
+    let touched = false;
+    for (let r in refs) {
+        let mapped = replace_map[r] != null ? replace_map[r] : r;
+        if (mapped != r)
+            touched = true;
+        if (seen_refs[mapped])
+            continue;
+        seen_refs[mapped] = true;
+        push(new_refs, mapped);
+    }
+    if (!touched)
+        return false;
+    set_list_option(ctx, obj, key, new_refs);
+    return true;
+}
+
+function cleanup_modular_entities_v1(ctx) {
+    let awg_scalar_keys = [
+        "awg_private_key", "awg_server_address", "awg_server_port",
+        "awg_peer_public_key", "awg_preshared_key", "awg_mtu", "awg_keepalive",
+        "awg_jc", "awg_jmin", "awg_jmax", "awg_s1", "awg_s2", "awg_s3", "awg_s4",
+        "awg_h1", "awg_h2", "awg_h3", "awg_h4",
+        "awg_i1", "awg_i2", "awg_i3", "awg_i4", "awg_i5",
+        "awg_j1", "awg_j2", "awg_j3", "awg_itime", "awg_version",
+        "awg_header_protection_key", "awg_content_padding_addition",
+        "awg_rekey_after_time", "awg_rekey_timeout", "awg_reject_after_time",
+        "awg_keepalive_timeout", "awg_max_handshake_attempts",
+        "awg_random_trailers", "awg_disable_cookies"
+    ];
+    let single_proto_actions = [
+        "anytls", "naive", "mieru", "snell", "sudoku", "masque", "tewfai", "csqtt",
+        "trusttunnel", "openconnect", "shadowtls", "warp", "openvpn", "tailscale", "tor", "desync"
+    ];
+
+    // 1. Sync inline protocol sections (e.g. action='awg') into outbound_source and
+    // remove empty duplicate src_awg_* when amnezia_configs is present without awg_private_key.
+    for (let section in (ctx.model.sections || [])) {
+        let sname = section_name(section);
+        if (sname == "")
+            continue;
+        let safe_sname = sanitize_uci_id(sname);
+        let sec_display_name = option(section, "label", option(section, "name", sname));
+        let sec_action = lc(trim(option(section, "action", "")));
+        let sec_amnezia = raw_list_option(section, "selector_amnezia_configs");
+        if (length(sec_amnezia) == 0)
+            sec_amnezia = raw_list_option(section, "amnezia_configs");
+        let sec_amnezia_text = trim(option(section, "amnezia_conf_text", ""));
+        let has_awg_tunnel = trim(option(section, "awg_private_key", "")) != "" && trim(option(section, "awg_server_address", "")) != "";
+        let awg_src_id = "src_awg_" + safe_sname;
+
+        if (sec_action == "awg") {
+            if (length(sec_amnezia) > 0 || sec_amnezia_text != "") {
+                let amn_src_id = "src_amnezia_" + safe_sname;
+                let amn_src = create_named_section(ctx, "outbound_source", amn_src_id);
+                set_option_if_missing(ctx, amn_src, "enabled", "1");
+                set_option_if_missing(ctx, amn_src, "name", sec_display_name + " (Amnezia)");
+                set_option_if_missing(ctx, amn_src, "source_type", "amnezia_config");
+                if (length(sec_amnezia) > 0)
+                    set_list_option(ctx, amn_src, "amnezia_configs", sec_amnezia);
+                if (sec_amnezia_text != "")
+                    set_option(ctx, amn_src, "amnezia_conf_text", sec_amnezia_text);
+                add_list_unique(ctx, section, "outbound_source_refs", amn_src_id);
             }
-            catch (e) {
+            if (has_awg_tunnel || (length(sec_amnezia) == 0 && sec_amnezia_text == "")) {
+                let awg_src = create_named_section(ctx, "outbound_source", awg_src_id);
+                set_option_if_missing(ctx, awg_src, "enabled", "1");
+                set_option_if_missing(ctx, awg_src, "name", sec_display_name + " (AWG)");
+                set_option_if_missing(ctx, awg_src, "source_type", "awg");
+                for (let ak in awg_scalar_keys) {
+                    let aval = trim(option(section, ak, ""));
+                    if (aval != "")
+                        set_option(ctx, awg_src, ak, aval);
+                }
+                let awg_addrs = list_option(section, "awg_local_address");
+                if (length(awg_addrs) > 0)
+                    set_list_option(ctx, awg_src, "awg_local_address", awg_addrs);
+                add_list_unique(ctx, section, "outbound_source_refs", awg_src_id);
+            }
+        } else if (sec_action == "fptn") {
+            let fptn_token = trim(option(section, "access_token", ""));
+            if (fptn_token != "") {
+                let fptn_src_id = "src_fptn_" + safe_sname;
+                let fptn_src = create_named_section(ctx, "outbound_source", fptn_src_id);
+                set_option_if_missing(ctx, fptn_src, "enabled", "1");
+                set_option_if_missing(ctx, fptn_src, "name", sec_display_name);
+                set_option_if_missing(ctx, fptn_src, "source_type", "fptn");
+                set_option(ctx, fptn_src, "access_token", fptn_token);
+                add_list_unique(ctx, section, "outbound_source_refs", fptn_src_id);
+            }
+        } else {
+            let dpi_inline_actions = [ "desync" ];
+            let eff_proto = (index(single_proto_actions, sec_action) >= 0 && index(dpi_inline_actions, sec_action) < 0) ? sec_action : "";
+            if (eff_proto == "" && sec_action == "connection" &&
+                length(list_option(section, "outbound_source_refs")) == 0 &&
+                length(list_option(section, "outbound_group_refs")) == 0 &&
+                length(list_option(section, "balancer_refs")) == 0 &&
+                length(list_option(section, "selector_proxy_links")) == 0 &&
+                trim(option(section, "selector_proxy_links_text", "")) == "" &&
+                length(sec_amnezia) == 0 && sec_amnezia_text == "") {
+                if (trim(option(section, "desync_preset", option(section, "desync_opts", ""))) != "")
+                    eff_proto = "desync";
+            }
+            if (eff_proto != "") {
+                let proto_src_id = "src_" + sanitize_uci_id(eff_proto) + "_" + safe_sname;
+                let proto_src = create_named_section(ctx, "outbound_source", proto_src_id);
+                set_option_if_missing(ctx, proto_src, "enabled", option(section, "enabled", "1") == "0" ? "0" : "1");
+                set_option_if_missing(ctx, proto_src, "name", sec_display_name);
+                set_option_if_missing(ctx, proto_src, "source_type", eff_proto);
+                for (let pk, pval in section) {
+                    if (index(pk, eff_proto + "_") != 0 &&
+                        !(eff_proto == "warp" && index(pk, "awg_") == 0))
+                        continue;
+                    if (type(pval) == "array") {
+                        if (length(pval) > 0)
+                            set_list_option(ctx, proto_src, pk, pval);
+                    } else {
+                        let s_pval = trim(as_string(pval));
+                        if (s_pval != "")
+                            set_option(ctx, proto_src, pk, s_pval);
+                    }
+                }
+                add_list_unique(ctx, section, "outbound_source_refs", proto_src_id);
+            }
+        }
+
+        if (length(sec_amnezia) > 0 || sec_amnezia_text != "") {
+            let kept_sources = [];
+            let removed_empty_awg = false;
+            for (let existing_src in (ctx.model.outbound_source || [])) {
+                if (section_name(existing_src) == awg_src_id &&
+                    option(existing_src, "source_type", "") == "awg" &&
+                    trim(option(existing_src, "awg_private_key", "")) == "" &&
+                    trim(option(existing_src, "awg_server_address", "")) == "") {
+                    removed_empty_awg = true;
+                    record_operation(ctx, { op: "delete_section", section: awg_src_id });
+                    continue;
+                }
+                push(kept_sources, existing_src);
+            }
+            if (removed_empty_awg) {
+                ctx.model.outbound_source = kept_sources;
+                let kept_refs = [];
+                for (let ref_id in list_option(section, "outbound_source_refs")) {
+                    if (ref_id != awg_src_id)
+                        push(kept_refs, ref_id);
+                }
+                set_list_option(ctx, section, "outbound_source_refs", kept_refs);
+            }
+        }
+
+        // Sync options from legacy subscription_url child sections onto matching existing outbound_source
+        for (let sub in (ctx.model.subscription_url || [])) {
+            if (option(sub, "section", "") != sname)
+                continue;
+            let url = trim(option(sub, "url", ""));
+            if (url == "")
+                continue;
+            let existing_src_obj = null;
+            for (let s in (ctx.model.outbound_source || [])) {
+                if (trim(option(s, "url", "")) == url) {
+                    existing_src_obj = s;
+                    break;
+                }
+            }
+            if (existing_src_obj == null)
+                continue;
+            for (let sk in [
+                "user_agent", "auto_user_agent", "hwid", "auto_hwid",
+                "prefix_nodes", "node_prefix", "hide_detour_outbounds",
+                "include_urltest_groups", "hide_urltest_group_outbounds",
+                "subscription_update_enabled", "subscription_update_interval",
+                "download_via_proxy_enabled", "download_via_proxy_section"
+            ]) {
+                let sval = option(sub, sk, "");
+                if (sval != "")
+                    set_option_if_missing(ctx, existing_src_obj, sk, sval);
             }
         }
     }
 
-    // create compatibility symlink if sing-box exists and tachyon-core does not
-    if (fs.stat("/usr/bin/sing-box") != null && fs.stat("/usr/bin/tachyon-core") == null) {
-        try {
-            fs.symlink("/usr/bin/sing-box", "/usr/bin/tachyon-core");
+    // 1b. Normalize outbound_source entries:
+    // - convert legacy proxy_links_text / selector_proxy_links_text / selector_proxy_links into list proxy_links
+    // - backfill missing url on subscription outbound_source when name holds an http(s):// URL
+    // - prune stale payload options left behind when an outbound_source changed type or ID was reused
+    for (let src in (ctx.model.outbound_source || [])) {
+        let explicit_stype = lc(trim(option(src, "source_type", "")));
+        let stype = explicit_stype != "" ? explicit_stype : "subscription";
+        if (stype == "subscription") {
+            let cur_url = trim(option(src, "url", ""));
+            let cur_name = trim(option(src, "name", ""));
+            if (cur_url == "" && (substr(lc(cur_name), 0, 7) == "http://" || substr(lc(cur_name), 0, 8) == "https://"))
+                set_option(ctx, src, "url", cur_name);
         }
-        catch (e) {
+        if (stype == "proxy_links" || stype == "links" || explicit_stype == "") {
+            let existing_links = list_option(src, "proxy_links");
+            for (let sl in list_option(src, "selector_proxy_links"))
+                push(existing_links, sl);
+            let text_links = trim(option(src, "proxy_links_text", ""));
+            let sel_text_links = trim(option(src, "selector_proxy_links_text", ""));
+            let combined_text = text_links != "" && sel_text_links != ""
+                ? (text_links + "\n" + sel_text_links)
+                : (text_links != "" ? text_links : sel_text_links);
+            if (combined_text != "" || option_exists(src, "selector_proxy_links")) {
+                let merged_links = extract_proxy_links_from_text_and_list(existing_links, combined_text);
+                if (length(merged_links) > 0)
+                    set_list_option(ctx, src, "proxy_links", merged_links);
+                delete_option(ctx, src, "proxy_links_text");
+                delete_option(ctx, src, "selector_proxy_links_text");
+                delete_option(ctx, src, "selector_proxy_links");
+            }
+        }
+        if (explicit_stype != "") {
+            if (explicit_stype != "proxy_links" && explicit_stype != "links") {
+                delete_option(ctx, src, "proxy_links");
+                delete_option(ctx, src, "proxy_links_text");
+                delete_option(ctx, src, "selector_proxy_links");
+                delete_option(ctx, src, "selector_proxy_links_text");
+            }
+            if (explicit_stype != "outbound_json" && explicit_stype != "json") {
+                delete_option(ctx, src, "outbound_jsons");
+                delete_option(ctx, src, "outbound_json");
+            }
+            if (explicit_stype != "amnezia_config" && explicit_stype != "awg") {
+                delete_option(ctx, src, "amnezia_configs");
+                delete_option(ctx, src, "selector_amnezia_configs");
+                delete_option(ctx, src, "amnezia_conf_text");
+            }
+            if (explicit_stype != "subscription") {
+                delete_option(ctx, src, "url");
+            }
+        }
+    }
+
+    // 2. Deduplicate identical Desync outbound_source entries so multiple sections
+    // using the same Desync strategy share one canonical Desync source.
+    let desync_sig_map = {};
+    let desync_replace_map = {};
+    let kept_outbound_sources = [];
+    for (let src in (ctx.model.outbound_source || [])) {
+        if (lc(trim(option(src, "source_type", ""))) != "desync") {
+            push(kept_outbound_sources, src);
+            continue;
+        }
+        let sig_parts = [];
+        for (let dk in [
+            "desync_preset", "desync_mode", "desync_fooling", "desync_auto_tune",
+            "desync_tlsrec_first", "desync_split_pos", "desync_seqovl", "desync_syndata",
+            "desync_wsize", "desync_ipfrag", "desync_udplen", "desync_fake_ttl",
+            "desync_fake_sni", "desync_repeats", "desync_split_delay_ms",
+            "desync_udp_fake", "desync_udp_repeats", "desync_udp_fake_ttl",
+            "desync_udp_fake_payload", "desync_udp_out_range", "desync_udp_keep_socket", "desync_opts"
+        ]) {
+            push(sig_parts, dk + "=" + lc(trim(option(src, dk, ""))));
+        }
+        let sig = join("|", sig_parts);
+        let src_id = section_name(src);
+        if (desync_sig_map[sig] != null) {
+            let primary = desync_sig_map[sig];
+            let primary_id = section_name(primary);
+            desync_replace_map[src_id] = primary_id;
+            if (option(primary, "name", "") != "Desync" && index(primary_id, "src_desync_") == 0)
+                set_option(ctx, primary, "name", "Desync");
+            record_operation(ctx, { op: "delete_section", section: src_id });
+            continue;
+        }
+        desync_sig_map[sig] = src;
+        push(kept_outbound_sources, src);
+    }
+    if (length(keys(desync_replace_map)) > 0) {
+        ctx.model.outbound_source = kept_outbound_sources;
+        for (let section in (ctx.model.sections || [])) {
+            let refs = list_option(section, "outbound_source_refs");
+            if (length(refs) == 0)
+                continue;
+            let new_refs = [];
+            let changed = false;
+            for (let r in refs) {
+                let mapped = desync_replace_map[r] || r;
+                if (mapped != r)
+                    changed = true;
+                if (index(new_refs, mapped) < 0)
+                    push(new_refs, mapped);
+            }
+            if (changed || length(new_refs) != length(refs))
+                set_list_option(ctx, section, "outbound_source_refs", new_refs);
+        }
+        for (let grp in (ctx.model.outbound_group || [])) {
+            let refs = list_option(grp, "outbound_sources");
+            if (length(refs) == 0)
+                continue;
+            let new_refs = [];
+            let changed = false;
+            for (let r in refs) {
+                let mapped = desync_replace_map[r] || r;
+                if (mapped != r)
+                    changed = true;
+                if (index(new_refs, mapped) < 0)
+                    push(new_refs, mapped);
+            }
+            if (changed || length(new_refs) != length(refs))
+                set_list_option(ctx, grp, "outbound_sources", new_refs);
+        }
+    }
+
+    // 2b. Deduplicate identical cloned atomic condition sections
+    let cond_list = ctx.model.condition || [];
+    let cond_count = length(cond_list);
+    if (cond_count > 1) {
+        let uf_parent = [];
+        let cond_ids = [];
+        let cond_sigs = [];
+        let base_buckets = {};
+        let rules_buckets = {};
+        for (let i = 0; i < cond_count; i++) {
+            push(uf_parent, i);
+            let cond = cond_list[i];
+            push(cond_ids, section_name(cond));
+            push(cond_sigs, condition_rule_signature(cond));
+        }
+
+        for (let i = 0; i < cond_count; i++) {
+            let cid = cond_ids[i];
+            let sig = cond_sigs[i];
+            if (cid == "" || sig == "")
+                continue;
+
+            let base_id = condition_clone_base_id(cid);
+            let base_key = base_id + "\n" + sig;
+            if (base_buckets[base_key] != null)
+                cond_uf_union(uf_parent, base_buckets[base_key], i);
+            else
+                base_buckets[base_key] = i;
+
+            let cname = trim(option(cond_list[i], "name", ""));
+            if (length(cname) >= 6 && substr(cname, length(cname) - 6) == " Rules") {
+                let rules_key = cname + "\n" + sig;
+                if (rules_buckets[rules_key] != null)
+                    cond_uf_union(uf_parent, rules_buckets[rules_key], i);
+                else
+                    rules_buckets[rules_key] = i;
+            }
+        }
+
+        let groups = {};
+        for (let i = 0; i < cond_count; i++) {
+            if (cond_ids[i] == "" || cond_sigs[i] == "")
+                continue;
+            let root = "" + cond_uf_find(uf_parent, i);
+            if (groups[root] == null)
+                groups[root] = [];
+            push(groups[root], i);
+        }
+
+        let cond_replace_map = {};
+        let deleted_cond_ids = {};
+        for (let root in keys(groups)) {
+            let members = groups[root];
+            if (length(members) <= 1)
+                continue;
+            let canon_idx = members[0];
+            for (let idx in members) {
+                let mid = cond_ids[idx];
+                if (mid == condition_clone_base_id(mid)) {
+                    canon_idx = idx;
+                    break;
+                }
+            }
+            let canon_id = cond_ids[canon_idx];
+            for (let idx in members) {
+                if (idx == canon_idx)
+                    continue;
+                let dup_id = cond_ids[idx];
+                if (dup_id != "" && dup_id != canon_id) {
+                    cond_replace_map[dup_id] = canon_id;
+                    deleted_cond_ids[dup_id] = true;
+                }
+            }
+        }
+
+        if (length(keys(cond_replace_map)) > 0) {
+            ctx.model.condition = filter(cond_list, function(c) {
+                return !deleted_cond_ids[section_name(c)];
+            });
+            for (let dup_id in sort(keys(deleted_cond_ids)))
+                record_operation(ctx, { op: "delete_section", section: dup_id });
+
+            for (let sec in (ctx.model.sections || [])) {
+                remap_cond_ref_list(ctx, sec, "condition_refs", cond_replace_map);
+                let raw_expr = option(sec, "condition_expression", "");
+                if (raw_expr != "") {
+                    let new_expr = replace_condition_expression_ids(raw_expr, cond_replace_map);
+                    if (new_expr != raw_expr)
+                        set_option(ctx, sec, "condition_expression", new_expr);
+                }
+            }
+
+            for (let cond in (ctx.model.condition || [])) {
+                remap_cond_ref_list(ctx, cond, "members", cond_replace_map);
+                remap_cond_ref_list(ctx, cond, "conditions", cond_replace_map);
+                let raw_expr = option(cond, "expression", "");
+                if (raw_expr != "") {
+                    let new_expr = replace_condition_expression_ids(raw_expr, cond_replace_map);
+                    if (new_expr != raw_expr)
+                        set_option(ctx, cond, "expression", new_expr);
+                }
+            }
+
+            ctx.changed = true;
+        }
+    }
+
+    // 3. Prune dangling references to deleted conditions, outbound_sources, outbound_groups, balancers, or sections
+    let valid_conds = {};
+    for (let c in (ctx.model.condition || [])) {
+        let id = section_name(c);
+        if (id != "") valid_conds[id] = true;
+    }
+    let valid_sources = {};
+    for (let s in (ctx.model.outbound_source || [])) {
+        let id = section_name(s);
+        if (id != "") valid_sources[id] = true;
+    }
+    let valid_groups = {};
+    for (let g in (ctx.model.outbound_group || [])) {
+        let id = section_name(g);
+        if (id != "") valid_groups[id] = true;
+    }
+    let valid_balancers = {};
+    for (let b in (ctx.model.balancer || [])) {
+        let id = section_name(b);
+        if (id != "") valid_balancers[id] = true;
+    }
+    let valid_sections = {};
+    for (let sec in (ctx.model.sections || [])) {
+        let id = section_name(sec);
+        if (id != "") valid_sections[id] = true;
+    }
+
+    let prune_ref_list = function(obj, key, valid_map, keep_special) {
+        let cur = (keep_special == "direct")
+            ? priority_level_list_option(obj, key)
+            : list_option(obj, key);
+        if (length(cur) == 0)
+            return;
+        let next = [];
+        let changed = false;
+        for (let item in cur) {
+            if ((keep_special != null && (lc(item) == keep_special || (keep_special == "direct" && substr(item, 0, 4) == "srv:"))) || valid_map[item]) {
+                if (index(next, item) < 0)
+                    push(next, item);
+                else
+                    changed = true;
+            } else {
+                changed = true;
+            }
+        }
+        if (changed) {
+            if (length(next) > 0)
+                set_list_option(ctx, obj, key, next);
+            else
+                delete_option(ctx, obj, key);
+        }
+    };
+
+    for (let sec in (ctx.model.sections || [])) {
+        prune_ref_list(sec, "condition_refs", valid_conds, null);
+        prune_ref_list(sec, "outbound_source_refs", valid_sources, null);
+        prune_ref_list(sec, "outbound_group_refs", valid_groups, null);
+        prune_ref_list(sec, "balancer_refs", valid_balancers, null);
+        prune_ref_list(sec, "group_members", valid_sections, null);
+        let out_detour = trim(option(sec, "outbound_detour_section", ""));
+        if (out_detour != "" && !valid_sections[out_detour]) {
+            delete_option(ctx, sec, "outbound_detour_section");
+            set_option(ctx, sec, "outbound_detour_enabled", "0");
+        }
+        let dns_detour = trim(option(sec, "dns_detour_section", ""));
+        if (dns_detour != "" && !valid_sections[dns_detour]) {
+            delete_option(ctx, sec, "dns_detour_section");
+            set_option(ctx, sec, "dns_detour_enabled", "0");
+        }
+    }
+    let valid_groups_and_sources = {};
+    for (let k, v in valid_groups)
+        valid_groups_and_sources[k] = v;
+    for (let k, v in valid_sources)
+        valid_groups_and_sources[k] = v;
+    for (let k, v in valid_balancers)
+        valid_groups_and_sources[k] = v;
+    for (let sec in (ctx.model.sections || []))
+        prune_ref_list(sec, "outbound_group_levels", valid_groups_and_sources, "direct");
+    for (let bal in (ctx.model.balancer || [])) {
+        let bid = section_name(bal);
+        let bal_srcs = list_option(bal, "source_refs");
+        let bal_grps = list_option(bal, "group_refs");
+        if (length(bal_srcs) > 0 || length(bal_grps) > 0) {
+            if (bid != "") {
+                for (let sec in (ctx.model.sections || [])) {
+                    if (index(list_option(sec, "balancer_refs"), bid) < 0)
+                        continue;
+                    if (length(list_option(sec, "outbound_source_refs")) == 0 && length(list_option(sec, "outbound_group_refs")) == 0) {
+                        for (let sref in bal_srcs) {
+                            if (valid_sources[sref])
+                                add_list_unique(ctx, sec, "outbound_source_refs", sref);
+                        }
+                        for (let gref in bal_grps) {
+                            if (valid_groups[gref])
+                                add_list_unique(ctx, sec, "outbound_group_refs", gref);
+                        }
+                    }
+                }
+            }
+            if (option_exists(bal, "source_refs"))
+                delete_option(ctx, bal, "source_refs");
+            if (option_exists(bal, "group_refs"))
+                delete_option(ctx, bal, "group_refs");
+        }
+        prune_ref_list(bal, "outbound_group_levels", valid_groups_and_sources, "direct");
+    }
+    for (let grp in (ctx.model.outbound_group || [])) {
+        prune_ref_list(grp, "source_refs", valid_sources, "*");
+        prune_ref_list(grp, "outbound_sources", valid_sources, "*");
+    }
+    for (let cond in (ctx.model.condition || [])) {
+        prune_ref_list(cond, "members", valid_conds, null);
+    }
+    for (let src in (ctx.model.outbound_source || [])) {
+        let dl_sec = trim(option(src, "download_via_proxy_section", ""));
+        if (dl_sec != "" && !valid_sections[dl_sec]) {
+            delete_option(ctx, src, "download_via_proxy_section");
+            set_option(ctx, src, "download_via_proxy_enabled", "0");
+        }
+        let detour_sec = trim(option(src, "outbound_detour_section", ""));
+        if (detour_sec != "" && !valid_sections[detour_sec]) {
+            delete_option(ctx, src, "outbound_detour_section");
+            set_option(ctx, src, "outbound_detour_enabled", "0");
+        }
+    }
+    let section_by_name = {};
+    for (let sec in (ctx.model.sections || [])) {
+        let id = section_name(sec);
+        if (id != "")
+            section_by_name[id] = sec;
+    }
+    let source_by_name = {};
+    let modular_sub_urls = {};
+    for (let s in (ctx.model.outbound_source || [])) {
+        let id = section_name(s);
+        if (id != "")
+            source_by_name[id] = s;
+        let su = trim(option(s, "url", ""));
+        if (su != "")
+            modular_sub_urls[su] = true;
+    }
+    for (let legacy_type in [ "subscription_url", "section_interface", "urltest", "priority_group", "priority_level" ]) {
+        let kept_children = [];
+        for (let child in (ctx.model[legacy_type] || [])) {
+            let parent_sec = trim(option(child, "section", ""));
+            let child_id = section_name(child);
+            if (parent_sec != "" && !valid_sections[parent_sec] && child_id != "") {
+                record_operation(ctx, { op: "delete_section", section: child_id });
+                continue;
+            }
+            if (legacy_type == "subscription_url" && parent_sec != "" && child_id != "" && length(ctx.model.outbound_source || []) > 0) {
+                let child_url = trim(option(child, "url", ""));
+                let sec_obj = section_by_name[parent_sec];
+                if (sec_obj != null && child_url != "") {
+                    let sec_refs = list_option(sec_obj, "outbound_source_refs");
+                    let attached_urls = {};
+                    let has_non_dpi_ref = false;
+                    for (let ref_id in sec_refs) {
+                        let ref_src = source_by_name[ref_id];
+                        if (ref_src != null) {
+                            let st = lc(trim(option(ref_src, "source_type", "subscription")));
+                            if (st != "zapret" && st != "zapret2" && st != "byedpi" && st != "desync")
+                                has_non_dpi_ref = true;
+                            let ru = trim(option(ref_src, "url", ""));
+                            if (ru != "")
+                                attached_urls[ru] = true;
+                        }
+                    }
+                    if (!attached_urls[child_url] && (modular_sub_urls[child_url] || has_non_dpi_ref)) {
+                        record_operation(ctx, { op: "delete_section", section: child_id });
+                        continue;
+                    }
+                }
+            }
+            push(kept_children, child);
+        }
+        ctx.model[legacy_type] = kept_children;
+    }
+
+    if (index(list_option(ctx.model.settings, APPLIED_MIGRATIONS_OPTION), "modular_entities_v1") >= 0) {
+        for (let sec in (ctx.model.sections || [])) {
+            let sid = section_name(sec);
+            if (sid == "")
+                continue;
+            let safe_sid = sanitize_uci_id(sid);
+            let sec_refs = list_option(sec, "outbound_source_refs");
+            if (index(sec_refs, "src_json_" + safe_sid) < 0) {
+                delete_option(ctx, sec, "outbound_jsons");
+                delete_option(ctx, sec, "outbound_json");
+            }
+            if (index(sec_refs, "src_links_" + safe_sid) < 0) {
+                delete_option(ctx, sec, "selector_proxy_links");
+                delete_option(ctx, sec, "selector_proxy_links_text");
+                delete_option(ctx, sec, "proxy_links");
+                delete_option(ctx, sec, "proxy_links_text");
+            }
+            let sec_act = lc(trim(option(sec, "action", "")));
+            if (sec_act != "awg" &&
+                index(sec_refs, "src_amnezia_" + safe_sid) < 0 &&
+                index(sec_refs, "src_awg_" + safe_sid) < 0) {
+                delete_option(ctx, sec, "selector_amnezia_configs");
+                delete_option(ctx, sec, "amnezia_configs");
+                delete_option(ctx, sec, "amnezia_conf_text");
+            }
+        }
+    }
+}
+
+function migrate_priority_group_levels_for_balancer(ctx, section, pg, bal) {
+    let sname = section_name(section);
+    let pg_id = section_name(pg);
+    let bal_id = section_name(bal);
+    if (sname == "" || pg_id == "" || bal_id == "")
+        return;
+
+    let matched_levels = [];
+    for (let pl in (ctx.model.priority_level || [])) {
+        let pl_grp = option(pl, "group", "");
+        let pl_sec = option(pl, "section", "");
+        if (pl_grp == pg_id || (pl_grp == "" && pl_sec == sname))
+            push(matched_levels, pl);
+    }
+    if (length(matched_levels) == 0)
+        return;
+
+    sort(matched_levels, function(left, right) {
+        let lo = int(option(left, "order", "0"), 10);
+        let ro = int(option(right, "order", "0"), 10);
+        return lo < ro ? -1 : (lo > ro ? 1 : 0);
+    });
+
+    let bal_levels = list_option(bal, "outbound_group_levels");
+    let sec_sources = list_option(section, "outbound_source_refs");
+    for (let li = 0; li < length(matched_levels); li++) {
+        let pl = matched_levels[li];
+        let is_direct = option(pl, "direct", "0") == "1";
+        if (is_direct) {
+            if (index(bal_levels, "direct") < 0)
+                push(bal_levels, "direct");
+            continue;
+        }
+        let pl_id = section_name(pl);
+        let pl_name = option(pl, "name", "Level " + (li + 1));
+        let grp_slug = sanitize_uci_id(pl_name);
+        if (grp_slug == "item" && pl_name != "item") {
+            let id_slug = substr(pl_id, 0, 3) == "cfg" ? "item" : sanitize_uci_id(pl_id);
+            grp_slug = (id_slug != "item" && id_slug != "") ? id_slug : ("lvl_" + (li + 1));
+        }
+        let base_grp_id = "grp_" + sanitize_uci_id(sname + "_" + grp_slug);
+        if (base_grp_id == "grp_" + sanitize_uci_id(sname + "_") || base_grp_id == "grp_")
+            base_grp_id = "grp_" + sanitize_uci_id(sname + "_lvl_" + (li + 1));
+
+        let existing_grp = null;
+        for (let g in (ctx.model.outbound_group || [])) {
+            let gid = section_name(g);
+            if (option(g, "name", "") == pl_name && index(bal_levels, gid) >= 0) {
+                existing_grp = g;
+                break;
+            }
+        }
+        let target_grp_id = base_grp_id;
+        if (existing_grp == null) {
+            let suffix = 1;
+            while (true) {
+                let collision = null;
+                for (let g in (ctx.model.outbound_group || [])) {
+                    if (section_name(g) == target_grp_id) {
+                        collision = g;
+                        break;
+                    }
+                }
+                if (collision == null)
+                    break;
+                if (option(collision, "name", "") == pl_name) {
+                    existing_grp = collision;
+                    break;
+                }
+                suffix++;
+                target_grp_id = base_grp_id + "_" + suffix;
+            }
+        }
+        let grp_id = existing_grp != null ? section_name(existing_grp) : target_grp_id;
+        let grp = existing_grp != null ? existing_grp : create_named_section(ctx, "outbound_group", grp_id);
+        set_option_if_missing(ctx, grp, "enabled", "1");
+        set_option_if_missing(ctx, grp, "name", pl_name);
+        set_option_if_missing(ctx, grp, "filter_mode", option(pl, "filter_mode", "include"));
+        set_option_if_missing(ctx, grp, "detect_server_country", option(pl, "detect_server_country", "flag_emoji"));
+
+        if (length(sec_sources) > 0 && length(list_option(grp, "source_refs")) == 0)
+            set_list_option(ctx, grp, "source_refs", sec_sources);
+
+        for (let lk in [
+            "include_prefixes", "exclude_prefixes",
+            "include_countries", "exclude_countries",
+            "include_outbounds", "exclude_outbounds",
+            "include_regex", "exclude_regex",
+            "include_protocols", "exclude_protocols",
+            "include_transports", "exclude_transports",
+            "include_securities", "exclude_securities",
+            "include_ports", "exclude_ports"
+        ]) {
+            let lvals = (lk == "include_regex" || lk == "exclude_regex")
+                ? raw_list_option(pl, lk) : list_option(pl, lk);
+            if (length(lvals) > 0 && !option_exists(grp, lk))
+                set_list_option(ctx, grp, lk, lvals);
+        }
+        let leg_countries = list_option(pl, "country");
+        if (length(leg_countries) > 0 && length(list_option(grp, "include_countries")) == 0)
+            set_list_option(ctx, grp, "include_countries", leg_countries);
+        let leg_servers = list_option(pl, "server_name");
+        if (length(leg_servers) > 0 && length(list_option(grp, "include_outbounds")) == 0)
+            set_list_option(ctx, grp, "include_outbounds", leg_servers);
+        let leg_regex = raw_list_option(pl, "regex");
+        if (length(leg_regex) > 0 && length(list_option(grp, "include_regex")) == 0)
+            set_list_option(ctx, grp, "include_regex", leg_regex);
+
+        for (let pk in [ "include_proxy_parameters", "exclude_proxy_parameters" ]) {
+            let pval = option(pl, pk, "");
+            if (pval != "")
+                set_option_if_missing(ctx, grp, pk, pval);
+        }
+
+        if (index(bal_levels, grp_id) < 0)
+            push(bal_levels, grp_id);
+        add_list_unique(ctx, section, "outbound_group_refs", grp_id);
+    }
+    if (length(bal_levels) > 0) {
+        set_list_option(ctx, bal, "outbound_group_levels", bal_levels);
+        if (length(raw_list_option(section, "outbound_group_levels")) == 0)
+            set_list_option(ctx, section, "outbound_group_levels", bal_levels);
+    }
+}
+
+function migrate_modular_entities_v1(ctx) {
+    let condition_list_keys = [
+        "community_lists",
+        "rule_set",
+        "rule_set_with_subnets",
+        "domain_ip_lists",
+        "domain_suffix",
+        "domain_keyword",
+        "domain_regex",
+        "user_domains",
+        "ip_cidr",
+        "source_ip_cidr",
+        "source_macs",
+        "ports",
+        "protocol",
+        "dscp",
+        "geoip_country",
+        "fully_routed_ips"
+    ];
+    let condition_scalar_keys = [
+        "domain",
+        "domain_text",
+        "domain_suffix_text",
+        "domain_keyword_text",
+        "domain_regex_text",
+        "user_domains_text",
+        "ip_cidr_text",
+        "source_ip_cidr_text",
+        "ports_text",
+        "geoip_mode"
+    ];
+
+    let sub_source_by_url = {};
+    let sub_index = 0;
+    for (let existing_src in (ctx.model.outbound_source || [])) {
+        let u = trim(option(existing_src, "url", ""));
+        if (u != "")
+            sub_source_by_url[u] = section_name(existing_src);
+    }
+
+    for (let section in (ctx.model.sections || [])) {
+        let sname = section_name(section);
+        if (sname == "")
+            continue;
+        let safe_sname = sanitize_uci_id(sname);
+        let sec_action = lc(trim(option(section, "action", "")));
+
+        // 1. Extract inline routing conditions into a reusable condition entity
+        if (length(list_option(section, "condition_refs")) == 0) {
+            let has_cond = false;
+            for (let k in condition_list_keys) {
+                if (length(condition_list_tokens(section, k)) > 0) {
+                    has_cond = true;
+                    break;
+                }
+            }
+            if (!has_cond) {
+                for (let k in condition_scalar_keys) {
+                    if (trim(option(section, k, "")) != "") {
+                        has_cond = true;
+                        break;
+                    }
+                }
+            }
+            if (has_cond) {
+                let cond_id = "cond_" + safe_sname;
+                let cond = create_named_section(ctx, "condition", cond_id);
+                set_option_if_missing(ctx, cond, "enabled", "1");
+                set_option_if_missing(ctx, cond, "name", option(section, "name", sname));
+                set_option_if_missing(ctx, cond, "condition_type", "atomic");
+                for (let k in condition_list_keys) {
+                    let vals = condition_list_tokens(section, k);
+                    if (length(vals) > 0)
+                        set_list_option(ctx, cond, k, vals);
+                }
+                for (let k in condition_scalar_keys) {
+                    let val = trim(option(section, k, ""));
+                    if (val != "")
+                        set_option(ctx, cond, k, val);
+                }
+                add_list_unique(ctx, section, "condition_refs", cond_id);
+            }
+        }
+
+        // 2. Extract subscription_url children into deduplicated outbound_source entities
+        for (let sub in (ctx.model.subscription_url || [])) {
+            if (option(sub, "section", "") != sname)
+                continue;
+            let url = trim(option(sub, "url", ""));
+            if (url == "")
+                continue;
+            let src_id = sub_source_by_url[url];
+            if (src_id == null || src_id == "") {
+                sub_index++;
+                src_id = "src_sub_" + sub_index;
+                sub_source_by_url[url] = src_id;
+                let src = create_named_section(ctx, "outbound_source", src_id);
+                set_option_if_missing(ctx, src, "enabled", "1");
+                set_option_if_missing(ctx, src, "name", option(sub, "node_prefix", "") != "" ? option(sub, "node_prefix", "") : ("Subscription " + sub_index));
+                set_option_if_missing(ctx, src, "source_type", "subscription");
+                set_option_if_missing(ctx, src, "url", url);
+                for (let sk in [
+                    "user_agent", "auto_user_agent", "hwid", "auto_hwid",
+                    "prefix_nodes", "node_prefix", "hide_detour_outbounds",
+                    "include_urltest_groups", "hide_urltest_group_outbounds",
+                    "subscription_update_enabled", "subscription_update_interval",
+                    "download_via_proxy_enabled", "download_via_proxy_section"
+                ]) {
+                    let sval = option(sub, sk, "");
+                    if (sval != "")
+                        set_option_if_missing(ctx, src, sk, sval);
+                }
+            }
+            add_list_unique(ctx, section, "outbound_source_refs", src_id);
+        }
+
+        // 2b. Extract other connection types (fptn, proxy_links, amnezia_config, awg, interface, outbound_json) into outbound_source
+        let sec_display_name = option(section, "name", sname);
+        let fptn_token = trim(option(section, "access_token", ""));
+        if (fptn_token != "") {
+            let fptn_src_id = "src_fptn_" + safe_sname;
+            let fptn_src = create_named_section(ctx, "outbound_source", fptn_src_id);
+            set_option_if_missing(ctx, fptn_src, "enabled", "1");
+            set_option_if_missing(ctx, fptn_src, "name", sec_display_name);
+            set_option_if_missing(ctx, fptn_src, "source_type", "fptn");
+            set_option_if_missing(ctx, fptn_src, "access_token", fptn_token);
+            add_list_unique(ctx, section, "outbound_source_refs", fptn_src_id);
+        }
+
+        let sec_links = list_option(section, "selector_proxy_links");
+        for (let pl in list_option(section, "proxy_links"))
+            push(sec_links, pl);
+        let sec_links_text = trim(option(section, "selector_proxy_links_text", ""));
+        let sec_plain_links_text = trim(option(section, "proxy_links_text", ""));
+        if (sec_plain_links_text != "")
+            sec_links_text = sec_links_text != "" ? (sec_links_text + "\n" + sec_plain_links_text) : sec_plain_links_text;
+        let merged_sec_links = extract_proxy_links_from_text_and_list(sec_links, sec_links_text);
+        if (length(merged_sec_links) > 0) {
+            let links_src_id = "src_links_" + safe_sname;
+            let links_src = create_named_section(ctx, "outbound_source", links_src_id);
+            set_option_if_missing(ctx, links_src, "enabled", "1");
+            set_option_if_missing(ctx, links_src, "name", sec_display_name + " (Links)");
+            set_option_if_missing(ctx, links_src, "source_type", "proxy_links");
+            let cur_src_links = extract_proxy_links_from_text_and_list(
+                list_option(links_src, "proxy_links"),
+                option(links_src, "proxy_links_text", "")
+            );
+            for (let ml in merged_sec_links) {
+                if (!(ml in cur_src_links))
+                    push(cur_src_links, ml);
+            }
+            set_list_option(ctx, links_src, "proxy_links", cur_src_links);
+            delete_option(ctx, links_src, "proxy_links_text");
+            delete_option(ctx, links_src, "selector_proxy_links_text");
+            add_list_unique(ctx, section, "outbound_source_refs", links_src_id);
+        }
+
+        let sec_amnezia = raw_list_option(section, "selector_amnezia_configs");
+        if (length(sec_amnezia) == 0)
+            sec_amnezia = raw_list_option(section, "amnezia_configs");
+        let sec_amnezia_text = trim(option(section, "amnezia_conf_text", ""));
+        if (length(sec_amnezia) > 0 || sec_amnezia_text != "") {
+            let amn_src_id = "src_amnezia_" + safe_sname;
+            let amn_src = create_named_section(ctx, "outbound_source", amn_src_id);
+            set_option_if_missing(ctx, amn_src, "enabled", "1");
+            set_option_if_missing(ctx, amn_src, "name", sec_display_name + " (Amnezia)");
+            set_option_if_missing(ctx, amn_src, "source_type", "amnezia_config");
+            if (length(sec_amnezia) > 0 && !option_exists(amn_src, "amnezia_configs"))
+                set_list_option(ctx, amn_src, "amnezia_configs", sec_amnezia);
+            if (sec_amnezia_text != "")
+                set_option_if_missing(ctx, amn_src, "amnezia_conf_text", sec_amnezia_text);
+            add_list_unique(ctx, section, "outbound_source_refs", amn_src_id);
+        }
+
+        let has_awg_tunnel = trim(option(section, "awg_private_key", "")) != "" && trim(option(section, "awg_server_address", "")) != "";
+        let awg_src_id = "src_awg_" + safe_sname;
+        if (has_awg_tunnel || (sec_action == "awg" && length(sec_amnezia) == 0 && sec_amnezia_text == "")) {
+            let awg_src = create_named_section(ctx, "outbound_source", awg_src_id);
+            set_option_if_missing(ctx, awg_src, "enabled", "1");
+            set_option_if_missing(ctx, awg_src, "name", sec_display_name + " (AWG)");
+            set_option_if_missing(ctx, awg_src, "source_type", "awg");
+            for (let ak in [
+                "awg_private_key", "awg_server_address", "awg_server_port",
+                "awg_peer_public_key", "awg_preshared_key", "awg_mtu", "awg_keepalive",
+                "awg_jc", "awg_jmin", "awg_jmax", "awg_s1", "awg_s2", "awg_s3", "awg_s4",
+                "awg_h1", "awg_h2", "awg_h3", "awg_h4",
+                "awg_i1", "awg_i2", "awg_i3", "awg_i4", "awg_i5",
+                "awg_j1", "awg_j2", "awg_j3", "awg_itime", "awg_version",
+                "awg_header_protection_key", "awg_content_padding_addition",
+                "awg_rekey_after_time", "awg_rekey_timeout", "awg_reject_after_time",
+                "awg_keepalive_timeout", "awg_max_handshake_attempts",
+                "awg_random_trailers", "awg_disable_cookies"
+            ]) {
+                let aval = trim(option(section, ak, ""));
+                if (aval != "")
+                    set_option_if_missing(ctx, awg_src, ak, aval);
+            }
+            let awg_addrs = list_option(section, "awg_local_address");
+            if (length(awg_addrs) > 0 && !option_exists(awg_src, "awg_local_address"))
+                set_list_option(ctx, awg_src, "awg_local_address", awg_addrs);
+            add_list_unique(ctx, section, "outbound_source_refs", awg_src_id);
+        } else if (length(sec_amnezia) > 0 || sec_amnezia_text != "") {
+            let kept_sources = [];
+            let removed_empty_awg = false;
+            for (let existing_src in (ctx.model.outbound_source || [])) {
+                if (section_name(existing_src) == awg_src_id &&
+                    option(existing_src, "source_type", "") == "awg" &&
+                    trim(option(existing_src, "awg_private_key", "")) == "" &&
+                    trim(option(existing_src, "awg_server_address", "")) == "") {
+                    removed_empty_awg = true;
+                    record_operation(ctx, { op: "delete_section", section: awg_src_id });
+                    continue;
+                }
+                push(kept_sources, existing_src);
+            }
+            if (removed_empty_awg) {
+                ctx.model.outbound_source = kept_sources;
+                let kept_refs = [];
+                for (let ref_id in list_option(section, "outbound_source_refs")) {
+                    if (ref_id != awg_src_id)
+                        push(kept_refs, ref_id);
+                }
+                set_list_option(ctx, section, "outbound_source_refs", kept_refs);
+            }
+        }
+
+        for (let sif in (ctx.model.section_interface || [])) {
+            if (option(sif, "section", "") != sname)
+                continue;
+            let iname = trim(option(sif, "name", ""));
+            if (iname == "")
+                continue;
+            let iface_src_id = "src_iface_" + sanitize_uci_id(iname);
+            let iface_src = create_named_section(ctx, "outbound_source", iface_src_id);
+            set_option_if_missing(ctx, iface_src, "enabled", "1");
+            set_option_if_missing(ctx, iface_src, "name", "Interface " + iname);
+            set_option_if_missing(ctx, iface_src, "source_type", "interface");
+            set_option_if_missing(ctx, iface_src, "interface_name", iname);
+            for (let ik in [ "domain_resolver_enabled", "domain_resolver_dns_type", "domain_resolver_dns_server" ]) {
+                let ival = trim(option(sif, ik, ""));
+                if (ival != "")
+                    set_option_if_missing(ctx, iface_src, ik, ival);
+            }
+            add_list_unique(ctx, section, "outbound_source_refs", iface_src_id);
+        }
+
+        let section_iface_ids = {};
+        for (let si in (ctx.model.section_interface || [])) {
+            let si_id = section_name(si);
+            if (si_id != "")
+                section_iface_ids[si_id] = true;
+        }
+        let direct_ifaces = list_option(section, "interfaces");
+        let single_iface = trim(option(section, "interface", ""));
+        if (single_iface != "" && index(direct_ifaces, single_iface) < 0)
+            push(direct_ifaces, single_iface);
+        for (let iname in direct_ifaces) {
+            iname = trim(as_string(iname));
+            if (iname == "" || section_iface_ids[iname])
+                continue;
+            let iface_src_id = "src_iface_" + sanitize_uci_id(iname);
+            let iface_src = create_named_section(ctx, "outbound_source", iface_src_id);
+            set_option_if_missing(ctx, iface_src, "enabled", "1");
+            set_option_if_missing(ctx, iface_src, "name", "Interface " + iname);
+            set_option_if_missing(ctx, iface_src, "source_type", "interface");
+            set_option_if_missing(ctx, iface_src, "interface_name", iname);
+            add_list_unique(ctx, section, "outbound_source_refs", iface_src_id);
+        }
+
+        let sec_jsons = raw_list_option(section, "outbound_jsons");
+        let sec_json_single = trim(option(section, "outbound_json", ""));
+        if (length(sec_jsons) > 0 || sec_json_single != "") {
+            let json_src_id = "src_json_" + safe_sname;
+            let json_src = create_named_section(ctx, "outbound_source", json_src_id);
+            set_option_if_missing(ctx, json_src, "enabled", "1");
+            set_option_if_missing(ctx, json_src, "name", sec_display_name + " (JSON)");
+            set_option_if_missing(ctx, json_src, "source_type", "outbound_json");
+            if (length(sec_jsons) > 0 && !option_exists(json_src, "outbound_jsons"))
+                set_list_option(ctx, json_src, "outbound_jsons", sec_jsons);
+            else if (length(sec_jsons) == 0 && sec_json_single != "")
+                set_option_if_missing(ctx, json_src, "outbound_json", sec_json_single);
+            add_list_unique(ctx, section, "outbound_source_refs", json_src_id);
+        }
+
+        let single_proto_actions = [
+            "anytls", "naive", "mieru", "snell", "sudoku", "masque", "tewfai", "csqtt",
+            "trusttunnel", "openconnect", "shadowtls", "warp", "openvpn", "tailscale", "tor", "desync"
+        ];
+        if (index(single_proto_actions, sec_action) >= 0 && option(section, "enabled", "1") != "0") {
+            let proto_src_id = "src_" + sanitize_uci_id(sec_action) + "_" + safe_sname;
+            let proto_src = create_named_section(ctx, "outbound_source", proto_src_id);
+            set_option_if_missing(ctx, proto_src, "enabled", "1");
+            set_option_if_missing(ctx, proto_src, "name", sec_display_name);
+            set_option_if_missing(ctx, proto_src, "source_type", sec_action);
+            for (let pk, pval in section) {
+                if (substr(pk, 0, 1) == "." || pk == "enabled" || pk == "name" || pk == "action" ||
+                    pk == "condition_refs" || pk == "outbound_source_refs" || pk == "outbound_group_refs" || pk == "balancer_refs" ||
+                    index(condition_list_keys, pk) >= 0 || index(condition_scalar_keys, pk) >= 0)
+                    continue;
+                if (type(pval) == "array") {
+                    if (length(pval) > 0 && !option_exists(proto_src, pk))
+                        set_list_option(ctx, proto_src, pk, pval);
+                } else {
+                    let s_pval = trim(as_string(pval));
+                    if (s_pval != "")
+                        set_option_if_missing(ctx, proto_src, pk, s_pval);
+                }
+            }
+            add_list_unique(ctx, section, "outbound_source_refs", proto_src_id);
+        }
+
+        // 3. Extract urltest & priority_group children into reusable balancer entities
+        let sec_bal_refs = list_option(section, "balancer_refs");
+        for (let ut in (ctx.model.urltest || [])) {
+            if (option(ut, "section", "") != sname)
+                continue;
+            let ut_id = section_name(ut);
+            let ut_name = option(ut, "name", "Fastest");
+            let name_slug = sanitize_uci_id(option(ut, "name", ut_id));
+            if (name_slug == "item" && option(ut, "name", ut_id) != "item")
+                name_slug = sanitize_uci_id(ut_id);
+            let target_bal_id = "bal_" + sanitize_uci_id(sname + "_" + name_slug);
+            let existing_bal = null;
+            for (let b in (ctx.model.balancer || [])) {
+                let bid = section_name(b);
+                if (bid == target_bal_id || (index(sec_bal_refs, bid) >= 0 && option(b, "name", "") == ut_name && lc(option(b, "balancer_type", "urltest")) == "urltest")) {
+                    existing_bal = b;
+                    break;
+                }
+            }
+            let bal_id = existing_bal != null ? section_name(existing_bal) : target_bal_id;
+            let bal = existing_bal != null ? existing_bal : create_named_section(ctx, "balancer", bal_id);
+            set_option_if_missing(ctx, bal, "enabled", "1");
+            set_option_if_missing(ctx, bal, "balancer_type", "urltest");
+            set_option_if_missing(ctx, bal, "name", ut_name);
+            for (let bk in [
+                "testing_url", "check_interval", "tolerance", "idle_timeout",
+                "interrupt_exist_connections", "pin_dashboard",
+                "mode", "sticky_hash", "passive_check",
+                "filter_mode", "detect_server_country",
+                "include_proxy_parameters", "exclude_proxy_parameters"
+            ]) {
+                let bval = option(ut, bk, "");
+                if (bval != "")
+                    set_option_if_missing(ctx, bal, bk, bval);
+            }
+            for (let lk in [
+                "include_prefixes", "exclude_prefixes",
+                "include_countries", "exclude_countries",
+                "include_outbounds", "exclude_outbounds",
+                "include_regex", "exclude_regex",
+                "include_protocols", "exclude_protocols",
+                "include_transports", "exclude_transports",
+                "include_securities", "exclude_securities",
+                "include_ports", "exclude_ports"
+            ]) {
+                let lvals = (lk == "include_regex" || lk == "exclude_regex")
+                    ? raw_list_option(ut, lk) : list_option(ut, lk);
+                if (length(lvals) > 0 && !option_exists(bal, lk))
+                    set_list_option(ctx, bal, lk, lvals);
+            }
+            add_list_unique(ctx, section, "balancer_refs", bal_id);
+        }
+
+        for (let pg in (ctx.model.priority_group || [])) {
+            if (option(pg, "section", "") != sname)
+                continue;
+            let pg_id = section_name(pg);
+            let pg_name = option(pg, "name", pg_id);
+            let name_slug = sanitize_uci_id(pg_name);
+            if (name_slug == "item" && pg_name != "item")
+                name_slug = sanitize_uci_id(pg_id);
+            let target_bal_id = "bal_" + sanitize_uci_id(sname + "_" + name_slug);
+            let existing_bal = null;
+            for (let b in (ctx.model.balancer || [])) {
+                let bid = section_name(b);
+                if (bid == target_bal_id || (index(sec_bal_refs, bid) >= 0 && option(b, "name", "") == pg_name && lc(option(b, "balancer_type", "urltest")) == "priority")) {
+                    existing_bal = b;
+                    break;
+                }
+            }
+            let bal_id = existing_bal != null ? section_name(existing_bal) : target_bal_id;
+            let bal = existing_bal != null ? existing_bal : create_named_section(ctx, "balancer", bal_id);
+            set_option_if_missing(ctx, bal, "enabled", "1");
+            set_option_if_missing(ctx, bal, "balancer_type", "priority");
+            set_option_if_missing(ctx, bal, "name", pg_name);
+            for (let bk in [ "health_url", "active_check_interval", "check_timeout", "recovery_check_interval", "pick_fastest", "switch_to_faster_same_priority", "fastest_check_interval", "interrupt_exist_connections", "pin_dashboard" ]) {
+                let bval = option(pg, bk, "");
+                if (bval != "")
+                    set_option_if_missing(ctx, bal, bk, bval);
+            }
+            add_list_unique(ctx, section, "balancer_refs", bal_id);
+            migrate_priority_group_levels_for_balancer(ctx, section, pg, bal);
+        }
+
+        let preserve_actions = [
+            "connection", "bypass", "block", "dns", "hosts",
+            "desync", "wdtt", "olcrtc"
+        ];
+        if (sec_action != "" && index(preserve_actions, sec_action) < 0) {
+            set_option(ctx, section, "action", "connection");
+        }
+    }
+
+    cleanup_modular_entities_v1(ctx);
+}
+
+function migrate_balancer_levels_to_sections(ctx) {
+    for (let section in (ctx.model.sections || [])) {
+        let sname = section_name(section);
+        if (sname == "")
+            continue;
+        if (length(priority_level_list_option(section, "outbound_group_levels")) > 0)
+            continue;
+        let sec_bal_refs = list_option(section, "balancer_refs");
+        for (let bal_id in sec_bal_refs) {
+            for (let b in (ctx.model.balancer || [])) {
+                if (section_name(b) != bal_id)
+                    continue;
+                if (lc(option(b, "balancer_type", "urltest")) != "priority")
+                    continue;
+                let b_levels = priority_level_list_option(b, "outbound_group_levels");
+                if (length(b_levels) > 0) {
+                    set_list_option(ctx, section, "outbound_group_levels", b_levels);
+                    break;
+                }
+            }
+            if (length(priority_level_list_option(section, "outbound_group_levels")) > 0)
+                break;
+        }
+    }
+}
+
+function migrate_priority_levels_to_outbound_groups(ctx) {
+    for (let section in (ctx.model.sections || [])) {
+        let sname = section_name(section);
+        if (sname == "")
+            continue;
+        let sec_bal_refs = list_option(section, "balancer_refs");
+        for (let pg in (ctx.model.priority_group || [])) {
+            if (option(pg, "section", "") != sname)
+                continue;
+            let pg_id = section_name(pg);
+            let pg_name = option(pg, "name", pg_id);
+            let name_slug = sanitize_uci_id(pg_name);
+            if (name_slug == "item" && pg_name != "item")
+                name_slug = sanitize_uci_id(pg_id);
+            let target_bal_id = "bal_" + sanitize_uci_id(sname + "_" + name_slug);
+            let existing_bal = null;
+            for (let b in (ctx.model.balancer || [])) {
+                let bid = section_name(b);
+                if (bid == target_bal_id || (index(sec_bal_refs, bid) >= 0 && option(b, "name", "") == pg_name && lc(option(b, "balancer_type", "urltest")) == "priority")) {
+                    existing_bal = b;
+                    break;
+                }
+            }
+            if (existing_bal == null)
+                continue;
+            if (length(list_option(existing_bal, "outbound_group_levels")) > 0)
+                continue;
+            migrate_priority_group_levels_for_balancer(ctx, section, pg, existing_bal);
+        }
+    }
+    migrate_balancer_levels_to_sections(ctx);
+}
+
+function migrate_relax_probe_intervals_v1(ctx) {
+    if (ctx.model && ctx.model.settings) {
+        let dns_iv = trim(option(ctx.model.settings, "dns_check_interval", ""));
+        if (dns_iv == "10s" || dns_iv == "10" || dns_iv == "15s" || dns_iv == "15")
+            set_option(ctx, ctx.model.settings, "dns_check_interval", "30s");
+
+        let proxy_iv = trim(option(ctx.model.settings, "ai_proxy_health_interval", ""));
+        if (proxy_iv == "30")
+            set_option(ctx, ctx.model.settings, "ai_proxy_health_interval", "60");
+
+        let ai_dns_iv = trim(option(ctx.model.settings, "ai_dns_interval", ""));
+        if (ai_dns_iv == "60")
+            set_option(ctx, ctx.model.settings, "ai_dns_interval", "180");
+    }
+
+    for (let bal in (ctx.model.balancer || [])) {
+        let active_iv = trim(option(bal, "active_check_interval", ""));
+        if (active_iv == "5s" || active_iv == "5")
+            set_option(ctx, bal, "active_check_interval", "15s");
+        let rec_iv = trim(option(bal, "recovery_check_interval", ""));
+        if (rec_iv == "15s" || rec_iv == "15")
+            set_option(ctx, bal, "recovery_check_interval", "30s");
+        let ut_iv = trim(option(bal, "interval", ""));
+        if (ut_iv == "5s" || ut_iv == "5" || ut_iv == "10s" || ut_iv == "10")
+            set_option(ctx, bal, "interval", "30s");
+    }
+
+    for (let ut in (ctx.model.urltest || [])) {
+        let ut_iv = trim(option(ut, "interval", ""));
+        if (ut_iv == "5s" || ut_iv == "5" || ut_iv == "10s" || ut_iv == "10")
+            set_option(ctx, ut, "interval", "30s");
+    }
+
+    for (let pg in (ctx.model.priority_group || [])) {
+        let active_iv = trim(option(pg, "active_check_interval", ""));
+        if (active_iv == "5s" || active_iv == "5")
+            set_option(ctx, pg, "active_check_interval", "15s");
+        let rec_iv = trim(option(pg, "recovery_check_interval", ""));
+        if (rec_iv == "15s" || rec_iv == "15")
+            set_option(ctx, pg, "recovery_check_interval", "30s");
+    }
+}
+
+function migrate_ensure_tcp_bbr_default(ctx) {
+    if (ctx.model && ctx.model.settings) {
+        if (trim(option(ctx.model.settings, "tcp_bbr", "")) == "")
+            set_option(ctx, ctx.model.settings, "tcp_bbr", "1");
+    }
+}
+
+// dns_intercept_all and webrtc_leak_protect shipped as '0' checkboxes before
+// 'auto' (on while a section is Fail-Closed) became their default; that stored
+// '0' was the old default, not a choice, so it moves to 'auto' once. A later
+// explicit '0' is kept.
+function migrate_fail_closed_auto_defaults(ctx) {
+    if (!ctx.model || !ctx.model.settings)
+        return;
+    for (let key in [ "dns_intercept_all", "webrtc_leak_protect" ])
+        if (trim(option(ctx.model.settings, key, "")) == "0")
+            set_option(ctx, ctx.model.settings, key, "auto");
+}
+
+function collect_condition_refs_recursive(cond_by_name, refs, visited, result_map) {
+    for (let cname in (refs || [])) {
+        cname = as_string(cname);
+        if (cname == "" || visited[cname])
+            continue;
+        visited[cname] = true;
+        result_map[cname] = true;
+        let cond = cond_by_name[cname];
+        if (cond)
+            collect_condition_refs_recursive(cond_by_name, list_option(cond, "conditions"), visited, result_map);
+    }
+}
+
+function migrate_ai_lists_1_8(ctx) {
+    if (!ctx || !ctx.model)
+        return;
+
+    let non_proxy_actions = [ "direct", "bypass", "block", "dns", "hosts" ];
+    let per_provider_ai_lists = [
+        "openai", "anthropic", "google_ai", "xai", "openrouter",
+        "cursor", "perplexity", "copilot", "deepseek",
+        "midjourney", "elevenlabs", "ai_video", "ai_cloud_gpu", "huggingface"
+    ];
+
+    let has_google_services_anywhere = false;
+    let cond_by_name = {};
+    for (let cond in (ctx.model.condition || [])) {
+        let cname = section_name(cond);
+        if (cname != "")
+            cond_by_name[cname] = cond;
+        if (list_contains(cond, "community_lists", "google_services"))
+            has_google_services_anywhere = true;
+    }
+    for (let sec in (ctx.model.sections || [])) {
+        if (list_contains(sec, "community_lists", "google_services"))
+            has_google_services_anywhere = true;
+    }
+
+    let cond_in_proxy = {};
+    let cond_in_non_proxy = {};
+    let proxy_sections = [];
+    for (let sec in (ctx.model.sections || [])) {
+        let action = lc(trim(option(sec, "action", "")));
+        let is_non_proxy = index(non_proxy_actions, action) >= 0;
+        let refs_map = {};
+        collect_condition_refs_recursive(cond_by_name, list_option(sec, "condition_refs"), {}, refs_map);
+        for (let cname in keys(refs_map)) {
+            if (is_non_proxy)
+                cond_in_non_proxy[cname] = true;
+            else
+                cond_in_proxy[cname] = true;
+        }
+        if (!is_non_proxy)
+            push(proxy_sections, sec);
+    }
+
+    let targets = [];
+    for (let sec in proxy_sections) {
+        if (length(list_option(sec, "community_lists")) > 0)
+            push(targets, sec);
+    }
+    for (let cond in (ctx.model.condition || [])) {
+        let cname = section_name(cond);
+        if (cname != "" && cond_in_proxy[cname] && !cond_in_non_proxy[cname] &&
+            length(list_option(cond, "community_lists")) > 0)
+            push(targets, cond);
+    }
+
+    for (let target in targets) {
+        let lists = list_option(target, "community_lists");
+        let has_ai_all = index(lists, "ai_all") >= 0;
+        let has_google_ai = index(lists, "google_ai") >= 0;
+        let provider_count = 0;
+        for (let k in per_provider_ai_lists) {
+            if (index(lists, k) >= 0)
+                provider_count++;
+        }
+
+        let updated = [];
+        for (let item in lists)
+            push(updated, item);
+        let changed = false;
+
+        if (!has_ai_all && provider_count >= 2) {
+            if (index(updated, "qwen") < 0) {
+                push(updated, "qwen");
+                changed = true;
+            }
+            if (index(updated, "kimi") < 0) {
+                push(updated, "kimi");
+                changed = true;
+            }
+        }
+
+        if (!has_google_services_anywhere && has_google_ai && (has_ai_all || provider_count >= 2)) {
+            push(updated, "google_services");
+            has_google_services_anywhere = true;
+            changed = true;
+        }
+
+        if (changed)
+            set_list_option(ctx, target, "community_lists", updated);
+    }
+
+    // Handle proxy sections whose ai_all and google_ai live in separate proxy-only conditions.
+    if (!has_google_services_anywhere) {
+        for (let sec in proxy_sections) {
+            if (has_google_services_anywhere)
+                break;
+            let refs_map = {};
+            collect_condition_refs_recursive(cond_by_name, list_option(sec, "condition_refs"), {}, refs_map);
+            let combined = [];
+            for (let x in list_option(sec, "community_lists"))
+                push(combined, x);
+            let google_target = index(combined, "google_ai") >= 0 ? sec : null;
+            for (let cname in keys(refs_map)) {
+                let c = cond_by_name[cname];
+                if (!c)
+                    continue;
+                for (let x in list_option(c, "community_lists"))
+                    push(combined, x);
+                if (!google_target && cond_in_proxy[cname] && !cond_in_non_proxy[cname] && list_contains(c, "community_lists", "google_ai"))
+                    google_target = c;
+            }
+            if (google_target && index(combined, "ai_all") >= 0 && index(combined, "google_ai") >= 0) {
+                let target_lists = list_option(google_target, "community_lists");
+                if (index(target_lists, "google_services") < 0) {
+                    push(target_lists, "google_services");
+                    set_list_option(ctx, google_target, "community_lists", target_lists);
+                    has_google_services_anywhere = true;
+                }
+            }
         }
     }
 }
@@ -1835,11 +3549,16 @@ const MIGRATIONS = [
     { id: "enable_component_checks", run: migrate_enable_component_checks },
     { id: "http_connection_urls", run: migrate_http_connection_urls },
     { id: "dns_hosts_to_option", run: migrate_dns_hosts_to_option },
-    { id: "steer_spec_v2", run: migrate_steer_spec_v2 },
     { id: "global_hosts_to_section", run: migrate_global_hosts_to_section },
     { id: "orphan_section_interface_cleanup", run: migrate_orphan_section_interfaces },
     { id: "ensure_dns_server_defaults", run: migrate_ensure_dns_server_defaults },
-    { id: "engine_identity_tachyon_core", run: migrate_engine_identity }
+    { id: "engine_identity_tachyon_core", run: migrate_engine_identity },
+    { id: "modular_entities_v1", run: migrate_modular_entities_v1 },
+    { id: "priority_levels_to_outbound_groups", run: migrate_priority_levels_to_outbound_groups },
+    { id: "relax_probe_intervals_v1", run: migrate_relax_probe_intervals_v1 },
+    { id: "ensure_tcp_bbr_default", run: migrate_ensure_tcp_bbr_default },
+    { id: "fail_closed_auto_defaults", run: migrate_fail_closed_auto_defaults },
+    { id: "ai_lists_1_8", run: migrate_ai_lists_1_8 }
 ];
 
 
@@ -1876,67 +3595,233 @@ function apply_migrations(ctx) {
     if (added)
         set_list_option(ctx, ctx.model.settings, APPLIED_MIGRATIONS_OPTION, applied);
 
-    if (release_at_most(ctx, "1.0.4"))
-        set_option(ctx, ctx.model.settings, CONFIG_VERSION_OPTION, "1.0.5");
+    if (compare_versions(ctx.source_release, "1.8.0") < 0)
+        set_option(ctx, ctx.model.settings, CONFIG_VERSION_OPTION, "1.8.0");
 }
 
-function migrate_podkop_model(model, constants) {
-    let ctx = migration_context(model);
-    constants = object_or_empty(constants);
+function migrate_ipv6_and_fakeip_settings(ctx) {
+    let settings = ctx && ctx.model ? ctx.model.settings : null;
+    if (!settings)
+        return;
 
-    delete_option(ctx, model.settings, "routing_excluded_ips");
-
-    // NetShift: dns_via_outbound and dns_outbound_section
-    if (bool_option(model.settings, "dns_via_outbound", false)) {
-        set_option_if_missing(ctx, model.settings, "dns_detour_enabled", "1");
-        let detour_sec = option(model.settings, "dns_outbound_section", "");
-        if (detour_sec != "")
-            set_option_if_missing(ctx, model.settings, "dns_detour_section", detour_sec);
+    let has_ipv6_enabled = option_exists(settings, "ipv6_enabled");
+    let has_enable_ipv6 = option_exists(settings, "enable_ipv6");
+    let has_legacy_fakeip = option_exists(settings, "fakeip");
+    if (has_ipv6_enabled || has_enable_ipv6) {
+        let cur_mode = trim(option(settings, "ipv6_mode", ""));
+        if (cur_mode == "") {
+            let legacy_key = has_ipv6_enabled ? "ipv6_enabled" : "enable_ipv6";
+            let legacy_on = bool_option(settings, legacy_key, false);
+            set_option(ctx, settings, "ipv6_mode", legacy_on ? "auto" : "off");
+            if (!legacy_on)
+                set_option_if_missing(ctx, settings, "ipv6_leak_guard", "1");
+        }
+        delete_option(ctx, settings, "ipv6_enabled");
+        delete_option(ctx, settings, "enable_ipv6");
     }
-    delete_option(ctx, model.settings, "dns_via_outbound");
-    delete_option(ctx, model.settings, "dns_outbound_section");
-    delete_option(ctx, model.settings, "block_doh");
-    delete_option(ctx, model.settings, "enable_ipv6");
 
-    migrate_dns_server_lists(ctx);
-    migrate_list_update_enabled(ctx);
-
-    let converted_sections = [];
-    for (let section in model.rules) {
-        migrate_rule_section(ctx, section, constants);
-        push(converted_sections, section);
+    if (has_legacy_fakeip) {
+        if (!option_exists(settings, "fakeip_enabled") || trim(option(settings, "fakeip_enabled", "")) == "")
+            set_option(ctx, settings, "fakeip_enabled", bool_option(settings, "fakeip", true) ? "1" : "0");
+        delete_option(ctx, settings, "fakeip");
     }
-    model.rules = [];
 
-    for (let section in model.sections) {
-        migrate_rule(ctx, section, false, constants);
-        migrate_combined_domain_conditions(ctx, section);
-        migrate_text_condition(ctx, section, "ip_cidr", "subnets");
-        migrate_rule_set_settings(ctx, section);
-    }
-    for (let section in converted_sections) {
-        migrate_rule_set_settings(ctx, section);
-        push(model.sections, section);
-    }
-    migrate_subscription_download_via_proxy_settings(ctx);
-    migrate_download_via_proxy_flags(ctx);
-    apply_migrations(ctx);
+    if (lc(trim(option(settings, "ui_mode", ""))) == "basic")
+        set_option(ctx, settings, "ui_mode", "simple");
 
-    return ctx;
+    // Populate missing schema defaults only when migrating a legacy configuration
+    // that actually carried deprecated IPv6 or FakeIP options; modern configs keep
+    // absent options implicit until explicitly set.
+    if (has_ipv6_enabled || has_enable_ipv6 || has_legacy_fakeip) {
+        set_option_if_missing(ctx, settings, "ipv6_mode", "auto");
+        set_option_if_missing(ctx, settings, "ipv6_leak_guard", "1");
+        set_option_if_missing(ctx, settings, "dns_strategy", "prefer_ipv4");
+        set_option_if_missing(ctx, settings, "fakeip_enabled", "1");
+        set_option_if_missing(ctx, settings, "fakeip_inet4_range", "198.18.0.0/15");
+        set_option_if_missing(ctx, settings, "fakeip_inet6_range", "fc00::/18");
+        set_option_if_missing(ctx, settings, "webrtc_leak_protect", "auto");
+        set_option_if_missing(ctx, settings, "tun_inet4", "172.19.0.1/30");
+        set_option_if_missing(ctx, settings, "ui_mode", "simple");
+    }
 }
 
-function migrate_tachyon_model(model) {
+function migrate_numeric_wizard_ids(ctx) {
+    let taken = { settings: true, telegram: true, guest_mode: true };
+    for (let list_key in [ "sections", "balancer", "outbound_source", "outbound_group", "condition", "server", "profile", "schedule" ]) {
+        for (let item in (ctx.model[list_key] || [])) {
+            let id = section_name(item);
+            if (id != "")
+                taken[id] = true;
+        }
+    }
+
+    let sec_map = {};
+    let bal_map = {};
+    for (let sec in (ctx.model.sections || [])) {
+        let old_id = section_name(sec);
+        if (old_id == "" || !match(old_id, /^[0-9]+$/))
+            continue;
+        let raw_title = trim(option(sec, "label", option(sec, "name", "")));
+        if (raw_title == "" || raw_title == "Подписка" || raw_title == "Subscription" || raw_title == old_id)
+            raw_title = "Main";
+        let base_id = replace(sanitize_uci_id(transliterate_cyrillic(raw_title)), /_+/g, "_");
+        if (base_id == "item" || match(base_id, /^[0-9]+$/))
+            base_id = "Main";
+        let new_id = base_id;
+        let suffix = 2;
+        while (taken[new_id]) {
+            new_id = base_id + "_" + suffix;
+            suffix++;
+        }
+        taken[new_id] = true;
+        sec_map[old_id] = new_id;
+
+        if (option(sec, "name", "") == "" || option(sec, "name", "") == "Подписка" || option(sec, "name", "") == old_id)
+            sec.name = raw_title;
+        if (option(sec, "label", "") == "" || option(sec, "label", "") == "Подписка" || option(sec, "label", "") == old_id)
+            sec.label = raw_title;
+
+        for (let bal in (ctx.model.balancer || [])) {
+            let old_bal_id = section_name(bal);
+            if (old_bal_id != "bal_auto_" + old_id && old_bal_id != "bal_" + old_id + "_auto")
+                continue;
+            let new_bal_id = "bal_" + new_id + "_auto";
+            let b_sfx = 2;
+            while (taken[new_bal_id]) {
+                new_bal_id = "bal_" + new_id + "_auto_" + b_sfx;
+                b_sfx++;
+            }
+            taken[new_bal_id] = true;
+            bal_map[old_bal_id] = new_bal_id;
+            let b_name = trim(option(bal, "name", ""));
+            if (b_name == "" || b_name == "Подписка (URLTest)" || b_name == "Subscription (URLTest)" || b_name == old_id + " (URLTest)" || b_name == old_id + " Auto" || b_name == raw_title + " (URLTest)")
+                bal.name = raw_title + " Auto";
+            bal[".name"] = new_bal_id;
+            record_operation(ctx, { op: "rename_section", section: old_bal_id, new_name: new_bal_id });
+            if (bal.name != null)
+                record_operation(ctx, { op: "set", section: new_bal_id, option: "name", value: as_string(bal.name) });
+        }
+
+        let b_refs = list_option(sec, "balancer_refs");
+        if (length(b_refs) > 0) {
+            let next_b_refs = [];
+            for (let r in b_refs)
+                push(next_b_refs, bal_map[r] || r);
+            sec.balancer_refs = next_b_refs;
+        }
+        let ut_refs = list_option(sec, "urltests");
+        if (length(ut_refs) > 0) {
+            let next_ut_refs = [];
+            for (let r in ut_refs)
+                push(next_ut_refs, bal_map[r] || r);
+            sec.urltests = next_ut_refs;
+        }
+
+        sec[".name"] = new_id;
+        record_operation(ctx, { op: "rename_section", section: old_id, new_name: new_id });
+        if (sec.name != null)
+            record_operation(ctx, { op: "set", section: new_id, option: "name", value: as_string(sec.name) });
+        if (sec.label != null)
+            record_operation(ctx, { op: "set", section: new_id, option: "label", value: as_string(sec.label) });
+        if (type(sec.balancer_refs) == "array" && length(sec.balancer_refs) > 0)
+            record_operation(ctx, { op: "set_list", section: new_id, option: "balancer_refs", values: sec.balancer_refs });
+        if (type(sec.urltests) == "array" && length(sec.urltests) > 0)
+            record_operation(ctx, { op: "set_list", section: new_id, option: "urltests", values: sec.urltests });
+    }
+
+    if (length(keys(sec_map)) == 0)
+        return;
+
+    for (let sk in [ "dns_detour_section", "default_tunnel_section", "subscription_download_via_proxy_section" ]) {
+        let cur = option(ctx.model.settings, sk, "");
+        if (cur != "" && sec_map[cur] != null)
+            set_option(ctx, ctx.model.settings, sk, sec_map[cur]);
+    }
+    for (let sec in (ctx.model.sections || [])) {
+        for (let fk in [ "outbound_detour_section", "dns_detour_section" ]) {
+            let cur = option(sec, fk, "");
+            if (cur != "" && sec_map[cur] != null)
+                set_option(ctx, sec, fk, sec_map[cur]);
+        }
+        let members = list_option(sec, "group_members");
+        if (length(members) > 0) {
+            let next_m = [];
+            let changed_m = false;
+            for (let m in members) {
+                if (sec_map[m] != null)
+                    changed_m = true;
+                push(next_m, sec_map[m] || m);
+            }
+            if (changed_m)
+                set_list_option(ctx, sec, "group_members", next_m);
+        }
+    }
+    for (let src in (ctx.model.outbound_source || [])) {
+        for (let fk in [ "download_via_proxy_section", "outbound_detour_section" ]) {
+            let cur = option(src, fk, "");
+            if (cur != "" && sec_map[cur] != null)
+                set_option(ctx, src, fk, sec_map[cur]);
+        }
+    }
+    for (let srv in (ctx.model.server || [])) {
+        let cur = option(srv, "routing_section", "");
+        if (cur != "" && sec_map[cur] != null)
+            set_option(ctx, srv, "routing_section", sec_map[cur]);
+    }
+    for (let prof in (ctx.model.profile || [])) {
+        let cur = option(prof, "routing_section", "");
+        if (cur != "" && sec_map[cur] != null)
+            set_option(ctx, prof, "routing_section", sec_map[cur]);
+    }
+    for (let sched in (ctx.model.schedule || [])) {
+        let cur = option(sched, "section", "");
+        if (cur != "" && sec_map[cur] != null)
+            set_option(ctx, sched, "section", sec_map[cur]);
+    }
+}
+
+function migrate_tachyon_model(model, is_fixture) {
     let ctx = migration_context(model);
-    migrate_cleanup_accidental_full_domain_prefixes(ctx);
+    ctx.fixture_mode = is_fixture ? true : false;
+    ctx.combined_domain_conditions = compare_versions(option(model.settings, CONFIG_VERSION_OPTION, ""), "1.0.5") >= 0;
+    let converted_any_rules = false;
+    if (length(model.rules || []) > 0) {
+        let constants = constants_context();
+        let converted_sections = [];
+        for (let section in model.rules) {
+            migrate_rule_section(ctx, section, constants);
+            push(converted_sections, section);
+        }
+        model.rules = [];
+        for (let section in converted_sections) {
+            migrate_rule_set_settings(ctx, section);
+            push(model.sections, section);
+            converted_any_rules = true;
+        }
+    }
+    migrate_normalize_domain_lists(ctx);
+    // Unify engine identity, auto-update targets, and native tachyon-core providers
+    // before modular extraction/deduplication so a single migration pass is idempotent.
+    normalize_tachyon_core_uci(ctx);
     apply_migrations(ctx);
-    // How client traffic reaches the proxy. Defaulted rather than left absent:
-    // the generator has to be able to express a legal config for a router that
-    // predates this option, and "no proxy_mode" would have to be read as tproxy
-    // in every caller - one of them forgetting is a silent mode switch.
+    if (converted_any_rules)
+        migrate_modular_entities_v1(ctx);
+    cleanup_modular_entities_v1(ctx);
+    migrate_balancer_levels_to_sections(ctx);
+    migrate_numeric_wizard_ids(ctx);
     set_option_if_missing(ctx, ctx.model.settings, "proxy_mode", "tproxy");
     set_option_if_missing(ctx, ctx.model.settings, "tun_interface", "tun0");
     set_option_if_missing(ctx, ctx.model.settings, "tun_inet4", "172.19.0.1/30");
     set_option_if_missing(ctx, ctx.model.settings, "tun_mtu", "9000");
+    migrate_ipv6_and_fakeip_settings(ctx);
+    if (option(ctx.model.settings, "cache_flush_interval", "") == "10s")
+        set_option(ctx, ctx.model.settings, "cache_flush_interval", "60s");
+    let raw_tcp_prof = lc(trim(option(ctx.model.settings, "tcp_profile", "")));
+    if (raw_tcp_prof != "" &&
+        raw_tcp_prof != "auto" && raw_tcp_prof != "windows" &&
+        raw_tcp_prof != "macos" && raw_tcp_prof != "ios" &&
+        raw_tcp_prof != "android" && raw_tcp_prof != "linux")
+        delete_option(ctx, ctx.model.settings, "tcp_profile");
     return ctx;
 }
 
@@ -2043,6 +3928,8 @@ function apply_operations(cursor, operations) {
                 cursor.set(CONFIG_NAME, section_ref(op.section), op.option, op.values);
             else if (op.op == "set_type")
                 cursor.set(CONFIG_NAME, section_ref(op.section), op.type);
+            else if (op.op == "rename_section" && type(cursor.rename) == "function")
+                cursor.rename(CONFIG_NAME, section_ref(op.section), op.new_name);
         } catch(e) {
             warn("Migration operation '" + op.op + "' failed: " + as_string(e) + "\n");
         }
@@ -2070,7 +3957,12 @@ function runtime_cursor() {
             return uci_core.set(package_name + "." + section_name + "." + option_name, value);
         },
         delete: function(package_name, section_name, option_name) {
+            if (option_name == null)
+                return uci_core.delete(package_name + "." + section_name);
             return uci_core.delete(package_name + "." + section_name + "." + option_name);
+        },
+        rename: function(package_name, section_name, new_name) {
+            return uci_core.rename(package_name, section_name, new_name);
         },
         commit: function(package_name) {
             return uci_core.commit(package_name);
@@ -2109,48 +4001,133 @@ function commit_cursor(cursor) {
     return true;
 }
 
-function migrate_model(model, source) {
-    return source == "podkop"
-        ? migrate_podkop_model(model, constants_context())
-        : migrate_tachyon_model(model);
+function migrate_model(model) {
+    return migrate_tachyon_model(model, false);
 }
 
-function migrate_runtime(source) {
+function cleanup_legacy_core_artifacts() {
+    if (!legacy_cleanup_host_enabled())
+        return;
+
+    // Always create a non-destructive backup before touching anything.
+    backup_external_singbox_configs();
+
+    // Never remove standalone user-installed sing-box.
+    if (!has_tachyon_managed_singbox_marker())
+        return;
+
+    // Preserve tachyon-core config/cache/version/backup non-destructively when absent.
+    for (let pair in [
+        [ "/etc/sing-box/config.json", "/etc/tachyon-core/config.json", false ],
+        [ "/usr/share/sing-box/cache.db", "/usr/share/tachyon-core/cache.db", true ],
+        [ "/etc/tachyon/sing-box-version", "/etc/tachyon/tachyon-core-version", false ]
+    ]) {
+        let src = legacy_path(pair[0]);
+        let dst = legacy_path(pair[1]);
+        if (fs.stat(dst) == null && fs.stat(src) != null) {
+            let dir = common.parent_dir(dst);
+            if (dir != "")
+                common.ensure_dir(dir);
+            if (pair[2])
+                common.copy_file_stream(src, dst);
+            else
+                common.copy_file(src, dst);
+        }
+    }
+
+    let old_bkp = legacy_path("/etc/tachyon/component-backups/sing_box");
+    let new_bkp = legacy_path("/etc/tachyon/component-backups/tachyon_core");
+    if (fs.stat(new_bkp) == null && fs.stat(old_bkp) != null) {
+        let bkp_parent = common.parent_dir(new_bkp);
+        if (bkp_parent != "")
+            common.ensure_dir(bkp_parent);
+        try { fs.rename(old_bkp, new_bkp); } catch (e) {}
+    }
+
+    let init_script = legacy_path("/etc/init.d/sing-box");
+    if (fs.stat(init_script) != null) {
+        common.command_status_from_args([ init_script, "stop" ]);
+        common.command_status_from_args([ init_script, "disable" ]);
+        try { fs.unlink(init_script); } catch (e) {}
+        for (let rc_entry in (fs.glob(legacy_path("/etc/rc.d/*sing-box*")) || []))
+            try { fs.unlink(rc_entry); } catch (e) {}
+    }
+
+    if (legacy_cleanup_root() == "") {
+        let pkgs = null;
+        try { pkgs = require("core.packages"); } catch (e) {}
+        if (pkgs != null && pkgs.find_lock_holder() == null) {
+            let mgr = pkgs.detect_pkg_manager();
+            for (let pkg in [ "sing-box", "sing-box-extended", "sing-box-tiny", "sing-box-lx" ]) {
+                if (pkgs.installed(pkg)) {
+                    if (mgr == "apk")
+                        common.command_status_from_args([ "apk", "del", "--no-network", "--repositories-file", "/dev/null", "--force-broken-world", pkg ]);
+                    else if (mgr == "opkg")
+                        common.command_status_from_args([ "opkg", "remove", "--force-depends", "--force-remove", pkg ]);
+                }
+            }
+        }
+    }
+
+    for (let stale_file in [
+        "/usr/bin/sing-box",
+        "/etc/config/sing-box",
+        "/etc/tachyon/sing-box-variant",
+        "/etc/tachyon/sing-box-version",
+        "/etc/tachyon/tachyon-core-variant"
+    ]) {
+        let target = legacy_path(stale_file);
+        if (fs.stat(target) != null)
+            try { fs.unlink(target); } catch (e) {}
+    }
+
+    for (let stale_dir in [ "/etc/sing-box", "/usr/share/sing-box", "/tmp/sing-box", "/etc/tachyon/component-backups/sing_box" ]) {
+        let target = legacy_path(stale_dir);
+        if (fs.stat(target) != null)
+            common.remove_tree(target);
+    }
+}
+
+function migrate_runtime() {
     ensure_runtime_cache_format();
     remove_legacy_server_country_cache();
 
     let cursor = runtime_cursor();
     cursor.load(CONFIG_NAME);
-    let ctx = migrate_model(model_from_uci(cursor), source);
-    if (!ctx.changed)
-        return true;
 
-    try {
-        apply_operations(cursor, ctx.operations);
-    } catch(e) {
-        warn("Migration apply_operations failed: " + as_string(e) + "\n");
-        return false;
+    let ctx = migrate_tachyon_model(model_from_uci(cursor), false);
+    if (ctx.changed) {
+        try {
+            apply_operations(cursor, ctx.operations);
+        } catch(e) {
+            warn("Migration apply_operations failed: " + as_string(e) + "\n");
+            return false;
+        }
+        if (!commit_cursor(cursor))
+            return false;
+        for (let path in ctx.removed_caches)
+            remove_cache_path(path);
+
+        // UCI rewrote the config file; keep the token-bearing mode tight.
+        if (fs.stat("/etc/config/" + CONFIG_NAME) != null)
+            common.command_status_from_args([ "chmod", "0600", "/etc/config/" + CONFIG_NAME ]);
     }
-    let committed = commit_cursor(cursor);
-    for (let path in ctx.removed_caches)
-        remove_cache_path(path);
 
-    // UCI rewrote the config file; keep the token-bearing mode tight.
-    system("chmod 0600 /etc/config/" + CONFIG_NAME + " 2>/dev/null");
-
-    return committed;
+    cleanup_legacy_core_artifacts();
+    return true;
 }
 
 function commit_runtime() {
     let cursor = runtime_cursor();
     cursor.load(CONFIG_NAME);
     let committed = commit_cursor(cursor);
-    system("chmod 0600 /etc/config/" + CONFIG_NAME + " 2>/dev/null");
+    if (fs.stat("/etc/config/" + CONFIG_NAME) != null)
+        common.command_status_from_args([ "chmod", "0600", "/etc/config/" + CONFIG_NAME ]);
     return committed;
 }
 
-function migrate_fixture(path, source) {
-    let ctx = migrate_model(model_from_fixture(path), source);
+function migrate_fixture(path) {
+    let ctx = migrate_tachyon_model(model_from_fixture(path), true);
     write_json({
         changed: ctx.changed,
         config: export_model(ctx.model),
@@ -2159,103 +4136,16 @@ function migrate_fixture(path, source) {
     });
 }
 
-// Config files that are legacy by definition, by name.
-//
-// The name is the only reliable discriminator, and content is not merely
-// unreliable here but structurally incapable. Tachyon is a fork of forkop, so
-// a forkop config carries forkop's OWN config_version and applied_migrations,
-// and a diff of the two default configs shows forkop introducing no option that
-// Tachyon lacks. A forkop install therefore detected as "tachyon" and skipped
-// the migration while reporting success.
-const LEGACY_CONFIG_BASENAMES = {
-    forkop: true,
-    forkop_plus: true,
-    podkop: true,
-    podkop_plus: true,
-    netshift: true
-};
-
-function detect_config_migration_source(path) {
-    path = as_string(path || "");
-
-    // Recognised legacy path means legacy, whatever the contents say. The
-    // scanner already used the name to find this file, so throwing that away
-    // and re-deciding from the text loses the one piece of information that
-    // actually settles it.
-    let slash = rindex(path, "/");
-    let basename = (slash >= 0) ? substr(path, slash + 1) : path;
-    if (LEGACY_CONFIG_BASENAMES[basename])
-        return "podkop";
-
-    let content = fs.readfile(path);
-    if (content == null || content == "")
-        return "tachyon";
-
-    // Unknown path (a backup, most likely) and content is genuinely ambiguous:
-    // Tachyon is a fork of forkop, so the two share config_version and the
-    // applied_migrations names. There is no marker that separates them. So keep
-    // the existing heuristic, which prefers "native" when the new-style
-    // markers are present - running the legacy conversion over a current config
-    // is destructive, whereas skipping it is merely unhelpful, and
-    // migrate-podkop is there for the cases that need a forced conversion.
-    //
-    // Note config[ \t]+rule is BOTH a legacy marker and a current Tachyon
-    // section type, so it only counts on the legacy side.
-    if ((match(content, /option[ \t]+config_version/) || match(content, /list[ \t]+applied_migrations/)) &&
-        !match(content, /option[ \t]+connection_type/) &&
-        !match(content, /option[ \t]+proxy_config_type/)) {
-        return "tachyon";
-    }
-
-    // Only markers Tachyon does NOT support are decisive. `config rule` is
-    // deliberately not one of them: it is both a legacy Podkop section type and
-    // a current Tachyon one, so counting it made a native config with rules
-    // detect as legacy, and the legacy conversion is the destructive direction.
-    if (match(content, /option[ \t]+domain_list_urls/) ||
-        match(content, /option[ \t]+subnet_list_urls/) ||
-        match(content, /option[ \t]+routing_excluded_ips/) ||
-        match(content, /option[ \t]+connection_type/) ||
-        match(content, /option[ \t]+proxy_config_type/) ||
-        match(content, /option[ \t]+proxy_string/) ||
-        match(content, /option[ \t]+subscription_url/) ||
-        match(content, /list[ \t]+subscription_url/) ||
-        match(content, /option[ \t]+dns_via_outbound/) ||
-        match(content, /option[ \t]+global_proxy/) ||
-        match(content, /option[ \t]+enable_udp_over_tcp/)) {
-        return "podkop";
-    }
-
-    return "tachyon";
-}
-
-function scan_legacy_config_candidates() {
+function scan_backup_config_candidates() {
     let base_cfg_dir = CONFIG_DIR;
-    let known = [
-        base_cfg_dir + "/forkop",
-        base_cfg_dir + "/forkop_plus",
-        base_cfg_dir + "/podkop",
-        base_cfg_dir + "/podkop_plus",
-        base_cfg_dir + "/netshift",
-        "/tmp/legacy-config.backup",
-        "/etc/.tachyon/.cfg-backup.pre-install"
-    ];
+    let known = [];
+    if (base_cfg_dir == "/etc/config") {
+        known = [
+            "/etc/.tachyon/.cfg-backup.pre-install"
+        ];
+    }
     let candidates = [];
     let seen = {};
-
-    // 1. Check if current active config itself contains unconverted legacy rules
-    let current_tachyon = TARGET_CONFIG;
-    if (detect_config_migration_source(current_tachyon) == "podkop") {
-        let st = fs.stat(current_tachyon);
-        if (st != null && (st.size || 0) > 10) {
-            push(candidates, {
-                path: current_tachyon,
-                size: st.size || 0,
-                mtime: st.mtime || 0,
-                in_place_legacy: true
-            });
-            seen[current_tachyon] = true;
-        }
-    }
 
     for (let path in known) {
         if (seen[path]) continue;
@@ -2267,27 +4157,18 @@ function scan_legacy_config_candidates() {
     }
 
     let globs = [
-        base_cfg_dir + "/*forkop*",
-        base_cfg_dir + "/*podkop*",
-        base_cfg_dir + "/*netshift*",
         base_cfg_dir + "/tachyon.backup*",
         base_cfg_dir + "/tachyon.bak*",
         base_cfg_dir + "/tachyon.pre-import-*",
-        base_cfg_dir + "/tachyon.pre-install*",
-        "/tmp/legacy-config*",
-        "/tmp/*forkop*",
-        "/tmp/*podkop*",
-        "/tmp/*netshift*",
-        "/tmp/*tachyon*",
-        "/tmp/tmp.*/legacy-config*",
-        "/etc/.tachyon/*",
-        "/root/*forkop*",
-        "/root/*podkop*",
-        "/root/*netshift*",
-        "/root/*tachyon*",
-        "/root/*.backup*",
-        "/root/*.bak*"
+        base_cfg_dir + "/tachyon.pre-install*"
     ];
+    if (base_cfg_dir == "/etc/config") {
+        push(globs, "/tmp/tachyon.backup*");
+        push(globs, "/tmp/tachyon.bak*");
+        push(globs, "/etc/.tachyon/*");
+        push(globs, "/root/tachyon.backup*");
+        push(globs, "/root/tachyon.bak*");
+    }
     for (let g in globs) {
         let paths = fs.glob(g);
         if (type(paths) == "array") {
@@ -2325,12 +4206,12 @@ function import_settings_cli(source_path) {
         print("[1/3] Using specified configuration file:\n");
         print("  ✓ " + chosen_path + " (" + sprintf("%.1f KB", (st.size || 0) / 1024.0) + ")\n\n");
     } else {
-        print("[1/3] Scanning system for legacy or backup configurations...\n");
-        candidate_list = scan_legacy_config_candidates();
+        print("[1/3] Scanning system for Tachyon backup configurations...\n");
+        candidate_list = scan_backup_config_candidates();
         if (length(candidate_list) == 0) {
-            print("  Notice: No legacy or backup configurations found in standard directories.\n\n");
+            print("  Notice: No backup configurations found in standard directories.\n\n");
             print("To locate any leftover configurations, you can search with:\n");
-            print("  grep -rnE 'vless://|vmess://|ss://|trojan://|config rule' /etc/ /root/ /tmp/ 2>/dev/null\n\n");
+            print("  grep -rnE 'vless://|vmess://|ss://|trojan://|config section' /etc/ /root/ /tmp/ 2>/dev/null\n\n");
             print("And specify the file path directly:\n");
             print("  tachyon import_settings /path/to/backup-file\n\n");
             return false;
@@ -2339,8 +4220,7 @@ function import_settings_cli(source_path) {
         print("  Found candidates:\n");
         for (let i = 0; i < length(candidate_list); i++) {
             let c = candidate_list[i];
-            let note = c.in_place_legacy ? " (unconverted legacy rules in active config)" : "";
-            print("  [" + (i + 1) + "] " + c.path + " (" + sprintf("%.1f KB", c.size / 1024.0) + ")" + note + "\n");
+            print("  [" + (i + 1) + "] " + c.path + " (" + sprintf("%.1f KB", c.size / 1024.0) + ")\n");
         }
         print("\n");
 
@@ -2378,14 +4258,9 @@ function import_settings_cli(source_path) {
     }
     system("chmod 0600 " + shell_quote(target_config) + " 2>/dev/null");
 
-    // Detect on the file the user actually chose, not on the destination. The
-    // two are the same bytes here, but the destination is always named
-    // "tachyon", and now that the file name decides, asking about it would
-    // report the source's format as Tachyon every time.
-    let source_type = detect_config_migration_source(chosen_path);
-    print("  ✓ Detected format: " + (source_type == "podkop" ? "Legacy Forkop / Podkop / NetShift" : "Tachyon") + "\n");
+    print("  ✓ Detected format: Tachyon\n");
 
-    let ok = migrate_runtime(source_type);
+    let ok = migrate_runtime();
     if (!ok) {
         warn("Error: Configuration migration failed during UCI commit.\n");
         return false;
@@ -2411,26 +4286,21 @@ function import_settings_cli(source_path) {
 function main(argv) {
     let mode = argv[0] || "";
 
-    if (mode == "migrate") {
-        let source = detect_config_migration_source(TARGET_CONFIG);
-        return migrate_runtime(source) ? 0 : 1;
-    }
-    if (mode == "migrate-podkop")
-        return migrate_runtime("podkop") ? 0 : 1;
+    if (mode == "migrate")
+        return migrate_runtime() ? 0 : 1;
     if (mode == "import-settings" || mode == "import_settings")
         return import_settings_cli(argv[1]) ? 0 : 1;
     if (mode == "commit")
         return commit_runtime() ? 0 : 1;
     if (mode == "migrate-fixture") {
-        migrate_fixture(argv[1], argv[2] || "tachyon");
+        migrate_fixture(argv[1]);
         return 0;
     }
 
     warn("Usage: config/migration.uc migrate\n");
-    warn("       config/migration.uc migrate-podkop\n");
     warn("       config/migration.uc import-settings [file]\n");
     warn("       config/migration.uc commit\n");
-    warn("       config/migration.uc migrate-fixture <fixture.json> [tachyon|podkop]\n");
+    warn("       config/migration.uc migrate-fixture <fixture.json>\n");
     return 1;
 }
 
@@ -2439,9 +4309,11 @@ function module_exports() {
         main: main,
         migrate_model: migrate_model,
         migrate_tachyon_model: migrate_tachyon_model,
-        migrate_podkop_model: migrate_podkop_model,
-        scan_legacy_config_candidates: scan_legacy_config_candidates,
-        detect_config_migration_source: detect_config_migration_source,
+        migrate_modular_entities_v1: migrate_modular_entities_v1,
+        scan_backup_config_candidates: scan_backup_config_candidates,
+        cleanup_legacy_core_artifacts: cleanup_legacy_core_artifacts,
+        backup_external_singbox_configs: backup_external_singbox_configs,
+        has_tachyon_managed_singbox_marker: has_tachyon_managed_singbox_marker,
         import_settings_cli: import_settings_cli,
         mark_internal_config_guard: mark_internal_config_guard
     };

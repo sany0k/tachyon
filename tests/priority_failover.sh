@@ -165,7 +165,7 @@ let selector = outbound_by_tag(config, "proxy-out");
 if (!main || !backup)
     fail("expected one selector per priority group");
 if (main.type != "selector" || backup.type != "selector")
-    fail("priority groups must be sing-box selectors");
+    fail("priority groups must be tachyon-core selectors");
 if (main.interrupt_exist_connections !== true)
     fail("main priority interrupt flag should default to true");
 if (backup.interrupt_exist_connections !== false)
@@ -231,7 +231,7 @@ let cfg = json(fs.readfile(ARGV[0]));
 let cache = json(fs.readfile(ARGV[1]));
 for (let outbound in cfg.outbounds || [])
     if (outbound && outbound.tag == "proxy-priority-pg_empty-out")
-        die("empty priority group must not be added to sing-box config\n");
+        die("empty priority group must not be added to tachyon-core config\n");
 let cached = (cache.priorityGroups || {})["proxy-priority-pg_empty-out"];
 if (!cached || cached.displayName != "Empty")
     die("empty priority group should be cached for dashboard\n");
@@ -271,7 +271,7 @@ let cfg = json(fs.readfile(ARGV[0]));
 let cache = json(fs.readfile(ARGV[1]));
 for (let outbound in cfg.outbounds || [])
     if (outbound && outbound.tag == "proxy-priority-pg_main-out")
-        die("priority group with no matched outbounds must not be added to sing-box config\n");
+        die("priority group with no matched outbounds must not be added to tachyon-core config\n");
 let cached = (cache.priorityGroups || {})["proxy-priority-pg_main-out"];
 if (!cached || length(cached.levels || []) != 1)
     die("priority group with empty level should be cached for dashboard\n");
@@ -315,7 +315,7 @@ let cfg = json(fs.readfile(ARGV[0]));
 let cache = json(fs.readfile(ARGV[1]));
 for (let outbound in cfg.outbounds || [])
     if (outbound && outbound.tag == "proxy-urltest-cfg_empty-out")
-        die("empty URLTest group must not be added to sing-box config\n");
+        die("empty URLTest group must not be added to tachyon-core config\n");
 let cached = (cache.urltestGroups || {})["proxy-urltest-cfg_empty-out"];
 if (!cached || cached.displayName != "Empty URLTest")
     die("empty URLTest group should be cached for dashboard\n");
@@ -604,7 +604,7 @@ if (expected) {
         die("URLTest/Priority selected the wrong refreshed outbound\n");
 }
 else if (urltest || priority) {
-    die("empty URLTest/Priority group remained in sing-box config after membership refresh\n");
+    die("empty URLTest/Priority group remained in tachyon-core config after membership refresh\n");
 }
 ' "$config_path" "$expected"
 }
@@ -652,4 +652,257 @@ same_level="$(ucode -L "$TACHYON_LIB" "$PRIORITY_UC" select-faster-fixture \
 printf '%s\n' "$same_level" | grep -Fq '"tag": "b"' ||
   fail "same-level switching should compare candidates with the active delay from the same pass"
 
+warm_out="$(ucode -L "$TACHYON_LIB" "$PRIORITY_UC" warm-fixture \
+  "$WORK_DIR/select-first-live-group.json" "$WORK_DIR/select-first-live-latency.json")"
+printf '%s\n' "$warm_out" | grep -Fq '"tag": "b"' ||
+  fail "warm-fixture should select live node from top priority level"
+printf '%s\n' "$warm_out" | grep -Fq '"c": {' ||
+  fail "warm-fixture should probe inactive fallback priority level members so their latency is not N/A"
+
+mkdir -p "$WORK_DIR/new-sec-subs"
+cat >"$WORK_DIR/new-sec-subs/new_sec-subscription-1.json" <<'JSON'
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "🇳🇱 NL Clouds 1",
+      "remark": "🇳🇱 NL Clouds 1",
+      "server": "nl.clouds.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000011",
+      "tls": { "enabled": true, "server_name": "nl.clouds.example" }
+    },
+    {
+      "type": "vless",
+      "tag": "🇩🇪 DE Clouds 2",
+      "remark": "🇩🇪 DE Clouds 2",
+      "server": "de.clouds.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000012",
+      "tls": { "enabled": true, "server_name": "de.clouds.example" }
+    }
+  ]
+}
+JSON
+printf 'https://clouds.example/sub\n' >"$WORK_DIR/new-sec-subs/new_sec-subscription-1.url"
+: >"$WORK_DIR/new-sec-subs/new_sec-subscription-1.user_agent"
+
+cat >"$WORK_DIR/new-sec-balancer-fixture.json" <<'JSON'
+{
+  "settings": { ".name": "settings", ".type": "settings" },
+  "outbound_source": [
+    {
+      ".name": "src_sub_1",
+      ".type": "outbound_source",
+      "enabled": "1",
+      "name": "Clouds",
+      "source_type": "subscription",
+      "url": "https://clouds.example/sub",
+      "prefix_nodes": "0"
+    }
+  ],
+  "balancer": [
+    {
+      ".name": "bal_ut",
+      ".type": "balancer",
+      "enabled": "1",
+      "name": "SoftPortal",
+      "balancer_type": "urltest",
+      "check_interval": "3m",
+      "tolerance": "50"
+    },
+    {
+      ".name": "bal_prio",
+      ".type": "balancer",
+      "enabled": "1",
+      "name": "MainPriority",
+      "balancer_type": "priority",
+      "pick_fastest": "1"
+    }
+  ],
+  "section": [
+    {
+      ".name": "new_sec",
+      ".type": "section",
+      "enabled": "1",
+      "action": "connection",
+      "balancer_refs": [ "bal_ut", "bal_prio" ],
+      "balancer_settings": "{\"bal_ut\":{\"filter_mode\":\"include\",\"include_prefixes\":[\"Clouds\"]}}"
+    }
+  ]
+}
+JSON
+validate_fixture "$WORK_DIR/new-sec-balancer-fixture.json"
+new_sec_out="$WORK_DIR/new-sec-balancer-config.json"
+mkdir -p "${new_sec_out}.section-cache"
+TMP_SUBSCRIPTION_FOLDER="$WORK_DIR/new-sec-subs" \
+  ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+  "$WORK_DIR/new-sec-balancer-fixture.json" "$new_sec_out" "127.0.0.1"
+ucode -e '
+let fs = require("fs");
+let cfg = json(fs.readfile(ARGV[0]));
+let cache = json(fs.readfile(ARGV[1]));
+let ut_out = null;
+let prio_out = null;
+for (let ob in cfg.outbounds || []) {
+    if (ob && ob.tag == "new_sec-urltest-bal_ut-out")
+        ut_out = ob;
+    if (ob && ob.tag == "new_sec-priority-bal_prio-out")
+        prio_out = ob;
+}
+if (!ut_out || length(ut_out.outbounds || []) != 2)
+    die("new section URLTest balancer did not capture subscription servers by source_name prefix\n");
+if (!prio_out || length(prio_out.outbounds || []) != 2)
+    die("new section Priority balancer did not capture subscription servers\n");
+let meta = (cache && cache.outboundMetadata) || {};
+if (!meta.source_ids || !meta.source_names || !meta.sources)
+    die("section cache outboundMetadata did not preserve sources/source_ids/source_names\n");
+if (meta.source_ids["🇳🇱 NL Clouds 1"] != "src_sub_1" || meta.source_names["🇳🇱 NL Clouds 1"] != "Clouds")
+    die("section cache outboundMetadata has wrong source_ids/source_names\n");
+' "$new_sec_out" "${new_sec_out}.section-cache/new_sec.json" ||
+  fail "new section URLTest and Priority balancer capture"
+
+mkdir -p "$WORK_DIR/mock-bin"
+cat >"$WORK_DIR/mock-bin/curl" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    */proxies/main-out)
+      printf '{"now":"%s"}\n' "${MOCK_PARENT_NOW:-main-urltest}"
+      exit 0
+      ;;
+    */proxies/main-priority-pg-out)
+      printf '{"now":"node-a"}\n'
+      exit 0
+      ;;
+    */proxies/*/delay*)
+      echo "probed" >> "$MOCK_PROBE_LOG"
+      printf '{"delay":42}\n'
+      exit 0
+      ;;
+  esac
+done
+exit 0
+SH
+chmod +x "$WORK_DIR/mock-bin/curl"
+
+: >"$WORK_DIR/probe.log"
+PATH="$WORK_DIR/mock-bin:$PATH" MOCK_PARENT_NOW="main-urltest" MOCK_PROBE_LOG="$WORK_DIR/probe.log" \
+  ucode -L "$TACHYON_LIB" -e '
+let prio = require("tachyon_core.priority");
+let grp = {
+    id: "pg",
+    tag: "main-priority-pg-out",
+    kind: "priority",
+    section: "main",
+    health_url: "https://www.gstatic.com/generate_204",
+    health_urls: [ "https://www.gstatic.com/generate_204" ],
+    active_check_interval: "5s",
+    check_timeout: "2s",
+    recovery_check_interval: "15s",
+    fastest_check_interval: "3m",
+    levels: [ { id: "l1", order: 0, outbounds: [ "node-a", "node-b" ] } ]
+};
+let st = prio.init_group_state(grp);
+prio.tick_group(st, grp);
+'
+if [ -s "$WORK_DIR/probe.log" ]; then
+  fail "tick_group must not probe an inactive priority group when parent selector is on another outbound"
+fi
+
+PATH="$WORK_DIR/mock-bin:$PATH" MOCK_PARENT_NOW="main-priority-pg-out" MOCK_PROBE_LOG="$WORK_DIR/probe.log" \
+  ucode -L "$TACHYON_LIB" -e '
+let prio = require("tachyon_core.priority");
+let grp = {
+    id: "pg",
+    tag: "main-priority-pg-out",
+    kind: "priority",
+    section: "main",
+    health_url: "https://www.gstatic.com/generate_204",
+    health_urls: [ "https://www.gstatic.com/generate_204" ],
+    active_check_interval: "5s",
+    check_timeout: "2s",
+    recovery_check_interval: "15s",
+    fastest_check_interval: "3m",
+    levels: [ { id: "l1", order: 0, outbounds: [ "node-a", "node-b" ] } ]
+};
+let st = prio.init_group_state(grp);
+prio.tick_group(st, grp);
+'
+if [ ! -s "$WORK_DIR/probe.log" ]; then
+  fail "tick_group must probe priority group when it is selected in parent selector"
+fi
+
+cat >"$WORK_DIR/mock-bin/curl" <<'SH'
+#!/usr/bin/env bash
+is_put=0
+for arg in "$@"; do
+  if [ "$arg" = "-X" ] || [ "$arg" = "PUT" ]; then
+    is_put=1
+  fi
+  case "$arg" in
+    */proxies/main-out)
+      printf '{"now":"main-priority-pg-out"}\n'
+      exit 0
+      ;;
+    */proxies/main-priority-pg-out)
+      if [ "$is_put" = "1" ]; then
+        printf '204\n'
+      else
+        printf '{"now":"node-a"}\n'
+      fi
+      exit 0
+      ;;
+    */proxies/node-a/delay*)
+      printf '{"message":"Timeout"}\n'
+      exit 0
+      ;;
+    */proxies/node-b/delay*)
+      printf '{"delay":42}\n'
+      exit 0
+      ;;
+  esac
+done
+if [ "$is_put" = "1" ]; then
+  printf '204\n'
+  exit 0
+fi
+exit 0
+SH
+chmod +x "$WORK_DIR/mock-bin/curl"
+
+PATH="$WORK_DIR/mock-bin:$PATH" \
+  ucode -L "$TACHYON_LIB" -e '
+let prio = require("tachyon_core.priority");
+let grp = {
+    id: "pg",
+    tag: "main-priority-pg-out",
+    kind: "priority",
+    section: "main",
+    health_url: "https://www.gstatic.com/generate_204",
+    health_urls: [ "https://www.gstatic.com/generate_204" ],
+    active_check_interval: "5s",
+    check_timeout: "2s",
+    recovery_check_interval: "15s",
+    fastest_check_interval: "3m",
+    levels: [ { id: "l1", order: 0, outbounds: [ "node-a", "node-b" ] } ]
+};
+let st = prio.init_group_state(grp);
+st.active = "node-a";
+st.levelIndex = 0;
+st.nextActiveCheck = 0;
+
+prio.tick_group(st, grp);
+if (st.activeFailStreak != 1)
+    die("expected activeFailStreak=1 after first failure, got " + st.activeFailStreak + "\n");
+if (st.active != "node-a")
+    die("active node must not switch on first probe failure (streak 1)\n");
+
+st.nextActiveCheck = 0;
+prio.tick_group(st, grp);
+if (st.active != "node-b")
+    die("active node must failover to node-b after 2 consecutive failures, got " + st.active + "\n");
+' || fail "priority same-tier failover hysteresis on activeFailStreak"
+
 printf 'Priority failover checks passed\n'
+

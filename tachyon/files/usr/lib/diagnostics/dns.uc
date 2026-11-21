@@ -10,12 +10,10 @@ let network_mod = require("diagnostics.network");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || constants.TACHYON_CONFIG_NAME || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const SB_DNS_INBOUND_ADDRESS = getenv("SB_DNS_INBOUND_ADDRESS") || constants.SB_DNS_INBOUND_ADDRESS || "127.0.0.42";
-const STEER_DNS_ADDRESS = getenv("STEER_DNS_ADDRESS") || "127.0.0.1";
-const STEER_DNS_PORT = getenv("STEER_DNS_PORT") || "5300";
+const CORE_DNS_INBOUND_ADDRESS = getenv("TACHYON_CORE_DNS_INBOUND_ADDRESS") || getenv("CORE_DNS_INBOUND_ADDRESS") || constants.TACHYON_CORE_DNS_INBOUND_ADDRESS || constants.CORE_DNS_INBOUND_ADDRESS || "127.0.0.42";
 const FAKEIP_TEST_DOMAIN = getenv("FAKEIP_TEST_DOMAIN") || constants.FAKEIP_TEST_DOMAIN || "fakeip.podkop.fyi";
 const DNS_APPLY_UC = LIB_DIR + "/dns/apply.uc";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
+const TACHYON_CORE_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const HELPERS_UC = LIB_DIR + "/core/helpers.uc";
 
 let as_string = common.as_string;
@@ -48,12 +46,7 @@ function settings() {
 
 function active_engine_name() {
     let engine = uci_core.get(CONFIG_NAME, "settings", "engine");
-    return (engine != null && engine != "") ? as_string(engine) : "sing-box";
-}
-
-function active_engine_is_steer() {
-    let name = active_engine_name();
-    return name == "steer" || name == "steer-extended";
+    return (engine != null && engine != "") ? as_string(engine) : "tachyon-core";
 }
 
 function valid_ipv4(value) {
@@ -120,12 +113,12 @@ function dns_check_resolve_host(host, resolver, timeout_seconds) {
     return "";
 }
 
-function dns_check_through_singbox(domain) {
-    let resolved = dns_check_resolve_host(domain, SB_DNS_INBOUND_ADDRESS, 3);
+function dns_check_through_core(domain) {
+    let resolved = dns_check_resolve_host(domain, CORE_DNS_INBOUND_ADDRESS, 3);
     if (resolved != "")
         return true;
 
-    let res = command_capture("nslookup " + shell_quote(domain) + " " + SB_DNS_INBOUND_ADDRESS + " 2>&1");
+    let res = command_capture("nslookup " + shell_quote(domain) + " " + CORE_DNS_INBOUND_ADDRESS + " 2>&1");
     return (index(res.output, "Address") >= 0 || index(res.output, "name =") >= 0) &&
            index(res.output, "NXDOMAIN") < 0 &&
            index(res.output, "can't resolve") < 0 &&
@@ -133,24 +126,24 @@ function dns_check_through_singbox(domain) {
 }
 
 function dns_check_router_resolver_available(domain) {
-    for (let address in [ "127.0.0.1", SB_DNS_INBOUND_ADDRESS ]) {
-        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=3", "+tries=2" ]))
+    for (let address in [ "127.0.0.1", CORE_DNS_INBOUND_ADDRESS ]) {
+        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=1", "+tries=1" ]))
             return true;
     }
 
-    let pipe = fs.popen(sprintf("ucode -L %s %s service-listen-address", shell_quote(LIB_DIR), shell_quote(SINGBOX_RUNTIME_UC)), "r");
+    let pipe = fs.popen(sprintf("ucode -L %s %s service-listen-address", shell_quote(LIB_DIR), shell_quote(TACHYON_CORE_RUNTIME_UC)), "r");
     let listen_address = "";
     if (pipe) {
         listen_address = replace(as_string(pipe.read("all")), /[\r\n]+$/g, "");
         pipe.close();
     }
-    if (listen_address != "" && command_success_from_args([ "dig", "@" + listen_address, domain, "+timeout=3", "+tries=2" ]))
+    if (listen_address != "" && command_success_from_args([ "dig", "@" + listen_address, domain, "+timeout=1", "+tries=1" ]))
         return true;
 
     let source_interfaces = option(settings(), "source_network_interfaces", "br-lan");
     for (let interface in network_mod.words(source_interfaces)) {
         let address = network_mod.device_ipv4_address(interface);
-        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=3", "+tries=2" ]))
+        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=1", "+tries=1" ]))
             return true;
     }
 
@@ -180,34 +173,34 @@ function check_dns_available() {
     let cfg = settings();
     let dns_type = option(cfg, "dns_type", "");
     let active = runtime_dns.active_values(cfg);
+    if (runtime_dns.is_explicit_fallback_index(cfg, active.state.main_index) ||
+        runtime_dns.is_wan_fallback_index(cfg, active.state.main_index))
+        dns_type = "udp";
     let dns_server = active.main;
     let bootstrap_dns_server = active.bootstrap;
     let dont_touch_dhcp = bool_option(cfg, "dont_touch_dhcp", false) ? 1 : 0;
     let domain = "example.com";
     let timeout_seconds = dns_check_timeout_seconds(option(cfg, "dns_check_timeout", "2s"));
-    if (timeout_seconds < 3)
-        timeout_seconds = 3;
+    if (timeout_seconds < 1)
+        timeout_seconds = 1;
+    if (timeout_seconds > 2)
+        timeout_seconds = 2;
     let dns_status = 0;
     let dns_on_router = 0;
     let bootstrap_dns_status = 0;
     let dhcp_config_status = 1;
 
     let active_dns_args = [ "dig" ];
-    if (active_engine_is_steer()) {
-        push(active_dns_args, "-p", STEER_DNS_PORT);
-        push(active_dns_args, "@" + STEER_DNS_ADDRESS);
-    } else {
-        if (runtime_dns.failover_enabled(cfg)) {
-            push(active_dns_args, "-p");
-            push(active_dns_args, as_string(runtime_dns.health_port("active", 0)));
-        }
-        push(active_dns_args, "@" + SB_DNS_INBOUND_ADDRESS);
+    if (runtime_dns.failover_enabled(cfg)) {
+        push(active_dns_args, "-p");
+        push(active_dns_args, as_string(runtime_dns.health_port("active", 0)));
     }
+    push(active_dns_args, "@" + CORE_DNS_INBOUND_ADDRESS);
     push(active_dns_args, domain);
     push(active_dns_args, "A");
     push(active_dns_args, "+short");
     push(active_dns_args, "+timeout=" + as_string(timeout_seconds));
-    push(active_dns_args, "+tries=2");
+    push(active_dns_args, "+tries=1");
     for (let line in split(command_output_from_args(active_dns_args), "\n"))
         if (valid_ipv4(trim(as_string(line)))) {
             dns_status = 1;
@@ -225,7 +218,7 @@ function check_dns_available() {
             for (let line in split(command_output_from_args([
                 "dig", "-p", as_string(runtime_dns.health_port("bootstrap", active.state.bootstrap_index)),
                 "@" + runtime_dns.DNS_HEALTH_ADDRESS, domain, "A", "+short",
-                "+timeout=" + as_string(timeout_seconds), "+tries=2"
+                "+timeout=" + as_string(timeout_seconds), "+tries=1"
             ]), "\n"))
                 if (valid_ipv4(trim(as_string(line)))) {
                     bootstrap_dns_status = 1;
@@ -241,13 +234,9 @@ function check_dns_available() {
         }
     }
 
-    if (active_engine_is_steer()) {
-        dhcp_config_status = 1;
-    } else {
-        let complete_rc = common.command_status(sprintf("ucode -L %s %s default-config-complete >/dev/null 2>&1", shell_quote(LIB_DIR), shell_quote(DNS_APPLY_UC)));
-        if (complete_rc != 0)
-            dhcp_config_status = 0;
-    }
+    let complete_rc = common.command_status(sprintf("ucode -L %s %s default-config-complete >/dev/null 2>&1", shell_quote(LIB_DIR), shell_quote(DNS_APPLY_UC)));
+    if (complete_rc != 0)
+        dhcp_config_status = 0;
 
     let status_mod = require("diagnostics.status_bridge");
     let display_dns_server = replace(status_mod.status_output([ "mask-dns-server", dns_server ], null), /[\r\n]+$/g, "");
@@ -268,33 +257,14 @@ function check_dns_available() {
     return 0;
 }
 
-function check_fakeip() {
-    if (active_engine_is_steer()) {
-        let fakeip_address = "";
-        let fakeip6_address = "";
-        for (let line in split(command_output_from_args([
-            "dig", "+short", "-p", STEER_DNS_PORT, "@" + STEER_DNS_ADDRESS,
-            FAKEIP_TEST_DOMAIN, "A", "+timeout=2", "+tries=1"
-        ]), "\n")) {
-            line = trim(as_string(line));
-            if (valid_ipv4(line)) {
-                fakeip_address = line;
-                break;
-            }
-        }
-        write_json({
-            fakeip: match(fakeip_address, /^198\.(18|19)\./) != null,
-            IP: fakeip_address,
-            IPv4: fakeip_address,
-            IPv6: fakeip6_address,
-            engine: active_engine_name()
-        });
-        return 0;
-    }
+function check_fakeip(target_domain) {
+    let query_domain = trim(as_string(target_domain || ""));
+    if (query_domain == "")
+        query_domain = FAKEIP_TEST_DOMAIN;
     let fakeip_address = "";
     let fakeip6_address = "";
     for (let line in split(command_output_from_args([
-        "dig", "+short", "@" + SB_DNS_INBOUND_ADDRESS, FAKEIP_TEST_DOMAIN, "A", "+timeout=2", "+tries=1"
+        "dig", "+short", "@" + CORE_DNS_INBOUND_ADDRESS, query_domain, "A", "+timeout=2", "+tries=1"
     ]), "\n")) {
         line = trim(as_string(line));
         if (valid_ipv4(line)) {
@@ -303,7 +273,7 @@ function check_fakeip() {
         }
     }
     for (let line in split(command_output_from_args([
-        "dig", "+short", "@" + SB_DNS_INBOUND_ADDRESS, FAKEIP_TEST_DOMAIN, "AAAA", "+timeout=2", "+tries=1"
+        "dig", "+short", "@" + CORE_DNS_INBOUND_ADDRESS, query_domain, "AAAA", "+timeout=2", "+tries=1"
     ]), "\n")) {
         line = lc(trim(as_string(line)));
         if (core_ip.valid_ipv6(line)) {
@@ -312,6 +282,7 @@ function check_fakeip() {
         }
     }
     write_json({
+        domain: query_domain,
         fakeip: match(fakeip_address, /^198\.(18|19)\./) != null || match(fakeip6_address, /^fc[0-3][0-9a-f]:/) != null,
         IP: fakeip_address != "" ? fakeip_address : fakeip6_address,
         IPv4: fakeip_address,
@@ -339,9 +310,14 @@ function resolve_domain_cli(domain) {
     let ips = [];
     let seen = {};
 
+    let is_fakeip = function(ip) {
+        ip = lc(trim(as_string(ip)));
+        return match(ip, /^198\.(18|19)\./) != null || match(ip, /^fc[0-3][0-9a-f]:/) != null;
+    };
+
     let add_ip = function(ip) {
         ip = trim(as_string(ip));
-        if (ip == "" || ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || seen[ip])
+        if (ip == "" || ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || is_fakeip(ip) || seen[ip])
             return;
         if (!core_ip.valid_ip(ip))
             return;
@@ -349,12 +325,8 @@ function resolve_domain_cli(domain) {
         push(ips, ip);
     };
 
-    let cmd_local = command_output_from_args([ "nslookup", domain, "127.0.0.1" ]);
-    let cmd_def = command_output_from_args([ "nslookup", domain ]);
-    let outputs = [ cmd_local, cmd_def ];
-
-    for (let out in outputs) {
-        if (!out) continue;
+    let parse_nslookup_output = function(out) {
+        if (!out) return;
         let past_header = false;
         for (let line in split(out, "\n")) {
             line = trim(as_string(line));
@@ -366,6 +338,36 @@ function resolve_domain_cli(domain) {
                     add_ip(m[1]);
             }
         }
+    };
+
+    parse_nslookup_output(command_output_from_args([ "nslookup", domain, "127.0.0.1" ]));
+    if (length(ips) == 0)
+        parse_nslookup_output(command_output_from_args([ "nslookup", domain ]));
+
+    if (length(ips) == 0) {
+        let cfg = settings();
+        let bootstrap_list = get_all_dns_servers(cfg, "bootstrap_dns_server");
+        let fallback_resolvers = [];
+        for (let b in bootstrap_list) {
+            let h = url_host(b);
+            if (h == "") h = trim(as_string(b));
+            if (valid_ipv4(h) && !is_fakeip(h))
+                push(fallback_resolvers, h);
+        }
+        for (let pub_dns in [ "77.88.8.8", "1.1.1.1", "8.8.8.8" ])
+            push(fallback_resolvers, pub_dns);
+
+        for (let srv in fallback_resolvers) {
+            let resolved = dns_check_resolve_host(domain, srv, 2);
+            if (resolved != "") {
+                add_ip(resolved);
+                if (length(ips) > 0)
+                    break;
+            }
+            parse_nslookup_output(command_output_from_args([ "nslookup", domain, srv ]));
+            if (length(ips) > 0)
+                break;
+        }
     }
 
     print(sprintf("%J\n", ips));
@@ -376,7 +378,7 @@ return {
     url_host,
     get_all_dns_servers,
     dns_check_resolve_host,
-    dns_check_through_singbox,
+    dns_check_through_core,
     dns_check_router_resolver_available,
     dns_check_timeout_seconds,
     dnsmasq_has_tachyon_dns,

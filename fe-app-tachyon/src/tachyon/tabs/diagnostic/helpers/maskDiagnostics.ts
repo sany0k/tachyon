@@ -1,24 +1,37 @@
 const MASKED_VALUE = '*******';
 
-const SING_BOX_MASKED_KEYS = new Set([
+const CORE_CONFIG_MASKED_KEYS = new Set([
   'auth_key',
+  'auth_token',
+  'access_token',
+  'token',
   'control_url',
   'exit_node',
   'hostname',
   'listen',
   'listen_port',
   'username',
+  'user',
   'uuid',
   'server',
   'server_name',
+  'sni',
   'secret',
   'password',
+  'psk',
+  'pre_shared_key',
+  'preshared_key',
   'private_key',
   'public_key',
+  'peer_public_key',
   'short_id',
   'fingerprint',
   'server_port',
   'server_ports',
+  'endpoint',
+  'endpoints',
+  'address',
+  'local_address',
   'advertise_routes',
   'domain',
   'domain_suffix',
@@ -26,6 +39,13 @@ const SING_BOX_MASKED_KEYS = new Set([
   'domain_regex',
   'ip_cidr',
   'source_ip_cidr',
+  'certificate',
+  'client_certificate',
+  'client_key',
+  'key',
+  'cookie',
+  'obfs_password',
+  'header_protection_key',
 ]);
 
 const TACHYON_MASK_AFTER_TOKEN = [
@@ -35,10 +55,15 @@ const TACHYON_MASK_AFTER_TOKEN = [
   'list subscription_urls',
   'list urltest_proxy_links',
   'list selector_proxy_links',
+  'list proxy_links',
+  'option proxy_links_text',
+  'option selector_proxy_links_text',
+  'option urltest_proxy_links_text',
   'list selector_amnezia_configs',
   'option selector_amnezia_configs',
   'list amnezia_configs',
   'option amnezia_config',
+  'option amnezia_conf_text',
   'list server_users',
   'option server_uuid',
   'option server_username',
@@ -54,6 +79,7 @@ const TACHYON_MASK_AFTER_TOKEN = [
 
 const TACHYON_MASK_AFTER_TOKEN_SPACE = [
   'option outbound_json',
+  'list outbound_jsons',
   'list domain',
   'list domain_suffix',
   'list domain_keyword',
@@ -99,22 +125,68 @@ const TACHYON_MASK_AFTER_TOKEN_SPACE = [
   'option password',
   'option private_key',
   'option awg_private_key',
+  'option awg_peer_public_key',
+  'option awg_preshared_key',
+  'option awg_server_address',
+  'option awg_server_port',
+  'option awg_endpoint',
+  'option awg_header_protection_key',
   'option bot_token',
   'option agent_api_token',
   'option admin_ids',
   'option url',
+  'option access_token',
   'option warp_private_key',
+  'option warp_peer_public_key',
   'option warp_access_token',
+  'option warp_account_id',
+  'option warp_endpoint_host',
   'option masque_private_key',
+  'option masque_peer_public_key',
   'option masque_access_token',
+  'option masque_server',
+  'option openvpn_server',
+  'option openvpn_username',
   'option openvpn_password',
   'option openvpn_key',
   'option openvpn_cert',
   'option openvpn_ca',
+  'option openvpn_tls_auth',
+  'option openvpn_tls_crypt',
+  'option openconnect_server',
+  'option openconnect_username',
+  'option openconnect_password',
+  'option openconnect_cookie',
+  'option openconnect_servercert',
+  'option tewfai_server',
+  'option tewfai_uuid',
+  'option tewfai_password',
+  'option trusttunnel_server',
+  'option trusttunnel_username',
+  'option trusttunnel_password',
+  'option shadowtls_server',
+  'option shadowtls_password',
+  'option mieru_server',
+  'option mieru_username',
+  'option mieru_password',
+  'option snell_server',
+  'option snell_psk',
+  'option sudoku_server',
+  'option sudoku_key',
+  'option naive_server',
+  'option naive_username',
+  'option naive_password',
+  'option anytls_server',
+  'option anytls_password',
   'option user_agent',
   'option hwid_token',
   'option anytls_sni',
+  'option naive_sni',
+  'option tewfai_sni',
+  'option trusttunnel_sni',
+  'option openconnect_sni',
   'option sni',
+  'option server',
   'option transport_path',
 ];
 
@@ -204,18 +276,18 @@ function maskMultilineContinuation(line: string) {
   return `${leadingSpace}${MASKED_VALUE}${hasClosingQuote ? "'" : ''}`;
 }
 
-export function maskSingBoxConfigValue(value: unknown): unknown {
+export function maskCoreConfigValue(value: unknown): unknown {
   if (Array.isArray(value)) {
-    return value.map((item) => maskSingBoxConfigValue(item));
+    return value.map((item) => maskCoreConfigValue(item));
   }
 
   if (isRecord(value)) {
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        SING_BOX_MASKED_KEYS.has(key)
+        CORE_CONFIG_MASKED_KEYS.has(key)
           ? MASKED_VALUE
-          : maskSingBoxConfigValue(item),
+          : maskCoreConfigValue(item),
       ]),
     );
   }
@@ -223,20 +295,20 @@ export function maskSingBoxConfigValue(value: unknown): unknown {
   return value;
 }
 
-export function stringifySingBoxConfig(value: unknown) {
+export function stringifyCoreConfig(value: unknown) {
   return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 }
 
-export function formatMaskedSingBoxConfig(value: unknown) {
+export function formatMaskedCoreConfig(value: unknown) {
   if (typeof value === 'string') {
     try {
-      return JSON.stringify(maskSingBoxConfigValue(JSON.parse(value)), null, 2);
+      return JSON.stringify(maskCoreConfigValue(JSON.parse(value)), null, 2);
     } catch (_error) {
       return value;
     }
   }
 
-  return JSON.stringify(maskSingBoxConfigValue(value), null, 2);
+  return JSON.stringify(maskCoreConfigValue(value), null, 2);
 }
 
 export function maskGlobalCheckText(text: string = '') {
@@ -257,8 +329,15 @@ export function maskGlobalCheckText(text: string = '') {
 
       if (
         line.includes('option outbound_json') ||
+        line.includes('list outbound_jsons') ||
         line.includes('selector_amnezia_configs') ||
-        line.includes('amnezia_config')
+        line.includes('amnezia_config') ||
+        line.includes('amnezia_conf_text') ||
+        line.includes('proxy_links_text') ||
+        line.includes('openvpn_key') ||
+        line.includes('openvpn_cert') ||
+        line.includes('openvpn_ca') ||
+        line.includes('openvpn_tls_')
       ) {
         const firstQuote = line.indexOf("'");
 
@@ -273,7 +352,7 @@ export function maskGlobalCheckText(text: string = '') {
 }
 
 // Hostnames, addresses and URLs in syslog lines identify the user's provider
-// infrastructure (a node shows up as `host:port` in every sing-box dial/TLS
+// infrastructure (a node shows up as `host:port` in every tachyon-core dial/TLS
 // line) and the sites they browse. maskGlobalCheckText cannot help there: it
 // only rewrites UCI `option`/`list` tokens, and log lines have none.
 const LOG_URL = /[a-z][a-z0-9+.-]*:\/\/\S+/gi;
@@ -291,7 +370,7 @@ const LOG_HOST_PORT = new RegExp(`(${LOG_HOST})(:\\d{1,5})`, 'gi');
 const LOG_SYSLOG_TAG =
   '(?:daemon|user|kern|kernel|local\\d*|auth|authpriv|cron|mail|news|syslog|ftp)\\.(?:emerg|alert|crit|err|error|warn|warning|notice|info|debug)\\b';
 const LOG_BARE_HOST = new RegExp(
-  `(?<![/\\w.-])(?!${LOG_SYSLOG_TAG})(${LOG_HOST})(?![/\\w-])`,
+  `(^|[^/\\w.-])(?!${LOG_SYSLOG_TAG})(${LOG_HOST})(?![/\\w-])`,
   'gi',
 );
 
@@ -299,7 +378,7 @@ function maskLogLine(line: string) {
   return line
     .replace(LOG_URL, '*******')
     .replace(LOG_HOST_PORT, '*******$2')
-    .replace(LOG_BARE_HOST, '*******')
+    .replace(LOG_BARE_HOST, '$1*******')
     .replace(WG_KEY_PATTERN, '$1*******');
 }
 

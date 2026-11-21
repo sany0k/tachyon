@@ -163,25 +163,31 @@ export interface StoreType {
     loading: boolean;
     failed: boolean;
     data: {
-      singbox: number;
+      tachyonCore: number;
       tachyonRunning: number;
       tachyonEnabled: number;
       tachyonStatus: string;
+      liteMode?: number;
       tachyonMemoryMb?: number;
+      tachyonPid?: number;
+      tachyonUptimeSeconds?: number;
+      tachyonUptimePretty?: string;
+      cpuLoadPercent?: number | null;
+      cpuTempC?: number | null;
       watchdogRunning: number;
-      singboxMemoryMb?: number;
-      zapret2Running?: number;
-      zapret2MemoryMb?: number;
+      tachyonCoreMemoryMb?: number;
+      tachyonCorePid?: number;
+      tachyonCoreUptimeSeconds?: number;
+      tachyonCoreUptimePretty?: string;
+      engineVersion?: string;
       dnsmasqRunning?: number;
       dnsmasqMemoryMb?: number;
       dnsmasqLocalCacheEnabled?: number;
       dnsmasqCacheSize?: number;
+      dnsmasqPid?: number;
+      dnsmasqUptimeSeconds?: number;
+      dnsmasqUptimePretty?: string;
     };
-  };
-  tailscaleWidget: {
-    loading: boolean;
-    failed: boolean;
-    data: Tachyon.GetTailscalePeers | null;
   };
   sectionsWidget: {
     loading: boolean;
@@ -206,7 +212,7 @@ export interface StoreType {
     doctor: { loading: boolean };
     aiDoctor: { loading: boolean };
     viewLogs: { loading: boolean };
-    showSingBoxConfig: { loading: boolean };
+    showTachyonCoreConfig: { loading: boolean };
     generateBugReport: { loading: boolean };
     checkServices: { loading: boolean };
   };
@@ -218,125 +224,88 @@ export interface StoreType {
     tachyon_commit_sha: string;
     tachyon_latest_version: string;
     luci_app_version: string;
-    sing_box_version: string;
-    sing_box_extended: number;
-    sing_box_tiny: number;
-    sing_box_compressed: number;
-    sing_box_lx: number;
-    sing_box_tachyon_core?: number;
-    sing_box_fptn?: number;
-    sing_box_tailscale: number;
-    sing_box_cert_pin?: number;
-    sing_box_repo_url?: string;
-    sing_box_backup_version?: string;
-    sing_box_backup_time?: number;
-    steer_version?: string;
-    steer_installed?: number;
-    steer_extended?: number;
-    steer_modules?: string[];
-    steer_repo_url?: string;
-    steer_backup_version?: string;
-    steer_backup_time?: number;
+    tachyon_core_version: string;
+    tachyon_core_fptn?: number;
+    tachyon_core_tailscale: number;
+    tachyon_core_cert_pin?: number;
+    tachyon_core_repo_url?: string;
+    tachyon_core_backup_version?: string;
+    tachyon_core_backup_time?: number;
     active_engine?: string;
-    zapret_version: string;
-    zapret_installed: number;
-    zapret_backup_version?: string;
-    zapret_backup_time?: number;
-    zapret2_version: string;
-    zapret2_installed: number;
-    zapret2_backup_version?: string;
-    zapret2_backup_time?: number;
-    byedpi_version: string;
-    byedpi_installed: number;
-    byedpi_backup_version?: string;
-    byedpi_backup_time?: number;
-    wdtt_version: string;
-    wdtt_installed: number;
-    wdtt_backup_version?: string;
-    wdtt_backup_time?: number;
-    olcrtc_version: string;
-    olcrtc_installed: number;
-    olcrtc_backup_version?: string;
-    olcrtc_backup_time?: number;
-    tailscale_version: string;
-    tailscale_installed: number;
-    tailscale_backup_version?: string;
-    tailscale_backup_time?: number;
-    fptn_version: string;
-    fptn_installed: number;
-    fptn_mode?: 'native' | 'component';
-    fptn_backup_version?: string;
-    fptn_backup_time?: number;
     server_inbounds_enabled_count: number;
     direct_bypass_enabled?: number;
     direct_bypass_address?: string;
     direct_bypass_port?: string;
+    torrserver_installed?: number;
+    torrserver_version?: string;
     torrserver_running?: number;
     torrserver_direct_available?: number;
     torrserver_direct_enabled?: number;
     torrserver_direct_active?: number;
     openwrt_version: string;
     device_model: string;
+    kernel_version?: string;
+    cpu_arch?: string;
+    uptime_seconds?: number;
+    load_avg?: string;
+    mem_total_mb?: number;
+    mem_used_mb?: number;
+    mem_free_mb?: number;
+    mem_used_pct?: number;
+    conntrack_count?: number;
+    conntrack_max?: number;
+    dns_type?: string;
+    dns_strategy?: string;
+    fakeip_enabled?: number;
+    fakeip_inet4_range?: string;
+    fakeip_inet6_range?: string;
+    ipv6_mode?: string;
+    ipv6_leak_guard?: '0' | '1' | number | boolean;
+    ipv6_effective_state?:
+      | 'disabled'
+      | 'leak_guard'
+      | 'tunnel_over_v4'
+      | 'full'
+      | string;
+    wan_ip?: string;
+    wan_ipv6?: string;
+    lan_ip?: string;
+    lan_ipv6?: string;
+    wan6_prefix?: string;
+    wan6_pd?: string[];
+    wan6_available?: 0 | 1 | boolean;
+    wan6_iface?: string;
+    router_hostname?: string;
+    runtime_dns_strategy?: string;
+    webrtc_leak_protect?: '0' | '1' | number | boolean;
+    inbound_mode?: string;
+    active_sections_count?: number;
+    total_sections_count?: number;
+    quarantined_sections_count?: number;
+    deferred_sections_count?: number;
   };
   updatesActions: {
     tachyonCheck: { loading: boolean };
     tachyonInstall: { loading: boolean };
     tachyonReinstall: { loading: boolean };
     tachyonRollback: { loading: boolean };
-    singBoxCheck: { loading: boolean };
-    singBoxInstall: { loading: boolean };
-    singBoxRollback: { loading: boolean };
-    singBoxInstallExtended: { loading: boolean };
-    singBoxInstallExtendedCompressed: { loading: boolean };
-    singBoxInstallLx: { loading: boolean };
-    singBoxInstallTachyonCore: { loading: boolean };
-    singBoxInstallTiny: { loading: boolean };
-    singBoxInstallStable: { loading: boolean };
-    zapretCheck: { loading: boolean };
-    zapretInstall: { loading: boolean };
-    zapretRemove: { loading: boolean };
-    zapretRollback: { loading: boolean };
-    zapret2Check: { loading: boolean };
-    zapret2Install: { loading: boolean };
-    zapret2Remove: { loading: boolean };
-    zapret2Rollback: { loading: boolean };
-    byedpiCheck: { loading: boolean };
-    byedpiInstall: { loading: boolean };
-    byedpiRemove: { loading: boolean };
-    byedpiRollback: { loading: boolean };
-    wdttCheck: { loading: boolean };
-    wdttInstall: { loading: boolean };
-    wdttRemove: { loading: boolean };
-    wdttRollback: { loading: boolean };
-    olcrtcCheck: { loading: boolean };
-    olcrtcInstall: { loading: boolean };
-    olcrtcRemove: { loading: boolean };
-    olcrtcRollback: { loading: boolean };
-    fptnCheck: { loading: boolean };
-    fptnInstall: { loading: boolean };
-    fptnRemove: { loading: boolean };
-    fptnRollback: { loading: boolean };
-    fptnSetNativeMode: { loading: boolean };
-    fptnSetComponentMode: { loading: boolean };
-    tailscaleCheck: { loading: boolean };
-    tailscaleInstall: { loading: boolean };
-    tailscaleRemove: { loading: boolean };
-    tailscaleRollback: { loading: boolean };
-    steerCheck: { loading: boolean };
-    steerInstall: { loading: boolean };
-    steerRemove: { loading: boolean };
-    steerRollback: { loading: boolean };
+    tachyonCoreCheck: { loading: boolean };
+    tachyonCoreInstall: { loading: boolean };
+    tachyonCoreRollback: { loading: boolean };
     directBypassEnable: { loading: boolean };
     directBypassDisable: { loading: boolean };
+    torrserverDirectCheck: { loading: boolean };
+    torrserverDirectInstall: { loading: boolean };
+    torrserverDirectRemove: { loading: boolean };
     torrserverDirectEnable: { loading: boolean };
     torrserverDirectDisable: { loading: boolean };
-    engineSwitch: { loading: boolean };
   };
   updatesChecks: Record<
     Tachyon.ComponentName,
     {
       status: 'latest' | 'outdated' | 'dev' | 'outdated_same_release' | null;
       latest_version: string;
+      current_version?: string;
       release_url: string;
       release_notes?: string;
       current_sha?: string;
@@ -350,7 +319,7 @@ const initialStore: StoreType = {
     current: '',
     all: [],
   },
-  activeEngine: 'sing-box',
+  activeEngine: 'tachyon-core',
   bandwidthWidget: {
     loading: true,
     failed: false,
@@ -370,17 +339,12 @@ const initialStore: StoreType = {
     loading: true,
     failed: false,
     data: {
-      singbox: 0,
+      tachyonCore: 0,
       tachyonRunning: 0,
       tachyonEnabled: 0,
       tachyonStatus: '',
       watchdogRunning: 0,
     },
-  },
-  tailscaleWidget: {
-    loading: true,
-    failed: false,
-    data: null,
   },
   sectionsWidget: {
     loading: true,

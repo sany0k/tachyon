@@ -1,8 +1,10 @@
 import { insertIf } from '../../../../helpers';
+import { renderServerIcon } from '../../../../icons';
 
-interface IRenderSystemInfoRow {
+export interface IRenderSystemInfoRow {
   key: string;
   value: string;
+  subvalue?: string;
   tag?: {
     label: string;
     kind: 'neutral' | 'warning' | 'success';
@@ -21,7 +23,7 @@ export function renderSystemInfo({ items }: IRenderSystemInfoProps) {
       E(
         'b',
         { class: 'tachyon_diagnostic-page__right-bar__system-info__title' },
-        _('System information'),
+        [renderServerIcon(14), _('System information')],
       ),
       ...items.map((item) => {
         const tagClass = [
@@ -48,6 +50,18 @@ export function renderSystemInfo({ items }: IRenderSystemInfoProps) {
               E('span', {}, item.value),
               E('span', { class: tagClass }, item?.tag?.label),
             ]),
+            ...(item.subvalue
+              ? [
+                  E(
+                    'span',
+                    {
+                      class:
+                        'tachyon_diagnostic-page__right-bar__system-info__row__sub',
+                    },
+                    item.subvalue,
+                  ),
+                ]
+              : []),
           ],
         );
       }),

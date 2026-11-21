@@ -1,4 +1,5 @@
 import { canUseDirectClashApi, getClashWsUrl, onMount } from '../../../helpers';
+import { isActiveLuciTab } from '../../helpers/isActiveLuciTab';
 import { showToast } from '../../../helpers/showToast';
 import {
   renderPauseIcon24,
@@ -7,7 +8,10 @@ import {
   renderXIcon24,
 } from '../../../icons';
 import { CustomTachyonMethods, TachyonShellMethods } from '../../methods';
-import { getClashApiSecret } from '../../methods/custom/getClashApiSecret';
+import {
+  getClashApiSecret,
+  isDirectClashApiExposed,
+} from '../../methods/custom/getClashApiSecret';
 import { logger, socket, store, StoreType } from '../../services';
 import {
   getCachedRuntimeUiState,
@@ -20,14 +24,21 @@ import {
 } from '../../helpers/serviceAvailability';
 import {
   type MonitoringTabId,
+  type ConnectionSourceFilter,
+  type ClashConnection,
   type LocalDeviceChoices,
   type ClashConnectionsPayload,
   type MonitoredConnection,
   normalizeConnectionsPayload,
+  getConnectionDataSource,
+  mergeCoreAndConntrackConnections,
+  isExcludedRoutingName,
   buildRouteDisplayNames,
   getRouteDisplayNameByTag,
-  getRouteDisplayNames,
+  getRouteSections,
   getRoute,
+  getRouteTooltip,
+  formatMatchedRuleSummary,
   getNetwork,
   getTargetCellParts,
   getSourceCellParts,
@@ -39,7 +50,8 @@ import {
   formatBytes,
 } from './filters';
 import { handleMonitoringValueCopy } from './clipboard';
-import { normalizeString } from './formatters';
+import { normalizeString, parseStartedAt } from './formatters';
+import { subscribeDashboardLayoutChanges } from '../dashboard/dashboardLayout';
 
 interface MonitoringControllerDependencies {
   loadLocalDeviceChoices?: () => Promise<LocalDeviceChoices>;
@@ -56,6 +68,7 @@ let monitoringMountId = 0;
 let monitoringLifecycleRegistered = false;
 let monitoringControllerInitialized = false;
 let serviceStateUnsubscribe: (() => void) | null = null;
+let layoutChangeUnsubscribe: (() => void) | null = null;
 let renderTimer: ReturnType<typeof setInterval> | null = null;
 let connectionsPollTimer: ReturnType<typeof setInterval> | null = null;
 let connectionsSocketUrl = '';
@@ -101,20 +114,23 @@ function canUseConnectionsSocket(): boolean {
   ) {
     return false;
   }
-  const activeEngine = store.get().activeEngine;
-  if (activeEngine === 'steer' || activeEngine === 'steer-extended') {
-    return false;
-  }
   return canUseDirectClashApi();
 }
 let connectionsUpdatesId = 0;
 let renderSkippedForSelection = false;
 let pendingConnectionsPayload: ClashConnectionsPayload | null = null;
 let pollingConnections = false;
+let pollingConntrackSupplement = false;
+let conntrackSupplementTimer: ReturnType<typeof setInterval> | null = null;
+let latestConntrackConnections: ClashConnection[] = [];
+let latestCoreConnections: ClashConnection[] = [];
 
 let activeTab: MonitoringTabId = 'active';
-let selectedDeviceFilter = ALL_FILTER_VALUE;
-let selectedRouteFilter = ALL_FILTER_VALUE;
+let selectedDataSourceFilter: ConnectionSourceFilter = 'core';
+const selectedDeviceFilters = new Set<string>();
+const selectedRouteFilters = new Set<string>();
+const selectedNetworkFilters = new Set<string>();
+let openDropdownId: 'device' | 'route' | null = null;
 let searchQuery = '';
 let localDeviceChoices: LocalDeviceChoices = {};
 let lastDeviceFilterSignature = '';
@@ -130,6 +146,41 @@ const activeConnections = new Map<string, MonitoredConnection>();
 const closedConnections = new Map<string, MonitoredConnection>();
 const closingConnectionIds = new Set<string>();
 
+function getRouteBadgeModifier(route: string): string {
+  const routeLower = (route || '').toLowerCase();
+  if (
+    routeLower.includes('block') ||
+    routeLower.includes('drop') ||
+    routeLower.includes('reject')
+  ) {
+    return 'tachyon_monitoring-page__route--block';
+  }
+  if (routeLower.includes('dpi') || routeLower.includes('desync')) {
+    return 'tachyon_monitoring-page__route--dpi';
+  }
+  if (
+    routeLower.includes('direct') ||
+    routeLower.includes('wan') ||
+    routeLower.includes('bypass')
+  ) {
+    return 'tachyon_monitoring-page__route--direct';
+  }
+  if (
+    routeLower.includes('proxy') ||
+    routeLower.includes('vpn') ||
+    routeLower.includes('vless') ||
+    routeLower.includes('hysteria') ||
+    routeLower.includes('tuic') ||
+    routeLower.includes('shadowsocks') ||
+    routeLower.includes('trojan') ||
+    routeLower.includes('wireguard') ||
+    routeLower.includes('warp')
+  ) {
+    return 'tachyon_monitoring-page__route--proxy';
+  }
+  return '';
+}
+
 function getLocalDeviceFilterLabel(ip: string): string {
   const allConnections = [
     ...Array.from(activeConnections.values()),
@@ -142,10 +193,25 @@ function getLocalSourceCellParts(connection: MonitoredConnection) {
   return getSourceCellParts(connection, [], localDeviceChoices);
 }
 
+function getCurrentTabConnections(): MonitoredConnection[] {
+  const all = Array.from(
+    (activeTab === 'active' ? activeConnections : closedConnections).values(),
+  );
+  if (selectedDataSourceFilter === 'all') {
+    return all;
+  }
+  return all.filter(
+    (c) =>
+      (c.dataSource || getConnectionDataSource(c)) === selectedDataSourceFilter,
+  );
+}
+
 function getVisibleConnections(): MonitoredConnection[] {
   return filterVisibleConnections({
-    deviceFilter: selectedDeviceFilter,
-    routeFilter: selectedRouteFilter,
+    dataSourceFilter: selectedDataSourceFilter,
+    deviceFilters: selectedDeviceFilters,
+    routeFilters: selectedRouteFilters,
+    networkFilters: selectedNetworkFilters,
     searchQuery,
     tab: activeTab,
     activeConnections: Array.from(activeConnections.values()),
@@ -154,6 +220,25 @@ function getVisibleConnections(): MonitoredConnection[] {
     allFilterValue: ALL_FILTER_VALUE,
     pausedAt: monitoringPausedAt,
   });
+}
+
+function setDataSourceFilter(next: ConnectionSourceFilter) {
+  if (selectedDataSourceFilter === next) {
+    return;
+  }
+  selectedDataSourceFilter = next;
+  if (next === 'conntrack' || next === 'all') {
+    void pollConntrackSupplement();
+  } else {
+    latestConntrackConnections = [];
+    for (const [id, conn] of Array.from(activeConnections.entries())) {
+      if (getConnectionDataSource(conn) === 'conntrack') {
+        activeConnections.delete(id);
+      }
+    }
+  }
+  renderControls();
+  renderConnections();
 }
 
 function moveConnectionToClosed(connection: MonitoredConnection, now: number) {
@@ -184,9 +269,17 @@ function applyConnectionsPayload(payload: ClashConnectionsPayload) {
   const mountId = monitoringMountId;
   const now = Date.now();
   const incomingIds = new Set<string>();
-  const rawConnections = Array.isArray(payload.connections)
+  const baseConnections = Array.isArray(payload.connections)
     ? payload.connections
     : [];
+  latestCoreConnections = baseConnections;
+  const rawConnections =
+    selectedDataSourceFilter !== 'core' && latestConntrackConnections.length > 0
+      ? mergeCoreAndConntrackConnections(
+          baseConnections,
+          latestConntrackConnections,
+        )
+      : baseConnections;
 
   rawConnections.forEach((rawConnection) => {
     const id = normalizeString(rawConnection.id);
@@ -196,10 +289,17 @@ function applyConnectionsPayload(payload: ClashConnectionsPayload) {
 
     incomingIds.add(id);
     closedConnections.delete(id);
+    const prev = activeConnections.get(id);
+    const startedAtMs =
+      prev && prev.start === rawConnection.start && prev.startedAtMs != null
+        ? prev.startedAtMs
+        : parseStartedAt({ start: rawConnection.start, lastSeenAt: now });
     activeConnections.set(id, {
       ...rawConnection,
+      dataSource: getConnectionDataSource(rawConnection),
       id,
       lastSeenAt: now,
+      startedAtMs,
     });
   });
 
@@ -247,89 +347,482 @@ function getKnownSourceIps(): string[] {
     }
   });
 
+  const labelsByIp = new Map<string, string>();
+  ips.forEach((ip) => {
+    labelsByIp.set(ip, getLocalDeviceFilterLabel(ip));
+  });
+
   return Array.from(ips).sort((a, b) => {
-    const byLabel = getLocalDeviceFilterLabel(a).localeCompare(
-      getLocalDeviceFilterLabel(b),
+    const byLabel = (labelsByIp.get(a) || a).localeCompare(
+      labelsByIp.get(b) || b,
     );
     return byLabel || a.localeCompare(b);
   });
 }
 
-function renderRouteFilterOptions() {
-  const select = document.getElementById(
-    'monitoring-route-filter',
-  ) as HTMLSelectElement | null;
-  if (!select) return;
-
+function getAvailableRoutes(): string[] {
   const uniqueRoutes = new Set<string>();
-  Object.values(getRouteDisplayNames()).forEach((name) => {
-    if (name) uniqueRoutes.add(name);
+
+  getRouteSections().forEach(({ displayName }) => {
+    if (displayName) uniqueRoutes.add(displayName);
   });
 
-  const routes = Array.from(uniqueRoutes).sort();
+  activeConnections.forEach((connection) => {
+    const route = getRoute(connection);
+    if (route && route !== '-') uniqueRoutes.add(route);
+  });
 
-  if (
-    selectedRouteFilter !== ALL_FILTER_VALUE &&
-    !routes.includes(selectedRouteFilter)
-  ) {
-    selectedRouteFilter = ALL_FILTER_VALUE;
+  closedConnections.forEach((connection) => {
+    const route = getRoute(connection);
+    if (route && route !== '-') uniqueRoutes.add(route);
+  });
+
+  return Array.from(uniqueRoutes)
+    .filter((name) => !isExcludedRoutingName(name))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function getRouteConnectionCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  getCurrentTabConnections().forEach((connection) => {
+    const route = getRoute(connection);
+    if (route && route !== '-') {
+      counts.set(route, (counts.get(route) || 0) + 1);
+    }
+  });
+  return counts;
+}
+
+function getDeviceConnectionCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  getCurrentTabConnections().forEach((connection) => {
+    const ip = getConnectionSourceIp(connection);
+    if (ip) {
+      counts.set(ip, (counts.get(ip) || 0) + 1);
+    }
+  });
+  return counts;
+}
+
+function getNetworkConnectionCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  getCurrentTabConnections().forEach((connection) => {
+    const net = (getNetwork(connection) || '').toLowerCase();
+    if (net) {
+      counts.set(net, (counts.get(net) || 0) + 1);
+    }
+  });
+  return counts;
+}
+
+function setDropdownOpen(target: 'device' | 'route' | null) {
+  openDropdownId = target;
+
+  const deviceWrap = document.getElementById('monitoring-device-filter-wrap');
+  const deviceTrigger = document.getElementById(
+    'monitoring-device-filter-trigger',
+  );
+  const deviceMenu = document.getElementById('monitoring-device-filter-menu');
+
+  const routeWrap = document.getElementById('monitoring-route-filter-wrap');
+  const routeTrigger = document.getElementById(
+    'monitoring-route-filter-trigger',
+  );
+  const routeMenu = document.getElementById('monitoring-route-filter-menu');
+
+  const isDeviceOpen = target === 'device';
+  const isRouteOpen = target === 'route';
+
+  if (deviceWrap) {
+    deviceWrap.classList.toggle(
+      'tachyon_monitoring-page__multiselect--open',
+      isDeviceOpen,
+    );
+  }
+  if (deviceTrigger) {
+    deviceTrigger.setAttribute('aria-expanded', String(isDeviceOpen));
+  }
+  if (deviceMenu) {
+    deviceMenu.hidden = !isDeviceOpen;
+    if (isDeviceOpen) {
+      deviceMenu.removeAttribute('hidden');
+    } else {
+      deviceMenu.setAttribute('hidden', '');
+    }
   }
 
-  const signature = [selectedRouteFilter, ...routes].join('|');
+  if (routeWrap) {
+    routeWrap.classList.toggle(
+      'tachyon_monitoring-page__multiselect--open',
+      isRouteOpen,
+    );
+  }
+  if (routeTrigger) {
+    routeTrigger.setAttribute('aria-expanded', String(isRouteOpen));
+  }
+  if (routeMenu) {
+    routeMenu.hidden = !isRouteOpen;
+    if (isRouteOpen) {
+      routeMenu.removeAttribute('hidden');
+    } else {
+      routeMenu.setAttribute('hidden', '');
+    }
+  }
+}
+
+function updateFilterCountsInContainer(
+  container: HTMLElement,
+  counts: Map<string, number>,
+) {
+  container
+    .querySelectorAll<HTMLElement>('[data-filter-count]')
+    .forEach((badge) => {
+      const key = badge.getAttribute('data-filter-count') || '';
+      const count = counts.get(key) || 0;
+      const nextText = String(count);
+      if (badge.textContent !== nextText) {
+        badge.textContent = nextText;
+      }
+    });
+}
+
+function renderRouteFilterOptions() {
+  const menu = document.getElementById('monitoring-route-filter-menu');
+  const labelEl = document.getElementById('monitoring-route-filter-label');
+  const trigger = document.getElementById(
+    'monitoring-route-filter-trigger',
+  ) as HTMLButtonElement | null;
+  if (!menu || !labelEl) return;
+
+  const routes = getAvailableRoutes();
+  const routeCounts = getRouteConnectionCounts();
+
+  Array.from(selectedRouteFilters).forEach((selected) => {
+    if (!routes.includes(selected)) {
+      selectedRouteFilters.delete(selected);
+    }
+  });
+
+  if (selectedRouteFilters.size === 0) {
+    labelEl.textContent = _('All Routes');
+  } else if (selectedRouteFilters.size === 1) {
+    labelEl.textContent = Array.from(selectedRouteFilters)[0];
+  } else {
+    labelEl.textContent = `${_('Routes')}: ${selectedRouteFilters.size}`;
+  }
+
+  if (trigger) {
+    trigger.classList.toggle(
+      'tachyon_monitoring-page__multiselect-trigger--active',
+      selectedRouteFilters.size > 0,
+    );
+    trigger.disabled =
+      serviceAvailability === 'stopped' && selectedDataSourceFilter === 'core';
+  }
+
+  const signature = [
+    Array.from(selectedRouteFilters).sort().join(','),
+    ...routes,
+  ].join('|');
 
   if (signature === lastRouteFilterSignature) {
-    select.value = selectedRouteFilter;
+    updateFilterCountsInContainer(menu, routeCounts);
     return;
   }
 
   lastRouteFilterSignature = signature;
 
-  const options = [
-    E('option', { value: ALL_FILTER_VALUE }, _('All Routes')),
-    ...routes.map((name) => E('option', { value: name }, name)),
-  ];
+  const allChecked = selectedRouteFilters.size === 0;
+  const header = E('div', { class: 'tachyon_monitoring-page__menu-header' }, [
+    E('label', { class: 'tachyon_monitoring-page__check-all' }, [
+      E('input', {
+        type: 'checkbox',
+        class: 'tachyon_monitoring-page__checkbox',
+        ...(allChecked ? { checked: true } : {}),
+        change: () => {
+          selectedRouteFilters.clear();
+          lastRouteFilterSignature = '';
+          renderControls();
+          renderConnections();
+        },
+      }),
+      E('span', {}, _('All Routes')),
+    ]),
+    ...(selectedRouteFilters.size > 0
+      ? [
+          E(
+            'button',
+            {
+              type: 'button',
+              class: 'tachyon_monitoring-page__menu-reset',
+              click: (e: MouseEvent) => {
+                e.stopPropagation();
+                selectedRouteFilters.clear();
+                lastRouteFilterSignature = '';
+                renderControls();
+                renderConnections();
+              },
+            },
+            _('Reset'),
+          ),
+        ]
+      : []),
+  ]);
 
-  select.replaceChildren(...options);
-  select.value = selectedRouteFilter;
+  const items =
+    routes.length > 0
+      ? routes.map((routeName) => {
+          const isChecked = selectedRouteFilters.has(routeName);
+          const count = routeCounts.get(routeName) || 0;
+          const badgeModifier = getRouteBadgeModifier(routeName);
+          const badgeClass = ['tachyon_monitoring-page__route', badgeModifier]
+            .filter(Boolean)
+            .join(' ');
+          const countBadge = E(
+            'span',
+            { class: 'tachyon_monitoring-page__check-count' },
+            String(count),
+          );
+          countBadge.setAttribute('data-filter-count', routeName);
+
+          return E(
+            'label',
+            {
+              class: `tachyon_monitoring-page__check-item${
+                isChecked ? ' tachyon_monitoring-page__check-item--checked' : ''
+              }`,
+            },
+            [
+              E('input', {
+                type: 'checkbox',
+                class: 'tachyon_monitoring-page__checkbox',
+                value: routeName,
+                ...(isChecked ? { checked: true } : {}),
+                change: (e: Event) => {
+                  const target = e.target as HTMLInputElement;
+                  if (target.checked) {
+                    selectedRouteFilters.add(routeName);
+                  } else {
+                    selectedRouteFilters.delete(routeName);
+                  }
+                  lastRouteFilterSignature = '';
+                  renderControls();
+                  renderConnections();
+                },
+              }),
+              E(
+                'span',
+                { class: 'tachyon_monitoring-page__check-label' },
+                E('span', { class: badgeClass }, routeName),
+              ),
+              countBadge,
+            ],
+          );
+        })
+      : [
+          E(
+            'div',
+            { class: 'tachyon_monitoring-page__menu-empty' },
+            _('No routes'),
+          ),
+        ];
+
+  menu.replaceChildren(
+    header,
+    E('div', { class: 'tachyon_monitoring-page__menu-list' }, items),
+  );
 }
 
 function renderDeviceFilterOptions() {
-  const select = document.getElementById(
-    'monitoring-device-filter',
-  ) as HTMLSelectElement | null;
+  const menu = document.getElementById('monitoring-device-filter-menu');
+  const labelEl = document.getElementById('monitoring-device-filter-label');
+  const trigger = document.getElementById(
+    'monitoring-device-filter-trigger',
+  ) as HTMLButtonElement | null;
 
-  if (!select) {
+  if (!menu || !labelEl) {
     return;
   }
 
   const sourceIps = getKnownSourceIps();
-  if (
-    selectedDeviceFilter !== ALL_FILTER_VALUE &&
-    !sourceIps.includes(selectedDeviceFilter)
-  ) {
-    selectedDeviceFilter = ALL_FILTER_VALUE;
+  const deviceCounts = getDeviceConnectionCounts();
+
+  Array.from(selectedDeviceFilters).forEach((selected) => {
+    if (!sourceIps.includes(selected)) {
+      selectedDeviceFilters.delete(selected);
+    }
+  });
+
+  if (selectedDeviceFilters.size === 0) {
+    labelEl.textContent = _('All sources');
+  } else if (selectedDeviceFilters.size === 1) {
+    const onlyIp = Array.from(selectedDeviceFilters)[0];
+    labelEl.textContent = getLocalDeviceFilterLabel(onlyIp);
+  } else {
+    labelEl.textContent = `${_('Source')}: ${selectedDeviceFilters.size}`;
+  }
+
+  if (trigger) {
+    trigger.classList.toggle(
+      'tachyon_monitoring-page__multiselect-trigger--active',
+      selectedDeviceFilters.size > 0,
+    );
+    trigger.disabled =
+      serviceAvailability === 'stopped' && selectedDataSourceFilter === 'core';
   }
 
   const signature = [
-    selectedDeviceFilter,
+    Array.from(selectedDeviceFilters).sort().join(','),
     ...sourceIps.map((ip) => `${ip}:${getLocalDeviceFilterLabel(ip)}`),
   ].join('|');
+
   if (signature === lastDeviceFilterSignature) {
-    select.value = selectedDeviceFilter;
+    updateFilterCountsInContainer(menu, deviceCounts);
     return;
   }
 
   lastDeviceFilterSignature = signature;
 
-  const options = [
-    E('option', { value: ALL_FILTER_VALUE }, _('All')),
-    ...sourceIps.map((ip) =>
-      E('option', { value: ip }, getLocalDeviceFilterLabel(ip)),
-    ),
-  ];
+  const allChecked = selectedDeviceFilters.size === 0;
+  const header = E('div', { class: 'tachyon_monitoring-page__menu-header' }, [
+    E('label', { class: 'tachyon_monitoring-page__check-all' }, [
+      E('input', {
+        type: 'checkbox',
+        class: 'tachyon_monitoring-page__checkbox',
+        ...(allChecked ? { checked: true } : {}),
+        change: () => {
+          selectedDeviceFilters.clear();
+          lastDeviceFilterSignature = '';
+          renderControls();
+          renderConnections();
+        },
+      }),
+      E('span', {}, _('All sources')),
+    ]),
+    ...(selectedDeviceFilters.size > 0
+      ? [
+          E(
+            'button',
+            {
+              type: 'button',
+              class: 'tachyon_monitoring-page__menu-reset',
+              click: (e: MouseEvent) => {
+                e.stopPropagation();
+                selectedDeviceFilters.clear();
+                lastDeviceFilterSignature = '';
+                renderControls();
+                renderConnections();
+              },
+            },
+            _('Reset'),
+          ),
+        ]
+      : []),
+  ]);
 
-  select.replaceChildren(...options);
-  select.value = selectedDeviceFilter;
+  const items =
+    sourceIps.length > 0
+      ? sourceIps.map((ip) => {
+          const isChecked = selectedDeviceFilters.has(ip);
+          const count = deviceCounts.get(ip) || 0;
+          const label = getLocalDeviceFilterLabel(ip);
+          const countBadge = E(
+            'span',
+            { class: 'tachyon_monitoring-page__check-count' },
+            String(count),
+          );
+          countBadge.setAttribute('data-filter-count', ip);
+
+          return E(
+            'label',
+            {
+              class: `tachyon_monitoring-page__check-item${
+                isChecked ? ' tachyon_monitoring-page__check-item--checked' : ''
+              }`,
+            },
+            [
+              E('input', {
+                type: 'checkbox',
+                class: 'tachyon_monitoring-page__checkbox',
+                value: ip,
+                ...(isChecked ? { checked: true } : {}),
+                change: (e: Event) => {
+                  const target = e.target as HTMLInputElement;
+                  if (target.checked) {
+                    selectedDeviceFilters.add(ip);
+                  } else {
+                    selectedDeviceFilters.delete(ip);
+                  }
+                  lastDeviceFilterSignature = '';
+                  renderControls();
+                  renderConnections();
+                },
+              }),
+              E(
+                'span',
+                {
+                  class: 'tachyon_monitoring-page__check-label',
+                  title: label,
+                },
+                label,
+              ),
+              countBadge,
+            ],
+          );
+        })
+      : [
+          E(
+            'div',
+            { class: 'tachyon_monitoring-page__menu-empty' },
+            _('No active connections'),
+          ),
+        ];
+
+  menu.replaceChildren(
+    header,
+    E('div', { class: 'tachyon_monitoring-page__menu-list' }, items),
+  );
+}
+
+function renderNetworkFilterControls() {
+  const group = document.getElementById('monitoring-network-filters');
+  if (!group) return;
+
+  const netCounts = getNetworkConnectionCounts();
+  const isStopped =
+    serviceAvailability === 'stopped' && selectedDataSourceFilter === 'core';
+
+  group
+    .querySelectorAll<HTMLLabelElement>('.tachyon_monitoring-page__proto-chip')
+    .forEach((chip) => {
+      const input = chip.querySelector<HTMLInputElement>(
+        'input[type="checkbox"]',
+      );
+      const proto = (input?.value || '').toLowerCase();
+      const isChecked = selectedNetworkFilters.has(proto);
+      chip.classList.toggle(
+        'tachyon_monitoring-page__proto-chip--checked',
+        isChecked,
+      );
+      if (input) {
+        input.checked = isChecked;
+        input.disabled = isStopped;
+      }
+      const count = netCounts.get(proto) || 0;
+      let countEl = chip.querySelector<HTMLElement>(
+        '.tachyon_monitoring-page__proto-count',
+      );
+      if (!countEl) {
+        countEl = E(
+          'span',
+          { class: 'tachyon_monitoring-page__proto-count' },
+          String(count),
+        );
+        chip.appendChild(countEl);
+      } else if (countEl.textContent !== String(count)) {
+        countEl.textContent = String(count);
+      }
+    });
 }
 
 function setButtonActive(button: HTMLElement | null, active: boolean) {
@@ -347,6 +840,50 @@ function renderTabButtonContent(label: string, count: number) {
   ];
 }
 
+function renderDataSourceFilterControls() {
+  const allBtn = document.getElementById(
+    'monitoring-datasource-all',
+  ) as HTMLButtonElement | null;
+  const coreBtn = document.getElementById(
+    'monitoring-datasource-core',
+  ) as HTMLButtonElement | null;
+  const ctBtn = document.getElementById(
+    'monitoring-datasource-conntrack',
+  ) as HTMLButtonElement | null;
+
+  const allTabList = Array.from(
+    (activeTab === 'active' ? activeConnections : closedConnections).values(),
+  );
+  let coreCount = 0;
+  let ctCount = 0;
+  allTabList.forEach((c) => {
+    if (getConnectionDataSource(c) === 'conntrack') {
+      ctCount++;
+    } else {
+      coreCount++;
+    }
+  });
+
+  if (allBtn) {
+    allBtn.replaceChildren(
+      ...renderTabButtonContent(_('All'), allTabList.length),
+    );
+    setButtonActive(allBtn, selectedDataSourceFilter === 'all');
+  }
+  if (coreBtn) {
+    coreBtn.replaceChildren(
+      ...renderTabButtonContent(_('Tachyon Core'), coreCount),
+    );
+    setButtonActive(coreBtn, selectedDataSourceFilter === 'core');
+  }
+  if (ctBtn) {
+    ctBtn.replaceChildren(
+      ...renderTabButtonContent(_('Router Conntrack'), ctCount),
+    );
+    setButtonActive(ctBtn, selectedDataSourceFilter === 'conntrack');
+  }
+}
+
 function renderControls() {
   const activeButton = document.getElementById(
     'monitoring-tab-active',
@@ -360,29 +897,35 @@ function renderControls() {
   const pauseToggleButton = document.getElementById(
     'monitoring-pause-toggle',
   ) as HTMLButtonElement | null;
+  const isCoreOnlyStopped =
+    serviceAvailability === 'stopped' && selectedDataSourceFilter === 'core';
 
   if (activeButton) {
     activeButton.replaceChildren(
       ...renderTabButtonContent(_('Active'), activeConnections.size),
     );
-    activeButton.disabled = serviceAvailability === 'stopped';
+    activeButton.disabled = isCoreOnlyStopped;
   }
 
   if (closedButton) {
     closedButton.replaceChildren(
       ...renderTabButtonContent(_('Closed'), closedConnections.size),
     );
-    closedButton.disabled = serviceAvailability === 'stopped';
+    closedButton.disabled = isCoreOnlyStopped;
   }
 
   setButtonActive(activeButton, activeTab === 'active');
   setButtonActive(closedButton, activeTab === 'closed');
 
+  const hasActiveCoreConnections = Array.from(activeConnections.values()).some(
+    (c) => getConnectionDataSource(c) === 'core',
+  );
+
   if (closeAllButton) {
     closeAllButton.replaceChildren(renderXIcon24());
     closeAllButton.disabled =
       serviceAvailability === 'stopped' ||
-      activeConnections.size === 0 ||
+      !hasActiveCoreConnections ||
       closingAll;
   }
 
@@ -393,7 +936,7 @@ function renderControls() {
     );
     pauseToggleButton.title = title;
     pauseToggleButton.setAttribute('aria-label', title);
-    pauseToggleButton.disabled = serviceAvailability === 'stopped';
+    pauseToggleButton.disabled = isCoreOnlyStopped;
     pauseToggleButton.classList.toggle(
       'tachyon_monitoring-page__icon-button--active',
       monitoringPaused,
@@ -407,45 +950,45 @@ function renderControls() {
     searchIcon.replaceChildren(renderSearchIcon24());
   }
 
+  renderDataSourceFilterControls();
   renderDeviceFilterOptions();
   renderRouteFilterOptions();
+  renderNetworkFilterControls();
 
-  const select = document.getElementById(
-    'monitoring-device-filter',
-  ) as HTMLSelectElement | null;
   const searchInput = document.getElementById(
     'monitoring-search',
   ) as HTMLInputElement | null;
 
-  if (select) {
-    select.disabled = serviceAvailability === 'stopped';
-  }
-
   if (searchInput) {
-    searchInput.disabled = serviceAvailability === 'stopped';
+    searchInput.disabled = isCoreOnlyStopped;
   }
 }
 
-function renderValue(value: string, className = '') {
+function renderValue(value: string, className = '', customTitle?: string) {
   const text = value || '-';
+  const tooltipText = customTitle || text;
   const element = E(
     'span',
     {
       class: ['tachyon_monitoring-page__value', className]
         .filter(Boolean)
         .join(' '),
-      title: text,
+      title: tooltipText,
     },
     text,
   );
 
   element.setAttribute('data-copy-value', text);
+  if (customTitle && customTitle !== text) {
+    element.setAttribute('data-rule-tooltip', customTitle);
+  }
 
   return element;
 }
 
 function renderSourceValue(source: ReturnType<typeof getSourceCellParts>) {
   const fullText = source.copyValue || source.primary || '-';
+  const title = [fullText, source.inbound].filter(Boolean).join('\n');
 
   if (!source.ip) {
     const element = E(
@@ -453,7 +996,7 @@ function renderSourceValue(source: ReturnType<typeof getSourceCellParts>) {
       {
         class:
           'tachyon_monitoring-page__value tachyon_monitoring-page__source-value tachyon_monitoring-page__source-value--ip-only',
-        title: fullText,
+        title,
       },
       source.primary || '-',
     );
@@ -468,7 +1011,7 @@ function renderSourceValue(source: ReturnType<typeof getSourceCellParts>) {
     {
       class:
         'tachyon_monitoring-page__value tachyon_monitoring-page__source-value',
-      title: fullText,
+      title,
     },
     [
       E(
@@ -495,8 +1038,9 @@ function renderConnectionRow(connection: MonitoredConnection) {
   const target = getTargetCellParts(connection);
   const source = getLocalSourceCellParts(connection);
   const isClosing = closingConnectionIds.has(connection.id);
+  const isConntrack = getConnectionDataSource(connection) === 'conntrack';
   const closeButton =
-    activeTab === 'active'
+    activeTab === 'active' && !isConntrack
       ? E(
           'button',
           {
@@ -511,6 +1055,33 @@ function renderConnectionRow(connection: MonitoredConnection) {
         )
       : E('span', {}, '-');
 
+  const network = getNetwork(connection);
+  const networkLower = (network || '').toLowerCase();
+  const networkClass =
+    networkLower === 'tcp'
+      ? 'tachyon_monitoring-page__network tachyon_monitoring-page__network--tcp'
+      : networkLower === 'quic'
+        ? 'tachyon_monitoring-page__network tachyon_monitoring-page__network--quic'
+        : networkLower === 'udp'
+          ? 'tachyon_monitoring-page__network tachyon_monitoring-page__network--udp'
+          : 'tachyon_monitoring-page__network';
+
+  const route = getRoute(connection);
+  const routeModifier = getRouteBadgeModifier(route);
+  const routeClass = ['tachyon_monitoring-page__route', routeModifier]
+    .filter(Boolean)
+    .join(' ');
+  const routeTooltip = getRouteTooltip(connection, route);
+
+  const networkBadge = renderValue(network, networkClass);
+  if (networkLower) {
+    networkBadge.setAttribute('data-filter-network', networkLower);
+  }
+  const routeBadge = renderValue(route, routeClass, routeTooltip);
+  if (route && route !== '-' && !isExcludedRoutingName(route)) {
+    routeBadge.setAttribute('data-filter-route', route);
+  }
+
   const row = E(
     'tr',
     {
@@ -518,12 +1089,8 @@ function renderConnectionRow(connection: MonitoredConnection) {
     },
     [
       renderTableCell(_('Host'), [renderValue(target.primary)]),
-      renderTableCell(_('Type'), [
-        renderValue(getNetwork(connection), 'tachyon_monitoring-page__network'),
-      ]),
-      renderTableCell(_('Route'), [
-        renderValue(getRoute(connection), 'tachyon_monitoring-page__route'),
-      ]),
+      renderTableCell(_('Type'), [networkBadge]),
+      renderTableCell(_('Route'), [routeBadge]),
       renderTableCell(_('Time'), [
         renderValue(formatConnectionDuration(connection)),
       ]),
@@ -629,7 +1196,10 @@ function renderConnections(options: { force?: boolean } = {}) {
   renderSkippedForSelection = false;
   const previousScrollLeft = container.scrollLeft;
 
-  if (serviceAvailability === 'stopped') {
+  if (
+    serviceAvailability === 'stopped' &&
+    selectedDataSourceFilter === 'core'
+  ) {
     container.replaceChildren(
       renderConnectionsTable([], {
         text: _(
@@ -689,8 +1259,10 @@ function getConnectionRowSignature(connection: MonitoredConnection): string {
     target.primary,
     getNetwork(connection),
     getRoute(connection),
+    formatMatchedRuleSummary(connection),
     source.primary,
     source.ip,
+    source.inbound,
     closingConnectionIds.has(connection.id) ? 'closing' : 'open',
   ].join('|');
 }
@@ -720,30 +1292,41 @@ function patchConnectionRows(visibleConnections: MonitoredConnection[]) {
     }
   }
 
-  const seenIds = new Set<string>();
-  for (const connection of visibleConnections) {
-    seenIds.add(connection.id);
+  const visibleIds = new Set<string>(visibleConnections.map((c) => c.id));
+  for (const [id, row] of existingRows) {
+    if (!visibleIds.has(id)) {
+      row.remove();
+      existingRows.delete(id);
+    }
+  }
+
+  for (let i = 0; i < visibleConnections.length; i++) {
+    const connection = visibleConnections[i];
     const signature = getConnectionRowSignature(connection);
     const existing = existingRows.get(connection.id);
 
     if (!existing) {
-      tbody.appendChild(renderConnectionRow(connection));
+      const newRow = renderConnectionRow(connection);
+      const refNode = tbody.children[i] || null;
+      tbody.insertBefore(newRow, refNode);
       continue;
     }
 
     if (existing.getAttribute('data-row-signature') !== signature) {
-      tbody.replaceChild(renderConnectionRow(connection), existing);
+      const replacement = renderConnectionRow(connection);
+      tbody.replaceChild(replacement, existing);
+      if (tbody.children[i] !== replacement) {
+        tbody.insertBefore(replacement, tbody.children[i] || null);
+      }
       continue;
     }
 
     // Patch volatile cells in place: Time, Downloaded, Uploaded.
-    patchVolatileCells(existing, connection);
-    tbody.appendChild(existing);
-  }
-
-  for (const [id, row] of existingRows) {
-    if (!seenIds.has(id)) {
-      row.remove();
+    if (activeTab === 'active') {
+      patchVolatileCells(existing, connection);
+    }
+    if (tbody.children[i] !== existing) {
+      tbody.insertBefore(existing, tbody.children[i] || null);
     }
   }
 }
@@ -764,37 +1347,26 @@ function patchVolatileCells(
     return;
   }
 
-  const volatileByIndex: Array<[number, () => HTMLElement]> = [
-    [
-      3,
-      () =>
-        renderTableCell(_('Time'), [
-          renderValue(formatConnectionDuration(connection)),
-        ]),
-    ],
-    [
-      4,
-      () =>
-        renderTableCell(_('Downloaded'), [
-          renderValue(formatBytes(connection.download)),
-        ]),
-    ],
-    [
-      5,
-      () =>
-        renderTableCell(_('Uploaded'), [
-          renderValue(formatBytes(connection.upload)),
-        ]),
-    ],
+  const volatileValues: Array<[number, string, string]> = [
+    [3, _('Time'), formatConnectionDuration(connection)],
+    [4, _('Downloaded'), formatBytes(connection.download)],
+    [5, _('Uploaded'), formatBytes(connection.upload)],
   ];
 
-  for (const [index, makeCell] of volatileByIndex) {
+  for (const [index, label, rawValue] of volatileValues) {
     const current = cells[index];
-    const next = makeCell();
-    if (current) {
-      row.replaceChild(next, current);
+    const text = rawValue || '-';
+    const span = current?.firstElementChild as HTMLElement | null;
+    if (span && span.classList.contains('tachyon_monitoring-page__value')) {
+      if (span.textContent !== text) {
+        span.textContent = text;
+        span.title = text;
+        span.setAttribute('data-copy-value', text);
+      }
+    } else if (current) {
+      row.replaceChild(renderTableCell(label, [renderValue(text)]), current);
     } else {
-      row.appendChild(next);
+      row.appendChild(renderTableCell(label, [renderValue(text)]));
     }
   }
 }
@@ -887,10 +1459,12 @@ async function closeAllConnections() {
     }
 
     const now = Date.now();
-    activeConnections.forEach((connection) => {
-      moveConnectionToClosed(connection, now);
+    Array.from(activeConnections.entries()).forEach(([id, connection]) => {
+      if (getConnectionDataSource(connection) === 'core') {
+        activeConnections.delete(id);
+        moveConnectionToClosed(connection, now);
+      }
     });
-    activeConnections.clear();
     pendingConnectionsPayload = null;
     trimClosedConnections();
   } catch (error) {
@@ -903,15 +1477,53 @@ async function closeAllConnections() {
   }
 }
 
+function handleDocumentPointerDown(event: MouseEvent) {
+  if (!openDropdownId) return;
+  const target = event.target as Node | null;
+  const deviceWrap = document.getElementById('monitoring-device-filter-wrap');
+  const routeWrap = document.getElementById('monitoring-route-filter-wrap');
+
+  if (
+    openDropdownId === 'device' &&
+    deviceWrap &&
+    target &&
+    deviceWrap.contains(target)
+  ) {
+    return;
+  }
+  if (
+    openDropdownId === 'route' &&
+    routeWrap &&
+    target &&
+    routeWrap.contains(target)
+  ) {
+    return;
+  }
+
+  setDropdownOpen(null);
+}
+
+function handleDocumentKeyDown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && openDropdownId) {
+    setDropdownOpen(null);
+  }
+}
+
 function bindControls() {
   const activeButton = document.getElementById('monitoring-tab-active');
   const closedButton = document.getElementById('monitoring-tab-closed');
-  const select = document.getElementById(
-    'monitoring-device-filter',
-  ) as HTMLSelectElement | null;
-  const routeSelect = document.getElementById(
-    'monitoring-route-filter',
-  ) as HTMLSelectElement | null;
+  const dsAllButton = document.getElementById('monitoring-datasource-all');
+  const dsCoreButton = document.getElementById('monitoring-datasource-core');
+  const dsConntrackButton = document.getElementById(
+    'monitoring-datasource-conntrack',
+  );
+  const deviceTrigger = document.getElementById(
+    'monitoring-device-filter-trigger',
+  );
+  const routeTrigger = document.getElementById(
+    'monitoring-route-filter-trigger',
+  );
+  const networkGroup = document.getElementById('monitoring-network-filters');
   const searchInput = document.getElementById(
     'monitoring-search',
   ) as HTMLInputElement | null;
@@ -929,6 +1541,16 @@ function bindControls() {
     closedButton.onclick = () => setTab('closed');
   }
 
+  if (dsAllButton) {
+    dsAllButton.onclick = () => setDataSourceFilter('all');
+  }
+  if (dsCoreButton) {
+    dsCoreButton.onclick = () => setDataSourceFilter('core');
+  }
+  if (dsConntrackButton) {
+    dsConntrackButton.onclick = () => setDataSourceFilter('conntrack');
+  }
+
   if (closeAllButton) {
     closeAllButton.onclick = () => {
       void closeAllConnections();
@@ -942,16 +1564,32 @@ function bindControls() {
     };
   }
 
-  if (select) {
-    select.onchange = () => {
-      selectedDeviceFilter = select.value || ALL_FILTER_VALUE;
-      renderConnections();
+  if (deviceTrigger) {
+    deviceTrigger.onclick = (event) => {
+      event.stopPropagation();
+      setDropdownOpen(openDropdownId === 'device' ? null : 'device');
     };
   }
 
-  if (routeSelect) {
-    routeSelect.onchange = () => {
-      selectedRouteFilter = routeSelect.value || ALL_FILTER_VALUE;
+  if (routeTrigger) {
+    routeTrigger.onclick = (event) => {
+      event.stopPropagation();
+      setDropdownOpen(openDropdownId === 'route' ? null : 'route');
+    };
+  }
+
+  if (networkGroup) {
+    networkGroup.onchange = (event) => {
+      const target = event.target as HTMLInputElement | null;
+      if (!target || target.type !== 'checkbox') return;
+      const proto = (target.value || '').toLowerCase();
+      if (!proto) return;
+      if (target.checked) {
+        selectedNetworkFilters.add(proto);
+      } else {
+        selectedNetworkFilters.delete(proto);
+      }
+      renderControls();
       renderConnections();
     };
   }
@@ -959,6 +1597,7 @@ function bindControls() {
   if (searchInput) {
     searchInput.oninput = () => {
       searchQuery = searchInput.value;
+      renderControls();
       renderConnections();
     };
   }
@@ -972,6 +1611,43 @@ function bindControls() {
 
       if (button?.value) {
         void closeConnection(button.value);
+        return;
+      }
+
+      if (isTextSelectionInsideMonitoring()) {
+        return;
+      }
+
+      const routeBadge = target?.closest<HTMLElement>('[data-filter-route]');
+      if (routeBadge) {
+        const routeValue = routeBadge.getAttribute('data-filter-route') || '';
+        if (routeValue && !isExcludedRoutingName(routeValue)) {
+          if (selectedRouteFilters.has(routeValue)) {
+            selectedRouteFilters.delete(routeValue);
+          } else {
+            selectedRouteFilters.add(routeValue);
+          }
+          lastRouteFilterSignature = '';
+          renderControls();
+          renderConnections();
+          return;
+        }
+      }
+
+      const netBadge = target?.closest<HTMLElement>('[data-filter-network]');
+      if (netBadge) {
+        const netValue = (
+          netBadge.getAttribute('data-filter-network') || ''
+        ).toLowerCase();
+        if (netValue) {
+          if (selectedNetworkFilters.has(netValue)) {
+            selectedNetworkFilters.delete(netValue);
+          } else {
+            selectedNetworkFilters.add(netValue);
+          }
+          renderControls();
+          renderConnections();
+        }
       }
     };
   }
@@ -1001,12 +1677,56 @@ async function loadRouteDisplayNames() {
   }
 }
 
+async function pollConntrackSupplement() {
+  if (
+    pollingConntrackSupplement ||
+    !monitoringMounted ||
+    monitoringPaused ||
+    serviceAvailability !== 'running' ||
+    selectedDataSourceFilter === 'core'
+  ) {
+    return;
+  }
+  pollingConntrackSupplement = true;
+  try {
+    const res = await TachyonShellMethods.getConntrackConnections();
+    if (res.success) {
+      const normalized = normalizeConnectionsPayload(res.data);
+      latestConntrackConnections = Array.isArray(normalized.connections)
+        ? normalized.connections
+        : [];
+      if (
+        monitoringMounted &&
+        !monitoringPaused &&
+        serviceAvailability === 'running' &&
+        connectionsSocketUrl
+      ) {
+        applyConnectionsPayload({ connections: latestCoreConnections });
+      }
+    }
+  } catch (_err) {
+    // Ignore supplement polling errors
+  } finally {
+    pollingConntrackSupplement = false;
+  }
+}
+
+function startConntrackSupplementPolling() {
+  if (conntrackSupplementTimer) {
+    return;
+  }
+  void pollConntrackSupplement();
+  conntrackSupplementTimer = setInterval(() => {
+    void pollConntrackSupplement();
+  }, CONNECTIONS_RPC_POLL_INTERVAL_MS);
+}
+
 async function pollConnectionsSnapshot() {
   if (
     pollingConnections ||
     !monitoringMounted ||
     monitoringPaused ||
-    serviceAvailability !== 'running'
+    (serviceAvailability !== 'running' && serviceAvailability !== 'stopped')
   ) {
     return;
   }
@@ -1015,35 +1735,39 @@ async function pollConnectionsSnapshot() {
   pollingConnections = true;
 
   try {
-    const response = await TachyonShellMethods.getClashApiConnections();
+    const response =
+      serviceAvailability === 'stopped'
+        ? await TachyonShellMethods.getConntrackConnections()
+        : await TachyonShellMethods.getClashApiConnections();
 
     if (
       !monitoringMounted ||
       mountId !== monitoringMountId ||
-      serviceAvailability !== 'running'
+      (serviceAvailability !== 'running' && serviceAvailability !== 'stopped')
     ) {
       return;
     }
 
     if (!response.success) {
-      failed = true;
+      failed = serviceAvailability === 'running';
       loading = false;
       renderConnections();
       return;
     }
 
+    latestConntrackConnections = [];
     applyConnectionsPayload(normalizeConnectionsPayload(response.data));
   } catch (error) {
     if (
       !monitoringMounted ||
       mountId !== monitoringMountId ||
-      serviceAvailability !== 'running'
+      (serviceAvailability !== 'running' && serviceAvailability !== 'stopped')
     ) {
       return;
     }
 
     logger.error('[MONITORING]', 'connections polling failed', error);
-    failed = true;
+    failed = serviceAvailability === 'running';
     loading = false;
     renderConnections();
   } finally {
@@ -1064,7 +1788,10 @@ function startConnectionsPolling() {
 
 async function connectToConnectionsSocket(updatesId: number) {
   const mountId = monitoringMountId;
-  const clashApiSecret = await getClashApiSecret();
+  const [clashApiSecret, directExposed] = await Promise.all([
+    getClashApiSecret(),
+    isDirectClashApiExposed(),
+  ]);
 
   if (
     !monitoringMounted ||
@@ -1075,8 +1802,17 @@ async function connectToConnectionsSocket(updatesId: number) {
     return;
   }
 
+  if (!directExposed) {
+    startConnectionsPolling();
+    return;
+  }
+
   unsubscribeConnectionsSocket();
-  connectionsSocketUrl = `${getClashWsUrl()}/connections?token=${clashApiSecret}`;
+  connectionsSocketUrl = `${getClashWsUrl()}/connections?token=${encodeURIComponent(clashApiSecret)}`;
+  if (loading) {
+    void pollConnectionsSnapshot();
+  }
+  startConntrackSupplementPolling();
 
   trackConnectionsSocketSubscription(
     connectionsSocketUrl,
@@ -1118,12 +1854,22 @@ async function connectToConnectionsSocket(updatesId: number) {
         connectionsSocketUrl = '';
       }
 
+      if (conntrackSupplementTimer) {
+        clearInterval(conntrackSupplementTimer);
+        conntrackSupplementTimer = null;
+      }
+
       startConnectionsPolling();
     },
   );
 }
 
 function startConnectionsUpdates() {
+  if (serviceAvailability === 'stopped') {
+    startConnectionsPolling();
+    return;
+  }
+
   if (serviceAvailability !== 'running') {
     return;
   }
@@ -1143,6 +1889,11 @@ function stopConnectionsUpdates() {
   if (connectionsPollTimer) {
     clearInterval(connectionsPollTimer);
     connectionsPollTimer = null;
+  }
+
+  if (conntrackSupplementTimer) {
+    clearInterval(conntrackSupplementTimer);
+    conntrackSupplementTimer = null;
   }
 
   if (connectionsSocketUrl) {
@@ -1169,9 +1920,8 @@ function setServiceAvailability(next: ServiceAvailability) {
     if (next === 'stopped') {
       loading = false;
       failed = false;
-      activeConnections.clear();
-      closedConnections.clear();
       closingConnectionIds.clear();
+      startConnectionsUpdates();
     } else if (next === 'unavailable') {
       loading = false;
       failed = true;
@@ -1193,7 +1943,10 @@ function watchServiceState() {
       getServiceAvailability({
         loading: false,
         failed: false,
-        running: uiState.service.tachyon.running,
+        running: Boolean(
+          uiState.service.tachyon.running ||
+            uiState.service.tachyon_core?.running,
+        ),
       }),
     );
   });
@@ -1201,8 +1954,12 @@ function watchServiceState() {
 
 function resetMonitoringState() {
   activeTab = 'active';
-  selectedDeviceFilter = ALL_FILTER_VALUE;
-  selectedRouteFilter = ALL_FILTER_VALUE;
+  selectedDataSourceFilter = 'core';
+  latestConntrackConnections = [];
+  selectedDeviceFilters.clear();
+  selectedRouteFilters.clear();
+  selectedNetworkFilters.clear();
+  setDropdownOpen(null);
   searchQuery = '';
   lastDeviceFilterSignature = '';
   lastRouteFilterSignature = '';
@@ -1241,6 +1998,11 @@ async function onPageMount() {
   void loadLocalDevices();
   void loadRouteDisplayNames();
 
+  layoutChangeUnsubscribe?.();
+  layoutChangeUnsubscribe = subscribeDashboardLayoutChanges(() => {
+    void loadRouteDisplayNames();
+  });
+
   if (getCachedRuntimeUiState()) {
     void refreshRuntimeUiState({ force: true });
   } else {
@@ -1257,6 +2019,8 @@ async function onPageMount() {
 
   document.addEventListener('selectionchange', flushRenderAfterSelection);
   document.addEventListener('copy', handleMonitoringValueCopy);
+  document.addEventListener('mousedown', handleDocumentPointerDown);
+  document.addEventListener('keydown', handleDocumentKeyDown);
 
   renderTimer = setInterval(() => {
     if (monitoringPaused) {
@@ -1282,7 +2046,7 @@ function pauseMonitoringUpdates() {
 function resumeMonitoringUpdates() {
   if (!monitoringMounted || !monitoringVisibilityPaused) return;
   monitoringVisibilityPaused = false;
-  if (serviceAvailability === 'running') {
+  if (serviceAvailability === 'running' || serviceAvailability === 'stopped') {
     startConnectionsUpdates();
   }
   if (!renderTimer) {
@@ -1312,6 +2076,7 @@ function onPageUnmount() {
   monitoringMounted = false;
   monitoringMountId += 1;
   monitoringVisibilityPaused = false;
+  setDropdownOpen(null);
 
   if (renderTimer) {
     clearInterval(renderTimer);
@@ -1321,9 +2086,13 @@ function onPageUnmount() {
   stopConnectionsUpdates();
   serviceStateUnsubscribe?.();
   serviceStateUnsubscribe = null;
+  layoutChangeUnsubscribe?.();
+  layoutChangeUnsubscribe = null;
 
   document.removeEventListener('selectionchange', flushRenderAfterSelection);
   document.removeEventListener('copy', handleMonitoringValueCopy);
+  document.removeEventListener('mousedown', handleDocumentPointerDown);
+  document.removeEventListener('keydown', handleDocumentKeyDown);
 }
 
 function registerLifecycleListeners() {
@@ -1370,7 +2139,10 @@ export async function initController(
   onMount('monitoring-status').then(() => {
     registerLifecycleListeners();
 
-    if (store.get().tabService.current === 'monitoring') {
+    if (
+      store.get().tabService.current === 'monitoring' ||
+      isActiveLuciTab('monitoring')
+    ) {
       onPageMount();
     }
   });

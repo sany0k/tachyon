@@ -2,20 +2,37 @@
 
 let fs = require("fs");
 let common = require("core.common");
+let uci_core = require("core.uci");
 let subscription_share_link = require("subscription.share_link");
 let subscription_wireguard = require("subscription.wireguard");
 
 let as_string = common.as_string;
-let read_json_file = common.read_json_file;
+let _raw_read_json_file = common.read_json_file;
 let array_or_empty = common.array_or_empty;
 let object_or_empty = common.object_or_empty;
 let object_key_count = common.object_key_count;
 
+let _json_file_cache = {};
+
+function read_json_file(path) {
+    let p = as_string(path);
+    let st = fs.stat(p);
+    if (st == null)
+        return null;
+    let stamp = p + "|" + as_string(st.size || 0) + "|" + as_string(st.mtime || 0);
+    if (exists(_json_file_cache, stamp))
+        return _json_file_cache[stamp];
+    let val = _raw_read_json_file(p);
+    _json_file_cache[stamp] = val;
+    return val;
+}
+
 const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || "/tmp/tachyon-core/subscriptions";
 const TACHYON_RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
+const TACHYON_SUBSCRIPTION_UPDATE_STATE_DIR = getenv("TACHYON_SUBSCRIPTION_UPDATE_STATE_DIR") || TACHYON_RUNTIME_STATE_DIR + "/subscription-update";
 const TACHYON_SECTION_CACHE_DIR = getenv("TACHYON_SECTION_CACHE_DIR") || TACHYON_RUNTIME_STATE_DIR + "/section-cache";
 const TACHYON_SUBSCRIPTION_METADATA_DIR = getenv("TACHYON_SUBSCRIPTION_METADATA_DIR") || TACHYON_RUNTIME_STATE_DIR + "/subscription-metadata";
-const TACHYON_RUNTIME_CACHE_FORMAT = int(getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "8");
+const TACHYON_RUNTIME_CACHE_FORMAT = int(getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "9");
 const TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR") || "/etc/tachyon/subscription-cache";
 
 let section_cache_dir = TACHYON_SECTION_CACHE_DIR;
@@ -72,12 +89,20 @@ function valid_metadata_object(value) {
 function metadata_items_from_value(value) {
     let result = [];
     if (type(value) == "array") {
-        for (let item in value)
-            if (valid_metadata_object(item))
-                push(result, item);
+        for (let item in value) {
+            if (valid_metadata_object(item)) {
+                let copy = {};
+                for (let k, v in item)
+                    copy[k] = v;
+                push(result, copy);
+            }
+        }
     }
     else if (valid_metadata_object(value)) {
-        push(result, value);
+        let copy = {};
+        for (let k, v in value)
+            copy[k] = v;
+        push(result, copy);
     }
     return result;
 }
@@ -129,11 +154,11 @@ function persistent_source_matches_entry(source_section, source_entry) {
     let cached_url = file_first_line(persistent_source_path(source_section, ".url"));
     let cached_user_agent = file_first_line(persistent_source_path(source_section, ".user_agent"));
 
-    if (cached_url != parsed.url)
+    if (cached_url == "" || cached_url != parsed.url)
         return false;
-    if (parsed.user_agent != "" && cached_user_agent != parsed.user_agent)
+    if (parsed.user_agent != "" && cached_user_agent != "" && cached_user_agent != parsed.user_agent)
         return false;
-    return cached_user_agent != "";
+    return true;
 }
 
 function read_persistent_source_metadata(source_section, source_entry) {
@@ -168,25 +193,115 @@ function read_section_metadata(section_name, source_section, source_index) {
     return selected;
 }
 
-function read_source_metadata(section_name, source_section, source_index, source_entry) {
-    let metadata = read_section_metadata(section_name, source_section, source_index);
-    if (length(metadata) == 0)
-        metadata = read_persistent_source_metadata(source_section, source_entry);
+function source_json_path(source_section) {
+    return TMP_SUBSCRIPTION_FOLDER + "/" + source_section + ".json";
+}
+
+function read_source_metadata(section_name, source_section, source_index, source_entry, fallback_title) {
+    let sec_metadata = read_section_metadata(section_name, source_section, source_index);
+    let rt_metadata = metadata_items_from_value(read_json_file(TMP_SUBSCRIPTION_FOLDER + "/" + source_section + ".metadata.json"));
+    let pers_metadata = read_persistent_source_metadata(source_section, source_entry);
+
+    let metadata = length(sec_metadata) > 0 ? sec_metadata :
+        (length(rt_metadata) > 0 ? rt_metadata : pers_metadata);
+
+    if (length(metadata) > 0) {
+        for (let donor_list in [ rt_metadata, pers_metadata ]) {
+            if (length(donor_list) == 0)
+                continue;
+            let donor = donor_list[0];
+            for (let item in metadata) {
+                for (let k in [ "title", "announce", "traffic", "expire", "webPageUrl", "supportUrl", "updatedAt" ]) {
+                    if ((item[k] == null || item[k] == "") && donor[k] != null && donor[k] != "")
+                        item[k] = donor[k];
+                }
+            }
+        }
+    }
+
+    let updated_at = 0;
+    for (let st in [
+        fs.stat(source_json_path(source_section)),
+        fs.stat(TMP_SUBSCRIPTION_FOLDER + "/" + source_section + ".metadata.json"),
+        fs.stat(persistent_source_path(source_section, ".json"))
+    ]) {
+        if (st != null && int(st.mtime || 0) > updated_at)
+            updated_at = int(st.mtime);
+    }
+    for (let ts_path in [
+        TACHYON_SUBSCRIPTION_UPDATE_STATE_DIR + "/" + source_section + ".timestamp",
+        TACHYON_SUBSCRIPTION_UPDATE_STATE_DIR + "/" + section_name + ".timestamp"
+    ]) {
+        let raw_ts = file_first_line(ts_path);
+        if (raw_ts != "" && match(raw_ts, /^[0-9]+$/) != null) {
+            let n_ts = int(raw_ts, 10);
+            if (n_ts > updated_at)
+                updated_at = n_ts;
+        }
+    }
+
+    fallback_title = trim(as_string(fallback_title || ""));
+    if (length(metadata) == 0 && updated_at > 0)
+        metadata = [ { updatedAt: updated_at } ];
 
     let result = [];
     for (let item in metadata) {
         item.sourceIndex = source_index;
         item.sourceSection = source_section;
+        if (updated_at > 0 && (item.updatedAt == null || int(item.updatedAt || 0) < updated_at))
+            item.updatedAt = updated_at;
+        if (fallback_title != "" && trim(as_string(item.title || "")) == "")
+            item.title = fallback_title;
         push(result, item);
     }
     return result;
 }
 
-function merge_source_metadata(state, section_name, source_section, source_index, source_entry) {
+function merge_source_metadata(state, section_name, source_section, source_index, source_entry, fallback_title) {
     if (type(state) != "object")
         return;
-    for (let item in read_source_metadata(section_name, source_section, source_index, source_entry))
+    for (let item in read_source_metadata(section_name, source_section, source_index, source_entry, fallback_title))
         push(state.subscriptionMetadata, item);
+}
+
+function resolve_interface_protocol(iface_name) {
+    iface_name = trim(as_string(iface_name || ""));
+    if (iface_name == "" || iface_name == "lo")
+        return "";
+    let lc_name = lc(iface_name);
+    if (lc_name == "tailscale0" || index(lc_name, "tailscale") == 0)
+        return "tailscale";
+    if (index(lc_name, "awg") == 0)
+        return "amneziawg";
+    if (index(lc_name, "wg") == 0)
+        return "wireguard";
+    if (index(lc_name, "ovpn") == 0 || index(lc_name, "tun") == 0) {
+        let p_direct = lc(trim(as_string(uci_core.get("network", iface_name, "proto") || "")));
+        if (p_direct == "amneziawg") return "amneziawg";
+        if (p_direct == "wireguard") return "wireguard";
+        if (p_direct == "openconnect") return "openconnect";
+        if (index(lc_name, "ovpn") == 0) return "openvpn";
+    }
+    try {
+        let p = lc(trim(as_string(uci_core.get("network", iface_name, "proto") || "")));
+        if (p == "amneziawg") return "amneziawg";
+        if (p == "wireguard") return "wireguard";
+        if (p == "openconnect") return "openconnect";
+        if (p == "openvpn") return "openvpn";
+        if (p == "" && type(uci_core.section_objects) == "function") {
+            for (let net_sec in uci_core.section_objects("network", "interface")) {
+                let dev = trim(as_string(net_sec.device || net_sec.ifname || ""));
+                if (dev == iface_name) {
+                    let sp = lc(trim(as_string(net_sec.proto || "")));
+                    if (sp == "amneziawg") return "amneziawg";
+                    if (sp == "wireguard") return "wireguard";
+                    if (sp == "openconnect") return "openconnect";
+                    if (sp == "openvpn") return "openvpn";
+                }
+            }
+        }
+    } catch (e) {}
+    return "interface";
 }
 
 function remember_outbound_metadata(state, tag_name, display_name, outbound, prefix) {
@@ -197,12 +312,28 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     if (prefix != "")
         state.outboundMetadata.prefixes[tag_name] = prefix;
     let protocol = lc(as_string(outbound.type || ""));
+    let bind_iface = trim(as_string(outbound.bind_interface || ""));
     if (protocol == "wireguard" && subscription_wireguard.has_awg(outbound))
         protocol = "amneziawg";
+    else if ((protocol == "direct" || protocol == "") && bind_iface != "" && bind_iface != "lo") {
+        let iface_proto = resolve_interface_protocol(bind_iface);
+        if (iface_proto != "")
+            protocol = iface_proto;
+    }
     if (protocol != "")
         state.outboundMetadata.protocols[tag_name] = protocol;
 
-    let transport = lc(as_string(object_or_empty(outbound.transport).type || ""));
+    let transport = "";
+    if (type(outbound.transport) == "object")
+        transport = lc(as_string(outbound.transport.type || ""));
+    else if (type(outbound.transport) == "array" && length(outbound.transport) > 0)
+        transport = lc(as_string(outbound.transport[0] || ""));
+    else if (type(outbound.transport) == "string")
+        transport = lc(as_string(outbound.transport));
+    if (transport == "" && protocol == "shadowsocks" && index(lc(as_string(outbound.plugin_opts || "")), "websocket") >= 0)
+        transport = "ws";
+    if (transport == "" && (protocol == "naive" || protocol == "trusttunnel") && outbound.quic === true)
+        transport = "quic";
     if (transport == "h2")
         transport = "http";
     else if (transport == "raw")
@@ -210,6 +341,7 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     else if (transport == "" && protocol != "" &&
              protocol != "direct" && protocol != "wireguard" && protocol != "amneziawg" &&
              protocol != "hysteria" && protocol != "hysteria2" && protocol != "tuic" &&
+             protocol != "masque" && protocol != "desync" && protocol != "chain" &&
              protocol != "dns" && protocol != "block" &&
              protocol != "selector" && protocol != "urltest")
         transport = "tcp";
@@ -228,6 +360,10 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
         state.outboundMetadata.ports = {};
     let wg_peer = as_string(outbound.type) == "wireguard" ? object_or_empty(array_or_empty(outbound.peers)[0]) : {};
     let port = outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : wg_peer.port);
+    if ((port == null || port == "" || int(port) == 0) && type(outbound.server_ports) == "array" && length(outbound.server_ports) > 0)
+        port = as_string(outbound.server_ports[0]);
+    else if ((port == null || port == "" || int(port) == 0) && type(outbound.server_ports) == "string" && trim(outbound.server_ports) != "")
+        port = trim(outbound.server_ports);
     if (port != null && port != "")
         state.outboundMetadata.ports[tag_name] = as_string(port);
 
@@ -241,6 +377,10 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     let badges = [];
     if (protocol == "urltest")
         push(badges, "авто-группы");
+    if (bind_iface != "" && bind_iface != "lo")
+        push(badges, "iface:" + bind_iface);
+    if (security == "reality" || security == "tls")
+        push(badges, security);
     let flow = as_string(outbound.flow || "");
     if (flow != "")
         push(badges, flow);
@@ -251,6 +391,16 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
             push(badges, "xmux");
     }
     if (tls != null && tls.enabled !== false) {
+        let sni = as_string(tls.server_name || "");
+        if (sni != "")
+            push(badges, "sni:" + sni);
+        let utls_obj = type(tls.utls) == "object" ? tls.utls : null;
+        if (utls_obj != null && utls_obj.enabled !== false && as_string(utls_obj.fingerprint || "") != "")
+            push(badges, "utls:" + as_string(utls_obj.fingerprint));
+        if (type(tls.alpn) == "array" && length(tls.alpn) > 0)
+            push(badges, "alpn:" + join(",", tls.alpn));
+        else if (type(tls.alpn) == "string" && tls.alpn != "")
+            push(badges, "alpn:" + tls.alpn);
         let csha = tls.certificate_sha256;
         if ((type(csha) == "array" && length(csha) > 0) || (type(csha) == "string" && csha != ""))
             push(badges, "cert_sha256");
@@ -266,13 +416,20 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
         state.outboundMetadata.details[tag_name] = b_str;
 }
 
-function remember_source_outbound(state, tag_name, display_name, outbound, source_link, prefix) {
+function remember_source_outbound(state, tag_name, display_name, outbound, source_link, prefix, source_key) {
     if (type(state) != "object")
         return;
     let is_cand = index(tag_name, "cand-") == 0 || index(tag_name, " cand-") >= 0;
     if (is_cand)
         return;
     remember_outbound_metadata(state, tag_name, display_name, outbound, prefix);
+    if (index(lc(as_string(source_link || "")), "shadowtls://") == 0)
+        state.outboundMetadata.protocols[tag_name] = "shadowtls";
+    if (source_key != null && as_string(source_key) != "") {
+        if (!state.outboundMetadata.sources)
+            state.outboundMetadata.sources = {};
+        state.outboundMetadata.sources[tag_name] = as_string(source_key);
+    }
     let outbound_type = as_string(outbound.type || "");
     if (outbound_type != "selector" && outbound_type != "urltest") {
         if (subscription_share_link.is_copyable_link(source_link))
@@ -307,7 +464,7 @@ function remember_urltest_group_config(state, tag_name, input_group) {
         outbounds: array_or_empty(input_group.outbounds)
     };
 
-    for (let key in [ "url", "interval", "tolerance", "idle_timeout", "interrupt_exist_connections" ]) {
+    for (let key in [ "url", "testing_urls", "multi_url_strategy", "active_check_interval", "interval", "tolerance", "idle_timeout", "interrupt_exist_connections" ]) {
         if (input_group[key] != null)
             output_group[key] = input_group[key];
     }
@@ -364,10 +521,6 @@ function source_cache_is_current(source_section, source_entry, expected_user_age
     return true;
 }
 
-function source_json_path(source_section) {
-    return TMP_SUBSCRIPTION_FOLDER + "/" + source_section + ".json";
-}
-
 function read_source_outbounds(source_section) {
     let subscription = object_or_empty(read_json_file(source_json_path(source_section)));
     return array_or_empty(subscription.outbounds);
@@ -386,7 +539,10 @@ function new_section_state(section_name) {
             securities: {},
             prefixes: {},
             ports: {},
-            details: {}
+            details: {},
+            sources: {},
+            source_ids: {},
+            source_names: {}
         },
         servers: {},
         urltestCandidateTags: [],

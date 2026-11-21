@@ -1,0 +1,967 @@
+#!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
+set -eo pipefail
+
+CONNECTIONS="$TACHYON_LIB/config/connections.uc"
+VALIDATOR="$TACHYON_LIB/config/validator.uc"
+MIGRATION="$TACHYON_LIB/config/migration.uc"
+GENERATOR_ROUTES="$TACHYON_LIB/tachyon_core/generator_routes.uc"
+
+# 1. Test Boolean Conditions (AND / OR / NOT), MAC resolution, Cycle Detection, and 2-Mode Rule Tracer
+export TACHYON_MOCK_DHCP_LEASES="aa:bb:cc:11:22:33=192.168.1.50"
+
+ucode -L "$TACHYON_LIB" - <<'UCODE'
+let connections = require("config.connections");
+
+let fixture = {
+    condition: [
+        {
+            ".name": "baned_domains",
+            ".type": "condition",
+            enabled: "1",
+            name: "Banned Domains",
+            condition_type: "atomic",
+            domain_suffix: [ "youtube.com", "discord.com" ],
+            community_lists: [ "discord" ]
+        },
+        {
+            ".name": "my_devices",
+            ".type": "condition",
+            enabled: "1",
+            name: "My Devices",
+            condition_type: "atomic",
+            source_macs: [ "AA:BB:CC:11:22:33" ]
+        },
+        {
+            ".name": "ru_whitelist",
+            ".type": "condition",
+            enabled: "1",
+            name: "RU Whitelist",
+            condition_type: "atomic",
+            domain_suffix: [ "gosuslugi.ru" ]
+        },
+        {
+            ".name": "My_devices_Timbuktu",
+            ".type": "condition",
+            enabled: "1",
+            name: "My Devices Timbuktu",
+            condition_type: "composite",
+            operator: "and",
+            members: [ "baned_domains", "my_devices" ]
+        }
+    ],
+    section: [
+        {
+            ".name": "Timbuktu",
+            ".type": "section",
+            enabled: "1",
+            name: "Timbuktu Proxy",
+            action: "connection",
+            condition_expression: "My_devices_Timbuktu AND NOT ru_whitelist"
+        }
+    ]
+};
+
+connections.set_item_sections_from_data(fixture);
+
+// Graph validation must succeed for valid DAG
+let graph_ok = connections.validate_condition_graph();
+if (!graph_ok.valid) {
+    warn("Expected valid condition graph, got: " + graph_ok.message + "\n");
+    exit(1);
+}
+
+// DNF clause compilation must merge baned_domains + my_devices and attach ru_whitelist as inverted condition
+let clauses = connections.section_effective_clauses(fixture.section[0]);
+if (length(clauses) != 1) {
+    warn("Expected 1 DNF clause, got " + length(clauses) + "\n");
+    exit(1);
+}
+let clause = clauses[0];
+let resolved_src_ips = connections.resolved_source_ip_cidrs(clause);
+if (length(resolved_src_ips) != 1 || resolved_src_ips[0] != "192.168.1.50") {
+    warn("Expected MAC AA:BB:CC:11:22:33 to resolve to 192.168.1.50, got: " + sprintf("%J", resolved_src_ips) + "\n");
+    exit(1);
+}
+if (length(clause.__inverted_conditions || []) != 1 || clause.__inverted_conditions[0][".name"] != "ru_whitelist") {
+    warn("Expected ru_whitelist in __inverted_conditions\n");
+    exit(1);
+}
+
+// Mode 1 (Presence): querying youtube.com alone must find baned_domains, My_devices_Timbuktu, and Timbuktu section
+let trace_presence = connections.trace_rules({ mode: "presence", search: "youtube.com" }, fixture.section);
+if (length(trace_presence.presence_conditions) != 2) {
+    warn("Expected 2 presence_conditions for youtube.com, got: " + sprintf("%J", trace_presence.presence_conditions) + "\n");
+    exit(1);
+}
+if (length(trace_presence.presence_sections) != 1 || trace_presence.presence_sections[0].id != "Timbuktu") {
+    warn("Expected Timbuktu in presence_sections for youtube.com\n");
+    exit(1);
+}
+if (length(trace_presence.exact_sections) != 0 || trace_presence.winning_section != null) {
+    warn("Expected youtube.com without source device NOT to satisfy exact AND rule\n");
+    exit(1);
+}
+
+// Mode 2 (Exact): querying youtube.com + MAC AA:BB:CC:11:22:33 must strictly satisfy Timbuktu
+let trace_exact = connections.trace_rules({
+    mode: "exact",
+    domain: "www.youtube.com",
+    source_mac: "AA:BB:CC:11:22:33"
+}, fixture.section);
+if (trace_exact.winning_section == null || trace_exact.winning_section.id != "Timbuktu") {
+    warn("Expected Timbuktu to win in exact mode when both domain and MAC match, got: " + sprintf("%J", trace_exact) + "\n");
+    exit(1);
+}
+
+// Mode 2 (Exact) with NOT condition triggered: gosuslugi.ru must NOT match Timbuktu even if domain_suffix was added
+let trace_not = connections.trace_rules({
+    mode: "exact",
+    domain: "gosuslugi.ru",
+    source_mac: "AA:BB:CC:11:22:33"
+}, fixture.section);
+if (trace_not.winning_section != null) {
+    warn("Expected NOT ru_whitelist to block exact match on gosuslugi.ru\n");
+    exit(1);
+}
+
+// Cycle detection: A -> B -> A must be rejected
+let cyclic_fixture = {
+    condition: [
+        { ".name": "cond_a", ".type": "condition", condition_type: "composite", members: [ "cond_b" ] },
+        { ".name": "cond_b", ".type": "condition", condition_type: "composite", members: [ "cond_a" ] }
+    ]
+};
+connections.set_item_sections_from_data(cyclic_fixture);
+let cyclic_check = connections.validate_condition_graph();
+if (cyclic_check.valid) {
+    warn("Expected circular dependency cond_a -> cond_b -> cond_a to fail validation\n");
+    exit(1);
+}
+
+// Self-reference detection: cond_self -> cond_self must be rejected
+let self_fixture = {
+    condition: [
+        { ".name": "cond_self", ".type": "condition", expression: "cond_self AND other" }
+    ]
+};
+connections.set_item_sections_from_data(self_fixture);
+let self_check = connections.validate_condition_graph();
+if (self_check.valid) {
+    warn("Expected self-referencing condition to fail validation\n");
+    exit(1);
+}
+UCODE
+
+# 2. Test Multi-Stage Outbound Pool Narrowing (Outbound Source -> Outbound Group AND intersection -> Section Exclude -> Reusable URLTest & Priority Balancers)
+ucode -L "$TACHYON_LIB" - <<'UCODE'
+let connections = require("config.connections");
+let routes = require("tachyon_core.generator_routes");
+
+let fixture = {
+    outbound_source: [
+        {
+            ".name": "src_unlim",
+            ".type": "outbound_source",
+            enabled: "1",
+            name: "Unlim Subscription",
+            source_type: "subscription",
+            url: "https://example.com/unlim",
+            prefix_nodes: "1",
+            node_prefix: "Unlim"
+        },
+        {
+            ".name": "src_backup",
+            ".type": "outbound_source",
+            enabled: "1",
+            name: "Backup Subscription",
+            source_type: "subscription",
+            url: "https://example.com/backup",
+            prefix_nodes: "1",
+            node_prefix: "Backup"
+        }
+    ],
+    outbound_group: [
+        {
+            ".name": "Unlim_RU",
+            ".type": "outbound_group",
+            enabled: "1",
+            name: "Unlim RU Group",
+            source_refs: [ "src_unlim", "src_backup" ],
+            filter_mode: "mixed",
+            include_prefixes: [ "Unlim" ],
+            include_countries: [ "RU" ],
+            exclude_regex: [ "Kazan" ]
+        },
+        {
+            ".name": "NL_or_Moscow",
+            ".type": "outbound_group",
+            enabled: "1",
+            name: "NL Flags OR Moscow Regex",
+            source_refs: [ "src_unlim" ],
+            filter_mode: "include",
+            include_countries: [ "NL" ],
+            include_regex: [ "Moscow #1" ]
+        },
+        {
+            ".name": "Unlim_NL",
+            ".type": "outbound_group",
+            enabled: "1",
+            name: "Unlim NL Group",
+            source_refs: [ "src_unlim" ],
+            filter_mode: "include",
+            include_prefixes: [ "Unlim" ],
+            include_countries: [ "NL" ]
+        }
+    ],
+    balancer: [
+        {
+            ".name": "Fastest",
+            ".type": "balancer",
+            enabled: "1",
+            name: "Fastest",
+            balancer_type: "urltest",
+            testing_url: "https://cp.cloudflare.com/generate_204",
+            check_interval: "2m",
+            tolerance: "35"
+        },
+        {
+            ".name": "RU_Then_NL",
+            ".type": "balancer",
+            enabled: "1",
+            name: "RU Then NL Priority",
+            balancer_type: "priority",
+            outbound_group_levels: [ "Unlim_RU", "Unlim_NL", "direct" ],
+            active_check_interval: "5s",
+            check_timeout: "3s",
+            recovery_check_interval: "30s"
+        }
+    ],
+    section: [
+        {
+            ".name": "RU_Services_no_WL",
+            ".type": "section",
+            enabled: "1",
+            action: "connection",
+            outbound_group_refs: [ "Unlim_RU" ],
+            section_filter_mode: "exclude",
+            section_exclude_regex: [ "\\|WL\\|", "Обход" ],
+            balancer_refs: [ "Fastest" ]
+        }
+    ]
+};
+
+connections.set_item_sections_from_data(fixture);
+
+let config = { outbounds: [], route: { rules: [] }, dns: { servers: [], rules: [] } };
+let candidate_tags = [
+    "node-ru-moscow-1",
+    "node-ru-spb-wl",
+    "node-ru-moscow-bypass",
+    "node-ru-kazan",
+    "node-nl-ams",
+    "node-backup-ru-moscow"
+];
+let state = require("tachyon_core.subscription").new_section_state("RU_Services_no_WL");
+state.outboundMetadata.names = {
+    "node-ru-moscow-1": "Unlim 🇷🇺 Moscow #1",
+    "node-ru-spb-wl": "Unlim 🇷🇺 SPB |WL|",
+    "node-ru-moscow-bypass": "Unlim 🇷🇺 Moscow Обход",
+    "node-ru-kazan": "Unlim 🇷🇺 Kazan",
+    "node-nl-ams": "Unlim 🇳🇱 Amsterdam",
+    "node-backup-ru-moscow": "Backup 🇷🇺 Moscow"
+};
+state.outboundMetadata.prefixes = {
+    "node-ru-moscow-1": "Unlim",
+    "node-ru-spb-wl": "Unlim",
+    "node-ru-moscow-bypass": "Unlim",
+    "node-ru-kazan": "Unlim",
+    "node-nl-ams": "Unlim",
+    "node-backup-ru-moscow": "Backup"
+};
+
+routes.add_proxy_selector(config, fixture.section[0], candidate_tags, candidate_tags, state, "");
+
+let outbounds_by_tag = {};
+for (let o in config.outbounds)
+    outbounds_by_tag[o.tag] = o;
+
+let urltest_out = outbounds_by_tag["RU_Services_no_WL-urltest-Fastest-out"];
+if (urltest_out == null) {
+    warn("Expected reusable balancer RU_Services_no_WL-urltest-Fastest-out to be generated\n");
+    exit(1);
+}
+// Only node-ru-moscow-1 should survive:
+// - node-backup-ru-moscow fails prefix 'Unlim'
+// - node-nl-ams fails country 'RU'
+// - node-ru-kazan fails group regex 'Moscow|SPB'
+// - node-ru-spb-wl and node-ru-moscow-bypass are narrowed out by section_exclude_regex '|WL|' and 'Обход'
+if (length(urltest_out.outbounds) != 1 || urltest_out.outbounds[0] != "node-ru-moscow-1") {
+    warn("Expected narrowed urltest outbounds to be ['node-ru-moscow-1'], got: " + sprintf("%J", urltest_out.outbounds) + "\n");
+    exit(1);
+}
+if (urltest_out.url != "https://cp.cloudflare.com/generate_204" || urltest_out.interval != "2m" || urltest_out.tolerance != 35) {
+    warn("Expected reusable balancer parameters on urltest outbound, got: " + sprintf("%J", urltest_out) + "\n");
+    exit(1);
+}
+
+let selector_out = outbounds_by_tag["RU_Services_no_WL-out"];
+if (selector_out == null || length(selector_out.outbounds) != 2 ||
+    selector_out.outbounds[0] != "node-ru-moscow-1" ||
+    selector_out.outbounds[1] != "RU_Services_no_WL-urltest-Fastest-out" ||
+    selector_out.default != "RU_Services_no_WL-urltest-Fastest-out") {
+    warn("Expected selector outbounds ['node-ru-moscow-1', 'RU_Services_no_WL-urltest-Fastest-out'] with default Fastest, got: " + sprintf("%J", selector_out) + "\n");
+    exit(1);
+}
+
+// Verify Priority balancer levels synthesized from outbound_group_levels
+let prio_levels = connections.priority_levels("RU_Then_NL");
+if (length(prio_levels) != 3) {
+    warn("Expected 3 priority levels synthesized from outbound_group_levels, got: " + sprintf("%J", prio_levels) + "\n");
+    exit(1);
+}
+if (!connections.priority_level_direct("RU_Then_NL", prio_levels[2])) {
+    warn("Expected 3rd priority tier to be direct fallback\n");
+    exit(1);
+}
+
+// Verify outbound_group with BOTH include_countries ("NL") and include_regex ("Moscow #1")
+// combines them via OR (union) instead of returning empty intersection and falling back to all servers.
+let union_sec = {
+    ".name": "Union_NL_Moscow",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    outbound_group_refs: [ "NL_or_Moscow" ]
+};
+let union_cfg = { outbounds: [], route: { rules: [] }, dns: { servers: [], rules: [] } };
+routes.add_proxy_selector(union_cfg, union_sec, candidate_tags, candidate_tags, state, "");
+let union_sel = null;
+for (let o in union_cfg.outbounds)
+    if (o.tag == "Union_NL_Moscow-out")
+        union_sel = o;
+if (union_sel == null || length(union_sel.outbounds) != 2 ||
+    union_sel.outbounds[0] != "node-ru-moscow-1" ||
+    union_sel.outbounds[1] != "node-nl-ams") {
+    warn("Expected include_countries + include_regex in outbound_group to produce union ['node-ru-moscow-1', 'node-nl-ams'], got: " + sprintf("%J", union_sel) + "\n");
+    exit(1);
+}
+UCODE
+
+# 3. Test Automatic Migration (modular_entities_v1) deduplicating shared subscriptions and extracting conditions & balancers
+cat >"$WORK_DIR/legacy_monolithic.json" <<'JSON'
+{
+  "settings": {
+    ".name": "settings",
+    ".type": "settings",
+    "config_version": "1.8.0",
+    "dns_server": [ "77.88.8.8" ],
+    "bootstrap_dns_server": [ "77.88.8.8" ]
+  },
+  "section": [
+    {
+      ".name": "sec_one",
+      ".type": "section",
+      "enabled": "1",
+      "action": "connection",
+      "community_lists": [ "discord", "youtube" ],
+      "ports": [ "443" ]
+    },
+    {
+      ".name": "sec_two",
+      ".type": "section",
+      "enabled": "1",
+      "action": "connection",
+      "domain_suffix": [ "example.org" ]
+    }
+  ],
+  "subscription_url": [
+    {
+      ".name": "sub1",
+      ".type": "subscription_url",
+      "section": "sec_one",
+      "url": "https://provider.example/shared-sub",
+      "prefix_nodes": "1",
+      "node_prefix": "Unlim"
+    },
+    {
+      ".name": "sub2",
+      ".type": "subscription_url",
+      "section": "sec_two",
+      "url": "https://provider.example/shared-sub",
+      "prefix_nodes": "1",
+      "node_prefix": "Unlim"
+    }
+  ],
+  "urltest": [
+    {
+      ".name": "ut1",
+      ".type": "urltest",
+      "section": "sec_one",
+      "name": "Fastest",
+      "check_interval": "3m",
+      "tolerance": "50",
+      "testing_url": "https://www.gstatic.com/generate_204"
+    }
+  ],
+  "priority_group": [
+    {
+      ".name": "pg1",
+      ".type": "priority_group",
+      "section": "sec_two",
+      "name": "Cascade",
+      "health_url": "https://www.gstatic.com/generate_204",
+      "active_check_interval": "5s"
+    }
+  ],
+  "priority_level": [
+    {
+      ".name": "cfg01_pl",
+      ".type": "priority_level",
+      "group": "pg1",
+      "name": "⭐️Лучшие",
+      "order": "0",
+      "country": [ "NL", "DE" ]
+    },
+    {
+      ".name": "cfg02_pl",
+      ".type": "priority_level",
+      "group": "pg1",
+      "name": "📦Резервные",
+      "order": "1",
+      "country": [ "FI" ]
+    },
+    {
+      ".name": "pl3",
+      ".type": "priority_level",
+      "group": "pg1",
+      "name": "Level 3 Fallback",
+      "order": "2",
+      "direct": "1"
+    }
+  ]
+}
+JSON
+
+TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$MIGRATION" migrate-fixture "$WORK_DIR/legacy_monolithic.json" >"$WORK_DIR/migrated_modular.json"
+
+node - "$WORK_DIR/migrated_modular.json" <<'NODE'
+const fs = require('fs');
+const out = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const cfg = out.config;
+
+function assert(cond, msg) {
+  if (!cond) {
+    console.error(msg);
+    process.exit(1);
+  }
+}
+
+assert(Array.isArray(cfg.condition) && cfg.condition.length === 2, 'Expected 2 extracted condition entities');
+assert(Array.isArray(cfg.outbound_source) && cfg.outbound_source.length === 1, 'Expected shared subscription URL to be deduplicated into 1 outbound_source');
+assert(cfg.outbound_source[0].url === 'https://provider.example/shared-sub', 'Expected deduplicated subscription URL to match');
+assert(Array.isArray(cfg.balancer) && cfg.balancer.length === 2, 'Expected 2 extracted balancer entities');
+assert(Array.isArray(cfg.outbound_group) && cfg.outbound_group.length === 2, 'Expected 2 extracted outbound_group entities from priority_level');
+
+const secOne = cfg.section.find(s => s['.name'] === 'sec_one');
+const secTwo = cfg.section.find(s => s['.name'] === 'sec_two');
+assert(JSON.stringify(secOne.condition_refs) === JSON.stringify(['cond_sec_one']), 'sec_one should reference cond_sec_one');
+assert(JSON.stringify(secTwo.condition_refs) === JSON.stringify(['cond_sec_two']), 'sec_two should reference cond_sec_two');
+assert(JSON.stringify(secOne.outbound_source_refs) === JSON.stringify(['src_sub_1']), 'sec_one should reference src_sub_1');
+assert(JSON.stringify(secTwo.outbound_source_refs) === JSON.stringify(['src_sub_1']), 'sec_two should share reference src_sub_1');
+assert(JSON.stringify(secOne.balancer_refs) === JSON.stringify(['bal_sec_one_Fastest']), 'sec_one should reference bal_sec_one_Fastest');
+assert(JSON.stringify(secTwo.balancer_refs) === JSON.stringify(['bal_sec_two_Cascade']), 'sec_two should reference bal_sec_two_Cascade');
+assert(JSON.stringify(secTwo.outbound_group_refs) === JSON.stringify(['grp_sec_two_lvl_1', 'grp_sec_two_lvl_2']), 'sec_two should reference both non-ASCII extracted outbound_groups');
+
+const balCascade = cfg.balancer.find(b => b['.name'] === 'bal_sec_two_Cascade');
+assert(balCascade && balCascade.balancer_type === 'priority', 'bal_sec_two_Cascade should be a priority balancer');
+assert(JSON.stringify(balCascade.outbound_group_levels) === JSON.stringify(['grp_sec_two_lvl_1', 'grp_sec_two_lvl_2', 'direct']), 'bal_sec_two_Cascade should have outbound_group_levels set');
+assert(JSON.stringify(secTwo.outbound_group_levels) === JSON.stringify(['grp_sec_two_lvl_1', 'grp_sec_two_lvl_2', 'direct']), 'sec_two should also have outbound_group_levels migrated onto the section');
+
+const grpFast = cfg.outbound_group.find(g => g['.name'] === 'grp_sec_two_lvl_1');
+assert(grpFast && JSON.stringify(grpFast.include_countries) === JSON.stringify(['NL', 'DE']), 'grp_sec_two_lvl_1 should preserve include_countries');
+const grpReserve = cfg.outbound_group.find(g => g['.name'] === 'grp_sec_two_lvl_2');
+assert(grpReserve && JSON.stringify(grpReserve.include_countries) === JSON.stringify(['FI']), 'grp_sec_two_lvl_2 should preserve include_countries');
+NODE
+
+# 4. Test that deleting modular entities after migration does NOT resurrect them on subsequent reloads
+# and automatically prunes dangling references from sections/balancers/groups
+node - "$WORK_DIR/migrated_modular.json" "$WORK_DIR/deleted_modular_input.json" <<'NODE'
+const fs = require('fs');
+const out = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const cfg = out.config;
+cfg.outbound_source = [];
+cfg.condition = cfg.condition.filter(c => c['.name'] !== 'cond_sec_one');
+cfg.balancer = [];
+fs.writeFileSync(process.argv[3], JSON.stringify(cfg, null, 2));
+NODE
+
+TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$MIGRATION" migrate-fixture "$WORK_DIR/deleted_modular_input.json" >"$WORK_DIR/deleted_modular_output.json"
+
+node - "$WORK_DIR/deleted_modular_output.json" <<'NODE'
+const fs = require('fs');
+const out = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const cfg = out.config;
+
+function assert(cond, msg) {
+  if (!cond) {
+    console.error(msg);
+    process.exit(1);
+  }
+}
+
+assert(!cfg.outbound_source || cfg.outbound_source.length === 0, 'Deleted outbound_source must NOT be resurrected from legacy subscription_url');
+assert(Array.isArray(cfg.condition) && cfg.condition.length === 1 && cfg.condition[0]['.name'] === 'cond_sec_two', 'Deleted condition cond_sec_one must NOT be resurrected');
+assert(!cfg.balancer || cfg.balancer.length === 0, 'Deleted balancer must NOT be resurrected from legacy urltest');
+
+const secOne = cfg.section.find(s => s['.name'] === 'sec_one');
+const secTwo = cfg.section.find(s => s['.name'] === 'sec_two');
+assert(!secOne.outbound_source_refs || secOne.outbound_source_refs.length === 0, 'Dangling outbound_source_refs on sec_one must be pruned');
+assert(!secTwo.outbound_source_refs || secTwo.outbound_source_refs.length === 0, 'Dangling outbound_source_refs on sec_two must be pruned');
+assert(!secOne.condition_refs || secOne.condition_refs.length === 0, 'Dangling condition_refs on sec_one must be pruned');
+assert(!secOne.balancer_refs || secOne.balancer_refs.length === 0, 'Dangling balancer_refs on sec_one must be pruned');
+NODE
+
+# 5. Test #252 (unified_delay profile), #253 (ANSI expand_check_error_reason, single leaf strip, dangling outbound dependency), and #255 (subscription_tls_fingerprint)
+RUNTIME_UC="$TACHYON_LIB/tachyon_core/runtime.uc"
+
+EXPANDED_REASON="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$RUNTIME_UC" expand-check-reason-fixture $'\x1b[31mFATAL\x1b[0m[0000] initialize outbound[52]: parse encryption: invalid encryption key length: 9')"
+case "$EXPANDED_REASON" in
+  initialize\ outbound\[52\]:*Причина:*) ;;
+  *)
+    printf 'Unexpected expand_check_error_reason output: %s\n' "$EXPANDED_REASON" >&2
+    exit 1
+    ;;
+esac
+
+cat >"$WORK_DIR/leaf_strip_cfg.json" <<'JSON'
+{
+  "outbounds": [
+    { "type": "vless", "tag": "good-node-1", "server": "1.1.1.1", "server_port": 443 },
+    { "type": "vless", "tag": "bad-node-2", "server": "2.2.2.2", "server_port": 443, "encryption": "mlkem768x25519plus.bad" },
+    { "type": "selector", "tag": "Proxy-out", "outbounds": [ "good-node-1", "bad-node-2" ], "default": "bad-node-2" },
+    { "type": "selector", "tag": "Instagram-out", "outbounds": [ "Proxy-out" ], "default": "Proxy-out" }
+  ]
+}
+JSON
+
+STRIP_RES="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$RUNTIME_UC" strip-leaf-outbound-fixture "$WORK_DIR/leaf_strip_cfg.json" "FATAL[0000] initialize outbound[1]: parse encryption: invalid encryption key length: 9")"
+[ "$STRIP_RES" = "stripped" ] || { printf 'Expected strip-leaf-outbound-fixture to return stripped, got %s\n' "$STRIP_RES" >&2; exit 1; }
+
+node - "$WORK_DIR/leaf_strip_cfg.json" <<'NODE'
+const fs = require('fs');
+const cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const proxySel = cfg.outbounds.find(o => o.tag === 'Proxy-out');
+if (!proxySel || JSON.stringify(proxySel.outbounds) !== JSON.stringify(['good-node-1']) || proxySel.default !== 'good-node-1') {
+  console.error('Expected Proxy-out to retain good-node-1 after stripping bad-node-2, got:', proxySel);
+  process.exit(1);
+}
+NODE
+
+cat >"$WORK_DIR/dangling_dep_cfg.json" <<'JSON'
+{
+  "outbounds": [
+    { "type": "direct", "tag": "direct-out" },
+    { "type": "selector", "tag": "Instagram-CDN-via-Proxy-out", "outbounds": [ "Proxy-out" ], "default": "Proxy-out" }
+  ]
+}
+JSON
+
+DANGLING_RES="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$RUNTIME_UC" dangling-dependency-fixture "$WORK_DIR/dangling_dep_cfg.json")"
+case "$DANGLING_RES" in
+  *dependency\[Proxy-out\]\ not\ found\ for\ outbound\[Instagram-CDN-via-Proxy-out\]*) ;;
+  *)
+    printf 'Expected dangling dependency on Proxy-out to be reported, got: %s\n' "$DANGLING_RES" >&2
+    exit 1
+    ;;
+esac
+
+TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" - <<'UCODE'
+let core_profile = require("tachyon_core.core_profile");
+let connections = require("config.connections");
+
+if (core_profile.supports_unified_delay("0.5.7", "tachyon-core")) {
+    warn("Expected tachyon-core profile to NOT claim unified_delay\n");
+    exit(1);
+}
+
+connections.set_item_sections_from_data({
+    outbound_source: [
+        {
+            ".name": "src_sub_fp",
+            ".type": "outbound_source",
+            enabled: "1",
+            source_type: "subscription",
+            url: "https://provider.example/sub",
+            tls_fingerprint: "chrome"
+        }
+    ],
+    section: [
+        {
+            ".name": "Proxy",
+            ".type": "section",
+            enabled: "1",
+            action: "connection",
+            outbound_source_refs: [ "src_sub_fp" ]
+        }
+    ]
+});
+
+let fp = connections.subscription_tls_fingerprint({
+    ".name": "Proxy",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    outbound_source_refs: [ "src_sub_fp" ]
+}, "https://provider.example/sub");
+if (fp != "chrome") {
+    warn("Expected subscription_tls_fingerprint to return 'chrome', got: " + fp + "\n");
+    exit(1);
+}
+
+// Regression check (DenSilent): a reusable balancer with empty source_refs/group_refs
+// attached to a section without non-DPI outbound_source_refs must NOT pull unrelated
+// global outbound_source entries into the section.
+connections.set_item_sections_from_data({
+    outbound_source: [
+        {
+            ".name": "src_links_old_ghost",
+            ".type": "outbound_source",
+            enabled: "1",
+            source_type: "proxy_links",
+            proxy_links: [ "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=none#Ghost" ]
+        }
+    ],
+    balancer: [
+        {
+            ".name": "bal_reusable_urltest",
+            ".type": "balancer",
+            enabled: "1",
+            balancer_type: "urltest"
+        }
+    ],
+    section: [
+        {
+            ".name": "SecWithoutSources",
+            ".type": "section",
+            enabled: "1",
+            action: "connection",
+            balancer_refs: [ "bal_reusable_urltest" ]
+        }
+    ]
+});
+let leaked_srcs = connections.section_effective_outbound_sources({
+    ".name": "SecWithoutSources",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    balancer_refs: [ "bal_reusable_urltest" ]
+});
+if (length(leaked_srcs) != 0) {
+    warn("Expected 0 effective outbound sources on section with empty balancer, got: " + sprintf("%J", leaked_srcs) + "\n");
+    exit(1);
+}
+
+// Issue #277: URLTest balancer referencing outbound_group must keep group candidate tags
+connections.set_item_sections_from_data({
+    outbound_source: [
+        {
+            ".name": "src_pool_277",
+            ".type": "outbound_source",
+            enabled: "1",
+            source_type: "manual",
+            proxy_links: [
+                "vless://11111111-1111-1111-1111-111111111111@198.51.100.1:443?security=none#ServerA",
+                "vless://22222222-2222-2222-2222-222222222222@198.51.100.2:443?security=none#ServerB"
+            ]
+        }
+    ],
+    outbound_group: [
+        {
+            ".name": "grp_all_277",
+            ".type": "outbound_group",
+            enabled: "1",
+            group_type: "auto",
+            filter_mode: "disabled"
+        }
+    ],
+    balancer: [
+        {
+            ".name": "bal_grp_urltest_277",
+            ".type": "balancer",
+            enabled: "1",
+            balancer_type: "urltest",
+            group_refs: [ "grp_all_277" ]
+        }
+    ],
+    section: [
+        {
+            ".name": "SecGroupBal277",
+            ".type": "section",
+            enabled: "1",
+            action: "connection",
+            outbound_source_refs: [ "src_pool_277" ],
+            balancer_refs: [ "bal_grp_urltest_277" ]
+        }
+    ]
+});
+let gen_routes = require("tachyon_core.generator_routes");
+let filtered_277 = gen_routes.urltest_filtered_outbounds(
+    { ".name": "SecGroupBal277", ".type": "section", action: "connection" },
+    "bal_grp_urltest_277",
+    [ "ServerA", "ServerB" ],
+    { outboundMetadata: { names: { ServerA: "ServerA", ServerB: "ServerB" } } }
+);
+if (length(filtered_277) != 2) {
+    warn("Issue #277: Expected 2 candidate outbounds in urltest_filtered_outbounds with group_refs, got: " + sprintf("%J", filtered_277) + "\n");
+    exit(1);
+}
+
+// Regression: section configured only with individual VLESS links (src_links_main)
+// must NOT inherit detached subscription src_sub_1 via leftover subscription_url child,
+// outbound_group.source_refs, or balancer.source_refs.
+connections.set_item_sections_from_data({
+    outbound_source: [
+        {
+            ".name": "src_links_main",
+            ".type": "outbound_source",
+            enabled: "1",
+            source_type: "proxy_links",
+            proxy_links: [ "vless://11111111-1111-1111-1111-111111111111@198.51.100.1:443?security=tls&type=xhttp#Moscow" ]
+        },
+        {
+            ".name": "src_sub_1",
+            ".type": "outbound_source",
+            enabled: "1",
+            source_type: "subscription",
+            url: "https://provider.example/sub"
+        }
+    ],
+    outbound_group: [
+        {
+            ".name": "grp_migrated_main",
+            ".type": "outbound_group",
+            enabled: "1",
+            source_refs: [ "src_sub_1", "src_links_main" ]
+        }
+    ],
+    balancer: [
+        {
+            ".name": "bal_fastest",
+            ".type": "balancer",
+            enabled: "1",
+            balancer_type: "urltest",
+            source_refs: [ "src_sub_1" ]
+        }
+    ],
+    subscription_url: [
+        {
+            ".name": "sub_child_stale",
+            ".type": "subscription_url",
+            section: "main",
+            url: "https://provider.example/sub"
+        }
+    ],
+    section: [
+        {
+            ".name": "main",
+            ".type": "section",
+            enabled: "1",
+            action: "connection",
+            outbound_source_refs: [ "src_links_main" ],
+            outbound_group_refs: [ "grp_migrated_main" ],
+            balancer_refs: [ "bal_fastest" ]
+        }
+    ]
+});
+let main_sub_urls = connections.subscription_urls({
+    ".name": "main",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    outbound_source_refs: [ "src_links_main" ],
+    outbound_group_refs: [ "grp_migrated_main" ],
+    balancer_refs: [ "bal_fastest" ]
+});
+if (length(main_sub_urls) != 0) {
+    warn("Expected 0 subscription_urls on section with only src_links_main, got: " + sprintf("%J", main_sub_urls) + "\n");
+    exit(1);
+}
+UCODE
+
+cat >"$WORK_DIR/all_disabled_sections.json" <<'JSON'
+{
+  "settings": {
+    "dns_server": "1.1.1.1"
+  },
+  "section": [
+    {
+      ".name": "Proxy",
+      ".type": "section",
+      "enabled": "0",
+      "action": "connection"
+    }
+  ]
+}
+JSON
+
+TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$TACHYON_LIB/tachyon_core/generator.uc" \
+  generate-config-fixture "$WORK_DIR/all_disabled_sections.json" "$WORK_DIR/all_disabled_out.json" 127.0.0.42 0 1
+
+grep -q '"direct-out"' "$WORK_DIR/all_disabled_out.json" || {
+  printf 'Expected generate-config-fixture with all sections disabled to produce direct-only config\n' >&2
+  exit 1
+}
+
+# 6. Verify reusable Priority balancer across 2 sections with distinct per-section outbound_group_levels
+TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" - <<'UCODE'
+let connections = require("config.connections");
+
+let sec_alpha = {
+    ".name": "sec_alpha",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    balancer_refs: [ "bal_shared_prio" ],
+    outbound_group_levels: [
+        "srv:[Akenai] Akenai BE Бельгия [VLESS+TCP]",
+        "srv:[Akenai] Akenai DE Германия [VLESS+TCP]"
+    ]
+};
+let sec_beta = {
+    ".name": "sec_beta",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    balancer_refs: [ "bal_shared_prio" ],
+    outbound_group_levels: [
+        "srv:[Other] Нидерланды [VLESS+REALITY]",
+        "srv:[Other] Финляндия [VLESS+REALITY]",
+        "direct"
+    ]
+};
+connections.set_item_sections_from_data({
+    settings: {
+        ".name": "settings",
+        ".type": "settings",
+        dns_server: "1.1.1.1"
+    },
+    balancer: [
+        {
+            ".name": "bal_shared_prio",
+            ".type": "balancer",
+            enabled: "1",
+            balancer_type: "priority",
+            name: "Shared Priority",
+            interrupt_exist_connections: "0"
+        }
+    ],
+    section: [ sec_alpha, sec_beta ]
+});
+
+let alpha_items = connections.priority_level_items("bal_shared_prio", sec_alpha);
+let beta_items = connections.priority_level_items("bal_shared_prio", sec_beta);
+if (length(alpha_items) != 2 || alpha_items[0].include_outbounds[0] != "[Akenai] Akenai BE Бельгия [VLESS+TCP]") {
+    warn("Expected sec_alpha to resolve its own 2 server tiers, got: " + sprintf("%J", alpha_items) + "\n");
+    exit(1);
+}
+if (length(beta_items) != 3 || beta_items[0].include_outbounds[0] != "[Other] Нидерланды [VLESS+REALITY]" || beta_items[2].direct != "1") {
+    warn("Expected sec_beta to resolve its own 3 tiers including direct, got: " + sprintf("%J", beta_items) + "\n");
+    exit(1);
+}
+if (connections.section_interrupt_exist_connections(sec_alpha) !== false) {
+    warn("Expected section_interrupt_exist_connections(sec_alpha) to inherit false from bal_shared_prio\n");
+    exit(1);
+}
+
+// 7. Verify AWG connection with 2 .conf files (CRLF vs LF + amnezia_conf_text) produces only 2 servers (no phantom 3rd server named after the connection)
+let conf_01_crlf = "[Interface]\r\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\nAddress = 10.8.1.2/32\r\n\r\n[Peer]\r\nPublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\r\nEndpoint = 198.51.100.10:51820\r\nAllowedIPs = 0.0.0.0/0\r\n";
+let conf_01_lf = "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.8.1.2/32\n\n[Peer]\nPublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\nEndpoint = 198.51.100.10:51820\nAllowedIPs = 0.0.0.0/0\n";
+let conf_02_crlf = "[Interface]\r\nPrivateKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=\r\nAddress = 10.8.1.3/32\r\n\r\n[Peer]\r\nPublicKey = DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=\r\nEndpoint = 198.51.100.11:51820\r\nAllowedIPs = 0.0.0.0/0\r\n";
+
+let sec_awg_multi = {
+    ".name": "Main",
+    ".type": "section",
+    enabled: "1",
+    action: "connection",
+    outbound_source_refs: [ "src_warp_awg3", "src_desync_1" ]
+};
+connections.set_item_sections_from_data({
+    outbound_source: [
+        {
+            ".name": "src_warp_awg3",
+            ".type": "outbound_source",
+            enabled: "1",
+            name: "WARPAmnezia#3",
+            source_type: "amnezia_config",
+            amnezia_configs: [
+                sprintf("%J", { name: "AWGwarp_tg_01", config: conf_01_crlf }),
+                sprintf("%J", { name: "AWGwarp_tg_02", config: conf_02_crlf }),
+                sprintf("%J", { name: "WARPAmnezia#3", config: conf_01_lf })
+            ],
+            amnezia_conf_text: conf_01_lf
+        },
+        {
+            ".name": "src_desync_1",
+            ".type": "outbound_source",
+            enabled: "1",
+            name: "AutoDesync",
+            source_type: "desync",
+            desync_preset: "auto"
+        }
+    ],
+    section: [ sec_awg_multi ]
+});
+
+let resolved_awg = connections.amnezia_configs(sec_awg_multi);
+if (length(resolved_awg) != 2) {
+    warn("Expected exactly 2 deduplicated AWG configs (AWGwarp_tg_01, AWGwarp_tg_02) without phantom WARPAmnezia#3, got: " + sprintf("%J", resolved_awg) + "\n");
+    exit(1);
+}
+let tier_refs = connections.section_combined_pool_tier_refs(sec_awg_multi);
+if (length(tier_refs) != 2 || tier_refs[0] != "src_warp_awg3" || tier_refs[1] != "src_desync_1") {
+    warn("Expected section_combined_pool_tier_refs to include both AWG and Desync outbound sources, got: " + sprintf("%J", tier_refs) + "\n");
+    exit(1);
+}
+
+// 8. Verify condition with UDP protocol filter + ports 7600, 7777 in Direct section generates route rule with network="udp" and port=[7600, 7777]
+let sec_direct_udp = {
+    ".name": "Direct",
+    ".type": "section",
+    enabled: "1",
+    action: "bypass",
+    condition_refs: [ "cond_udp_ports" ]
+};
+connections.set_item_sections_from_data({
+    condition: [
+        {
+            ".name": "cond_udp_ports",
+            ".type": "condition",
+            enabled: "1",
+            condition_type: "atomic",
+            ports: [ "7600", "7777" ],
+            protocol: [ "udp" ]
+        }
+    ],
+    section: [ sec_direct_udp ]
+});
+let gen_routes_mod = require("tachyon_core.generator_routes");
+gen_routes_mod.init({
+    runtime_settings: function() { return {}; },
+    runtime_generate_unsupported: function(msg) { warn(msg + "\n"); exit(1); }
+});
+let udp_cfg = { outbounds: [], route: { rules: [] }, dns: { servers: [], rules: [] } };
+gen_routes_mod.add_combined_route_for_section(udp_cfg, sec_direct_udp);
+if (length(udp_cfg.route.rules) != 1 ||
+    udp_cfg.route.rules[0].network != "udp" ||
+    udp_cfg.route.rules[0].protocol != null ||
+    length(udp_cfg.route.rules[0].port) != 2 ||
+    udp_cfg.route.rules[0].port[0] != 7600 ||
+    udp_cfg.route.rules[0].port[1] != 7777 ||
+    udp_cfg.route.rules[0].outbound != "bypass-out") {
+    warn("Expected Direct section with UDP+ports condition to emit route rule with network='udp', port=[7600,7777], outbound='bypass-out', got: " + sprintf("%J", udp_cfg.route.rules) + "\n");
+    exit(1);
+}
+UCODE
+
+printf 'modular redesign #242 checks passed\n'

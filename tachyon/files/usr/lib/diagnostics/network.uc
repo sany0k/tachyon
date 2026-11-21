@@ -8,9 +8,9 @@ let common = require("core.common");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || constants.TACHYON_CONFIG_NAME || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const SB_TPROXY_INBOUND6_ADDRESS = getenv("SB_TPROXY_INBOUND6_ADDRESS") || constants.SB_TPROXY_INBOUND6_ADDRESS || "::1";
-const SB_TPROXY_INBOUND_PORT = getenv("SB_TPROXY_INBOUND_PORT") || constants.SB_TPROXY_INBOUND_PORT || "1602";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
+const CORE_TPROXY_INBOUND6_ADDRESS = getenv("TACHYON_CORE_TPROXY_INBOUND6_ADDRESS") || getenv("CORE_TPROXY_INBOUND6_ADDRESS") || constants.TACHYON_CORE_TPROXY_INBOUND6_ADDRESS || constants.CORE_TPROXY_INBOUND6_ADDRESS || "::1";
+const CORE_TPROXY_INBOUND_PORT = getenv("TACHYON_CORE_TPROXY_INBOUND_PORT") || getenv("CORE_TPROXY_INBOUND_PORT") || constants.TACHYON_CORE_TPROXY_INBOUND_PORT || constants.CORE_TPROXY_INBOUND_PORT || "1602";
+const TACHYON_CORE_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
@@ -105,6 +105,46 @@ function valid_public_ip(value) {
     return valid_public_ipv4(value) || valid_public_ipv6(value);
 }
 
+function is_non_local_ipv6(value) {
+    value = lc(trim(as_string(value)));
+    if (!core_ip.valid_ipv6(value))
+        return false;
+    if (value == "::" || value == "::1")
+        return false;
+    if (substr(value, 0, 2) == "ff" || match(value, /^fe[89ab]/) != null)
+        return false;
+    // Exclude FakeIPv6 pool fc00::/18 (fc00..fc3f)
+    if (match(value, /^fc[0-3][0-9a-f]:/) != null)
+        return false;
+    return true;
+}
+
+function is_ula_ipv6(value) {
+    return match(lc(trim(as_string(value))), /^f[cd][0-9a-f]{2}:/) != null;
+}
+
+function strip_cidr_suffix(cidr) {
+    let s = trim(as_string(cidr));
+    if (s == "")
+        return "";
+    return replace(s, /\/.*$/, "");
+}
+
+function first_ipv6_from_list(list_or_str) {
+    let tokens = words(list_or_str);
+    let ula = "";
+    for (let tok in tokens) {
+        let addr = strip_cidr_suffix(tok);
+        if (!is_non_local_ipv6(addr))
+            continue;
+        if (!is_ula_ipv6(addr))
+            return addr;
+        if (ula == "")
+            ula = addr;
+    }
+    return ula;
+}
+
 function network_status_ip_addresses(data, key) {
     let value = parse_json_or_null(data);
     let addresses = type(value) == "object" ? value[key] : null;
@@ -131,6 +171,8 @@ function is_virtual_or_tunnel_iface(dev) {
 function get_wan_ip_addresses() {
     let result = [];
     let seen = {};
+    let has_v4 = false;
+    let has_v6 = false;
 
     let ifaces = [ "wan", "wan6", "wwan", "wwan6" ];
     let custom_iface = trim(as_string(uci_core.get(CONFIG_NAME + ".settings.output_network_interface")));
@@ -141,36 +183,202 @@ function get_wan_ip_addresses() {
         let data = command_output_from_args([
             "ubus", "-S", "call", "network.interface." + interface, "status"
         ]);
-        for (let ip in network_status_ip_addresses(data, "ipv4-address"))
+        for (let ip in network_status_ip_addresses(data, "ipv4-address")) {
+            if (valid_ipv4(ip))
+                has_v4 = true;
             push_unique(result, seen, ip);
-        for (let ip in network_status_ip_addresses(data, "ipv6-address"))
-            push_unique(result, seen, ip);
+        }
+        for (let ip in network_status_ip_addresses(data, "ipv6-address")) {
+            let addr = strip_cidr_suffix(ip);
+            if (!is_non_local_ipv6(addr))
+                continue;
+            has_v6 = true;
+            push_unique(result, seen, addr);
+        }
     }
 
-    if (length(result) > 0)
-        return join(" ", result);
+    if (!has_v4) {
+        let route = command_output_from_args([ "ip", "-4", "route", "show", "default" ]);
+        for (let line in split(route, "\n")) {
+            let m = match(line, /dev\s+([a-zA-Z0-9_\.\-]+)/);
+            if (!m || !m[1])
+                continue;
+            let iface = m[1];
+            if (is_virtual_or_tunnel_iface(iface))
+                continue;
 
-    let route = command_output_from_args([ "ip", "-4", "route", "show", "default" ]);
-    for (let line in split(route, "\n")) {
-        let m = match(line, /dev\s+([a-zA-Z0-9_\.\-]+)/);
-        if (!m || !m[1])
-            continue;
-        let iface = m[1];
-        if (is_virtual_or_tunnel_iface(iface))
-            continue;
-
-        let addr = command_output_from_args([ "ip", "-4", "addr", "show", "dev", iface ]);
-        for (let l in split(addr, "\n")) {
-            l = trim(as_string(l));
-            let matched = match(l, /^inet[ \t]+([0-9.]+)\//);
-            if (matched != null)
-                push_unique(result, seen, matched[1]);
+            let addr = command_output_from_args([ "ip", "-4", "addr", "show", "dev", iface ]);
+            for (let l in split(addr, "\n")) {
+                l = trim(as_string(l));
+                let matched = match(l, /^inet[ \t]+([0-9.]+)\//);
+                if (matched != null) {
+                    has_v4 = true;
+                    push_unique(result, seen, matched[1]);
+                }
+            }
+            if (has_v4)
+                break;
         }
-        if (length(result) > 0)
-            break;
+    }
+
+    if (!has_v6) {
+        let route6 = command_output_from_args([ "ip", "-6", "route", "show", "default" ]);
+        for (let line in split(route6, "\n")) {
+            let m = match(line, /dev[ \t]+([a-zA-Z0-9_.-]+)/);
+            if (!m || !m[1])
+                continue;
+            let iface = m[1];
+            if (is_virtual_or_tunnel_iface(iface))
+                continue;
+
+            let addr6 = command_output_from_args([ "ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global" ]);
+            for (let l in split(addr6, "\n")) {
+                let matched = match(trim(as_string(l)), /(^|[ \t])inet6[ \t]+([0-9a-fA-F:]+)(\/[0-9]+)?/);
+                if (matched != null && is_non_local_ipv6(matched[2]) && !is_ula_ipv6(matched[2])) {
+                    has_v6 = true;
+                    push_unique(result, seen, matched[2]);
+                }
+            }
+            if (has_v6)
+                break;
+        }
+        if (!has_v6 && ((getenv("TACHYON_MOCK_WAN6_STATUS_JSON") || "") != "" || (getenv("TACHYON_MOCK_WAN6_PD") || "") != "")) {
+            let live = common.wan6_live_status();
+            for (let cidr in (type(live.wan6_gua) == "array" ? live.wan6_gua : [])) {
+                let addr = strip_cidr_suffix(cidr);
+                if (is_non_local_ipv6(addr) && !is_ula_ipv6(addr))
+                    push_unique(result, seen, addr);
+            }
+        }
     }
 
     return join(" ", result);
+}
+
+function get_wan_ipv6_addresses(settings_cfg, wan6_live) {
+    let result = [];
+    let seen = {};
+    let ula = [];
+    let seen_ula = {};
+    let live = type(wan6_live) == "object" ? wan6_live : common.wan6_live_status();
+    for (let cidr in (type(live.wan6_gua) == "array" ? live.wan6_gua : [])) {
+        let addr = strip_cidr_suffix(cidr);
+        if (!is_non_local_ipv6(addr))
+            continue;
+        if (is_ula_ipv6(addr))
+            push_unique(ula, seen_ula, addr);
+        else
+            push_unique(result, seen, addr);
+    }
+    if (length(result) == 0) {
+        for (let tok in words(get_wan_ip_addresses())) {
+            let addr = strip_cidr_suffix(tok);
+            if (!is_non_local_ipv6(addr))
+                continue;
+            if (is_ula_ipv6(addr))
+                push_unique(ula, seen_ula, addr);
+            else
+                push_unique(result, seen, addr);
+        }
+    }
+    return length(result) > 0 ? result : ula;
+}
+
+function get_lan_ipv6_addresses(settings_cfg) {
+    let gua = [];
+    let seen_gua = {};
+    let ula = [];
+    let seen_ula = {};
+    let add_candidate = function(raw) {
+        let addr = strip_cidr_suffix(raw);
+        if (!is_non_local_ipv6(addr))
+            return;
+        if (is_ula_ipv6(addr))
+            push_unique(ula, seen_ula, addr);
+        else
+            push_unique(gua, seen_gua, addr);
+    };
+
+    let ifaces = words(type(settings_cfg) == "object" ? settings_cfg.source_network_interfaces : null);
+    let lan_ubus = parse_json_or_null(command_output_from_args([
+        "ubus", "-S", "call", "network.interface.lan", "status"
+    ]));
+    if (type(lan_ubus) == "object") {
+        if (type(lan_ubus["ipv6-address"]) == "array") {
+            for (let item in lan_ubus["ipv6-address"])
+                if (type(item) == "object")
+                    add_candidate(item.address || "");
+        }
+        if (type(lan_ubus["ipv6-prefix-assignment"]) == "array") {
+            for (let pa in lan_ubus["ipv6-prefix-assignment"]) {
+                if (type(pa) == "object" && type(pa["local-address"]) == "object")
+                    add_candidate(pa["local-address"].address || "");
+            }
+        }
+        let dev = trim(as_string(lan_ubus.l3_device || lan_ubus.device || ""));
+        if (dev != "")
+            push(ifaces, dev);
+    }
+
+    if (length(ifaces) == 0)
+        ifaces = [ "br-lan" ];
+    let checked_dev = {};
+    for (let iface in ifaces) {
+        if (checked_dev[iface])
+            continue;
+        checked_dev[iface] = true;
+        let out = command_output_from_args([
+            "ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global"
+        ]);
+        for (let line in split(out, "\n")) {
+            let m = match(trim(as_string(line)), /(^|[ \t])inet6[ \t]+([0-9a-fA-F:]+)(\/[0-9]+)?/);
+            if (m && m[2])
+                add_candidate(m[2]);
+        }
+    }
+
+    let out = [];
+    for (let ip in gua)
+        push(out, ip);
+    for (let ip in ula)
+        push(out, ip);
+    return out;
+}
+
+function get_router_hostname() {
+    let h = trim(as_string(uci_core.get("system", "@system[0]", "hostname") || ""));
+    if (h != "")
+        return h;
+    let proc_h = trim(as_string(fs.readfile("/proc/sys/kernel/hostname") || ""));
+    if (proc_h != "")
+        return proc_h;
+    return "";
+}
+
+function get_ipv6_runtime_telemetry(settings_cfg) {
+    if (type(settings_cfg) != "object")
+        settings_cfg = uci_core.get_all(CONFIG_NAME, "settings") || {};
+    let wan6_live = common.wan6_live_status();
+    let eff = common.resolve_effective_ipv6_state(settings_cfg, wan6_live);
+    let wan6_addrs = get_wan_ipv6_addresses(settings_cfg, wan6_live);
+    let lan6_addrs = get_lan_ipv6_addresses(settings_cfg);
+    return {
+        router_hostname: get_router_hostname(),
+        wan_ipv6: length(wan6_addrs) > 0 ? wan6_addrs[0] : "",
+        wan_ipv6_list: wan6_addrs,
+        lan_ipv6: length(lan6_addrs) > 0 ? lan6_addrs[0] : "",
+        lan_ipv6_list: lan6_addrs,
+        wan6_available: eff.wan6_available ? 1 : 0,
+        wan6_iface: as_string(eff.wan6_iface || ""),
+        wan6_prefix: length(eff.wan6_pd) > 0 ? as_string(eff.wan6_pd[0]) : "",
+        wan6_pd: type(eff.wan6_pd) == "array" ? eff.wan6_pd : [],
+        ipv6_effective_state: as_string(eff.effective || "disabled"),
+        ipv6_mode: as_string(eff.ipv6_mode || "auto"),
+        ipv6_leak_guard: eff.ipv6_leak_guard ? 1 : 0,
+        dns_strategy: as_string(eff.configured_dns_strategy || "prefer_ipv4"),
+        runtime_dns_strategy: as_string(eff.runtime_dns_strategy || "ipv4_only"),
+        fakeip_enabled: eff.fakeip_enabled ? 1 : 0
+    };
 }
 
 function get_wan_interface() {
@@ -203,7 +411,10 @@ function get_wan_interface() {
 
 function default_gateway_exists() {
     let out = command_output_from_args([ "ip", "route" ]);
-    return index(out, "default") >= 0;
+    if (index(out, "default") >= 0)
+        return true;
+    let out6 = command_output_from_args([ "ip", "-6", "route", "show", "default" ]);
+    return index(out6, "default") >= 0;
 }
 
 function wan_has_ip() {
@@ -233,22 +444,135 @@ function device_ipv4_address(interface) {
     return "";
 }
 
-function sing_box_standard_ports_listening(netstat) {
-    netstat = as_string(netstat);
-    let port_53_ok = index(netstat, "127.0.0.42:53") >= 0;
-    let tproxy_suffix = ":" + SB_TPROXY_INBOUND_PORT;
-    let port_1602_ok = index(netstat, "0.0.0.0" + tproxy_suffix) >= 0 ||
-        index(netstat, "127.0.0.1" + tproxy_suffix) >= 0;
-    let port_1602_v6_ok = !core_ip.ipv6_supported() ||
-        index(netstat, SB_TPROXY_INBOUND6_ADDRESS + tproxy_suffix) >= 0 ||
-        index(netstat, "[" + SB_TPROXY_INBOUND6_ADDRESS + "]" + tproxy_suffix) >= 0 ||
-        index(netstat, "0:0:0:0:0:0:0:1" + tproxy_suffix) >= 0 ||
-        index(netstat, ":::" + SB_TPROXY_INBOUND_PORT) >= 0;
-    return port_53_ok && port_1602_ok && port_1602_v6_ok;
+function uci_settings() {
+    return uci_core.get_all(CONFIG_NAME, "settings") || {};
 }
 
-function sing_box_standard_ports_listening_fixture() {
-    exit(sing_box_standard_ports_listening(read_stdin()) ? 0 : 1);
+function read_tachyon_core_inbounds(settings) {
+    let cfg_path = trim(as_string(getenv("TACHYON_CORE_CONFIG_PATH") || "")) ||
+        trim(as_string((type(settings) == "object" ? settings.config_path : "") || "")) ||
+        "/etc/tachyon-core/config.json";
+    let raw = fs.readfile(cfg_path);
+    if (raw == null) return null;
+    let parsed = parse_json_or_null(raw);
+    if (type(parsed) != "object" || type(parsed.inbounds) != "array")
+        return null;
+    return parsed.inbounds;
+}
+
+function tproxy4_listening(netstat, listen, port) {
+    let suffix = ":" + as_string(port);
+    listen = trim(as_string(listen));
+    if (listen != "" && index(netstat, listen + suffix) >= 0)
+        return true;
+    return index(netstat, "0.0.0.0" + suffix) >= 0 ||
+        index(netstat, "127.0.0.1" + suffix) >= 0;
+}
+
+function tproxy6_listening(netstat, listen, port) {
+    port = as_string(port);
+    let suffix = ":" + port;
+    listen = trim(as_string(listen || CORE_TPROXY_INBOUND6_ADDRESS)) || CORE_TPROXY_INBOUND6_ADDRESS;
+    return index(netstat, listen + suffix) >= 0 ||
+        index(netstat, "[" + listen + "]" + suffix) >= 0 ||
+        index(netstat, CORE_TPROXY_INBOUND6_ADDRESS + suffix) >= 0 ||
+        index(netstat, "[" + CORE_TPROXY_INBOUND6_ADDRESS + "]" + suffix) >= 0 ||
+        index(netstat, "0:0:0:0:0:0:0:1" + suffix) >= 0 ||
+        index(netstat, ":::" + port) >= 0;
+}
+
+function tun_interface_up(iface_name) {
+    iface_name = trim(as_string(iface_name || "tun0")) || "tun0";
+    return fs.stat("/sys/class/net/" + iface_name) != null ||
+        index(command_output_from_args([ "ip", "link", "show", iface_name ]), iface_name) >= 0;
+}
+
+function tachyon_core_missing_standard_ports(netstat) {
+    netstat = as_string(netstat);
+    let settings = uci_settings();
+    let inbounds = read_tachyon_core_inbounds(settings);
+    let missing = [];
+
+    if (inbounds != null) {
+        let dns_ib = null;
+        let tun_ib = null;
+        let mixed_ib = null;
+        let tproxy4_ib = null;
+        let tproxy6_ib = null;
+        for (let ib in inbounds) {
+            if (type(ib) != "object") continue;
+            let tag = as_string(ib.tag || "");
+            let ib_type = as_string(ib.type || "");
+            let ib_listen = as_string(ib.listen || "");
+            if (tag == "dns-in" || (ib_type == "direct" && as_string(ib.listen_port || "") == "53"))
+                dns_ib = dns_ib || ib;
+            else if (ib_type == "tun" || tag == "tun-in")
+                tun_ib = tun_ib || ib;
+            else if (ib_type == "mixed" || ib_type == "socks" || tag == "client-mixed-in")
+                mixed_ib = mixed_ib || ib;
+            else if (tag == "tproxy6-in" || (ib_type == "tproxy" && index(ib_listen, ":") >= 0))
+                tproxy6_ib = tproxy6_ib || ib;
+            else if (tag == "tproxy-in" || ib_type == "tproxy")
+                tproxy4_ib = tproxy4_ib || ib;
+        }
+        let dns_ep = (trim(as_string(dns_ib?.listen || "")) || "127.0.0.42") + ":" +
+            (as_string(dns_ib?.listen_port || "") || "53");
+        if (index(netstat, dns_ep) < 0)
+            push(missing, dns_ep);
+        if (tun_ib != null) {
+            let tun_if = trim(as_string(tun_ib.interface_name || "tun0")) || "tun0";
+            if (!tun_interface_up(tun_if))
+                push(missing, tun_if);
+        }
+        if (mixed_ib != null) {
+            let socks_port = as_string(mixed_ib.listen_port || settings.socks_port || "1080");
+            if (index(netstat, ":" + socks_port) < 0)
+                push(missing, ":" + socks_port);
+        }
+        if (tproxy4_ib != null) {
+            let p4 = as_string(tproxy4_ib.listen_port || CORE_TPROXY_INBOUND_PORT);
+            let l4 = trim(as_string(tproxy4_ib.listen || "0.0.0.0")) || "0.0.0.0";
+            if (!tproxy4_listening(netstat, l4, p4))
+                push(missing, l4 + ":" + p4);
+        }
+        if (tproxy6_ib != null) {
+            let p6 = as_string(tproxy6_ib.listen_port || CORE_TPROXY_INBOUND_PORT);
+            let l6 = trim(as_string(tproxy6_ib.listen || CORE_TPROXY_INBOUND6_ADDRESS)) || CORE_TPROXY_INBOUND6_ADDRESS;
+            if (!tproxy6_listening(netstat, l6, p6))
+                push(missing, "[" + l6 + "]:" + p6);
+        }
+        return missing;
+    }
+
+    if (index(netstat, "127.0.0.42:53") < 0)
+        push(missing, "127.0.0.42:53");
+    let proxy_mode = lc(trim(as_string(settings.proxy_mode || "tproxy")));
+    if (proxy_mode == "tun") {
+        if (!tun_interface_up("tun0"))
+            push(missing, "tun0");
+        return missing;
+    }
+    if (proxy_mode == "socks") {
+        let socks_port = as_string(settings.socks_port || "1080");
+        if (index(netstat, ":" + socks_port) < 0)
+            push(missing, ":" + socks_port);
+        return missing;
+    }
+    if (!tproxy4_listening(netstat, "0.0.0.0", CORE_TPROXY_INBOUND_PORT))
+        push(missing, "0.0.0.0:" + CORE_TPROXY_INBOUND_PORT);
+    let eff_v6 = common.resolve_effective_ipv6_state(settings, null);
+    let v6_active = (eff_v6 && eff_v6.ipv6_active) ? true : false;
+    if (v6_active && !tproxy6_listening(netstat, CORE_TPROXY_INBOUND6_ADDRESS, CORE_TPROXY_INBOUND_PORT))
+        push(missing, "[" + CORE_TPROXY_INBOUND6_ADDRESS + "]:" + CORE_TPROXY_INBOUND_PORT);
+    return missing;
+}
+
+function tachyon_core_standard_ports_listening(netstat) {
+    return length(tachyon_core_missing_standard_ports(netstat)) == 0;
+}
+
+function tachyon_core_standard_ports_listening_fixture() {
+    exit(tachyon_core_standard_ports_listening(read_stdin()) ? 0 : 1);
 }
 
 function server_required_port_conflict_owners(listen, port, required_proto) {
@@ -267,10 +591,6 @@ function server_required_ports_listening(listen, port, required_proto) {
         [ "server-required-ports-listening", listen, port, required_proto ],
         netstat
     );
-}
-
-function uci_settings() {
-    return uci_core.get_all(CONFIG_NAME, "settings") || {};
 }
 
 function lan_clients() {
@@ -400,15 +720,24 @@ return {
     valid_public_ipv4,
     valid_public_ipv6,
     valid_public_ip,
+    is_non_local_ipv6,
+    is_ula_ipv6,
+    strip_cidr_suffix,
+    first_ipv6_from_list,
     network_status_ip_addresses,
     is_virtual_or_tunnel_iface,
     get_wan_ip_addresses,
+    get_wan_ipv6_addresses,
+    get_lan_ipv6_addresses,
+    get_router_hostname,
+    get_ipv6_runtime_telemetry,
     get_wan_interface,
     default_gateway_exists,
     wan_has_ip,
     device_ipv4_address,
-    sing_box_standard_ports_listening,
-    sing_box_standard_ports_listening_fixture,
+    tachyon_core_missing_standard_ports,
+    tachyon_core_standard_ports_listening,
+    tachyon_core_standard_ports_listening_fixture,
     server_required_port_conflict_owners,
     server_required_ports_listening,
     lan_clients,

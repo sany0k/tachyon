@@ -93,6 +93,14 @@ function escapePoString(str) {
     return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+function isCorruptedTranslation(msgid, msgstr) {
+    if (!msgstr) return false;
+    if (msgstr.includes('\uFFFD') || /\?{2,}/.test(msgstr)) return true;
+    const qInStr = (msgstr.match(/\?/g) || []).length;
+    const qInId = (msgid.match(/\?/g) || []).length;
+    return qInStr > qInId;
+}
+
 async function generatePo() {
     const [callsRaw, oldPoRaw] = await Promise.all([
         fs.readFile(callsPath, 'utf8'),
@@ -105,23 +113,55 @@ async function generatePo() {
     const callKeys = new Set(calls.map(({ key }) => key));
 
     const bodyParts = [];
+    const corrupted = [];
 
     // First: all keys from calls.json (source-of-truth for what's used in code)
-    for (const { key } of calls) {
+    for (const { key, ru } of calls) {
         const msgid = key;
-        const msgstr = oldTranslations.get(msgid) || '';
+        const existing = oldTranslations.get(msgid);
+        const fallbackRu = lang === 'ru' && ru ? ru : '';
+        const msgstr =
+            existing && !isCorruptedTranslation(msgid, existing)
+                ? existing
+                : fallbackRu || existing || '';
+        if (isCorruptedTranslation(msgid, msgstr)) {
+            corrupted.push({ msgid, msgstr });
+        }
+        if (msgstr && !oldTranslations.get(msgid)) {
+            oldTranslations.set(msgid, msgstr);
+        }
         bodyParts.push(
             `msgid "${escapePoString(msgid)}"\nmsgstr "${escapePoString(msgstr)}"`
         );
     }
 
+    const isLegacyObsolete = (id, str) => {
+        const text = `${id} ${str || ''}`;
+        if (/antizapret/i.test(text) || /podkop\.fyi/i.test(text) || /release\/sing-box\/.*\.srs/i.test(text)) {
+            return false;
+        }
+        return /byedpi|zapret|sing[-_]box|podkop|forkop|netshift|qwdtt|olcrtc/i.test(text);
+    };
+
     // Second: preserve existing entries NOT in calls.json (manual additions, legacy strings)
     for (const [msgid, msgstr] of oldTranslations) {
         if (!callKeys.has(msgid) && msgid !== '') {
+            if (isLegacyObsolete(msgid, msgstr)) {
+                continue;
+            }
+            if (isCorruptedTranslation(msgid, msgstr)) {
+                corrupted.push({ msgid, msgstr });
+            }
             bodyParts.push(
                 `msgid "${escapePoString(msgid)}"\nmsgstr "${escapePoString(msgstr)}"`
             );
         }
+    }
+
+    if (corrupted.length > 0) {
+        throw new Error(
+            `Corrupted encoding detected in ${corrupted.length} PO entries (first: ${JSON.stringify(corrupted[0].msgid)} => ${JSON.stringify(corrupted[0].msgstr)})`
+        );
     }
 
     const header = getHeader(lang);
@@ -134,4 +174,5 @@ async function generatePo() {
 
 generatePo().catch((err) => {
     console.error('Ошибка генерации PO файла:', err);
+    process.exit(1);
 });

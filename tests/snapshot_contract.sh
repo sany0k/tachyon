@@ -67,8 +67,9 @@ run_uc() {
   TACHYON_SNAPSHOTS_DIR="$WORK_DIR/snapshots" \
   TACHYON_SNAPSHOT_LIMIT="${SNAPSHOT_LIMIT:-10}" \
   TACHYON_SNAPSHOT_VALIDATE_BIN="${VALIDATE_BIN:-$WORK_DIR/fake-validate}" \
+  TACHYON_SNAPSHOT_EXPORT_FILE="$WORK_DIR/export-tmp.json" \
   TACHYON_SNAPSHOT_BIN_LOG="$WORK_DIR/bin.log" \
-    ucode -L "$WORK_DIR/lib" -L "$TACHYON_LIB" "$SNAPSHOT_UC" "$mode" "$@"
+    ucode -L "$WORK_DIR/lib" -L "$TACHYON_LIB" -- "$SNAPSHOT_UC" "$mode" "$@"
 }
 
 # ---- snapshot-save: creates a tar.gz with the Telegram backup member layout
@@ -200,17 +201,100 @@ run_uc snapshot-delete "evil" >"$WORK_DIR/result.json" &&
 grep -Fq 'invalid snapshot name' "$WORK_DIR/result.json" ||
   fail "invalid file name delete must be rejected"
 
-# ---- argument validation
+# ---- argument validation and auto-generated random ID on empty name
 
-run_uc snapshot-save >"$WORK_DIR/result.json" && fail "snapshot-save without a name must fail"
-grep -Fq 'snapshot name required' "$WORK_DIR/result.json" ||
-  fail "snapshot-save without a name must explain itself"
+run_uc snapshot-save >"$WORK_DIR/auto1.json" ||
+  fail "snapshot-save without a name must auto-generate a unique hex ID"
+grep -Fq '"success": true' "$WORK_DIR/auto1.json" ||
+  fail "snapshot-save without a name must report success"
+AUTO_NAME_1="$(ucode -e 'let fs = require("fs"); let r = json(fs.readfile(ARGV[0])); print(r.name || "");' "$WORK_DIR/auto1.json")"
+AUTO_FILE_1="$(ucode -e 'let fs = require("fs"); let r = json(fs.readfile(ARGV[0])); print(r.file || "");' "$WORK_DIR/auto1.json")"
+[[ "$AUTO_NAME_1" =~ ^[0-9a-f]{8}$ ]] ||
+  fail "auto-generated snapshot ID must be an 8-char lowercase hex string, got: $AUTO_NAME_1"
+[[ "$AUTO_FILE_1" =~ ^${AUTO_NAME_1}-[0-9]{8}-[0-9]{6}\.tar\.gz$ ]] ||
+  fail "auto-generated snapshot file must start with its hex ID: $AUTO_FILE_1"
+
+run_uc snapshot-save "" >"$WORK_DIR/auto2.json" ||
+  fail "snapshot-save with empty string must auto-generate a unique hex ID"
+AUTO_NAME_2="$(ucode -e 'let fs = require("fs"); let r = json(fs.readfile(ARGV[0])); print(r.name || "");' "$WORK_DIR/auto2.json")"
+[[ "$AUTO_NAME_2" =~ ^[0-9a-f]{8}$ ]] ||
+  fail "second auto-generated snapshot ID must be an 8-char lowercase hex string, got: $AUTO_NAME_2"
+[ "$AUTO_NAME_1" != "$AUTO_NAME_2" ] ||
+  fail "auto-generated snapshot IDs must be unique across consecutive saves ($AUTO_NAME_1)"
+
 run_uc snapshot-save "./" >"$WORK_DIR/result.json" && fail "unsafe name must be rejected"
 grep -Fq 'invalid snapshot name' "$WORK_DIR/result.json" ||
   fail "unsafe name must be rejected as invalid"
 run_uc snapshot-restore "evil" >"$WORK_DIR/result.json" && fail "restore must reject invalid files"
 grep -Fq 'invalid snapshot name' "$WORK_DIR/result.json" ||
   fail "restore of an invalid file name must be rejected"
+
+# ---- active component versions in snapshot-save, snapshot-list, export/import, delete & rotation
+
+printf '%s\n' '0.4.9' >"$WORK_DIR/tachyon/tachyon-core-version"
+printf '%s\n' 'tachyon-core' >"$WORK_DIR/tachyon/tachyon-core-variant"
+cat >"$WORK_DIR/config/tachyon" <<'EOF'
+config settings 'settings'
+	option dns_type 'udp'
+	option dns '8.8.8.8'
+	option engine 'tachyon-core'
+
+config section 's_desync'
+	option label 'Active Desync'
+	option enabled '1'
+	option action 'desync'
+	option desync_preset 'auto'
+
+config section 's_disabled_fptn'
+	option label 'Disabled FPTN'
+	option enabled '0'
+	option action 'fptn'
+EOF
+
+TACHYON_VERSION="1.7.24" \
+TACHYON_CORE_VERSION_FILE="$WORK_DIR/tachyon/tachyon-core-version" \
+TACHYON_CORE_BIN="$WORK_DIR/nonexistent-core-bin" \
+  run_uc snapshot-save "" >"$WORK_DIR/comp-save.json"
+grep -Fq '"success": true' "$WORK_DIR/comp-save.json" ||
+  fail "snapshot-save with active component metadata must succeed"
+COMP_FILE="$(sed -n 's/.*"file": "\([^"]*\)".*/\1/p' "$WORK_DIR/comp-save.json")"
+COMP_BASE="${COMP_FILE%.tar.gz}"
+[ -f "$WORK_DIR/snapshots/${COMP_BASE}.meta.json" ] ||
+  fail "snapshot-save must write sidecar .meta.json for active components"
+[ "$(ucode -e "let fs = require('fs'); printf('%o', fs.stat('$WORK_DIR/snapshots/${COMP_BASE}.meta.json').mode & 511);")" = "600" ] ||
+  fail "snapshot .meta.json sidecar must be chmod 600"
+
+run_uc snapshot-list >"$WORK_DIR/comp-list.json"
+grep -Fq '"version": "1.7.24"' "$WORK_DIR/comp-list.json" ||
+  fail "snapshot-list must expose Tachyon version from snapshot metadata"
+grep -Fq '"name": "Tachyon Core"' "$WORK_DIR/comp-list.json" ||
+  fail "snapshot-list must expose Tachyon Core name from snapshot metadata"
+grep -Fq '"version": "0.4.9"' "$WORK_DIR/comp-list.json" ||
+  fail "snapshot-list must expose Tachyon Core version from snapshot metadata"
+
+run_uc snapshot-export "$COMP_FILE" >"$WORK_DIR/comp-export.json"
+grep -Fq '"version": "0.4.9"' "$WORK_DIR/comp-export.json" ||
+  fail "snapshot-export must preserve components array in tachyon-profile-v1"
+
+run_uc snapshot-delete "$COMP_FILE" >/dev/null
+[ ! -e "$WORK_DIR/snapshots/${COMP_BASE}.meta.json" ] ||
+  fail "snapshot-delete must clean up the .meta.json sidecar file"
+
+run_uc snapshot-import "$WORK_DIR/comp-export.json" >"$WORK_DIR/comp-import.json"
+COMP_IMP_FILE="$(sed -n 's/.*"file": "\([^"]*\)".*/\1/p' "$WORK_DIR/comp-import.json")"
+COMP_IMP_BASE="${COMP_IMP_FILE%.tar.gz}"
+[ -f "$WORK_DIR/snapshots/${COMP_IMP_BASE}.meta.json" ] ||
+  fail "snapshot-import must restore .meta.json sidecar from exported profile"
+run_uc snapshot-list >"$WORK_DIR/comp-list-after-imp.json"
+grep -Fq '"version": "0.4.9"' "$WORK_DIR/comp-list-after-imp.json" ||
+  fail "snapshot-list after import must return preserved component versions"
+
+sleep 1
+SNAPSHOT_LIMIT=1 TACHYON_VERSION="1.7.24" TACHYON_CORE_VERSION_FILE="$WORK_DIR/tachyon/tachyon-core-version" \
+  TACHYON_CORE_BIN="$WORK_DIR/nonexistent-core-bin" \
+  run_uc snapshot-save newest_only >/dev/null
+[ ! -e "$WORK_DIR/snapshots/${COMP_IMP_BASE}.meta.json" ] ||
+  fail "prune_snapshots rotation must remove .meta.json sidecars of pruned snapshots"
 
 # ---- snapshot-diff (with secret masking), snapshot-export, and snapshot-import
 
@@ -240,6 +324,10 @@ fi
 run_uc snapshot-export "$PROF_FILE" >"$WORK_DIR/export.json"
 grep -Fq '"format": "tachyon-profile-v1"' "$WORK_DIR/export.json" ||
   fail "snapshot-export must emit tachyon-profile-v1 format"
+[ -f "$WORK_DIR/export-tmp.json" ] ||
+  fail "snapshot-export must also write fallback JSON to TACHYON_SNAPSHOT_EXPORT_FILE"
+grep -Fq '"format": "tachyon-profile-v1"' "$WORK_DIR/export-tmp.json" ||
+  fail "fallback export file must contain tachyon-profile-v1 JSON"
 
 run_uc snapshot-delete "$PROF_FILE" >/dev/null
 run_uc snapshot-import "$WORK_DIR/export.json" >"$WORK_DIR/import.json"
@@ -248,5 +336,208 @@ grep -Fq '"success": true' "$WORK_DIR/import.json" ||
 IMPORTED_FILE="$(sed -n 's/.*"file": "\([^"]*\)".*/\1/p' "$WORK_DIR/import.json")"
 [ -f "$WORK_DIR/snapshots/$IMPORTED_FILE" ] ||
   fail "snapshot-import must create the archive in snapshots directory"
+
+# ---- heavy cache directories (rulesets, installer-backups, subscription-cache,
+# component-backups, hosts-lists) must be excluded from snapshot-save, preserved
+# on snapshot-restore, and stripped during snapshot-export of legacy bloated archives.
+
+mkdir -p "$WORK_DIR/tachyon/rulesets" "$WORK_DIR/tachyon/installer-backups" "$WORK_DIR/tachyon/subscription-cache" "$WORK_DIR/tachyon/component-backups" "$WORK_DIR/tachyon/hosts-lists"
+printf '%s\n' 'compiled-srs-blob' >"$WORK_DIR/tachyon/rulesets/heavy.srs"
+printf '%s\n' 'old-ipk' >"$WORK_DIR/tachyon/installer-backups/old.ipk"
+printf '%s\n' 'sub-cache' >"$WORK_DIR/tachyon/subscription-cache/sub.json"
+printf '%s\n' 'heavy-binary-backup' >"$WORK_DIR/tachyon/component-backups/tachyon-core.bin"
+printf '%s\n' 'hosts-list-cache' >"$WORK_DIR/tachyon/hosts-lists/adblock.txt"
+printf '%s\n' 'user-custom-list' >"$WORK_DIR/tachyon/custom.lst"
+
+run_uc snapshot-save slim >"$WORK_DIR/result.json"
+SLIM_FILE="$(sed -n 's/.*"file": "\([^"]*\)".*/\1/p' "$WORK_DIR/result.json")"
+if tar -tzf "$WORK_DIR/snapshots/$SLIM_FILE" | grep -Eq '^tachyon/(rulesets|installer-backups|subscription-cache|component-backups|hosts-lists)(/|$)'; then
+  fail "snapshot-save must exclude rulesets, installer-backups, subscription-cache, component-backups, and hosts-lists"
+fi
+grep -Fxq 'tachyon/custom.lst' <(tar -tzf "$WORK_DIR/snapshots/$SLIM_FILE") ||
+  fail "snapshot-save must preserve user files in /etc/tachyon"
+
+printf '%s\n' 'updated-srs-blob' >"$WORK_DIR/tachyon/rulesets/heavy.srs"
+printf '%s\n' 'updated-binary-backup' >"$WORK_DIR/tachyon/component-backups/tachyon-core.bin"
+rm -f "$WORK_DIR/tachyon/custom.lst"
+run_uc snapshot-restore "$SLIM_FILE" >"$WORK_DIR/result.json"
+grep -Fq '"success": true' "$WORK_DIR/result.json" ||
+  fail "snapshot-restore of slim archive must succeed"
+[ "$(cat "$WORK_DIR/tachyon/custom.lst")" = 'user-custom-list' ] ||
+  fail "snapshot-restore must restore user files"
+[ "$(cat "$WORK_DIR/tachyon/rulesets/heavy.srs")" = 'updated-srs-blob' ] ||
+  fail "snapshot-restore must preserve existing rulesets directory on disk"
+[ "$(cat "$WORK_DIR/tachyon/component-backups/tachyon-core.bin")" = 'updated-binary-backup' ] ||
+  fail "snapshot-restore must preserve existing component-backups directory on disk"
+
+# Create a legacy bloated archive that still contains rulesets/ and component-backups/ inside it
+tar -czf "$WORK_DIR/snapshots/legacy-20250101-010101.tar.gz" -C "$WORK_DIR" config/tachyon tachyon
+grep -Fxq 'tachyon/rulesets/heavy.srs' <(tar -tzf "$WORK_DIR/snapshots/legacy-20250101-010101.tar.gz") ||
+  fail "legacy test archive must contain rulesets/heavy.srs"
+grep -Fxq 'tachyon/component-backups/tachyon-core.bin' <(tar -tzf "$WORK_DIR/snapshots/legacy-20250101-010101.tar.gz") ||
+  fail "legacy test archive must contain component-backups/tachyon-core.bin"
+
+run_uc snapshot-export "legacy-20250101-010101.tar.gz" >"$WORK_DIR/legacy-export.json"
+grep -Fq '"success": true' "$WORK_DIR/legacy-export.json" ||
+  fail "snapshot-export of legacy archive must succeed"
+run_uc snapshot-import "$WORK_DIR/legacy-export.json" >"$WORK_DIR/legacy-import.json"
+LEGACY_IMPORTED="$(sed -n 's/.*"file": "\([^"]*\)".*/\1/p' "$WORK_DIR/legacy-import.json")"
+if tar -tzf "$WORK_DIR/snapshots/$LEGACY_IMPORTED" | grep -Eq '^tachyon/(rulesets|installer-backups|subscription-cache|component-backups|hosts-lists)(/|$)'; then
+  fail "snapshot-export must strip heavy cache directories from legacy archives"
+fi
+
+# ---- BusyBox tar -tzf lists top-level directory as "tachyon" (without trailing slash)
+mkdir -p "$WORK_DIR/fakebin"
+cat >"$WORK_DIR/fakebin/tar" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-tzf" ]; then
+  /bin/tar "$@" | sed 's|^tachyon/$|tachyon|; s|^config/$|config|'
+else
+  exec /bin/tar "$@"
+fi
+EOF
+chmod +x "$WORK_DIR/fakebin/tar"
+PATH="$WORK_DIR/fakebin:$PATH" run_uc snapshot-export "$SLIM_FILE" >"$WORK_DIR/bb-export.json"
+grep -Fq '"success": true' "$WORK_DIR/bb-export.json" ||
+  fail "snapshot-export must accept BusyBox tar -tzf output where directory member is 'tachyon' without trailing slash"
+PATH="$WORK_DIR/fakebin:$PATH" run_uc snapshot-import "$WORK_DIR/bb-export.json" >"$WORK_DIR/bb-import.json"
+grep -Fq '"success": true' "$WORK_DIR/bb-import.json" ||
+  fail "snapshot-import must accept BusyBox tar -tzf output where directory member is 'tachyon' without trailing slash"
+
+# ---- Chunked snapshot export (read-chunk) and chunked snapshot import (chunk-init / chunk-append)
+run_uc snapshot-export "read-chunk:0:128" >"$WORK_DIR/chunk-read.json"
+grep -Fq '"success": true' "$WORK_DIR/chunk-read.json" ||
+  fail "snapshot-export read-chunk must succeed"
+grep -Fq '"chunk":' "$WORK_DIR/chunk-read.json" ||
+  fail "snapshot-export read-chunk must include chunk string"
+
+run_uc snapshot-import "chunk-init" >"$WORK_DIR/chunk-init.json"
+grep -Fq '"success": true' "$WORK_DIR/chunk-init.json" ||
+  fail "snapshot-import chunk-init must succeed"
+B64_PAYLOAD="$(ucode -e "let fs = require('fs'); print(b64enc(fs.readfile('$WORK_DIR/export-tmp.json')));")"
+HALF_LEN=$(( ${#B64_PAYLOAD} / 2 ))
+# Ensure first chunk length is a multiple of 4 for base64 decoding
+HALF_LEN=$(( (HALF_LEN / 4) * 4 ))
+CHUNK1="${B64_PAYLOAD:0:$HALF_LEN}"
+CHUNK2="${B64_PAYLOAD:$HALF_LEN}"
+run_uc snapshot-import "chunk-append:$CHUNK1" >"$WORK_DIR/chunk-app1.json"
+grep -Fq '"success": true' "$WORK_DIR/chunk-app1.json" ||
+  fail "snapshot-import chunk-append first chunk must succeed"
+run_uc snapshot-import "chunk-append:$CHUNK2" >"$WORK_DIR/chunk-app2.json"
+grep -Fq '"success": true' "$WORK_DIR/chunk-app2.json" ||
+  fail "snapshot-import chunk-append second chunk must succeed"
+run_uc snapshot-import "/tmp/tachyon-snapshot-import.json" >"$WORK_DIR/chunk-finish.json"
+grep -Fq '"success": true' "$WORK_DIR/chunk-finish.json" ||
+  fail "snapshot-import from assembled chunk file must succeed"
+
+ACL_FILE="$ROOT_DIR/tachyon/files/usr/share/rpcd/acl.d/luci-app-tachyon.json"
+grep -Fq '"cgi-io"' "$ACL_FILE" ||
+  fail "luci-app-tachyon ACL must grant cgi-io permissions for LuCI fs.read/fs.write"
+
+# ---- Compact transfer codes (tachyon://t1/... short encrypted token & tachyon://cfg1/... offline fallback)
+cat >"$WORK_DIR/config/tachyon" <<'EOF'
+config settings 'settings'
+	option dns_type 'doh'
+	option dns '1.1.1.1'
+	option engine 'tachyon-core'
+
+config section 's_media'
+	option label 'Media'
+	option enabled '1'
+
+config server 'srv_eu'
+	option label 'EU Inbound VPN'
+	option protocol 'vless'
+
+config outbound_source 'sub_main'
+	option label 'Main Sub'
+	list proxy_links 'vless://00000000-0000-0000-0000-000000000001@198.51.100.10:443#Node1'
+EOF
+printf '%s\n' 'transfer-custom-domain.example' >"$WORK_DIR/tachyon/custom.lst"
+
+TACHYON_TRANSFER_RELAY_DIR="$WORK_DIR/relay" run_uc snapshot-export "code:routes" >"$WORK_DIR/code-routes.json"
+grep -Fq '"success": true' "$WORK_DIR/code-routes.json" ||
+  fail "snapshot-export code:routes must succeed"
+grep -Fq '"scope": "routes"' "$WORK_DIR/code-routes.json" ||
+  fail "snapshot-export code:routes must report scope=routes"
+ROUTES_CODE="$(sed -n 's/.*"code": "\([^"]*\)".*/\1/p' "$WORK_DIR/code-routes.json")"
+case "$ROUTES_CODE" in
+  tachyon://t1/l/*) ;;
+  *) fail "snapshot-export code:routes with relay must produce a short tachyon://t1/ token (got: $ROUTES_CODE)" ;;
+esac
+
+TACHYON_TRANSFER_OFFLINE_ONLY=1 run_uc snapshot-export "code:full" >"$WORK_DIR/code-full.json"
+grep -Fq '"success": true' "$WORK_DIR/code-full.json" ||
+  fail "snapshot-export code:full must succeed"
+FULL_CODE="$(sed -n 's/.*"code": "\([^"]*\)".*/\1/p' "$WORK_DIR/code-full.json")"
+case "$FULL_CODE" in
+  tachyon://cfg1/*|tachyon://cfg1u/*) ;;
+  *) fail "snapshot-export with TACHYON_TRANSFER_OFFLINE_ONLY=1 must produce a tachyon://cfg1/ code" ;;
+esac
+
+TACHYON_TRANSFER_RELAY_DIR="$WORK_DIR/relay" run_uc snapshot-import "code-inspect:$ROUTES_CODE" >"$WORK_DIR/code-inspect.json"
+grep -Fq '"success": true' "$WORK_DIR/code-inspect.json" ||
+  fail "snapshot-import code-inspect must succeed"
+grep -Fq '"scope": "routes"' "$WORK_DIR/code-inspect.json" ||
+  fail "code-inspect must report scope=routes"
+grep -Fq '"Media"' "$WORK_DIR/code-inspect.json" ||
+  fail "code-inspect must include section label Media"
+
+# Target router has different system settings and its own existing route section
+cat >"$WORK_DIR/config/tachyon" <<'EOF'
+config settings 'settings'
+	option dns_type 'udp'
+	option dns '9.9.9.9'
+	option log_level 'warn'
+
+config section 's_existing'
+	option label 'Existing Local Route'
+	option enabled '1'
+EOF
+rm -f "$WORK_DIR/tachyon/custom.lst"
+
+# 1) Merge mode: keeps s_existing and target settings, adds s_media and sub_main, and restores custom.lst
+TACHYON_TRANSFER_RELAY_DIR="$WORK_DIR/relay" run_uc snapshot-import "code-apply:merge:$ROUTES_CODE" >"$WORK_DIR/code-merge.json"
+grep -Fq '"success": true' "$WORK_DIR/code-merge.json" ||
+  fail "code-apply:merge must succeed"
+grep -Fq "option dns '9.9.9.9'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:merge (routes) must preserve target router settings"
+grep -Fq "config section 's_existing'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:merge must preserve existing route sections on target router"
+grep -Fq "config section 's_media'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:merge must add incoming route sections"
+grep -Fq "config outbound_source 'sub_main'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:merge must add incoming outbound_source sections"
+[ "$(cat "$WORK_DIR/tachyon/custom.lst")" = 'transfer-custom-domain.example' ] ||
+  fail "code-apply:merge must transfer user files in /etc/tachyon"
+
+# 2) Replace mode (scope=routes): preserves target settings, replaces s_existing with s_media
+TACHYON_TRANSFER_RELAY_DIR="$WORK_DIR/relay" run_uc snapshot-import "code-apply:replace:$ROUTES_CODE" >"$WORK_DIR/code-replace.json"
+grep -Fq '"success": true' "$WORK_DIR/code-replace.json" ||
+  fail "code-apply:replace must succeed"
+grep -Fq "option dns '9.9.9.9'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:replace (routes) must preserve target router settings"
+if grep -Fq "config section 's_existing'" "$WORK_DIR/config/tachyon"; then
+  fail "code-apply:replace must remove old route sections not in the transfer code"
+fi
+grep -Fq "config section 's_media'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:replace must write transferred route sections"
+
+# 3) Replace mode (scope=full): replaces target settings and includes inbound server
+run_uc snapshot-import "code-apply:replace:$FULL_CODE" >"$WORK_DIR/code-replace-full.json"
+grep -Fq '"success": true' "$WORK_DIR/code-replace-full.json" ||
+  fail "code-apply:replace (full) must succeed"
+grep -Fq "option dns '1.1.1.1'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:replace (full) must apply transferred settings"
+grep -Fq "config server 'srv_eu'" "$WORK_DIR/config/tachyon" ||
+  fail "code-apply:replace (full) must include inbound VPN server sections"
+
+# 4) Negative test: corrupted transfer code or wrong token key is rejected without modifying config
+run_uc snapshot-import "code-apply:replace:tachyon://cfg1/not_valid_gzip_payload" >"$WORK_DIR/code-bad.json" &&
+  fail "corrupted transfer code must fail"
+grep -Fq '"success": false' "$WORK_DIR/code-bad.json" ||
+  fail "corrupted transfer code must report success=false"
+grep -Fq "option dns '1.1.1.1'" "$WORK_DIR/config/tachyon" ||
+  fail "rejected transfer code must leave current config intact"
 
 printf 'snapshot contract checks passed\n'

@@ -64,15 +64,19 @@ grep -Fq '/usr/bin/tachyon package_prerm upgrade' "$BUILD_SCRIPT" ||
 # `exit(system(...))` returns a raw wait status, so a killed cleanup (the sweep used
 # to SIGKILL its own parent, giving 128+119=247) aborted the upgrade and rolled the
 # new build back.
-for hook in 'backend-pre-upgrade.sh' 'backend-pre-deinstall.sh'; do
+for hook in 'backend-pre-upgrade.sh' 'backend-pre-deinstall.sh' 'backend-post-install.sh' 'backend-post-upgrade.sh'; do
   sed -n "/cat > \"\$scripts_dir\/$hook\" <<'EOF'/,/^EOF$/p" "$BUILD_SCRIPT" >"$WORK_DIR/$hook"
   [ -s "$WORK_DIR/$hook" ] || fail "build.sh must write $hook"
-  grep -Fq 'timeout' "$WORK_DIR/$hook" ||
-    fail "build.sh $hook must bound package_prerm so a stuck cleanup cannot roll the upgrade back"
+  case "$hook" in
+    backend-pre-*)
+      grep -Fq 'timeout' "$WORK_DIR/$hook" ||
+        fail "build.sh $hook must bound package_prerm so a stuck cleanup cannot roll the upgrade back"
+      ;;
+  esac
   # Comments are stripped first: the hook documents the `exit(system(...))` form it
   # replaced, and matching prose would fail the very file that fixed the bug.
   if sed 's|//.*||' "$WORK_DIR/$hook" | grep -Fq 'exit(system('; then
-    fail "build.sh $hook must not return the cleanup's status; a nonzero hook aborts the upgrade"
+    fail "build.sh $hook must not return the raw system() status; a negative signal status fails apk hooks"
   fi
 done
 
@@ -88,7 +92,7 @@ grep -Fq 'timeout' "$WORK_DIR/ipk-prerm.sh" ||
 
 # These hooks live inside heredocs, so ucode_syntax_lint.sh never compiles them: a
 # syntax error would only surface on a router mid-upgrade, as a rolled-back package.
-for hook in 'backend-pre-upgrade.sh' 'backend-pre-deinstall.sh' 'ipk-prerm.sh'; do
+for hook in 'backend-pre-upgrade.sh' 'backend-pre-deinstall.sh' 'backend-post-install.sh' 'backend-post-upgrade.sh' 'ipk-prerm.sh'; do
   sed '1d;$d' "$WORK_DIR/$hook" >"$WORK_DIR/$hook.body.uc"
   ucode -c -o /dev/null "$WORK_DIR/$hook.body.uc" 2>"$WORK_DIR/$hook.err" ||
     fail "build.sh $hook must compile: $(cat "$WORK_DIR/$hook.err")"
@@ -134,9 +138,8 @@ TACHYON_INIT="$WORK_DIR/tachyon-init" \
 TACHYON_STOP_LOG="$WORK_DIR/stop-order.log" \
 TACHYON_BIN="$WORK_DIR/missing-tachyon-bin" \
 TACHYON_DNS_APPLY_UC="$WORK_DIR/missing-dns-apply.uc" \
-TACHYON_SING_BOX_INIT="$WORK_DIR/missing-sing-box-init" \
-TACHYON_SING_BOX_BIN="$WORK_DIR/missing-sing-box-bin" \
-TACHYON_SING_BOX_CRONET="$WORK_DIR/missing-cronet" \
+TACHYON_CORE_INIT="$WORK_DIR/missing-tachyon-core-init" \
+TACHYON_CORE_BIN="$WORK_DIR/missing-tachyon-core-bin" \
 TACHYON_RT_TABLES="$WORK_DIR/rt_tables_stop_order" \
   ucode -L "$TACHYON_LIB" "$PACKAGE_UC" prerm
 grep -Fxq 'stop-with-route-table' "$WORK_DIR/stop-order.log" ||
@@ -167,9 +170,8 @@ TACHYON_UCI_STATE_FILE="$WORK_DIR/dont-touch.state" \
 TACHYON_RESTORE_LOG="$WORK_DIR/restore-dont-touch.log" \
 TACHYON_BIN="$WORK_DIR/tachyon-bin" \
 TACHYON_DNS_APPLY_UC="$WORK_DIR/missing-dns-apply.uc" \
-TACHYON_SING_BOX_INIT="$WORK_DIR/missing-sing-box-init" \
-TACHYON_SING_BOX_BIN="$WORK_DIR/missing-sing-box-bin" \
-TACHYON_SING_BOX_CRONET="$WORK_DIR/missing-cronet" \
+TACHYON_CORE_INIT="$WORK_DIR/missing-tachyon-core-init" \
+TACHYON_CORE_BIN="$WORK_DIR/missing-tachyon-core-bin" \
 TACHYON_RT_TABLES="$WORK_DIR/rt_tables_dont_touch" \
   ucode -L "$TACHYON_LIB" "$PACKAGE_UC" prerm
 if grep -Fxq 'restore_dnsmasq' "$WORK_DIR/restore-dont-touch.log"; then
@@ -189,9 +191,8 @@ TACHYON_UCI_STATE_FILE="$WORK_DIR/restore.state" \
 TACHYON_RESTORE_LOG="$WORK_DIR/restore.log" \
 TACHYON_BIN="$WORK_DIR/tachyon-bin" \
 TACHYON_DNS_APPLY_UC="$WORK_DIR/missing-dns-apply.uc" \
-TACHYON_SING_BOX_INIT="$WORK_DIR/missing-sing-box-init" \
-TACHYON_SING_BOX_BIN="$WORK_DIR/missing-sing-box-bin" \
-TACHYON_SING_BOX_CRONET="$WORK_DIR/missing-cronet" \
+TACHYON_CORE_INIT="$WORK_DIR/missing-tachyon-core-init" \
+TACHYON_CORE_BIN="$WORK_DIR/missing-tachyon-core-bin" \
 TACHYON_RT_TABLES="$WORK_DIR/rt_tables_restore" \
   ucode -L "$TACHYON_LIB" "$PACKAGE_UC" prerm
 grep -Fxq 'restore_dnsmasq' "$WORK_DIR/restore.log" ||
@@ -246,7 +247,7 @@ TACHYON_HOOK_COMMAND_TIMEOUT=2 \
 TACHYON_INIT="$WORK_DIR/hanging-init" \
 TACHYON_BIN="$WORK_DIR/hanging-init" \
 TACHYON_DNS_APPLY_UC="$WORK_DIR/missing-dns-apply.uc" \
-TACHYON_SING_BOX_INIT="$WORK_DIR/missing-sing-box-init" \
+TACHYON_CORE_INIT="$WORK_DIR/missing-tachyon-core-init" \
 TACHYON_UCI_STATE_FILE="$WORK_DIR/dont-touch.state" \
 TACHYON_RT_TABLES="$WORK_DIR/rt_tables_hang" \
   ucode -L "$TACHYON_LIB" "$PACKAGE_UC" prerm upgrade
@@ -289,7 +290,7 @@ TACHYON_SWEEP_LOG="$WORK_DIR/sweep.log" \
   TACHYON_BIN="$sweep_parent" \
   TACHYON_INIT="$WORK_DIR/upgrade-init" \
   TACHYON_DNS_APPLY_UC="$WORK_DIR/missing-dns-apply.uc" \
-  TACHYON_SING_BOX_INIT="$WORK_DIR/missing-sing-box-init" \
+  TACHYON_CORE_INIT="$WORK_DIR/missing-tachyon-core-init" \
   TACHYON_UCI_STATE_FILE="$WORK_DIR/dont-touch.state" \
   TACHYON_RT_TABLES="$WORK_DIR/rt_tables_sweep" \
   TACHYON_SWEEP_LOG="$WORK_DIR/sweep.log" \
@@ -328,5 +329,26 @@ grep -Fq '[ "$$1" = "upgrade" ] && exit 0' "$ROOT_DIR/luci-app-tachyon/Makefile"
 if grep -E 'rpcd restart|uhttpd restart' "$ROOT_DIR/luci-app-tachyon/Makefile" "$BUILD_SCRIPT" >/dev/null; then
   fail "package postrm scripts must not restart rpcd or uhttpd"
 fi
+
+# luci-postinst wipes system-info.json after tachyon postinst already warmed it,
+# so it must kick off a background warmup of get_ui_capabilities and get_system_info
+# to keep the first LuCI visit after install/upgrade from hitting cold caches.
+: >"$WORK_DIR/warm.log"
+TACHYON_UCI_STATE_FILE="$WORK_DIR/dont-touch.state" \
+TACHYON_UCITRACK_FILE="$WORK_DIR/missing-ucitrack" \
+TACHYON_LUCI_CACHE_GLOBS="$WORK_DIR/luci-indexcache*" \
+TACHYON_RESTORE_LOG="$WORK_DIR/warm.log" \
+TACHYON_BIN="$WORK_DIR/tachyon-bin" \
+  ucode -L "$TACHYON_LIB" "$PACKAGE_UC" luci-postinst
+for _ in 1 2 3 4 5; do
+  if grep -Fxq 'get_ui_capabilities' "$WORK_DIR/warm.log" && grep -Fxq 'get_system_info' "$WORK_DIR/warm.log"; then
+    break
+  fi
+  sleep 0.2
+done
+grep -Fxq 'get_ui_capabilities' "$WORK_DIR/warm.log" ||
+  fail "luci-postinst must warm get_ui_capabilities in the background"
+grep -Fxq 'get_system_info' "$WORK_DIR/warm.log" ||
+  fail "luci-postinst must re-warm get_system_info in the background after clearing cache"
 
 printf 'package lifecycle checks passed\n'

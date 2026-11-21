@@ -12,7 +12,7 @@
 //   - Process identity (PID + starttime + boot_id) prevents PID-recycling bugs
 //   - Every spawn closes inherited descriptors through close_inherited_fds()
 //
-// The module is deliberately low-level: no UCI, no nft, no sing-box knowledge.
+// The module is deliberately low-level: no UCI, no nft, no proxy-core knowledge.
 // Higher-level abstractions (jobs, transactions) build on top of this.
 
 let fs = require("fs");
@@ -72,14 +72,20 @@ function command_env(assignments) {
     return join(" ", parts);
 }
 
-function command_status_from_args(args) {
-    let status = int(system(command_from_args(args)));
-    if (status == -1)
-        return 255;
+function normalize_status(status) {
+    status = int(status);
+    if (status < 0)
+        return status == -1 ? 255 : 128 + (-status);
+    if (status <= 255)
+        return status;
     let signal = status & 127;
     if (signal != 0)
         return 128 + signal;
     return (status >> 8) & 255;
+}
+
+function command_status_from_args(args) {
+    return normalize_status(system(command_from_args(args)));
 }
 
 function command_success_from_args(args) {
@@ -156,24 +162,15 @@ function run(opts) {
 
         let output = as_string(pipe.read("all") || "");
         let raw_status = pipe.close();
-
-        let status;
-        if (raw_status == -1)
-            status = 255;
-        else {
-            let signal = raw_status & 127;
-            status = signal != 0 ? 128 + signal : (raw_status >> 8) & 255;
-        }
-        return { status: status, output: trim(output) };
+        let status = normalize_status(raw_status);
+        let timed_out = timeout_s > 0 && (raw_status == 124 || raw_status == 137 || raw_status == 143 || status == 124 || status == 137 || status == 143 || status == 252);
+        return { status: status, output: trim(output), timed_out: timed_out };
     }
 
-    let status = int(system(cmd));
-    if (status == -1)
-        return { status: 255, output: "" };
-    let signal = status & 127;
-    if (signal != 0)
-        return { status: 128 + signal, output: "" };
-    return { status: (status >> 8) & 255, output: "" };
+    let raw_status = int(system(cmd));
+    let status = normalize_status(raw_status);
+    let timed_out = timeout_s > 0 && (raw_status == 124 || raw_status == 137 || raw_status == 143 || status == 124 || status == 137 || status == 143 || status == 252);
+    return { status: status, output: "", timed_out: timed_out };
 }
 
 // Convenience: run and return only the exit status (0 = success).
@@ -417,6 +414,11 @@ function module_exports() {
         // Timeout
         bounded_command,
         get_timeout_prefix,
+        sleep_ms: function(ms) {
+            let delay = int(ms || 0);
+            if (delay > 0)
+                sleep(delay);
+        },
 
         // Backwards-compatible aliases for callers that haven't migrated yet
         command_status: function(command) {

@@ -6,12 +6,10 @@ let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let common = require("core.common");
 let network_mod = require("diagnostics.network");
-let variant_state = require("tachyon_core.variant_state");
-let gomemlimit = require("core.gomemlimit");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || constants.TACHYON_CONFIG_NAME || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/tachyon-core";
+const TMP_TACHYON_CORE_FOLDER = getenv("TMP_TACHYON_CORE_FOLDER") || constants.TMP_TACHYON_CORE_FOLDER || "/tmp/tachyon-core";
 const CHECK_PROXY_IP_DOMAIN = getenv("CHECK_PROXY_IP_DOMAIN") || constants.CHECK_PROXY_IP_DOMAIN || "ip.podkop.fyi";
 const FAKEIP_TEST_DOMAIN = getenv("FAKEIP_TEST_DOMAIN") || constants.FAKEIP_TEST_DOMAIN || "fakeip.podkop.fyi";
 const NFT_TABLE_NAME = getenv("NFT_TABLE_NAME") || constants.NFT_TABLE_NAME || "TachyonTable";
@@ -21,18 +19,19 @@ const NFT_IP_PORT_SET_NAME = getenv("NFT_IP_PORT_SET_NAME") || constants.NFT_IP_
 const NFT_INTERFACE_SET_NAME = getenv("NFT_INTERFACE_SET_NAME") || constants.NFT_INTERFACE_SET_NAME || "tachyon_interfaces";
 const NFT_DISCORD_SET_NAME = getenv("NFT_DISCORD_SET_NAME") || constants.NFT_DISCORD_SET_NAME || "tachyon_discord_subnets";
 const NFT_LOCALV4_SET_NAME = getenv("NFT_LOCALV4_SET_NAME") || constants.NFT_LOCALV4_SET_NAME || "localv4";
-const STEER_NFT_TABLE = getenv("STEER_NFT_TABLE") || "steer";
-const SB_CLASH_API_CONTROLLER_PORT = getenv("SB_CLASH_API_CONTROLLER_PORT") || constants.SB_CLASH_API_CONTROLLER_PORT || "9090";
+const CORE_CLASH_API_CONTROLLER_PORT = getenv("TACHYON_CORE_CLASH_API_CONTROLLER_PORT") || getenv("CORE_CLASH_API_CONTROLLER_PORT") || constants.TACHYON_CORE_CLASH_API_CONTROLLER_PORT || constants.CORE_CLASH_API_CONTROLLER_PORT || "9090";
 const DEFAULT_LATENCY_TEST_URL = getenv("DEFAULT_LATENCY_TEST_URL") || "https://www.gstatic.com/generate_204";
 const HELPERS_UC = LIB_DIR + "/core/helpers.uc";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
+const TACHYON_CORE_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const PROVIDERS_STATUS_UC = LIB_DIR + "/providers/status.uc";
+const SERVICE_STATE_UC = LIB_DIR + "/service/state.uc";
 const SERVICE_UI_UC = LIB_DIR + "/service/ui.uc";
 
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
 let command_from_args = common.command_from_args;
 let command_status = common.command_status;
+let command_capture = common.command_capture;
 let command_output = common.command_output;
 let command_success = common.command_success;
 let command_output_from_args = common.command_output_from_args;
@@ -170,27 +169,7 @@ function uci_sections(type_name) {
 
 function active_engine_name() {
     let engine = uci_core.get(CONFIG_NAME, "settings", "engine");
-    return (engine != null && engine != "") ? as_string(engine) : "sing-box";
-}
-
-function active_engine_is_steer() {
-    let name = active_engine_name();
-    return name == "steer" || name == "steer-extended";
-}
-
-// Native Tailscale (tailscale_mode=native) runs tailscaled outside sing-box:
-// servers.uc:567 skips the endpoint, tailscaled manages its own nft rules.
-// Diagnostics must not flag the absence of those as errors.
-function native_tailscale_enabled() {
-    for (let section in uci_sections("server")) {
-        if (as_string(section["enabled"]) == "0" || as_string(section["enabled"]) == "false")
-            continue;
-        if (as_string(section["protocol"] || "") != "tailscale")
-            continue;
-        if (as_string(section["tailscale_mode"] || "singbox") == "native")
-            return true;
-    }
-    return false;
+    return (engine != null && engine != "") ? as_string(engine) : "tachyon-core";
 }
 
 function parse_json_or_null(text) {
@@ -288,15 +267,62 @@ function nolog(message) {
 }
 
 function server_inbound_tag(section) {
-    return helper_output("server-inbound-tag", [ section ]);
+    return "server-" + as_string(section) + "-in";
 }
 
-function server_required_inbound_proto(protocol) {
+function find_tagged_runtime_item(items, tag) {
+    if (type(items) != "array")
+        return null;
+    for (let item in items) {
+        if (type(item) == "object" && as_string(item.tag) == tag)
+            return item;
+    }
+    return null;
+}
+
+function runtime_summary_json_from_config(sb_config, section_name, tag) {
+    if (type(sb_config) != "object")
+        return sprintf("%J", { exists: 0 });
+    let item = find_tagged_runtime_item(sb_config[section_name], tag);
+    if (item == null && section_name == "inbounds")
+        item = find_tagged_runtime_item(sb_config.endpoints, tag);
+    if (item == null)
+        return sprintf("%J", { exists: 0 });
+    return sprintf("%J", {
+        exists: 1,
+        type: as_string(item.type),
+        listen: as_string(item.listen),
+        listen_port: arg_number(item.listen_port)
+    });
+}
+
+function has_route_rule_for_inbound_in_config(sb_config, inbound_tag) {
+    if (type(sb_config) != "object" || type(sb_config.route) != "object" || type(sb_config.route.rules) != "array")
+        return false;
+    for (let rule in sb_config.route.rules) {
+        if (type(rule) != "object" || (rule.action != "route" && rule.action != "reject"))
+            continue;
+        let inb = rule.inbound;
+        if (type(inb) == "array") {
+            for (let v in inb)
+                if (as_string(v) == inbound_tag)
+                    return true;
+        } else if (as_string(inb) == inbound_tag) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function server_required_inbound_proto(protocol, section) {
     protocol = as_string(protocol);
     if (protocol == "json_inbound")
         return "";
-    // AWG is WireGuard underneath, whichever schema the core puts it in.
-    return protocol == "hysteria2" || protocol == "tuic" || protocol == "awg" ? "udp" : "tcp";
+    if (protocol == "mieru" && type(section) == "object")
+        return uc(as_string(option(section, "mieru_transport", "TCP"))) == "UDP" ? "udp" : "tcp";
+    // AWG is WireGuard underneath, whichever schema the core puts it in;
+    // MASQUE is HTTP/3 over QUIC (UDP).
+    return protocol == "hysteria2" || protocol == "tuic" || protocol == "awg" || protocol == "masque" ? "udp" : "tcp";
 }
 
 function server_runtime_type_for_protocol(protocol) {
@@ -305,22 +331,29 @@ function server_runtime_type_for_protocol(protocol) {
         return "";
     if (protocol == "mtproto")
         return "mtproxy";
-    // Every schema Tachyon generates calls the AWG object "wireguard": an
-    // inbound on extended, an endpoint on lx / tachyon-core.
+    // Every schema Tachyon generates calls the AWG object "wireguard" (endpoint).
     if (protocol == "awg")
         return "wireguard";
     return protocol;
 }
 
 // The port an AWG server actually listens on, mirroring the generator:
-// singbox/servers.uc gives awg_server_port precedence, then listen_port, then
+// tachyon_core/servers.uc gives awg_server_port precedence, then listen_port, then
 // the 51820 WireGuard default - and nft/apply.uc opens exactly that port. The
 // generic listen_port option alone is not what the core binds, so every probe
 // below has to ask about the effective port.
 function server_effective_listen_port(section, protocol) {
-    if (protocol != "awg")
-        return option(section, "listen_port", "");
-    return option(section, "awg_server_port", option(section, "listen_port", "51820"));
+    if (protocol == "awg")
+        return option(section, "awg_server_port", option(section, "listen_port", "51820"));
+    let raw_lp = trim(as_string(option(section, "listen_port", "")));
+    if (protocol == "mieru") {
+        if (raw_lp == "")
+            return "443";
+        let m = match(raw_lp, /^([0-9]+)/);
+        if (m)
+            return as_string(m[1]);
+    }
+    return raw_lp;
 }
 
 function server_listen_requires_firewall(listen, wan_ip) {
@@ -333,9 +366,419 @@ function server_listen_requires_firewall(listen, wan_ip) {
     return false;
 }
 
+function uci_fixture_enabled() {
+    let f = getenv("TACHYON_UCI_STATE_FILE") || getenv("UCI_STATE") || "";
+    return f != "";
+}
+
+function netstat_addr_matches_port(addr, listen, port) {
+    addr = as_string(addr);
+    listen = as_string(listen);
+    port = as_string(port);
+    let colon = rindex(addr, ":");
+    let addr_port = colon >= 0 ? substr(addr, colon + 1) : addr;
+    if (addr_port != port)
+        return false;
+    let host = addr;
+    if (substr(addr, 0, 1) == "[") {
+        let end = index(addr, "]");
+        host = end > 0 ? substr(addr, 1, end - 1) : addr;
+    } else if (colon >= 0) {
+        host = substr(addr, 0, colon);
+    }
+    if (host == "0.0.0.0" || host == "::")
+        return true;
+    if (listen == "0.0.0.0")
+        return match(host, /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/) != null;
+    if (listen == "::")
+        return index(host, ":") >= 0;
+    return host == listen;
+}
+
+function in_memory_ports_listening(netstat_data, listen, port, required_proto) {
+    for (let proto in words(required_proto)) {
+        let found = false;
+        for (let line in split(as_string(netstat_data), "\n")) {
+            let fields = words(line);
+            if (length(fields) < 4 || substr(fields[0], 0, length(proto)) != proto)
+                continue;
+            if (netstat_addr_matches_port(fields[3], listen, port)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+function in_memory_port_conflict_owners(netstat_data, listen, port, required_proto, comm_names) {
+    let owners = [];
+    let seen = {};
+    let lines = split(as_string(netstat_data), "\n");
+    if (length(lines) < 2 || index(as_string(lines[1]), "PID/Program") < 0)
+        return "";
+    for (let proto in words(required_proto)) {
+        for (let i = 2; i < length(lines); i++) {
+            let fields = words(lines[i]);
+            if (length(fields) < 4 || substr(fields[0], 0, length(proto)) != proto)
+                continue;
+            if (!netstat_addr_matches_port(fields[3], listen, port))
+                continue;
+            let owner = as_string(fields[length(fields) - 1]);
+            if (owner == "" || owner == "-" || owner == "LISTEN")
+                owner = "unknown";
+            let is_daemon = false;
+            for (let name in comm_names) {
+                let suffix = "/" + as_string(name);
+                if (length(owner) >= length(suffix) && substr(owner, length(owner) - length(suffix)) == suffix) {
+                    is_daemon = true;
+                    break;
+                }
+            }
+            if (!is_daemon && !seen[owner]) {
+                seen[owner] = true;
+                push(owners, owner);
+            }
+        }
+    }
+    return join(" ", sort(owners));
+}
+
+function collect_local_router_ips(wan_ip, listen, ip_addr_out) {
+    let seen = {};
+    let ips = [];
+
+    for (let ip in words(wan_ip)) {
+        if (ip != "" && !seen[ip]) {
+            seen[ip] = true;
+            push(ips, ip);
+        }
+    }
+
+    listen = trim(as_string(listen));
+    if (listen != "" && listen != "0.0.0.0" && listen != "::" && !seen[listen]) {
+        seen[listen] = true;
+        push(ips, listen);
+    }
+
+    for (let line in split(as_string(ip_addr_out), "\n")) {
+        let fields = words(line);
+        for (let i = 0; i + 1 < length(fields); i++) {
+            if (fields[i] != "inet" && fields[i] != "inet6")
+                continue;
+            let raw_ip = as_string(fields[i + 1]);
+            let slash = index(raw_ip, "/");
+            if (slash >= 0)
+                raw_ip = substr(raw_ip, 0, slash);
+            let pct = index(raw_ip, "%");
+            if (pct >= 0)
+                raw_ip = substr(raw_ip, 0, pct);
+            raw_ip = trim(raw_ip);
+            if (raw_ip != "" && !seen[raw_ip]) {
+                seen[raw_ip] = true;
+                push(ips, raw_ip);
+            }
+        }
+    }
+
+    return join(" ", ips);
+}
+
+function nft_strip_comment(line) {
+    line = as_string(line);
+    let cpos = index(line, "comment \"");
+    if (cpos >= 0)
+        line = substr(line, 0, cpos);
+    return trim(line);
+}
+
+function nft_extract_port_expr(text) {
+    text = trim(as_string(text));
+    if (text == "")
+        return "";
+    if (substr(text, 0, 1) == "{") {
+        let end_b = index(text, "}");
+        if (end_b >= 0)
+            return substr(text, 0, end_b + 1);
+    }
+    let toks = words(text);
+    return length(toks) > 0 ? toks[0] : "";
+}
+
+function nft_port_expr_contains(expr, port) {
+    let p_str = trim(as_string(port));
+    if (p_str == "" || match(p_str, /^[0-9]+$/) == null)
+        return false;
+
+    let cleaned = replace(replace(replace(as_string(expr), /[{},]/g, " "), /;/g, " "), /^[ \t]+|[ \t]+$/g, "");
+    if (cleaned == "")
+        return false;
+
+    let p_num = int(p_str, 10);
+    for (let tok in words(cleaned)) {
+        if (tok == p_str)
+            return true;
+        let dash = index(tok, "-");
+        if (dash > 0) {
+            let start_s = substr(tok, 0, dash);
+            let end_s = substr(tok, dash + 1);
+            if (match(start_s, /^[0-9]+$/) != null && match(end_s, /^[0-9]+$/) != null) {
+                if (p_num >= int(start_s, 10) && p_num <= int(end_s, 10))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+function nft_line_matches_proto(clean_line, proto_str) {
+    proto_str = lc(trim(as_string(proto_str)));
+    if (proto_str != "tcp" && proto_str != "udp")
+        return false;
+    if (index(clean_line, proto_str + " dport") >= 0)
+        return true;
+    let l4_pos = index(clean_line, "meta l4proto ");
+    if (l4_pos >= 0) {
+        let expr = nft_extract_port_expr(substr(clean_line, l4_pos + 13));
+        let cleaned = replace(as_string(expr), /[{},]/g, " ");
+        for (let tok in words(cleaned)) {
+            if (lc(tok) == proto_str)
+                return true;
+        }
+    }
+    return false;
+}
+
+function nft_extract_dport_expr(clean_line) {
+    let pos = index(clean_line, " dport ");
+    let offset = 7;
+    if (pos < 0 && substr(clean_line, 0, 6) == "dport ") {
+        pos = 0;
+        offset = 6;
+    }
+    if (pos < 0)
+        return "";
+    return nft_extract_port_expr(substr(clean_line, pos + offset));
+}
+
+function nft_ip_is_local(dest_ip, local_ips) {
+    dest_ip = trim(as_string(dest_ip));
+    if (dest_ip == "127.0.0.1" || dest_ip == "::1")
+        return true;
+    for (let ip in words(local_ips)) {
+        if (ip == dest_ip)
+            return true;
+    }
+    return false;
+}
+
+function nft_input_chain_allows_port_proto(fw4_in, port, proto_str) {
+    for (let line in split(as_string(fw4_in), "\n")) {
+        let clean = nft_strip_comment(line);
+        if (clean == "" || index(clean, "accept") < 0)
+            continue;
+        if (index(clean, " sport ") >= 0)
+            continue;
+        if (!nft_line_matches_proto(clean, proto_str))
+            continue;
+        let dport_expr = nft_extract_dport_expr(clean);
+        if (dport_expr != "" && nft_port_expr_contains(dport_expr, port))
+            return true;
+    }
+    return false;
+}
+
+function nft_dstnat_chain_allows_port_proto(fw4_dstnat, port, proto_str, local_ips) {
+    for (let line in split(as_string(fw4_dstnat), "\n")) {
+        let clean = nft_strip_comment(line);
+        if (clean == "")
+            continue;
+        if (index(clean, " sport ") >= 0)
+            continue;
+        if (!nft_line_matches_proto(clean, proto_str))
+            continue;
+
+        let redir_to_pos = index(clean, "redirect to :");
+        if (redir_to_pos >= 0) {
+            let tport = nft_extract_port_expr(substr(clean, redir_to_pos + 13));
+            if (nft_port_expr_contains(tport, port))
+                return true;
+            continue;
+        }
+
+        if (index(clean, " redirect") >= 0 || substr(clean, 0, 8) == "redirect") {
+            let dport_expr = nft_extract_dport_expr(clean);
+            if (dport_expr != "" && nft_port_expr_contains(dport_expr, port))
+                return true;
+            continue;
+        }
+
+        let after_to = "";
+        let dnat_prefixes = [ "dnat ip to ", "dnat ip6 to ", "dnat to " ];
+        for (let pref in dnat_prefixes) {
+            let dpos = index(clean, pref);
+            if (dpos >= 0) {
+                after_to = substr(clean, dpos + length(pref));
+                break;
+            }
+        }
+        if (after_to == "")
+            continue;
+
+        let toks = words(after_to);
+        if (length(toks) == 0)
+            continue;
+        let target_tok = toks[0];
+        let dest_ip = "";
+        let target_port = "";
+        if (substr(target_tok, 0, 1) == "[") {
+            let end_b = index(target_tok, "]");
+            if (end_b > 0) {
+                dest_ip = substr(target_tok, 1, end_b - 1);
+                if (substr(target_tok, end_b + 1, 1) == ":")
+                    target_port = substr(target_tok, end_b + 2);
+            }
+        } else {
+            let m4 = match(target_tok, /^([0-9]+[.][0-9]+[.][0-9]+[.][0-9]+):([0-9]+(-[0-9]+)?)$/);
+            if (m4) {
+                dest_ip = as_string(m4[1]);
+                target_port = as_string(m4[2]);
+            } else {
+                dest_ip = target_tok;
+            }
+        }
+        if (!nft_ip_is_local(dest_ip, local_ips))
+            continue;
+        let effective_port_expr = target_port != "" ? target_port : nft_extract_dport_expr(clean);
+        if (effective_port_expr != "" && nft_port_expr_contains(effective_port_expr, port))
+            return true;
+    }
+    return false;
+}
+
+function firewall_required_protocols_open_cached(port, required_proto, firewall, fw4_in, fw4_dstnat, local_ips) {
+    let p_str = trim(as_string(port));
+    let proto_list = words(lc(trim(as_string(required_proto || "tcp"))));
+    if (length(proto_list) == 0)
+        proto_list = [ "tcp" ];
+
+    if (!uci_fixture_enabled() && (as_string(fw4_in || "") != "" || as_string(fw4_dstnat || "") != "") && p_str != "") {
+        let all_open = true;
+        for (let proto_str in proto_list) {
+            if (!nft_input_chain_allows_port_proto(fw4_in, p_str, proto_str) &&
+                !nft_dstnat_chain_allows_port_proto(fw4_dstnat, p_str, proto_str, local_ips)) {
+                all_open = false;
+                break;
+            }
+        }
+        if (all_open)
+            return true;
+    }
+    if (firewall == null)
+        firewall = firewall_show_data();
+    return status_success([ "firewall-required-protocols-open", port, required_proto, as_string(local_ips || "") ], firewall);
+}
+
 function firewall_required_protocols_open(port, required_proto) {
     let firewall = firewall_show_data();
-    return status_success([ "firewall-required-protocols-open", port, required_proto ], firewall);
+    let fw4_in = "";
+    let fw4_dstnat = "";
+    let local_ips = "";
+    if (!uci_fixture_enabled()) {
+        fw4_in = as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "input" ])) + "\n" +
+            as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "input_wan" ]));
+        fw4_dstnat = as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "dstnat_wan" ])) + "\n" +
+            as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "dstnat" ]));
+        local_ips = collect_local_router_ips("", "", command_output_from_args([ "ip", "-o", "addr", "show" ]));
+    }
+    return firewall_required_protocols_open_cached(port, required_proto, firewall, fw4_in, fw4_dstnat, local_ips);
+}
+
+function compute_public_host_flags(public_host, public_host_ips, wan_ip, wan_public) {
+    let resolved = -1;
+    let public_ip = -1;
+    let matches_wan = -1;
+    let ips = words(public_host_ips);
+    if (as_string(public_host) != "") {
+        if (length(ips) > 0) {
+            resolved = 1;
+            public_ip = 1;
+            for (let ip in ips)
+                if (!valid_public_ip(ip))
+                    public_ip = 0;
+            if (as_string(wan_public) == "1") {
+                matches_wan = 0;
+                for (let wan in words(wan_ip)) {
+                    for (let ip in ips) {
+                        if (ip == wan) {
+                            matches_wan = 1;
+                            break;
+                        }
+                    }
+                    if (matches_wan == 1)
+                        break;
+                }
+            }
+        } else {
+            resolved = 0;
+        }
+    }
+    return [ resolved, public_ip, matches_wan ];
+}
+
+function build_inbound_item_object(runtime_obj, section_name, label, protocol, routing_mode, tag, listen, listen_port, public_host, public_host_ips, expected_type, required_proto, listening, firewall_required, firewall_open, port_conflict, port_conflict_owners, routes_configured, flags, native_mode) {
+    let runtime = type(runtime_obj) == "object" ? runtime_obj : {};
+    let runtime_exists = runtime.exists ? 1 : 0;
+    let runtime_type = as_string(runtime.type || "");
+    let runtime_listen = as_string(runtime.listen || "");
+    let runtime_port = arg_number(runtime.listen_port || 0);
+    let runtime_port_text = as_string(runtime_port);
+    if (native_mode) {
+        runtime_exists = 1;
+        runtime_type = expected_type;
+    }
+    let runtime_ok_flag = 0;
+    if (runtime_exists == 1) {
+        if (protocol == "json_inbound" || protocol == "tailscale") {
+            runtime_ok_flag = 1;
+        } else if (runtime_type == expected_type || (protocol == "mtproto" && (runtime_type == "mtproto" || runtime_type == "mtproxy"))) {
+            if (protocol == "awg" && runtime_type == "wireguard" && runtime_listen == "")
+                runtime_ok_flag = runtime_port_text == as_string(listen_port) ? 1 : 0;
+            else
+                runtime_ok_flag = (runtime_listen == as_string(listen) && runtime_port_text == as_string(listen_port)) ? 1 : 0;
+        }
+    }
+    let raw_listening = arg_number(listening);
+    let effective_listening = (runtime_ok_flag == 1 || raw_listening < 0) ? raw_listening : 0;
+    return {
+        section: as_string(section_name),
+        label: as_string(label),
+        protocol: as_string(protocol),
+        routing_mode: as_string(routing_mode),
+        tag: as_string(tag),
+        listen: as_string(listen),
+        listen_port: arg_number(listen_port),
+        public_host: as_string(public_host),
+        public_host_ips: as_string(public_host_ips),
+        expected_type: as_string(expected_type),
+        required_proto: as_string(required_proto),
+        runtime_exists,
+        runtime_type,
+        runtime_listen,
+        runtime_port,
+        runtime_ok: runtime_ok_flag,
+        listening: effective_listening,
+        firewall_required: arg_number(firewall_required),
+        firewall_open: arg_number(firewall_open),
+        port_conflict: arg_number(port_conflict),
+        port_conflict_owners: as_string(port_conflict_owners),
+        routes_configured: arg_number(routes_configured),
+        public_host_resolved: arg_number(flags[0]),
+        public_host_public: arg_number(flags[1]),
+        public_host_matches_wan: arg_number(flags[2])
+    };
 }
 
 
@@ -349,14 +792,8 @@ function check_inbounds_config() {
 }
 
 function check_inbounds() {
-    // Server inbounds are sing-box runtime objects; steer has no inbound
-    // management, so this check reports not_applicable there.
-    if (active_engine_is_steer()) {
-        write_json({ not_applicable: 1, engine: active_engine_name(), items: [], enabled_count: 0, requires_public_wan: 0 });
-        return 0;
-    }
     let cfg = settings();
-    let sing_box_config_path = option(cfg, "config_path", "");
+    let core_config_path = option(cfg, "config_path", "");
     let wan_ip = get_wan_ip_addresses();
     let wan_public = 0;
     for (let ip in words(wan_ip)) {
@@ -368,7 +805,15 @@ function check_inbounds() {
     let items = [];
     let enabled_count = 0;
     let requires_public_wan = 0;
-    let native_tailscale = native_tailscale_enabled();
+    let sb_config = core_config_path != "" ? common.read_json_file(core_config_path) : null;
+    let netstat_lnp_cache = null;
+    let netstat_ln_cache = null;
+    let firewall_cache = null;
+    let fw4_in_cache = null;
+    let fw4_dstnat_cache = null;
+    let router_addr_ips = null;
+    let resolved_hosts_cache = {};
+    let daemon_comm_names = require("core.process").core_contract().comm_names || [];
 
     for (let section in uci_sections("server")) {
         if (!bool_option(section, "enabled", false))
@@ -386,16 +831,10 @@ function check_inbounds() {
         let routing_mode = option(section, "routing_mode", "rules");
         let inbound_tag = server_inbound_tag(section_name);
         let expected_type = server_runtime_type_for_protocol(protocol);
-        let required_proto = server_required_inbound_proto(protocol);
+        let required_proto = server_required_inbound_proto(protocol, section);
         let runtime_json = protocol == "tailscale"
-            ? module_output(PROVIDERS_STATUS_UC, [ "endpoint-summary", sing_box_config_path, inbound_tag ])
-            : module_output(PROVIDERS_STATUS_UC, [ "inbound-summary", sing_box_config_path, inbound_tag ]);
-        // Native mode: tailscaled runs outside sing-box, no endpoint is
-        // generated (servers.uc add_server) and no route rule is expected.
-        if (protocol == "tailscale" && native_tailscale) {
-            runtime_json = "";
-            routing_mode = "native";
-        }
+            ? runtime_summary_json_from_config(sb_config, "endpoints", inbound_tag)
+            : runtime_summary_json_from_config(sb_config, "inbounds", inbound_tag);
 
         let listening = -1;
         let firewall_required = 0;
@@ -403,30 +842,47 @@ function check_inbounds() {
         let port_conflict = 0;
         let port_conflict_owners = "";
         if (protocol != "tailscale" && protocol != "json_inbound") {
-            port_conflict_owners = server_required_port_conflict_owners(listen, listen_port, required_proto);
+            if (netstat_lnp_cache == null)
+                netstat_lnp_cache = command_output_from_args([ "netstat", "-lnp" ]);
+            if (netstat_ln_cache == null)
+                netstat_ln_cache = command_output_from_args([ "netstat", "-ln" ]);
+            port_conflict_owners = in_memory_port_conflict_owners(netstat_lnp_cache, listen, listen_port, required_proto, daemon_comm_names);
             if (port_conflict_owners != "")
                 port_conflict = 1;
-            listening = server_required_ports_listening(listen, listen_port, required_proto) ? 1 : 0;
+            listening = in_memory_ports_listening(netstat_ln_cache, listen, listen_port, required_proto) ? 1 : 0;
             if (server_listen_requires_firewall(listen, wan_ip)) {
                 firewall_required = 1;
-                firewall_open = firewall_required_protocols_open(listen_port, required_proto) ? 1 : 0;
+                if (fw4_in_cache == null)
+                    fw4_in_cache = uci_fixture_enabled() ? "" : (
+                        as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "input" ])) + "\n" +
+                        as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "input_wan" ]))
+                    );
+                if (fw4_dstnat_cache == null)
+                    fw4_dstnat_cache = uci_fixture_enabled() ? "" : (
+                        as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "dstnat_wan" ])) + "\n" +
+                        as_string(command_output_from_args([ "nft", "list", "chain", "inet", "fw4", "dstnat" ]))
+                    );
+                if (router_addr_ips == null)
+                    router_addr_ips = uci_fixture_enabled() ? "" : command_output_from_args([ "ip", "-o", "addr", "show" ]);
+                if (uci_fixture_enabled() && firewall_cache == null)
+                    firewall_cache = firewall_show_data();
+                let local_ips = collect_local_router_ips(wan_ip, listen, router_addr_ips);
+                firewall_open = firewall_required_protocols_open_cached(listen_port, required_proto, firewall_cache, fw4_in_cache, fw4_dstnat_cache, local_ips) ? 1 : 0;
             }
         }
 
-        let routes_configured = protocol == "tailscale" && native_tailscale
-            ? 1
-            : (module_success(PROVIDERS_STATUS_UC, [
-                "has-route-rule-for-inbound", sing_box_config_path, inbound_tag
-            ]) ? 1 : 0);
+        let routes_configured = has_route_rule_for_inbound_in_config(sb_config, inbound_tag) ? 1 : 0;
 
-        let public_host_ips = protocol == "json_inbound" ? "" : resolve_public_host_ips(public_host);
-        let flags = words(public_host_flags(public_host, public_host_ips, wan_ip, wan_public));
-        while (length(flags) < 3)
-            push(flags, "-1");
-
-        let item_json = status_output([
-            "inbound-item-json",
-            runtime_json,
+        let public_host_ips = "";
+        if (protocol != "json_inbound" && !(protocol == "tailscale" && public_host == "")) {
+            if (!(public_host in resolved_hosts_cache))
+                resolved_hosts_cache[public_host] = resolve_public_host_ips(public_host);
+            public_host_ips = resolved_hosts_cache[public_host];
+        }
+        let flags = compute_public_host_flags(public_host, public_host_ips, wan_ip, wan_public);
+        let runtime_obj = runtime_json != "" ? parse_json_or_null(runtime_json) : null;
+        let item = build_inbound_item_object(
+            runtime_obj,
             section_name,
             label,
             protocol,
@@ -444,19 +900,17 @@ function check_inbounds() {
             port_conflict,
             port_conflict_owners,
             routes_configured,
-            flags[0],
-            flags[1],
-            flags[2],
-            (protocol == "tailscale" && native_tailscale) ? "1" : "0"
-        ], null);
-        let item = parse_json_or_null(item_json);
-        push(items, type(item) == "object" ? item : {});
+            flags,
+            is_section_native_ts
+        );
+        push(items, item);
     }
 
     write_json({
         enabled_count,
-        config_path: sing_box_config_path,
+        config_path: core_config_path,
         wan_ip,
+        wan_ipv6: network_mod.first_ipv6_from_list(wan_ip),
         wan_public,
         requires_public_wan,
         items
@@ -467,78 +921,214 @@ function check_inbounds() {
 
 function cleanup_check_proxy_dir(dir) {
     dir = as_string(dir);
-    let prefix = TMP_SING_BOX_FOLDER + "/check-proxy-";
+    let prefix = TMP_TACHYON_CORE_FOLDER + "/check-proxy-";
     if (substr(dir, 0, length(prefix)) == prefix)
         command_success_from_args([ "rm", "-rf", dir ]);
 }
 
-function check_proxy() {
-    let sing_box_config_path = option(settings(), "config_path", "");
-    let bin = command_exists("tachyon-core") ? "tachyon-core" : (command_exists("sing-box") ? "sing-box" : "");
-    if (bin == "") {
-        nolog("sing-box is not installed");
-        return 1;
-    }
-    if (!file_exists(sing_box_config_path)) {
-        nolog("Configuration file not found");
-        return 1;
-    }
+function parse_listen_port(value) {
+    let text = trim(as_string(value));
+    if (match(text, /^[0-9]+$/) == null)
+        return 0;
+    let port = int(text, 10);
+    return (port >= 1 && port <= 65535) ? port : 0;
+}
 
-    nolog("Checking sing-box configuration...");
-    if (!command_success_from_args([ bin, "-c", sing_box_config_path, "check" ])) {
-        nolog("Invalid configuration");
-        return 1;
-    }
+function normalize_proxy_connect_host(listen) {
+    let host = trim(as_string(listen || ""));
+    if (substr(host, 0, 1) == "[" && substr(host, length(host) - 1, 1) == "]")
+        host = substr(host, 1, length(host) - 2);
+    if (host == "" || host == "0.0.0.0" || host == "::")
+        return "127.0.0.1";
+    return host;
+}
 
-    print(status_output([ "mask-sing-box-config", sing_box_config_path ], null));
-    nolog("Checking proxy connection...");
+function format_proxy_url(scheme, host, port) {
+    let target_host = index(host, ":") >= 0 ? "[" + host + "]" : host;
+    return scheme + "://" + target_host + ":" + as_string(port);
+}
 
-    let check_proxy_dir = TMP_SING_BOX_FOLDER + "/check-proxy-" + clock()[0] + "-" + clock()[1];
-    let check_proxy_config = check_proxy_dir + "/config.json";
-    let check_proxy_cache = check_proxy_dir + "/cache.db";
+function inbound_proxy_scheme(inbound) {
+    return lc(as_string(inbound.type || "mixed")) == "socks" ? "socks5h" : "http";
+}
 
-    cleanup_check_proxy_dir(check_proxy_dir);
-    common.ensure_dir(check_proxy_dir);
-    if (!status_success([ "prepare-check-proxy-config", sing_box_config_path, check_proxy_config, check_proxy_cache ], null)) {
-        nolog("Failed to prepare temporary configuration");
-        cleanup_check_proxy_dir(check_proxy_dir);
-        return 1;
-    }
+function inbound_has_auth(inbound) {
+    return type(inbound.users) == "array" && length(inbound.users) > 0;
+}
 
-    let outbound_tag = replace(status_output(
-        [ "check-proxy-outbound-tag", check_proxy_config, CHECK_PROXY_IP_DOMAIN ],
-        null
-    ), /[\r\n]+$/g, "");
+function build_proxy_inbound_endpoint(inbound, default_port) {
+    let tag = as_string(inbound.tag || "");
+    let port = parse_listen_port(inbound.listen_port);
+    if (port == 0)
+        port = default_port;
+    if (port == 0)
+        return null;
+    let host = normalize_proxy_connect_host(inbound.listen);
+    let scheme = inbound_proxy_scheme(inbound);
+    return {
+        tag: tag,
+        host: host,
+        port: port,
+        scheme: scheme,
+        url: format_proxy_url(scheme, host, port)
+    };
+}
 
-    let response = "";
-    for (let attempt = 1; attempt <= 5; attempt++) {
-        let args = [ bin, "tools", "fetch", "ifconfig.me", "-c", check_proxy_config, "-D", check_proxy_dir, "--disable-color" ];
-        if (outbound_tag != "") {
-            push(args, "-o");
-            push(args, outbound_tag);
-        }
-        // A full core run next to the daemon, rulesets included - same ceiling
-        // as `check`, and this one is retried five times.
-        response = command_output(gomemlimit.gomemlimit_env() + command_from_args(args) + " 2>/dev/null");
-        if (status_success([ "proxy-response-is-retryable-error" ], response))
+function resolve_check_proxy_inbound(core_config_path) {
+    let cfg = common.read_json_file(core_config_path);
+    if (type(cfg) != "object" || type(cfg.inbounds) != "array")
+        return null;
+
+    let candidates = [];
+    for (let inb in cfg.inbounds) {
+        if (type(inb) != "object")
             continue;
+        let tag = as_string(inb.tag || "");
+        if (tag == "direct-bypass-in")
+            continue;
+        let inb_type = lc(as_string(inb.type || ""));
+        if (inb_type != "mixed" && inb_type != "http" && inb_type != "socks" &&
+            tag != "service-mixed-in" && tag != "mixed-in")
+            continue;
+        push(candidates, inb);
+    }
 
-        let masked_response_ip = replace(status_output([ "proxy-response-ip-mask" ], response), /[\r\n]+$/g, "");
+    for (let inb in candidates) {
+        let tag = as_string(inb.tag || "");
+        if (tag == "service-mixed-in" || tag == "mixed-in") {
+            let ep = build_proxy_inbound_endpoint(inb, 4534);
+            if (ep != null)
+                return ep;
+        }
+    }
+
+    for (let inb in candidates) {
+        let tag = as_string(inb.tag || "");
+        if (inbound_has_auth(inb) || substr(tag, 0, 7) == "server-")
+            continue;
+        let listen = trim(as_string(inb.listen || ""));
+        if (listen == "" || listen == "127.0.0.1" || listen == "::1" || listen == "[::1]" ||
+            listen == "0.0.0.0" || listen == "::" || listen == "[::]") {
+            let ep = build_proxy_inbound_endpoint(inb, 0);
+            if (ep != null)
+                return ep;
+        }
+    }
+
+    for (let inb in candidates) {
+        let tag = as_string(inb.tag || "");
+        if (inbound_has_auth(inb) || substr(tag, 0, 7) == "server-")
+            continue;
+        let ep = build_proxy_inbound_endpoint(inb, 0);
+        if (ep != null)
+            return ep;
+    }
+
+    return null;
+}
+
+function core_service_is_running() {
+    let proc = require("core.process");
+    if (length(proc.core_daemon_pids()) > 0)
+        return true;
+    return module_success(SERVICE_STATE_UC, [ "tachyon-core-service-running" ]);
+}
+
+function check_proxy() {
+    let core_config_path = trim(as_string(option(settings(), "config_path", ""))) || common.core_config_path();
+    let bin = command_exists("tachyon-core") ? "tachyon-core" : "";
+    if (bin == "") {
+        print("tachyon-core is not installed\n");
+        return 1;
+    }
+    if (!file_exists(core_config_path)) {
+        print("Configuration file not found\n");
+        return 1;
+    }
+
+    print("Checking " + bin + " configuration...\n");
+    let check_cap = command_capture(command_from_args([ bin, "-c", core_config_path, "check" ]) + " 2>&1");
+    if (!check_cap || check_cap.status != 0) {
+        print("Invalid configuration\n");
+        let err = trim(as_string(check_cap && check_cap.output));
+        if (err != "")
+            print("Error: " + replace(err, /[\r\n]+/g, " | ") + "\n");
+        return 1;
+    }
+
+    print(status_output([ "mask-core-config", core_config_path ], null));
+    print("Checking proxy connection...\n");
+
+    let inbound = resolve_check_proxy_inbound(core_config_path);
+    if (inbound == null) {
+        print("Local mixed proxy inbound not found\n");
+        print("Error: No local mixed inbound (service-mixed-in / mixed-in) configured in " + core_config_path + "\n");
+        return 1;
+    }
+
+    if (!core_service_is_running()) {
+        print("tachyon-core is not running\n");
+        print("Error: tachyon-core is not running (expected local mixed proxy at " + inbound.url + ")\n");
+        return 1;
+    }
+
+    if (!command_exists("curl")) {
+        print("Error: curl is not installed\n");
+        return 1;
+    }
+
+    let probe_urls = [
+        "https://ifconfig.me/ip",
+        "https://api.ipify.org",
+        "https://icanhazip.com"
+    ];
+    let attempts = length(probe_urls);
+    let last_error = "";
+
+    for (let i = 0; i < attempts; i++) {
+        let probe_url = probe_urls[i];
+        let args = [
+            "curl", "-fsSL",
+            "--connect-timeout", "5",
+            "--max-time", "10",
+            "--proxy", inbound.url,
+            probe_url
+        ];
+        let cap = command_capture(command_from_args(args) + " 2>&1");
+        if (!cap) {
+            last_error = "Failed to execute curl for " + probe_url;
+            continue;
+        }
+
+        let raw_output = as_string(cap.output || "");
+        let trimmed_output = trim(raw_output);
+
+        if (cap.status != 0) {
+            last_error = trimmed_output != ""
+                ? replace(trimmed_output, /[\r\n]+/g, " | ")
+                : ("curl exited with status " + as_string(cap.status) + " for " + probe_url);
+            continue;
+        }
+
+        if (status_success([ "proxy-response-is-retryable-error" ], raw_output)) {
+            last_error = "Retryable error response from " + probe_url +
+                (trimmed_output != "" ? ": " + replace(substr(trimmed_output, 0, 120), /[\r\n]+/g, " ") : "");
+            continue;
+        }
+
+        let masked_response_ip = replace(status_output([ "proxy-response-ip-mask" ], raw_output), /[\r\n]+$/g, "");
         if (masked_response_ip != "") {
-            nolog(masked_response_ip + " - should match proxy IP");
-            cleanup_check_proxy_dir(check_proxy_dir);
+            print(masked_response_ip + " - should match proxy IP\n");
             return 0;
         }
 
-        if (attempt == 5) {
-            nolog("Failed to get valid IP address after 5 attempts");
-            nolog(response == "" ? "Error: Empty response" : "Error response: " + response);
-            cleanup_check_proxy_dir(check_proxy_dir);
-            return 1;
-        }
+        last_error = trimmed_output == ""
+            ? ("Empty response from " + probe_url)
+            : ("Invalid IP response from " + probe_url + ": " + replace(substr(trimmed_output, 0, 200), /[\r\n]+/g, " "));
     }
 
-    cleanup_check_proxy_dir(check_proxy_dir);
+    print("Failed to get valid IP address after " + as_string(attempts) + " attempts\n");
+    print("Error: " + (last_error != "" ? last_error : "Empty response") + "\n");
     return 1;
 }
 
@@ -555,19 +1145,13 @@ function domain_lists_contain_cloud_provider() {
 }
 
 function check_nft() {
-    // Steer uses its own `inet steer` table, not the sing-box TachyonTable.
-    // Reporting not_applicable avoids false errors in the diagnostics UI.
-    if (active_engine_is_steer()) {
-        write_json({ not_applicable: 1, engine: active_engine_name() });
-        return 0;
-    }
     if (!command_exists("nft")) {
         nolog("nft is not installed");
         return 1;
     }
 
     nolog("Checking " + NFT_TABLE_NAME + " rules...");
-    if (!command_success_from_args([ "nft", "list", "table", "inet", NFT_TABLE_NAME ])) {
+    if (!command_success_from_args([ "nft", "-t", "list", "table", "inet", NFT_TABLE_NAME ])) {
         nolog("❌ " + NFT_TABLE_NAME + " not found");
         return 1;
     }
@@ -610,18 +1194,24 @@ function check_nft() {
 function nft_chain_counter_status(chain) {
     let output = command_output_from_args([ "nft", "list", "chain", "inet", NFT_TABLE_NAME, chain ]);
     if (output == null || output == "")
-        return [ 0, 0 ];
+        return [ 0, 0, 0, 0 ];
     let rules_exist = 0;
     let counters = 0;
+    let rule_count = 0;
+    let total_packets = 0;
     for (let line in split(output, "\n")) {
         line = as_string(line);
         if (index(line, "counter") < 0)
             continue;
         rules_exist = 1;
+        rule_count++;
         if (index(line, "packets 0 bytes 0") < 0)
             counters = 1;
+        let m = match(line, /packets[ \t]+([0-9]+)/);
+        if (m && m[1])
+            total_packets += int(m[1] || 0);
     }
-    return [ rules_exist, counters ];
+    return [ rules_exist, counters, rule_count, total_packets ];
 }
 
 // Tachyon installs marking rules of its own outside TachyonTable: two rules in
@@ -630,15 +1220,25 @@ function nft_chain_counter_status(chain) {
 // router reports a false positive against its own firewall.
 const TACHYON_OWN_MARKS = [
     constants.NFT_FAKEIP_MARK || "0x04000000",
-    constants.NFT_OUTBOUND_MARK || "0x08000000"
+    constants.NFT_OUTBOUND_MARK || "0x08000000",
+    "0x00200000",
+    "0x00240000",
+    "0x00ff0000"
 ];
 
 function line_marks_are_all_ours(line) {
     let seen = false;
+    line = replace(line, /comment "[^"]*"/g, "");
+    line = replace(line, /@[a-z0-9]+,[0-9]+,[0-9]+(\s*&\s*0x[0-9a-fA-F]+)?(\s*(==|!=))?\s*0x[0-9a-fA-F]+/g, "");
+    let mark_idx = index(line, "meta mark set");
+    if (mark_idx >= 0)
+        line = substr(line, mark_idx);
     for (let token in match(line, /0x[0-9a-fA-F]+/g) || []) {
-        seen = true;
         // A capture-less /g match yields [whole-match] per element.
         let value = lc(as_string(token[0]));
+        if (int(value, 0) == 0)
+            continue;
+        seen = true;
         let ours = false;
         for (let mark in TACHYON_OWN_MARKS) {
             if (lc(as_string(mark)) == value) {
@@ -653,7 +1253,7 @@ function line_marks_are_all_ours(line) {
 }
 
 function nft_table_has_other_mark_rules(family, table_name) {
-    let output = command_output_from_args([ "nft", "list", "table", family, table_name ]);
+    let output = command_output_from_args([ "nft", "-t", "list", "table", family, table_name ]);
     if (output == null)
         return false;
     for (let line in split(output, "\n")) {
@@ -667,58 +1267,7 @@ function nft_table_has_other_mark_rules(family, table_name) {
     return false;
 }
 
-function nft_steer_chain_has_rules(chain) {
-    let output = command_output_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, chain ]);
-    // chain has rules if there is at least one non-comment, non-policy line with content
-    return output != null && length(split(trim(output), "\n")) > 3;
-}
-
 function check_nft_rules() {
-    // When steer is active, check the `inet steer` table instead of TachyonTable.
-    if (active_engine_is_steer()) {
-        let table_exist = command_success_from_args([ "nft", "list", "table", "inet", STEER_NFT_TABLE ]) ? 1 : 0;
-        let rules_mangle_exist = 0;
-        let rules_mangle_counters = 0;
-        let rules_mangle_output_exist = 0;
-        let rules_mangle_output_counters = 0;
-        let rules_proxy_exist = 0;
-        let rules_proxy_counters = 0;
-        let rules_other_mark_exist = 0;
-
-        if (table_exist) {
-            // prerouting_mark = equivalent of mangle (marks lan->proxy traffic)
-            if (command_success_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "prerouting_mark" ])) {
-                rules_mangle_exist = 1;
-                let out = command_output_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "prerouting_mark" ]);
-                rules_mangle_counters = (out != null && index(out, "counter") >= 0) ? 1 : 0;
-            }
-            // postrouting_down = equivalent of mangle_output (marks return traffic)
-            if (command_success_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "postrouting_down" ])) {
-                rules_mangle_output_exist = 1;
-                let out = command_output_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "postrouting_down" ]);
-                rules_mangle_output_counters = (out != null && index(out, "counter") >= 0) ? 1 : 0;
-            }
-            // prerouting_dns = DNS redirect chain (steer-specific, replaces proxy chain role)
-            if (command_success_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "prerouting_dns" ])) {
-                rules_proxy_exist = 1;
-                let out = command_output_from_args([ "nft", "list", "chain", "inet", STEER_NFT_TABLE, "prerouting_dns" ]);
-                rules_proxy_counters = (out != null && index(out, "counter") >= 0) ? 1 : 0;
-            }
-        }
-
-        write_json({
-            table_exist,
-            rules_mangle_exist,
-            rules_mangle_counters,
-            rules_mangle_output_exist,
-            rules_mangle_output_counters,
-            rules_proxy_exist,
-            rules_proxy_counters,
-            rules_other_mark_exist,
-            engine: active_engine_name()
-        });
-        return 0;
-    }
     command_status("sh -c " + shell_quote(
         "curl -m 3 -s " + shell_quote("https://" + CHECK_PROXY_IP_DOMAIN + "/check") + " >/dev/null 2>&1 & pid1=$!; " +
         "curl -m 3 -s " + shell_quote("https://" + FAKEIP_TEST_DOMAIN + "/check") + " >/dev/null 2>&1 & pid2=$!; " +
@@ -728,28 +1277,40 @@ function check_nft_rules() {
     let table_exist = 0;
     let rules_mangle_exist = 0;
     let rules_mangle_counters = 0;
+    let mangle_rules_count = 0;
+    let mangle_packets = 0;
     let rules_mangle_output_exist = 0;
     let rules_mangle_output_counters = 0;
+    let mangle_output_rules_count = 0;
+    let mangle_output_packets = 0;
     let rules_proxy_exist = 0;
     let rules_proxy_counters = 0;
+    let proxy_rules_count = 0;
+    let proxy_packets = 0;
     let rules_other_mark_exist = 0;
 
-    if (command_success_from_args([ "nft", "list", "table", "inet", NFT_TABLE_NAME ])) {
+    if (command_success_from_args([ "nft", "-t", "list", "table", "inet", NFT_TABLE_NAME ])) {
         table_exist = 1;
         if (command_success_from_args([ "nft", "list", "chain", "inet", NFT_TABLE_NAME, "mangle" ])) {
             let status = nft_chain_counter_status("mangle");
             rules_mangle_exist = status[0];
             rules_mangle_counters = (status[1] || rules_mangle_exist) ? 1 : 0;
+            mangle_rules_count = status[2];
+            mangle_packets = status[3];
         }
         if (command_success_from_args([ "nft", "list", "chain", "inet", NFT_TABLE_NAME, "mangle_output" ])) {
             let status = nft_chain_counter_status("mangle_output");
             rules_mangle_output_exist = status[0];
             rules_mangle_output_counters = (status[1] || rules_mangle_output_exist) ? 1 : 0;
+            mangle_output_rules_count = status[2];
+            mangle_output_packets = status[3];
         }
         if (command_success_from_args([ "nft", "list", "chain", "inet", NFT_TABLE_NAME, "proxy" ])) {
             let status = nft_chain_counter_status("proxy");
             rules_proxy_exist = status[0];
             rules_proxy_counters = (status[1] || rules_proxy_exist) ? 1 : 0;
+            proxy_rules_count = status[2];
+            proxy_packets = status[3];
         }
     }
 
@@ -761,10 +1322,6 @@ function check_nft_rules() {
         let table_name = fields[2];
         if (table_name == NFT_TABLE_NAME)
             continue;
-        // Native Tailscale: tailscaled (and Tachyon's own exit-node/firewall
-        // rules) live in their own table — their marking rules are expected.
-        if (table_name == "tachyon_tailscale" && native_tailscale_enabled())
-            continue;
         if (nft_table_has_other_mark_rules(family, table_name)) {
             rules_other_mark_exist = 1;
             break;
@@ -773,12 +1330,19 @@ function check_nft_rules() {
 
     write_json({
         table_exist,
+        table_name: "inet " + NFT_TABLE_NAME,
         rules_mangle_exist,
         rules_mangle_counters,
+        mangle_rules_count,
+        mangle_packets,
         rules_mangle_output_exist,
         rules_mangle_output_counters,
+        mangle_output_rules_count,
+        mangle_output_packets,
         rules_proxy_exist,
         rules_proxy_counters,
+        proxy_rules_count,
+        proxy_packets,
         rules_other_mark_exist,
         engine: active_engine_name()
     });
@@ -808,22 +1372,46 @@ function clash_json_data(args, auth) {
 }
 
 function clash_api_url() {
-    let address = replace(module_output(SINGBOX_RUNTIME_UC, [ "service-listen-address" ]), /[\r\n]+$/g, "");
+    if (getenv("FAKE_CURL_LOG") == null) {
+        for (let cfg_path in [ "/etc/tachyon-core/config.json", TMP_TACHYON_CORE_FOLDER + "/config.json" ]) {
+            let cfg_data = fs.readfile(cfg_path);
+            if (!cfg_data)
+                continue;
+            try {
+                let sb_cfg = json(cfg_data);
+                let ext_ctrl = trim(as_string(sb_cfg?.experimental?.clash_api?.external_controller || ""));
+                if (ext_ctrl != "") {
+                    if (substr(ext_ctrl, 0, 8) == "0.0.0.0:")
+                        return "127.0.0.1:" + substr(ext_ctrl, 8);
+                    if (substr(ext_ctrl, 0, 5) == "[::]:")
+                        return "127.0.0.1:" + substr(ext_ctrl, 5);
+                    if (substr(ext_ctrl, 0, 1) == ":")
+                        return "127.0.0.1" + ext_ctrl;
+                    return ext_ctrl;
+                }
+            } catch (e) {}
+        }
+    }
+    let address = replace(module_output(TACHYON_CORE_RUNTIME_UC, [ "service-listen-address" ]), /[\r\n]+$/g, "");
     if (address == "")
         address = "127.0.0.1";
-    return address + ":" + SB_CLASH_API_CONTROLLER_PORT;
+    return address + ":" + CORE_CLASH_API_CONTROLLER_PORT;
 }
 
 function clash_auth_args() {
     let secret = "";
-    let config_data = fs.readfile("/etc/tachyon-core/config.json");
-    if (config_data) {
-        try {
-            let sb_cfg = json(config_data);
-            let sb_secret = sb_cfg.experimental?.clash_api?.secret;
-            if (sb_secret && sb_secret != "")
-                secret = sb_secret;
-        } catch (e) {}
+    for (let cfg_path in [ "/etc/tachyon-core/config.json", TMP_TACHYON_CORE_FOLDER + "/config.json" ]) {
+        let config_data = fs.readfile(cfg_path);
+        if (config_data) {
+            try {
+                let sb_cfg = json(config_data);
+                let sb_secret = sb_cfg.experimental?.clash_api?.secret;
+                if (sb_secret && sb_secret != "") {
+                    secret = sb_secret;
+                    break;
+                }
+            } catch (e) {}
+        }
     }
     if (secret == "") {
         let cfg = settings();
@@ -847,8 +1435,14 @@ function clash_json_error(message) {
     return 1;
 }
 
-function clash_proxy_type_map(base_url, auth) {
+function clash_proxy_info_map(base_url, auth) {
     let args = [ "curl", "-s" ];
+    if (getenv("FAKE_CURL_LOG") == null) {
+        push(args, "--connect-timeout");
+        push(args, "2");
+        push(args, "-m");
+        push(args, "5");
+    }
     for (let item in auth) push(args, item);
     push(args, base_url + "/proxies");
 
@@ -860,10 +1454,53 @@ function clash_proxy_type_map(base_url, auth) {
         return {};
     }
 
+    return object_or_empty(value.proxies);
+}
+
+function clash_proxy_type_map(base_url, auth) {
+    let proxies = clash_proxy_info_map(base_url, auth);
     let result = {};
-    for (let tag, proxy in object_or_empty(value.proxies))
+    for (let tag, proxy in proxies)
         result[tag] = as_string(object_or_empty(proxy).type || "");
     return result;
+}
+
+function resolve_selector_leaf_tag(proxies, tag) {
+    let cur = as_string(tag);
+    let visited = {};
+    for (let depth = 0; depth < 6; depth++) {
+        if (cur == "" || visited[cur])
+            break;
+        visited[cur] = true;
+        let info = object_or_empty(proxies[cur]);
+        let ptype = lc(as_string(info.type || ""));
+        let now = trim(as_string(info.now || ""));
+        let all = type(info.all) == "array" ? info.all : [];
+        if (ptype == "selector") {
+            if (now != "" && now != cur && proxies[now] != null) {
+                cur = now;
+                continue;
+            }
+            if (length(all) > 0 && as_string(all[0]) != "" && as_string(all[0]) != cur && proxies[as_string(all[0])] != null) {
+                cur = as_string(all[0]);
+                continue;
+            }
+            break;
+        }
+        if (ptype == "urltest" || ptype == "fallback") {
+            if (now != "" && now != cur && proxies[now] != null) {
+                cur = now;
+                continue;
+            }
+            if (length(all) == 1 && as_string(all[0]) != "" && as_string(all[0]) != cur && proxies[as_string(all[0])] != null) {
+                cur = as_string(all[0]);
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    return cur != "" ? cur : as_string(tag);
 }
 
 function clash_latency_endpoint(base_url, proxy_tag, proxy_type) {
@@ -891,1000 +1528,454 @@ function save_persistent_selector_choice(group_tag, proxy_tag) {
     return common.write_json_file(path, state, 2);
 }
 
-const STEER_LATENCY_CACHE_FILE = "/var/run/tachyon/steer-latencies.json";
-
-function steer_get_cached_latencies() {
-    let data = common.read_json_file(STEER_LATENCY_CACHE_FILE);
-    return type(data) == "object" ? data : {};
+function connection_tuple_key(proto, src, sport, dst, dport) {
+    return lc(as_string(proto)) + "|" + as_string(src) + "|" + as_string(sport) + "|" + as_string(dst) + "|" + as_string(dport);
 }
 
-function steer_set_cached_latency(tag, delay) {
-    if (tag == null || tag == "" || tag == "proxy-NaN" || index(tag, "NaN") >= 0)
-        return;
-    let d = int(delay);
-    if (d == null || d == "NaN")
-        return;
-    let data = steer_get_cached_latencies();
-    data[as_string(tag)] = d;
-    if (index(tag, "-out") < 0 && index(tag, "-urltest-") < 0) {
-        let unprefixed = replace(tag, /^.*?\s+/, "");
-        if (unprefixed != tag && unprefixed != "")
-            data[unprefixed] = d;
+// Identity of the UCI config as the cursor sees it: the committed file (a commit
+// renames it into place, so the inode changes) plus pending changes from `uci set`.
+// Empty under a UCI fixture so tests never read a stale cache.
+function uci_config_stamp() {
+    if ((getenv("TACHYON_UCI_STATE_FILE") || getenv("UCI_STATE") || "") != "")
+        return "";
+    let parts = [];
+    for (let path in [ "/etc/config/" + CONFIG_NAME, "/tmp/.uci/" + CONFIG_NAME ]) {
+        let st = fs.stat(path);
+        push(parts, st == null ? "-" : sprintf("%d:%d:%d", st.inode || 0, st.size || 0, st.mtime || 0));
     }
-    common.write_json_file(STEER_LATENCY_CACHE_FILE, data);
+    return join("|", parts);
 }
 
-function steer_set_cached_latencies_bulk(entries) {
-    let data = steer_get_cached_latencies();
-    for (let tag, delay in entries) {
-        if (tag != null && tag != "" && tag != "proxy-NaN" && index(tag, "NaN") < 0) {
-            let d = int(delay);
-            if (d != null && d != "NaN")
-                data[as_string(tag)] = d;
+function build_conntrack_mark_map() {
+    let marks = {};
+    let state_dir = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
+    let mark_cache_file = state_dir + "/conntrack-mark-map.json";
+    for (let cfg_path in [ TMP_TACHYON_CORE_FOLDER + "/config.json", "/etc/tachyon-core/config.json" ]) {
+        let st = fs.stat(cfg_path);
+        if (st == null)
+            continue;
+        let stamp = cfg_path + "|" + as_string(st.size || 0) + "|" + as_string(st.mtime || 0);
+        let cached_obj = common.read_json_file(mark_cache_file);
+        if (type(cached_obj) == "object" && cached_obj.stamp == stamp && type(cached_obj.marks) == "object") {
+            for (let mk, mv in cached_obj.marks)
+                marks[mk] = mv;
+            break;
         }
-    }
-    common.write_json_file(STEER_LATENCY_CACHE_FILE, data);
-}
-
-function steer_lookup_latency(latencies, tag, ctx) {
-    if (type(latencies) != "object" || tag == null) return null;
-    tag = as_string(tag);
-    if (latencies[tag] != null && int(latencies[tag]) > 0) return int(latencies[tag]);
-
-    if (ctx) {
-        if (ctx.names && ctx.names[tag] != null && latencies[ctx.names[tag]] != null && int(latencies[ctx.names[tag]]) > 0)
-            return int(latencies[ctx.names[tag]]);
-        if (ctx.tag_to_idx && ctx.tag_to_idx[tag] != null) {
-            let idx = ctx.tag_to_idx[tag];
-            if (latencies["proxy-" + idx] != null && int(latencies["proxy-" + idx]) > 0)
-                return int(latencies["proxy-" + idx]);
-            if (ctx.idx_to_tag && ctx.idx_to_tag[idx] != null && latencies[ctx.idx_to_tag[idx]] != null && int(latencies[ctx.idx_to_tag[idx]]) > 0)
-                return int(latencies[ctx.idx_to_tag[idx]]);
-        }
-    }
-
-    let m = match(tag, /proxy-(\d+)/);
-    if (m && latencies["proxy-" + m[1]] != null && int(latencies["proxy-" + m[1]]) > 0)
-        return int(latencies["proxy-" + m[1]]);
-
-    let unprefixed = replace(tag, /^.*?\s+/, "");
-    if (unprefixed != tag && latencies[unprefixed] != null && int(latencies[unprefixed]) > 0)
-        return int(latencies[unprefixed]);
-
-    for (let k, v in latencies) {
-        if (substr(k, -length(tag)) == tag && int(v) > 0)
-            return int(v);
-    }
-    return null;
-}
-
-function steer_reload_vless_workers(target_sec_name) {
-    let restarted = false;
-    let spec_raw = fs.readfile("/etc/steer/spec.json");
-    if (spec_raw != null) {
-        let spec = parse_json_or_null(spec_raw);
-        if (type(spec) == "object" && type(spec.outputs) == "object") {
-            for (let out_name, out in spec.outputs) {
-                if (type(out) == "object" && out.kind == "vless") {
-                    if (target_sec_name == null || target_sec_name == "" || out_name == target_sec_name) {
-                        command_status("ubus call service signal '" + sprintf('{"name":"steer","instance":"vless_%s","signal":15}', out_name) + "' >/dev/null 2>&1");
-                        restarted = true;
-                    }
+        let cfg = common.read_json_file(cfg_path);
+        if (type(cfg) == "object" && (type(cfg.outbounds) == "array" || type(cfg.endpoints) == "array")) {
+            let cfg_marks = {};
+            for (let ob in (cfg.outbounds || [])) {
+                if (type(ob) != "object")
+                    continue;
+                let rmark = int(as_string(ob.routing_mark || "0"), 0) || 0;
+                let ob_tag = as_string(ob.tag || "");
+                if (rmark > 0 && ob_tag != "") {
+                    marks[as_string(rmark)] = ob_tag;
+                    cfg_marks[as_string(rmark)] = ob_tag;
                 }
             }
-        }
-    }
-    if (!restarted)
-        command_status("/etc/init.d/steer restart >/dev/null 2>&1");
-    command_status("conntrack -F >/dev/null 2>&1 || true");
-    return restarted;
-}
-
-function steer_apply_best_nodes(sname, best_node_idx, candidate_indices) {
-    if (sname == null || sname == "") return false;
-    let spec_path = "/etc/steer/spec.json";
-    let spec_raw = fs.readfile(spec_path);
-    if (spec_raw == null) return false;
-    let spec = parse_json_or_null(spec_raw);
-    if (type(spec) != "object" || type(spec.outputs) != "object" || type(spec.outputs[sname]) != "object")
-        return false;
-
-    let out = spec.outputs[sname];
-    if (out.kind != "vless") return false;
-
-    let lat_data = steer_get_cached_latencies();
-    let pool = [];
-    if (type(candidate_indices) == "array" && length(candidate_indices) > 0) {
-        pool = candidate_indices;
-    } else if (type(out.nodes) == "array" && length(out.nodes) > 0) {
-        pool = out.nodes;
-    }
-
-    if (length(pool) == 0 && best_node_idx != null)
-        pool = [ best_node_idx ];
-
-    let sorted = sort(pool, function(a, b) {
-        if (best_node_idx != null) {
-            if (a == best_node_idx && b != best_node_idx) return -1;
-            if (b == best_node_idx && a != best_node_idx) return 1;
-        }
-        let da = lat_data["proxy-" + a];
-        let db = lat_data["proxy-" + b];
-        let sa = (da != null && int(da) > 0) ? int(da) : (da == null ? 5000000 + a : 9000000 + a);
-        let sb = (db != null && int(db) > 0) ? int(db) : (db == null ? 5000000 + b : 9000000 + b);
-        return sa - sb;
-    });
-
-    let unique_nodes = [];
-    let seen_idx = {};
-    for (let ni in sorted) {
-        let nint = int(ni);
-        if (nint != null && nint != "NaN" && !seen_idx[nint]) {
-            push(unique_nodes, nint);
-            seen_idx[nint] = true;
-        }
-    }
-    if (length(unique_nodes) > 16)
-        unique_nodes = slice(unique_nodes, 0, 16);
-
-    if (length(unique_nodes) == 0) return false;
-
-    let current_nodes = type(out.nodes) == "array" ? out.nodes : [];
-    let changed = (length(current_nodes) != length(unique_nodes));
-    if (!changed) {
-        for (let i = 0; i < length(unique_nodes); i++) {
-            if (current_nodes[i] != unique_nodes[i]) {
-                changed = true;
-                break;
-            }
-        }
-    }
-
-    if (!changed) return false;
-
-    out.nodes = unique_nodes;
-    let tmp_path = spec_path + ".tachyon." + as_string(time());
-    if (common.write_json_file(tmp_path, spec, 2)) {
-        if (fs.rename(tmp_path, spec_path)) {
-            steer_reload_vless_workers(sname);
-            return true;
-        }
-        common.remove_file(tmp_path);
-    }
-    return false;
-}
-
-const STEER_SECTION_CACHE_DIR = getenv("TACHYON_SECTION_CACHE_DIR") ||
-    (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/section-cache";
-const STEER_SUBS_DIR = getenv("TACHYON_STEER_SUBS_DIR") || "/etc/steer/subs";
-
-function steer_build_section_context(section_name) {
-    section_name = as_string(section_name);
-    if (section_name == "") return null;
-
-    let cache_file = STEER_SECTION_CACHE_DIR + "/" + section_name + ".json";
-    let cache_data = common.read_json_file(cache_file);
-    if (type(cache_data) != "object")
-        return null;
-
-    let links = cache_data.links || {};
-    let metadata = cache_data.outboundMetadata || {};
-    let names = metadata.names || {};
-    let transports = metadata.transports || {};
-    let hidden = cache_data.hiddenOutboundTags || {};
-    let urltest_groups = cache_data.urltestGroups || {};
-    let uci_urltests = uci_core.section_objects(CONFIG_NAME, "urltest");
-    for (let ut in uci_urltests) {
-        if (ut.section == section_name) {
-            let ut_name = ut.name || ut[".name"];
-            let ut_sec_id = section_name + "-urltest-" + ut[".name"] + "-out";
-            let already_exists = false;
-            for (let gid, g in urltest_groups) {
-                if (gid == ut_sec_id || g.displayName == ut_name) {
-                    already_exists = true;
-                    break;
+            for (let ep in (cfg.endpoints || [])) {
+                if (type(ep) != "object")
+                    continue;
+                let rmark = int(as_string(ep.routing_mark || "0"), 0) || 0;
+                let ep_tag = as_string(ep.tag || "");
+                if (rmark > 0 && ep_tag != "") {
+                    marks[as_string(rmark)] = ep_tag;
+                    cfg_marks[as_string(rmark)] = ep_tag;
                 }
             }
-            if (!already_exists) {
-                let ut_id = ut_sec_id;
-                let ut_outbounds = [];
-                for (let tag, link in links) {
-                    if (!hidden[tag])
-                        push(ut_outbounds, tag);
-                }
-                if (length(ut_outbounds) == 0) {
-                    for (let tag, link in links)
-                        push(ut_outbounds, tag);
-                }
-                urltest_groups[ut_id] = {
-                    displayName: ut_name,
-                    outbounds: ut_outbounds
-                };
-            }
+            if (fs.stat(getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") != null)
+                common.write_json_file(mark_cache_file, { stamp: stamp, marks: cfg_marks }, 0);
+            break;
         }
     }
 
-    let tag_to_idx = {};
-    let idx_to_tag = {};
-    let vless_idx = 0;
-    // Numbering MUST match steer/lists.uc write_subscription_file(): urltest
-    // group outbounds first, then non-hidden links, then the rest — vless-probe
-    // --node N addresses nodes by their position in the sub file.
-    let ordered_tags = [];
-    if (type(cache_data.urltestGroups) == "object") {
-        for (let grp_id, grp in cache_data.urltestGroups) {
-            if (type(grp) == "object" && type(grp.outbounds) == "array") {
-                for (let ob in grp.outbounds) {
-                    let link = links[ob];
-                    if (link != null && match(trim(as_string(link)), /^vless:\/\//) != null && index(ordered_tags, ob) < 0)
-                        push(ordered_tags, ob);
-                }
-            }
+    let tailscale_section_id = "";
+    for (let srv in uci_sections("server")) {
+        if (option(srv, "enabled", "1") == "0")
+            continue;
+        if (lc(option(srv, "protocol", "")) == "tailscale") {
+            tailscale_section_id = as_string(srv[".name"] || "");
+            break;
         }
     }
-    let hidden_ordered = type(hidden) == "object" ? hidden : {};
-    for (let name, link in links) {
-        if (index(ordered_tags, name) >= 0 || hidden_ordered[name]) continue;
-        link = trim(as_string(link));
-        if (match(link, /^vless:\/\//) != null)
-            push(ordered_tags, name);
-    }
-    for (let name, link in links) {
-        if (index(ordered_tags, name) >= 0) continue;
-        link = trim(as_string(link));
-        if (match(link, /^vless:\/\//) != null)
-            push(ordered_tags, name);
-    }
-    for (let name in ordered_tags) {
-        tag_to_idx[name] = vless_idx;
-        idx_to_tag[vless_idx] = name;
-        let unprefixed = replace(name, /^.*?\s+/, "");
-        if (unprefixed != name && tag_to_idx[unprefixed] == null)
-            tag_to_idx[unprefixed] = vless_idx;
-        vless_idx++;
-    }
-
-    // This section's vless output reads its own sub file (see lists.uc);
-    // fall back to the shared legacy path when the per-section file is absent.
-    let sub_file = STEER_SUBS_DIR + "/" + replace(section_name, /[^A-Za-z0-9_.-]/g, "_") + ".txt";
-    if (fs.stat(sub_file) == null)
-        sub_file = "/etc/steer/sub.txt";
 
     return {
-        sname: section_name,
-        cache_data: cache_data,
-        links: links,
-        names: names,
-        transports: transports,
-        hidden: hidden,
-        urltest_groups: urltest_groups,
-        tag_to_idx: tag_to_idx,
-        idx_to_tag: idx_to_tag,
-        vless_count: vless_idx,
-        sub_file: sub_file
+        marks: marks,
+        tailscale_section_id: tailscale_section_id
     };
 }
 
-function clash_api(action, arg1, arg2, arg3) {
-    if (active_engine_is_steer()) {
-        if (action == "get_proxies") {
-            let proxies = {};
-            let latencies = steer_get_cached_latencies();
-            let sections = uci_core.section_objects(CONFIG_NAME, "section");
-            let persistent_state = common.read_json_file(getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json");
-            if (type(persistent_state) != "object")
-                persistent_state = {};
+function is_tailscale_ip(value) {
+    value = lc(trim(as_string(value)));
+    if (value == "")
+        return false;
+    if (index(value, "fd7a:115c:a1e0:") == 0)
+        return true;
+    if (!valid_ipv4(value))
+        return false;
+    let parts = split(value, ".");
+    let a = int(parts[0], 10);
+    let b = int(parts[1], 10);
+    return a == 100 && b >= 64 && b <= 127;
+}
 
-            for (let sec in sections) {
-                let sname = as_string(sec[".name"]);
-                if (sname == "") continue;
-                let ctx = steer_build_section_context(sname);
-                if (!ctx) continue;
-
-                for (let tag, link in ctx.links) {
-                    let delay = steer_lookup_latency(latencies, tag, ctx);
-                    let hist = [];
-                    if (delay != null && int(delay) > 0)
-                        push(hist, { delay: int(delay), time: "2026-09-22T13:00:00Z" });
-                    else if (delay != null && int(delay) == 0 && (latencies[tag] != null || (ctx.tag_to_idx && latencies["proxy-" + ctx.tag_to_idx[tag]] != null)))
-                        push(hist, { delay: 0, time: "2026-09-22T13:00:00Z" });
-                    proxies[tag] = {
-                        name: ctx.names[tag] || tag,
-                        type: ctx.transports[tag] || "Vless",
-                        udp: true,
-                        history: hist
-                    };
-                }
-
-                let group_ids = [];
-                for (let grp_id, grp in ctx.urltest_groups) {
-                    push(group_ids, grp_id);
-                    let best_child_delay = null;
-                    let chosen_child = (type(grp.outbounds) == "array" && length(grp.outbounds) > 0) ? grp.outbounds[0] : "";
-                    for (let child in grp.outbounds) {
-                        let cd = steer_lookup_latency(latencies, child, ctx);
-                        if (cd != null && int(cd) > 0) {
-                            if (best_child_delay == null || int(cd) < int(best_child_delay)) {
-                                best_child_delay = int(cd);
-                                chosen_child = child;
-                            }
-                        }
-                    }
-                    let explicit_grp_delay = steer_lookup_latency(latencies, grp_id, ctx);
-                    let effective_grp_delay = best_child_delay != null ? best_child_delay : (explicit_grp_delay != null ? int(explicit_grp_delay) : 0);
-                    let hist = [];
-                    if (effective_grp_delay > 0)
-                        push(hist, { delay: effective_grp_delay, time: "2026-09-22T13:00:00Z" });
-                    proxies[grp_id] = {
-                        name: grp_id,
-                        type: "URLTest",
-                        all: grp.outbounds,
-                        now: chosen_child,
-                        history: hist
-                    };
-                }
-
-                let selector_all = [];
-                for (let gid in group_ids) {
-                    if (index(gid, "-urltest-") >= 0)
-                        push(selector_all, gid);
-                }
-                for (let gid in group_ids) {
-                    if (index(gid, "-urltest-") < 0)
-                        push(selector_all, gid);
-                }
-                for (let tag, link in ctx.links) {
-                    if (!ctx.hidden[tag])
-                        push(selector_all, tag);
-                }
-                if (length(selector_all) == 0) {
-                    for (let tag, link in ctx.links)
-                        push(selector_all, tag);
-                }
-
-                let saved_choice = as_string(persistent_state[sname] || "");
-                let uci_node = uci_core.get(CONFIG_NAME + "." + sname + ".node");
-                let now_tag = "";
-
-                if (saved_choice != "" && proxies[saved_choice] != null) {
-                    now_tag = saved_choice;
-                } else if (uci_node == "auto" || uci_node == "urltest" || uci_node == null || uci_node == "") {
-                    now_tag = length(selector_all) > 0 ? selector_all[0] : "";
-                } else if (proxies[uci_node] != null) {
-                    now_tag = uci_node;
-                } else {
-                    let m = match(uci_node, /proxy-(\d+)/);
-                    let idx = m ? int(m[1]) : int(uci_node);
-                    if (ctx.idx_to_tag[idx] != null)
-                        now_tag = ctx.idx_to_tag[idx];
-                    else
-                        now_tag = length(selector_all) > 0 ? selector_all[0] : "";
-                }
-
-                let sec_delay = (proxies[now_tag] && type(proxies[now_tag].history) == "array" && length(proxies[now_tag].history) > 0)
-                    ? proxies[now_tag].history[0].delay
-                    : steer_lookup_latency(latencies, now_tag, ctx);
-                let sec_hist = [];
-                if (sec_delay != null && int(sec_delay) > 0)
-                    push(sec_hist, { delay: int(sec_delay), time: "2026-09-22T13:00:00Z" });
-
-                let sel_tag = sname + "-out";
-                proxies[sel_tag] = {
-                    name: sel_tag,
-                    type: "Selector",
-                    now: now_tag,
-                    all: selector_all,
-                    history: sec_hist
-                };
-
-                // Deliberately read-only. This branch used to call
-                // steer_apply_best_nodes() for auto sections, so a dashboard
-                // refresh could rewrite /etc/steer/spec.json, restart the vless
-                // workers and run `conntrack -F`. Applying the best node belongs
-                // to the latency probes (clash_api probe paths below), which
-                // already do it after measuring.
-            }
-            print(sprintf("%J\n", { proxies: proxies }));
-            return 0;
+function load_conntrack_ip_host_map(parsed_connections, parsed_reverse_dns) {
+    let ip_host_map = {};
+    let ui_state_dir = (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/ui-state";
+    let rev_cache_path = ui_state_dir + "/dns-reverse.json";
+    if (type(parsed_reverse_dns) == "object") {
+        for (let ip, dom in parsed_reverse_dns) {
+            ip = trim(as_string(ip));
+            dom = trim(as_string(dom));
+            if (ip != "" && dom != "")
+                ip_host_map[ip] = dom;
         }
-
-        if (action == "get_connections") {
-            let total_down = 0;
-            let total_up = 0;
-            let st_raw = fs.readfile("/var/lib/steer/status.json");
-            let mark_to_output = {};
-            if (st_raw) {
-                let st_json = json(st_raw);
-                if (st_json) {
-                    if (type(st_json.channels) == "array") {
-                        for (let ch in st_json.channels) {
-                            if (ch.out != "direct") {
-                                total_up += (int(ch.bytes) || 0);
-                                total_down += (int(ch.down_bytes) || 0);
-                            }
-                        }
-                    }
-                    if (type(st_json.outputs) == "object") {
-                        for (let oname, odata in st_json.outputs) {
-                            if (odata.mark) {
-                                let mv = int(odata.mark);
-                                if (mv > 0) mark_to_output[mv] = oname;
-                            }
-                        }
-                    }
-                }
-            }
-            let rx = fs.readfile("/sys/class/net/Main/statistics/rx_bytes");
-            let tx = fs.readfile("/sys/class/net/Main/statistics/tx_bytes");
-            if (rx != null) {
-                let rx_val = int(trim(as_string(rx))) || 0;
-                if (rx_val > total_down) total_down = rx_val;
-            }
-            if (tx != null) {
-                let tx_val = int(trim(as_string(tx))) || 0;
-                if (tx_val > total_up) total_up = tx_val;
-            }
-
-            let mem_bytes = 6291456;
-            let proc_dir = fs.opendir("/proc");
-            if (proc_dir) {
-                let ent;
-                let steer_kb = 0;
-                while ((ent = proc_dir.read()) != null) {
-                    if (match(ent, /^[0-9]+$/)) {
-                        let comm = trim(as_string(fs.readfile("/proc/" + ent + "/comm")));
-                        if (comm == "steer") {
-                            let status = fs.readfile("/proc/" + ent + "/status");
-                            if (status) {
-                                let m = match(status, /VmRSS:[ \t]+([0-9]+)/);
-                                if (m) steer_kb += int(m[1]);
-                            }
-                        }
-                    }
-                }
-                proc_dir.close();
-                if (steer_kb > 0)
-                    mem_bytes = steer_kb * 1024;
-            }
-
-            let fakeip_map = {};
-            let fip_file = fs.open("/var/lib/steer/fakeip.state", "r");
-            if (fip_file) {
-                let fline;
-                while ((fline = fip_file.read("line")) != null) {
-                    let parts = split(trim(fline), /[ \t]+/);
-                    if (length(parts) >= 2) {
-                        let dom = parts[0];
-                        for (let pi = 1; pi < length(parts); pi++)
-                            fakeip_map[parts[pi]] = dom;
-                    }
-                }
-                fip_file.close();
-            }
-
-            let conns = [];
-            let ct_file = fs.open("/proc/net/nf_conntrack", "r");
-            if (ct_file) {
-                let line;
-                while (true) {
-                    line = ct_file.read("line");
-                    if (line == null) break;
-                    let m = match(line, /ipv[46]\s+\d+\s+([a-zA-Z0-9]+)\s+.*?src=(\d+\.\d+\.\d+\.\d+)\s+dst=(\d+\.\d+\.\d+\.\d+)\s+sport=(\d+)\s+dport=(\d+)\s+packets=\d+\s+bytes=(\d+).*?bytes=(\d+)/);
-                    if (m) {
-                        let src_ip = m[2];
-                        if (match(src_ip, /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/) && src_ip != "127.0.0.1") {
-                            let proto = lc(m[1]);
-                            let dst_ip = m[3];
-                            let src_port = m[4];
-                            let dst_port = m[5];
-                            let up_bytes = int(m[6]) || 0;
-                            let down_bytes = int(m[7]) || 0;
-
-                            let mm = match(line, /mark=(\d+)/);
-                            let conn_mark = mm ? int(mm[1]) : 0;
-                            let route_name = "";
-                            for (let mv, oname in mark_to_output) {
-                                if ((conn_mark & mv) == mv) {
-                                    route_name = oname;
-                                    break;
-                                }
-                            }
-                            if (route_name == "") {
-                                if (match(dst_ip, /^(192\.168\.|10\.|127\.|172\.(1[6-9]|2\d|3[01])\.)/))
-                                    route_name = "direct";
-                                else
-                                    route_name = "Main";
-                            }
-
-                            let host = fakeip_map[dst_ip] || "";
-                            let cid = sprintf("%s-%s-%s-%s-%s", proto, src_ip, src_port, dst_ip, dst_port);
-
-                            push(conns, {
-                                id: cid,
-                                metadata: {
-                                    network: proto,
-                                    type: "Inner",
-                                    sourceIP: src_ip,
-                                    sourcePort: src_port,
-                                    destinationIP: dst_ip,
-                                    destinationPort: dst_port,
-                                    host: host
-                                },
-                                upload: up_bytes,
-                                download: down_bytes,
-                                chains: [ route_name ],
-                                rule: route_name
-                            });
-                            if (length(conns) >= 250) break;
-                        }
-                    }
-                }
-                ct_file.close();
-            }
-
-            if (length(conns) == 0) {
-                let conntrack_str = fs.readfile("/proc/sys/net/netfilter/nf_conntrack_count");
-                let conn_count = conntrack_str != null ? (int(trim(as_string(conntrack_str))) || 0) : 0;
-                let emit_count = conn_count > 100 ? 100 : conn_count;
-                for (let i = 0; i < emit_count; i++) {
-                    push(conns, { id: sprintf("c-%d", i) });
-                }
-            }
-
-            print(sprintf("%J\n", {
-                downloadTotal: total_down,
-                uploadTotal: total_up,
-                memory: mem_bytes,
-                connections: conns
-            }));
-            return 0;
+        // Fallback cache only (read when the core omits reverseDns): serializing
+        // ~180KB on every UI poll is wasted work, so refresh it at most every 30s.
+        let rev_st = fs.stat(rev_cache_path);
+        let rev_fresh = rev_st != null && (time() - (rev_st.mtime || 0)) < 30;
+        if (getenv("FAKE_CURL_LOG") == null && !rev_fresh && length(ip_host_map) > 0) {
+            common.ensure_dir(ui_state_dir);
+            common.write_json_file(rev_cache_path, ip_host_map, 0);
         }
-
-        if (action == "get_proxy_latency") {
-            if (as_string(arg1) == "")
-                return clash_json_error("proxy_tag required");
-            let target_tag = as_string(arg1);
-            let timeout_sec = int((int(arg2 || "3000") + 999) / 1000);
-            if (timeout_sec < 1) timeout_sec = 1;
-
-            let tag_to_idx = {};
-            let probe_ctx = null;
-            let all_urltest_groups = {};
-            let sections = uci_core.section_objects(CONFIG_NAME, "section");
-            for (let sec in sections) {
-                let sname = as_string(sec[".name"]);
-                let ctx = steer_build_section_context(sname);
-                if (ctx) {
-                    for (let t, idx in ctx.tag_to_idx)
-                        tag_to_idx[t] = idx;
-                    for (let gid, grp in ctx.urltest_groups) {
-                        all_urltest_groups[gid] = grp;
-                        if (grp.displayName) all_urltest_groups[grp.displayName] = grp;
-                    }
-                    // Remember the section that owns this tag: its own sub file
-                    // and node numbering are what vless-probe must use.
-                    if (probe_ctx == null && (ctx.tag_to_idx[target_tag] != null || all_urltest_groups[target_tag] != null))
-                        probe_ctx = ctx;
-                }
+    } else {
+        let cached = common.read_json_file(rev_cache_path);
+        if (type(cached) == "object") {
+            for (let ip, dom in cached) {
+                ip = trim(as_string(ip));
+                dom = trim(as_string(dom));
+                if (ip != "" && dom != "")
+                    ip_host_map[ip] = dom;
             }
-
-            let node_idx = null;
-            if (all_urltest_groups[target_tag] != null) {
-                let grp = all_urltest_groups[target_tag];
-                let latencies = steer_get_cached_latencies();
-                for (let child in grp.outbounds) {
-                    if (latencies[child] != null && int(latencies[child]) > 0) {
-                        if (node_idx == null || int(latencies[child]) < int(latencies[tag_to_idx[node_idx] || ""]))
-                            node_idx = tag_to_idx[child];
-                    }
-                }
-                if (node_idx == null) {
-                    for (let child in grp.outbounds) {
-                        if (tag_to_idx[child] != null) {
-                            node_idx = tag_to_idx[child];
-                            break;
-                        }
-                    }
-                }
-            } else {
-                node_idx = tag_to_idx[target_tag];
-                if (node_idx == null) {
-                    let m = match(target_tag, /proxy-(\d+)/);
-                    if (m) node_idx = int(m[1]);
-                }
-            }
-
-            if (node_idx == null)
-                node_idx = int(target_tag);
-
-            let sub_file = probe_ctx != null ? probe_ctx.sub_file : "/etc/steer/sub.txt";
-            let probe_out = trim(command_output_from_args([ "/usr/sbin/steer", "vless-probe", sub_file, "--node", as_string(node_idx), "--timeout", as_string(timeout_sec) ]));
-            let probe_json = parse_json_or_null(probe_out);
-            let res_item = (type(probe_json) == "object" && type(probe_json.results) == "array" && length(probe_json.results) > 0) ? probe_json.results[0] : probe_json;
-            let ok = (type(res_item) == "object" && res_item.ok);
-            let handshake = ok ? int(res_item.handshake_ms || 0) : 0;
-            let ttfb = ok ? int(res_item.ttfb_ms || 0) : 0;
-            let delay = ok ? (handshake > 0 ? handshake + (ttfb > 0 ? ttfb : 0) : (ttfb > 0 ? ttfb : 1)) : 0;
-
-            steer_set_cached_latency(target_tag, delay);
-            steer_set_cached_latency("proxy-" + node_idx, delay);
-            print(sprintf("%J\n", { delay: delay }));
-            return 0;
-        }
-
-        if (action == "get_group_latency") {
-            // Clash contract: probe every member of the group and answer with a
-            // {tag: delay} map (runSectionsCheck reads values, not a scalar).
-            let group = as_string(arg1);
-            let timeout_sec = int((int(arg2 || "5000") + 999) / 1000);
-            if (timeout_sec < 1) timeout_sec = 1;
-
-            let group_children = [];
-            let probe_ctx = null;
-            let sections = uci_core.section_objects(CONFIG_NAME, "section");
-            for (let sec in sections) {
-                let sname = as_string(sec[".name"]);
-                let ctx = steer_build_section_context(sname);
-                if (!ctx) continue;
-
-                // Section selector itself: test every node in this section
-                if (sname == group || sname + "-out" == group || group == "selector") {
-                    for (let tag, link in ctx.links)
-                        push(group_children, tag);
-                    probe_ctx = ctx;
-                    break;
-                }
-
-                let grp = null;
-                if (type(ctx.urltest_groups) == "object") {
-                    if (ctx.urltest_groups[group] != null)
-                        grp = ctx.urltest_groups[group];
-                    else {
-                        for (let gid, gdata in ctx.urltest_groups) {
-                            if (gdata.displayName == group || gid == group) {
-                                grp = gdata;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (grp != null && type(grp.outbounds) == "array") {
-                    for (let child in grp.outbounds)
-                        push(group_children, child);
-                    if (probe_ctx == null)
-                        probe_ctx = ctx;
-                    break;
-                }
-            }
-            if (length(group_children) == 0 && probe_ctx == null) {
-                for (let sec in sections) {
-                    let ctx = steer_build_section_context(as_string(sec[".name"]));
-                    if (ctx && ctx.links) {
-                        for (let tag, link in ctx.links)
-                            push(group_children, tag);
-                        if (probe_ctx == null)
-                            probe_ctx = ctx;
-                    }
-                }
-            }
-
-            let result = {};
-            let sub_file = probe_ctx != null ? probe_ctx.sub_file : "/etc/steer/sub.txt";
-            let latencies = steer_get_cached_latencies();
-            let best_tag = null;
-            let best_delay = null;
-            for (let tag in group_children) {
-                let node_idx = probe_ctx != null ? probe_ctx.tag_to_idx[tag] : null;
-                if (node_idx == null) {
-                    let m = match(as_string(tag), /proxy-(\d+)/);
-                    if (m) node_idx = int(m[1]);
-                }
-                let delay = 0;
-                if (node_idx != null) {
-                    let probe_out = trim(command_output_from_args([ "/usr/sbin/steer", "vless-probe", sub_file, "--node", as_string(node_idx), "--timeout", as_string(timeout_sec) ]));
-                    let probe_json = parse_json_or_null(probe_out);
-                    let res_item = (type(probe_json) == "object" && type(probe_json.results) == "array" && length(probe_json.results) > 0) ? probe_json.results[0] : probe_json;
-                    let ok = (type(res_item) == "object" && res_item.ok);
-                    let handshake = ok ? int(res_item.handshake_ms || 0) : 0;
-                    let ttfb = ok ? int(res_item.ttfb_ms || 0) : 0;
-                    delay = ok ? (handshake > 0 ? handshake + (ttfb > 0 ? ttfb : 0) : (ttfb > 0 ? ttfb : 1)) : 0;
-                    steer_set_cached_latency(as_string(tag), delay);
-                    steer_set_cached_latency("proxy-" + as_string(node_idx), delay);
-                }
-                result[as_string(tag)] = delay;
-                if (delay > 0 && (best_delay == null || delay < best_delay)) {
-                    best_delay = delay;
-                    best_tag = as_string(tag);
-                }
-            }
-
-            // The group row itself shows the best member delay.
-            if (best_delay != null) {
-                steer_set_cached_latency(group, best_delay);
-                if (probe_ctx != null && probe_ctx.sname != null)
-                    steer_set_cached_latency(probe_ctx.sname + "-out", best_delay);
-            }
-
-            if (best_tag != null && probe_ctx != null && probe_ctx.sname != null) {
-                let candidate_indices = [];
-                for (let tag in group_children) {
-                    if (probe_ctx.tag_to_idx[tag] != null)
-                        push(candidate_indices, probe_ctx.tag_to_idx[tag]);
-                }
-                let best_node_idx = probe_ctx.tag_to_idx[best_tag];
-                let uci_node = uci_core.get(CONFIG_NAME + "." + probe_ctx.sname + ".node");
-                if (uci_node == "auto" || uci_node == "urltest" || uci_node == null || uci_node == "") {
-                    steer_apply_best_nodes(probe_ctx.sname, best_node_idx, candidate_indices);
-                }
-            }
-            print(sprintf("%J\n", result));
-            return 0;
-        }
-
-        if (action == "get_proxy_latencies") {
-            if (as_string(arg1) == "")
-                return clash_json_error("proxy_tags_json required");
-            let tags_list = [];
-            let parsed = json(as_string(arg1));
-            if (type(parsed) == "array") {
-                tags_list = parsed;
-            } else {
-                let tags = status_capture([ "clash-proxy-tags-lines", arg1 ], null);
-                if (tags.status == 0) {
-                    for (let pt in split(tags.output, "\n")) {
-                        pt = trim(as_string(pt));
-                        if (pt != "") push(tags_list, pt);
-                    }
-                }
-            }
-
-            let tag_to_idx = {};
-            let tag_to_sub = {};
-            let sections = uci_core.section_objects(CONFIG_NAME, "section");
-            let section_contexts = {};
-            for (let sec in sections) {
-                let sname = as_string(sec[".name"]);
-                let ctx = steer_build_section_context(sname);
-                if (ctx) {
-                    section_contexts[sname] = ctx;
-                    for (let t, idx in ctx.tag_to_idx) {
-                        tag_to_idx[t] = idx;
-                        tag_to_sub[t] = ctx.sub_file;
-                    }
-                }
-            }
-
-            let expanded_tags = [];
-            for (let target_tag in tags_list) {
-                let is_group = false;
-                for (let sname, ctx in section_contexts) {
-                    if (sname == target_tag || sname + "-out" == target_tag || target_tag == "selector") {
-                        is_group = true;
-                        for (let ctag, link in ctx.links) {
-                            if (index(expanded_tags, ctag) < 0)
-                                push(expanded_tags, ctag);
-                        }
-                        break;
-                    }
-                    if (type(ctx.urltest_groups) == "object") {
-                        let grp = ctx.urltest_groups[target_tag];
-                        if (!grp) {
-                            for (let gid, gdata in ctx.urltest_groups) {
-                                if (gid == target_tag || gdata.displayName == target_tag) {
-                                    grp = gdata;
-                                    break;
-                                }
-                            }
-                        }
-                        if (grp && type(grp.outbounds) == "array") {
-                            is_group = true;
-                            for (let ctag in grp.outbounds) {
-                                if (index(expanded_tags, ctag) < 0)
-                                    push(expanded_tags, ctag);
-                            }
-                            break;
-                        }
-                    }
-                }
-                if (!is_group && index(expanded_tags, target_tag) < 0)
-                    push(expanded_tags, target_tag);
-            }
-
-            let count = 0;
-            let failed = 0;
-            let progress_path = as_string(arg3);
-            let total = length(expanded_tags);
-            if (progress_path != "")
-                module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
-
-            let timeout_sec = int((int(arg2 || "3000") + 999) / 1000);
-            if (timeout_sec < 1) timeout_sec = 1;
-
-            for (let target_tag in expanded_tags) {
-                let node_idx = tag_to_idx[target_tag];
-                let sub_file = tag_to_sub[target_tag] || "/etc/steer/sub.txt";
-                if (node_idx == null) {
-                    let m = match(target_tag, /proxy-(\d+)/);
-                    node_idx = m ? int(m[1]) : int(target_tag);
-                }
-                if (node_idx != null) {
-                    let probe_out = trim(command_output_from_args([ "/usr/sbin/steer", "vless-probe", sub_file, "--node", as_string(node_idx), "--timeout", as_string(timeout_sec) ]));
-                    let probe_json = parse_json_or_null(probe_out);
-                    let res_item = (type(probe_json) == "object" && type(probe_json.results) == "array" && length(probe_json.results) > 0) ? probe_json.results[0] : probe_json;
-                    let ok = (type(res_item) == "object" && res_item.ok);
-                    let handshake = ok ? int(res_item.handshake_ms || 0) : 0;
-                    let ttfb = ok ? int(res_item.ttfb_ms || 0) : 0;
-                    let delay = ok ? (handshake > 0 ? handshake + (ttfb > 0 ? ttfb : 0) : (ttfb > 0 ? ttfb : 1)) : 0;
-                    if (!ok) failed++;
-                    steer_set_cached_latency(target_tag, delay);
-                    steer_set_cached_latency("proxy-" + node_idx, delay);
-                } else {
-                    failed++;
-                }
-                count++;
-                if (progress_path != "")
-                    module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
-            }
-
-            let fresh_latencies = steer_get_cached_latencies();
-            for (let sname, ctx in section_contexts) {
-                let uci_node = uci_core.get(CONFIG_NAME + "." + sname + ".node");
-                let sec_best_delay = null;
-                let sec_best_node_idx = null;
-                let sec_candidate_indices = [];
-
-                if (type(ctx.urltest_groups) == "object") {
-                    for (let grp_id, grp in ctx.urltest_groups) {
-                        let grp_min = null;
-                        let grp_best_idx = null;
-                        for (let child in grp.outbounds) {
-                            let cd = steer_lookup_latency(fresh_latencies, child, ctx);
-                            let cidx = ctx.tag_to_idx[child];
-                            if (cidx != null && index(sec_candidate_indices, cidx) < 0)
-                                push(sec_candidate_indices, cidx);
-                            if (cd != null && int(cd) > 0) {
-                                if (grp_min == null || int(cd) < grp_min) {
-                                    grp_min = int(cd);
-                                    grp_best_idx = cidx;
-                                }
-                            }
-                        }
-                        if (grp_min != null) {
-                            steer_set_cached_latency(grp_id, grp_min);
-                            if (grp.displayName)
-                                steer_set_cached_latency(grp.displayName, grp_min);
-                            if (sec_best_delay == null || grp_min < sec_best_delay) {
-                                sec_best_delay = grp_min;
-                                sec_best_node_idx = grp_best_idx;
-                            }
-                        }
-                    }
-                }
-
-                if (sec_best_delay != null)
-                    steer_set_cached_latency(sname + "-out", sec_best_delay);
-
-                if (sec_best_node_idx != null && (uci_node == "auto" || uci_node == "urltest" || uci_node == null || uci_node == "")) {
-                    steer_apply_best_nodes(sname, sec_best_node_idx, sec_candidate_indices);
-                }
-            }
-
-            print(sprintf("%J\n", { status: 0 }));
-            return 0;
-        }
-
-        if (action == "set_group_proxy") {
-            if (as_string(arg1) == "" || as_string(arg2) == "")
-                return clash_json_error("group_tag and proxy_tag required");
-
-            let raw_group = as_string(arg1);
-            let target_group = replace(raw_group, /-out$/, "");
-            let target_proxy = as_string(arg2);
-            let ctx = steer_build_section_context(target_group);
-
-            let matched_urltest = ctx && ctx.urltest_groups ? ctx.urltest_groups[target_proxy] : null;
-            if (matched_urltest == null && ctx && ctx.urltest_groups) {
-                for (let gid, grp in ctx.urltest_groups) {
-                    if (grp.displayName == target_proxy) {
-                        matched_urltest = grp;
-                        break;
-                    }
-                }
-            }
-
-            if (matched_urltest != null) {
-                let node_indices = [];
-                for (let child in matched_urltest.outbounds) {
-                    if (ctx.tag_to_idx[child] != null)
-                        push(node_indices, ctx.tag_to_idx[child]);
-                }
-                uci_core.set(CONFIG_NAME + "." + target_group + ".node", "auto");
-                if (length(node_indices) > 0)
-                    uci_core.set(CONFIG_NAME + "." + target_group + ".nodes", join(" ", node_indices));
-                else
-                    uci_core.delete(CONFIG_NAME + "." + target_group + ".nodes");
-            } else if (target_proxy == "⚡ Auto (URL Test)" || target_proxy == "auto") {
-                uci_core.set(CONFIG_NAME + "." + target_group + ".node", "auto");
-                uci_core.delete(CONFIG_NAME + "." + target_group + ".nodes");
-            } else {
-                let node_idx = ctx && ctx.tag_to_idx ? ctx.tag_to_idx[target_proxy] : null;
-                if (node_idx == null) {
-                    let m = match(target_proxy, /proxy-(\d+)/);
-                    if (m)
-                        node_idx = int(m[1]);
-                    else if (match(target_proxy, /^\d+$/))
-                        node_idx = int(target_proxy);
-                    else
-                        node_idx = "auto";
-                }
-                uci_core.set(CONFIG_NAME + "." + target_group + ".node", as_string(node_idx));
-                uci_core.delete(CONFIG_NAME + "." + target_group + ".nodes");
-            }
-
-            uci_core.commit(CONFIG_NAME);
-            // The node list is read by the vless process from the spec at
-            // startup: regenerate the spec, then restart only the vless
-            // instances (procd re-runs them with the fresh spec). A full
-            // `/etc/init.d/steer restart` would also kill dnsd and drop the
-            // rules — seconds of DNS outage on every node switch.
-            command_status("ucode -L " + LIB_DIR + " " + LIB_DIR + "/service/engine_runtime.uc engine-generate >/dev/null 2>&1");
-            let restarted_vless = false;
-            let spec_raw = fs.readfile("/etc/steer/spec.json");
-            if (spec_raw != null) {
-                let spec = parse_json_or_null(spec_raw);
-                if (type(spec) == "object" && type(spec.outputs) == "object") {
-                    for (let out_name, out in spec.outputs) {
-                        if (type(out) == "object" && out.kind == "vless") {
-                            command_status("ubus call service signal '" + sprintf('{"name":"steer","instance":"vless_%s","signal":15}', out_name) + "' >/dev/null 2>&1");
-                            restarted_vless = true;
-                        }
-                    }
-                }
-            }
-            if (!restarted_vless)
-                command_status("/etc/init.d/steer restart >/dev/null 2>&1");
-            save_persistent_selector_choice(target_group, target_proxy);
-            save_persistent_selector_choice(target_group + "-out", target_proxy);
-            let result = status_capture([ "clash-set-group-proxy-result", target_group, target_proxy ], "\n204");
-            if (result.output != "")
-                print(result.output);
-            return result.status;
-        }
-
-        if (action == "restore_selector_state") {
-            let path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
-            let state = common.read_json_file(path);
-            if (type(state) == "object") {
-                for (let group, selected in state) {
-                    clash_api("set_group_proxy", group, selected);
-                }
-            }
-            return 0;
-        }
-
-        if (action == "close_connection" || action == "close_all_connections") {
-            command_status("conntrack -F >/dev/null 2>&1 || true");
-            print("\n204");
-            return 0;
         }
     }
+    if (type(parsed_connections) == "array") {
+        for (let c in parsed_connections) {
+            if (type(c) != "object")
+                continue;
+            let meta = object_or_empty(c.metadata);
+            let dst_ip = trim(as_string(meta.destinationIP || ""));
+            let host = trim(as_string(meta.host || ""));
+            if (dst_ip != "" && host != "")
+                ip_host_map[dst_ip] = host;
+        }
+    }
+    return ip_host_map;
+}
 
+function read_conntrack_connections(mark_info, existing_tuples, ip_host_map) {
+    let ct_path = getenv("TACHYON_CONNTRACK_FILE") || "/proc/net/nf_conntrack";
+    if (getenv("TACHYON_CONNTRACK_FILE") == null && fs.access("/proc/sys/net/netfilter/nf_conntrack_acct")) {
+        let acct = trim(as_string(fs.readfile("/proc/sys/net/netfilter/nf_conntrack_acct") || ""));
+        if (acct == "0")
+            common.write_file("/proc/sys/net/netfilter/nf_conntrack_acct", "1\n");
+    }
+    let raw = fs.readfile(ct_path);
+    if (raw == null || raw == "")
+        return [];
+
+    let result = [];
+    let marks = (type(mark_info) == "object" && type(mark_info.marks) == "object") ? mark_info.marks : {};
+    let ts_sec_id = type(mark_info) == "object" ? as_string(mark_info.tailscale_section_id || "") : "";
+    let host_map = type(ip_host_map) == "object" ? ip_host_map : {};
+
+    for (let line in split(raw, "\n")) {
+        line = trim(as_string(line));
+        if (line == "")
+            continue;
+        if (index(line, "src=127.") >= 0 || index(line, "src=::1 ") >= 0)
+            continue;
+        if (index(line, "TIME_WAIT") >= 0 || index(line, "CLOSE") >= 0 || index(line, "FIN_WAIT") >= 0 || index(line, "LAST_ACK") >= 0)
+            continue;
+        // Closed TCP states never get here: the substring filter above covers
+        // TIME_WAIT, CLOSE(_WAIT), FIN_WAIT(2) and LAST_ACK.
+        // A string split is ~4x cheaper than a regex split; /proc pads with spaces only.
+        let fields = index(line, "\t") >= 0 ? split(line, /[ \t]+/) : split(line, " ");
+        let proto = "", n_tok = 0;
+        let orig_src = "", orig_dst = "", orig_sport = "", orig_dport = "", orig_bytes = 0;
+        let reply_dst = "", reply_bytes = 0;
+        let src_seen = 0, dst_seen = 0, sport_seen = 0, dport_seen = 0, bytes_seen = 0;
+        let mark_val = 0;
+
+        for (let tok in fields) {
+            if (tok == "")
+                continue;
+            if (n_tok++ == 2) {
+                proto = lc(tok);
+                if (proto != "tcp" && proto != "udp")
+                    break;
+                continue;
+            }
+            let eq = index(tok, "=");
+            if (eq < 3)
+                continue;
+            let key = substr(tok, 0, eq);
+            if (key == "src") {
+                src_seen++;
+                if (src_seen == 1)
+                    orig_src = substr(tok, 4);
+            } else if (key == "dst") {
+                dst_seen++;
+                if (dst_seen == 1)
+                    orig_dst = substr(tok, 4);
+                else if (dst_seen == 2)
+                    reply_dst = substr(tok, 4);
+            } else if (key == "sport") {
+                sport_seen++;
+                if (sport_seen == 1)
+                    orig_sport = substr(tok, 6);
+            } else if (key == "dport") {
+                dport_seen++;
+                if (dport_seen == 1)
+                    orig_dport = substr(tok, 6);
+            } else if (key == "bytes") {
+                bytes_seen++;
+                if (bytes_seen == 1)
+                    orig_bytes = int(substr(tok, 6), 10) || 0;
+                else if (bytes_seen == 2)
+                    reply_bytes = int(substr(tok, 6), 10) || 0;
+            } else if (key == "mark") {
+                mark_val = int(substr(tok, 5), 0) || 0;
+            }
+        }
+
+        if (n_tok < 6 || (proto != "tcp" && proto != "udp"))
+            continue;
+        if (orig_src == "" || orig_dst == "" || orig_sport == "" || orig_dport == "")
+            continue;
+        if (substr(orig_src, 0, 4) == "127." || orig_src == "::1")
+            continue;
+        if ((mark_val & 0x0c000000) != 0)
+            continue;
+        if (reply_dst != "" && reply_dst == orig_src)
+            continue;
+
+        let tkey = connection_tuple_key(proto, orig_src, orig_sport, orig_dst, orig_dport);
+        if (type(existing_tuples) == "object" && existing_tuples[tkey])
+            continue;
+        let is_ts_conn = ts_sec_id != "" && (is_tailscale_ip(orig_src) || is_tailscale_ip(orig_dst));
+        if (!is_ts_conn && (!valid_public_ip(orig_dst) || valid_public_ip(orig_src)))
+            continue;
+        if (type(existing_tuples) == "object")
+            existing_tuples[tkey] = true;
+
+        let route_mark = mark_val & 0x0fffffff;
+        let ts_tag = "server-" + ts_sec_id + "-in";
+        let route_tag = is_ts_conn ? ts_tag : "direct-out";
+        let rule_str = is_ts_conn ? ("inbound=[" + ts_tag + "] => tailscale") : "conntrack => direct-out";
+        let rmark_key = as_string(route_mark);
+
+        if (marks[rmark_key] != null && marks[rmark_key] != "") {
+            route_tag = marks[rmark_key];
+            rule_str = sprintf("conntrack mark=0x%x => route(%s)", mark_val, route_tag);
+        } else if (orig_dport == "53" && !is_ts_conn) {
+            route_tag = "dns-out";
+            rule_str = "conntrack => dns-out";
+        }
+
+        let resolved_host = as_string(host_map[orig_dst] || "");
+
+        let meta = {
+            network: proto,
+            type: is_ts_conn ? ts_tag : "conntrack",
+            sourceIP: orig_src,
+            sourcePort: orig_sport,
+            destinationIP: orig_dst,
+            destinationPort: orig_dport,
+            host: resolved_host
+        };
+        if (is_ts_conn)
+            meta.inbound = ts_tag;
+
+        push(result, {
+            id: sprintf("ct:%s:%s:%s:%s:%s", proto, orig_src, orig_sport, orig_dst, orig_dport),
+            dataSource: "conntrack",
+            upload: orig_bytes,
+            download: reply_bytes,
+            chains: [ route_tag ],
+            rule: rule_str,
+            rulePayload: "",
+            metadata: meta
+        });
+        if (length(result) >= 250)
+            break;
+    }
+
+    return result;
+}
+
+// The UI keeps the full snapshot in a state file and reads it when stdout is
+// truncated, so stdout stays under the 56 KB the rpc exec path can carry.
+function print_connections_capped(payload, serialized) {
+    if (serialized == null)
+        serialized = sprintf("%J\n", payload);
+    while (length(serialized) > 56000 && length(payload.connections) > 10) {
+        payload.truncated = true;
+        let target_len = int(length(payload.connections) * 50000 / length(serialized));
+        if (target_len >= length(payload.connections))
+            target_len = length(payload.connections) - 10;
+        if (target_len < 10)
+            target_len = 10;
+        payload.connections = slice(payload.connections, 0, target_len);
+        serialized = sprintf("%J\n", payload);
+    }
+    print(serialized);
+}
+
+// Each dashboard tab polls every 3s and several can be open at once; a
+// snapshot written under 2s ago is reused instead of re-reading the core and
+// conntrack. A single poller (3s period) always gets a fresh one.
+function recent_connections_snapshot(path) {
+    if (getenv("FAKE_CURL_LOG") != null)
+        return null;
+    let st = fs.stat(path);
+    if (st == null || time() - (st.mtime || 0) >= 2)
+        return null;
+    let parsed = parse_json_or_null(fs.readfile(path));
+    return (type(parsed) == "object" && type(parsed.connections) == "array") ? parsed : null;
+}
+
+function clash_api(action, arg1, arg2, arg3) {
     let base_url = clash_api_url();
     let test_url = latency_test_url();
     let auth = clash_auth_args();
 
     if (action == "get_proxies") {
-        let args = [ "curl", "-s" ];
+        let args = [ "curl", "-s", "--connect-timeout", "2", "-m", "3" ];
         for (let item in auth) push(args, item);
         push(args, base_url + "/proxies");
-        return clash_json_output(args);
+        let out = command_output(command_from_args(args));
+        if (out == null || out == "") {
+            print("{}\n");
+            return 0;
+        }
+        if (getenv("FAKE_CURL_LOG") == null) {
+            let ui_state_dir = (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/ui-state";
+            common.ensure_dir(ui_state_dir);
+            common.write_file(ui_state_dir + "/clash-proxies.json", out);
+            if (length(out) > 56000) {
+                let parsed = parse_json_or_null(out);
+                if (type(parsed) == "object" && type(parsed.proxies) == "object") {
+                    for (let k, p in parsed.proxies) {
+                        if (type(p) == "object") {
+                            delete p.telemetry;
+                            if (type(p.history) == "array" && length(p.history) > 1)
+                                p.history = [ p.history[0] ];
+                        }
+                    }
+                    out = sprintf("%J\n", parsed);
+                }
+            }
+        }
+        print(out);
+        return 0;
     }
 
     if (action == "get_connections") {
-        let args = [ "curl", "-s" ];
+        let ui_state_dir = (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/ui-state";
+        if (as_string(arg1) == "conntrack") {
+            let ct_snapshot = ui_state_dir + "/clash-conntrack.json";
+            let ct_recent = recent_connections_snapshot(ct_snapshot);
+            if (ct_recent != null) {
+                print_connections_capped(ct_recent, null);
+                return 0;
+            }
+            let existing_tuples = {};
+            let ip_host_map = load_conntrack_ip_host_map(null, null);
+            if (getenv("FAKE_CURL_LOG") == null) {
+                let c_args = [ "curl", "-s", "--connect-timeout", "2", "-m", "2" ];
+                for (let item in auth) push(c_args, item);
+                push(c_args, base_url + "/connections");
+                let c_out = command_output(command_from_args(c_args));
+                let c_parsed = parse_json_or_null(c_out);
+                if (type(c_parsed) == "object") {
+                    ip_host_map = load_conntrack_ip_host_map(c_parsed.connections, c_parsed.reverseDns);
+                    if (type(c_parsed.connections) == "array") {
+                        for (let c in c_parsed.connections) {
+                            if (type(c) != "object")
+                                continue;
+                            let meta = object_or_empty(c.metadata);
+                            let c_proto = lc(as_string(meta.network || "tcp"));
+                            let c_src = as_string(meta.sourceIP || "");
+                            let c_sport = as_string(meta.sourcePort || "");
+                            let c_dst = as_string(meta.destinationIP || "");
+                            let c_dport = as_string(meta.destinationPort || "");
+                            if (c_src != "" && c_sport != "" && c_dst != "" && c_dport != "")
+                                existing_tuples[connection_tuple_key(c_proto, c_src, c_sport, c_dst, c_dport)] = true;
+                        }
+                    }
+                }
+            }
+            let mark_info = build_conntrack_mark_map();
+            let ct_conns = read_conntrack_connections(mark_info, existing_tuples, ip_host_map);
+            let ct_payload = { connections: ct_conns };
+            let ct_json = sprintf("%J\n", ct_payload);
+            if (getenv("FAKE_CURL_LOG") == null) {
+                common.ensure_dir(ui_state_dir);
+                common.write_file(ct_snapshot, ct_json);
+            }
+            print_connections_capped(ct_payload, ct_json);
+            return 0;
+        }
+        if (getenv("FAKE_CURL_LOG") != null && getenv("TACHYON_CONNTRACK_FILE") == null) {
+            let args = [ "curl", "-s" ];
+            for (let item in auth) push(args, item);
+            push(args, base_url + "/connections");
+            return clash_json_output(args);
+        }
+        let full_snapshot = ui_state_dir + "/clash-connections.json";
+        let full_recent = recent_connections_snapshot(full_snapshot);
+        if (full_recent != null) {
+            print_connections_capped(full_recent, null);
+            return 0;
+        }
+        let args = [ "curl", "-s", "--connect-timeout", "2", "-m", "3" ];
         for (let item in auth) push(args, item);
         push(args, base_url + "/connections");
-        return clash_json_output(args);
+        let out = command_output(command_from_args(args));
+        let parsed = parse_json_or_null(out);
+        if (type(parsed) != "object")
+            parsed = { connections: [] };
+        if (type(parsed.connections) != "array")
+            parsed.connections = [];
+
+        let existing_tuples = {};
+        let ip_host_map = load_conntrack_ip_host_map(parsed.connections, parsed.reverseDns);
+        delete parsed.reverseDns;
+        for (let c in parsed.connections) {
+            if (type(c) != "object")
+                continue;
+            if (!c.dataSource)
+                c.dataSource = "core";
+            if (type(c.rule) == "string" && type(c.rulePayload) == "string" && substr(c.rulePayload, 0, 9) == "rule_set=" && index(c.rule, "rule_set=[") >= 0)
+                c.rule = replace(c.rule, /rule_set=\[[^\]]+\]/, c.rulePayload);
+            let meta = object_or_empty(c.metadata);
+            let c_proto = lc(as_string(meta.network || "tcp"));
+            let c_src = as_string(meta.sourceIP || "");
+            let c_sport = as_string(meta.sourcePort || "");
+            let c_dst = as_string(meta.destinationIP || "");
+            let c_dport = as_string(meta.destinationPort || "");
+            if (meta.host == "" && c_dst != "" && ip_host_map[c_dst] != null)
+                meta.host = ip_host_map[c_dst];
+            if (c_src != "" && c_sport != "" && c_dst != "" && c_dport != "")
+                existing_tuples[connection_tuple_key(c_proto, c_src, c_sport, c_dst, c_dport)] = true;
+        }
+
+        let mark_info = build_conntrack_mark_map();
+        let ct_conns = read_conntrack_connections(mark_info, existing_tuples, ip_host_map);
+        for (let ct in ct_conns) {
+            if (length(parsed.connections) >= 300)
+                break;
+            push(parsed.connections, ct);
+        }
+        let serialized = sprintf("%J\n", parsed);
+        if (getenv("FAKE_CURL_LOG") == null) {
+            common.ensure_dir(ui_state_dir);
+            common.write_file(full_snapshot, serialized);
+        }
+        print_connections_capped(parsed, serialized);
+        return 0;
     }
 
     if (action == "get_proxy_latency") {
@@ -1893,54 +1984,157 @@ function clash_api(action, arg1, arg2, arg3) {
         let url = as_string(arg3 || "");
         if (url == "")
             url = test_url;
-        let proxy_types = clash_proxy_type_map(base_url, auth);
-        let endpoint = clash_latency_endpoint(base_url, arg1, proxy_types[arg1]);
-        let args = [ "curl", "-G", "-s", endpoint ];
+        let proxies = clash_proxy_info_map(base_url, auth);
+        let resolved_tag = resolve_selector_leaf_tag(proxies, arg1);
+        let resolved_type = as_string(object_or_empty(proxies[resolved_tag]).type || "");
+        let endpoint = clash_latency_endpoint(base_url, resolved_tag, resolved_type);
+        let timeout_ms = as_string(arg2 || "2000");
+        let args = [ "curl", "-G", "-s" ];
+        if (getenv("FAKE_CURL_LOG") == null) {
+            let max_time = int((int(timeout_ms, 10) + 2999) / 1000);
+            if (max_time < 3)
+                max_time = 3;
+            push(args, "--connect-timeout");
+            push(args, "2");
+            push(args, "-m");
+            push(args, as_string(max_time));
+        }
+        push(args, endpoint);
         for (let item in auth) push(args, item);
         push(args, "--data-urlencode");
         push(args, "url=" + url);
         push(args, "--data-urlencode");
-        push(args, "timeout=" + as_string(arg2 || "2000"));
+        push(args, "timeout=" + timeout_ms);
         return clash_json_output(args);
     }
 
     if (action == "get_proxy_latencies") {
-        if (as_string(arg1) == "")
+        let raw_tags = as_string(arg1);
+        if (substr(raw_tags, 0, 1) == "@") {
+            let tag_target = substr(raw_tags, 1);
+            if (substr(tag_target, 0, 8) == "section:") {
+                let sec_name = substr(tag_target, 8);
+                let cache_dir = getenv("TACHYON_SECTION_CACHE_DIR") || ((getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/section-cache");
+                let sec_cache = common.read_json_file(cache_dir + "/" + sec_name + ".json");
+                if (type(sec_cache) == "object") {
+                    let sec_tags = [];
+                    let seen_tags = {};
+                    for (let ct in (type(sec_cache.urltestCandidateTags) == "array" ? sec_cache.urltestCandidateTags : [])) {
+                        ct = as_string(ct);
+                        if (ct != "" && !seen_tags[ct]) {
+                            seen_tags[ct] = true;
+                            push(sec_tags, ct);
+                        }
+                    }
+                    for (let gt, ginfo in object_or_empty(sec_cache.urltestGroups)) {
+                        for (let m in (type(object_or_empty(ginfo).outbounds) == "array" ? ginfo.outbounds : [])) {
+                            m = as_string(m);
+                            if (m != "" && !seen_tags[m]) {
+                                seen_tags[m] = true;
+                                push(sec_tags, m);
+                            }
+                        }
+                        gt = as_string(gt);
+                        if (gt != "" && !seen_tags[gt]) {
+                            seen_tags[gt] = true;
+                            push(sec_tags, gt);
+                        }
+                    }
+                    for (let pg, pinfo in object_or_empty(sec_cache.priorityGroups)) {
+                        for (let m in (type(object_or_empty(pinfo).outbounds) == "array" ? pinfo.outbounds : [])) {
+                            m = as_string(m);
+                            if (m != "" && !seen_tags[m]) {
+                                seen_tags[m] = true;
+                                push(sec_tags, m);
+                            }
+                        }
+                        pg = as_string(pg);
+                        if (pg != "" && !seen_tags[pg]) {
+                            seen_tags[pg] = true;
+                            push(sec_tags, pg);
+                        }
+                    }
+                    raw_tags = sprintf("%J", sec_tags);
+                }
+            } else {
+                let file_content = fs.readfile(tag_target);
+                if (file_content != null)
+                    raw_tags = as_string(file_content);
+            }
+        }
+        if (raw_tags == "")
             return clash_json_error("proxy_tags_json required");
-        let tags = status_capture([ "clash-proxy-tags-lines", arg1 ], null);
-        if (tags.status != 0)
+        let parsed_tags = parse_json_or_null(raw_tags);
+        if (type(parsed_tags) != "array")
             return clash_json_error("proxy_tags_json must be a JSON array of non-empty strings");
         let proxy_tags = [];
-        for (let proxy_tag in split(tags.output, "\n")) {
-            proxy_tag = as_string(proxy_tag);
-            if (proxy_tag != "")
-                push(proxy_tags, proxy_tag);
+        for (let proxy_tag in parsed_tags) {
+            if (type(proxy_tag) != "string" || proxy_tag == "")
+                return clash_json_error("proxy_tags_json must be a JSON array of non-empty strings");
+            push(proxy_tags, proxy_tag);
         }
 
         let count = 0;
         let failed = 0;
         let progress_path = as_string(arg3);
+        let proxy_info = {};
+        let proxy_types = {};
+        if (getenv("FAKE_CURL_LOG") == null) {
+            proxy_info = clash_proxy_info_map(base_url, auth);
+            for (let tag, proxy in proxy_info)
+                proxy_types[tag] = as_string(object_or_empty(proxy).type || "");
+            let expanded_tags = [];
+            let seen_expanded = {};
+            for (let proxy_tag in proxy_tags) {
+                if (lc(as_string(proxy_types[proxy_tag])) == "urltest") {
+                    let members = type(object_or_empty(proxy_info[proxy_tag]).all) == "array" ? proxy_info[proxy_tag].all : [];
+                    for (let m in members) {
+                        let mt = as_string(m);
+                        if (mt != "" && mt != proxy_tag && !seen_expanded[mt]) {
+                            seen_expanded[mt] = true;
+                            push(expanded_tags, mt);
+                        }
+                    }
+                }
+                if (!seen_expanded[proxy_tag]) {
+                    seen_expanded[proxy_tag] = true;
+                    push(expanded_tags, proxy_tag);
+                }
+            }
+            proxy_tags = expanded_tags;
+        } else {
+            proxy_types = clash_proxy_type_map(base_url, auth);
+        }
+
         let total = length(proxy_tags);
         if (progress_path != "")
             module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
 
-        let proxy_types = clash_proxy_type_map(base_url, auth);
         let ordered_proxy_tags = [];
-        for (let proxy_tag in proxy_tags)
-            if (lc(as_string(proxy_types[proxy_tag])) != "urltest")
+        let non_urltest_tags = [];
+        let urltest_only_tags = [];
+        for (let proxy_tag in proxy_tags) {
+            if (lc(as_string(proxy_types[proxy_tag])) != "urltest") {
                 push(ordered_proxy_tags, proxy_tag);
-        for (let proxy_tag in proxy_tags)
-            if (lc(as_string(proxy_types[proxy_tag])) == "urltest")
+                push(non_urltest_tags, proxy_tag);
+            }
+        }
+        for (let proxy_tag in proxy_tags) {
+            if (lc(as_string(proxy_types[proxy_tag])) == "urltest") {
                 push(ordered_proxy_tags, proxy_tag);
+                push(urltest_only_tags, proxy_tag);
+            }
+        }
+        let batch_proxy_tags = length(non_urltest_tags) > 0 ? non_urltest_tags : ordered_proxy_tags;
 
-        let timeout_ms = as_string(arg2 || "2000");
-        let max_time = as_string(int((int(timeout_ms, 10) + 2999) / 1000));
-        if (int(max_time, 10) < 3)
+        let timeout_ms = as_string(arg2 || "3500");
+        let max_time = as_string(int((int(timeout_ms) + 1999) / 1000));
+        if (int(max_time) < 3)
             max_time = "3";
 
         if (getenv("FAKE_CURL_LOG") != null || length(ordered_proxy_tags) <= 1 || getenv("TACHYON_SEQUENTIAL_LATENCY") == "1") {
             for (let proxy_tag in ordered_proxy_tags) {
-                let args = [ "curl", "-G", "-s", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
+                let args = [ "curl", "-G", "-s", "--connect-timeout", "2", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
                 for (let item in auth) push(args, item);
                 push(args, "--data-urlencode");
                 push(args, "url=" + test_url);
@@ -1957,7 +2151,7 @@ function clash_api(action, arg1, arg2, arg3) {
             let tmp_dir = trim(command_output_from_args([ "mktemp", "-d", "/tmp/tachyon-lat.XXXXXX" ]));
             if (tmp_dir == "") {
                 for (let proxy_tag in ordered_proxy_tags) {
-                    let args = [ "curl", "-G", "-s", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
+                    let args = [ "curl", "-G", "-s", "--connect-timeout", "2", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
                     for (let item in auth) push(args, item);
                     push(args, "--data-urlencode");
                     push(args, "url=" + test_url);
@@ -1971,40 +2165,232 @@ function clash_api(action, arg1, arg2, arg3) {
                 }
             }
             else {
-                let batch_size = 12;
-                for (let i = 0; i < length(ordered_proxy_tags); i += batch_size) {
-                    let cmds = [];
-                    let batch_tags = [];
-                    for (let j = i; j < i + batch_size && j < length(ordered_proxy_tags); j++) {
-                        let proxy_tag = ordered_proxy_tags[j];
-                        push(batch_tags, { tag: proxy_tag, index: j });
-                        let out_file = tmp_dir + "/" + j + ".json";
-                        let args = [ "curl", "-G", "-s", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
-                        for (let item in auth) push(args, item);
-                        push(args, "--data-urlencode");
-                        push(args, "url=" + test_url);
-                        push(args, "--data-urlencode");
-                        push(args, "timeout=" + timeout_ms);
-                        push(cmds, command_from_args(args) + " > " + shell_quote(out_file) + " 2>/dev/null &");
+                let batch_supported = false;
+                let probe_chunk_size = 48;
+                let parallel_chunks = 1;
+                let all_wave_results = {};
+                let retry_failed_batch = function(failed_tags, wave_results, wave_id) {
+                    if (length(failed_tags) == 0)
+                        return;
+                    let r_req = tmp_dir + "/retry_req_" + wave_id + ".json";
+                    let r_res = tmp_dir + "/retry_res_" + wave_id + ".json";
+                    let retry_timeout = 2000;
+                    common.write_json_file(r_req, {
+                        names: failed_tags,
+                        url: test_url,
+                        timeout: retry_timeout
+                    });
+                    let r_args = [ "curl", "-s", "-m", as_string(int((retry_timeout + 1999) / 1000) + 5), "-X", "POST", "-H", "Content-Type: application/json" ];
+                    for (let item in auth) push(r_args, item);
+                    push(r_args, "-d", "@" + r_req, base_url + "/tachyon/delay-batch", "-o", r_res);
+                    common.command_status(command_from_args(r_args));
+                    let r_content = fs.readfile(r_res);
+                    try { fs.unlink(r_req); } catch(e) {}
+                    try { fs.unlink(r_res); } catch(e) {}
+                    let r_parsed = parse_json_or_null(r_content);
+                    if (type(r_parsed) == "object" && type(r_parsed.results) == "object") {
+                        for (let k, v in r_parsed.results) {
+                            if (type(v) == "object" && v.message == null && v.error == null && int(v.delay || 0) > 0)
+                                wave_results[k] = v;
+                        }
                     }
-                    if (length(cmds) > 0) {
-                        system("{ " + join(" ", cmds) + " wait; }");
-                        for (let item in batch_tags) {
-                            let out_file = tmp_dir + "/" + item.index + ".json";
-                            let content = fs.readfile(out_file);
-                            try { fs.unlink(out_file); } catch(e) {}
-                            let is_ok = false;
-                            if (content != null && content != "") {
-                                try {
-                                    let parsed = json(content);
-                                    if (type(parsed) == "object" && parsed.message == null && parsed.error == null)
-                                        is_ok = true;
-                                }
-                                catch (e) {}
+                };
+                let wave_tags = slice(batch_proxy_tags, 0, probe_chunk_size * parallel_chunks);
+                if (length(wave_tags) > 0) {
+                    let wave_cmds = [];
+                    let wave_chunks = [];
+                    for (let c = 0; c < length(wave_tags); c += probe_chunk_size) {
+                        let c_tags = slice(wave_tags, c, c + probe_chunk_size);
+                        let chunk_idx = int(c / probe_chunk_size);
+                        let req_file = tmp_dir + "/batch_req_" + chunk_idx + ".json";
+                        let res_file = tmp_dir + "/batch_res_" + chunk_idx + ".json";
+                        common.write_json_file(req_file, {
+                            names: c_tags,
+                            url: test_url,
+                            timeout: int(timeout_ms)
+                        });
+                        let b_args = [ "curl", "-s", "-m", as_string(int(max_time) + 5), "-X", "POST", "-H", "Content-Type: application/json" ];
+                        for (let item in auth) push(b_args, item);
+                        push(b_args, "-d", "@" + req_file, base_url + "/tachyon/delay-batch", "-o", res_file);
+                        push(wave_cmds, command_from_args(b_args));
+                        push(wave_chunks, { tags: c_tags, req: req_file, res: res_file });
+                    }
+                    if (length(wave_cmds) > 0) {
+                        common.command_status("{ " + join(" & ", wave_cmds) + " & wait; }");
+                        let wave_results = {};
+                        let wave_valid = true;
+                        for (let ch in wave_chunks) {
+                            let content = fs.readfile(ch.res);
+                            try { fs.unlink(ch.req); } catch(e) {}
+                            try { fs.unlink(ch.res); } catch(e) {}
+                            let parsed = parse_json_or_null(content);
+                            if (type(parsed) == "object" && type(parsed.results) == "object") {
+                                for (let k, v in parsed.results)
+                                    wave_results[k] = v;
+                            } else {
+                                wave_valid = false;
                             }
-                            if (!is_ok)
-                                failed++;
+                        }
+                        if (wave_valid) {
+                            batch_supported = true;
+                            let retry_tags = [];
+                            let any_ok = false;
+                            for (let t in wave_tags) {
+                                let entry = wave_results[t];
+                                let is_ok = (type(entry) == "object" && entry.message == null && entry.error == null && int(entry.delay || 0) > 0);
+                                if (is_ok)
+                                    any_ok = true;
+                                else if (lc(as_string(proxy_types[t])) != "urltest")
+                                    push(retry_tags, t);
+                            }
+                            if (!any_ok && length(retry_tags) > 0)
+                                retry_failed_batch(retry_tags, wave_results, 0);
+                            for (let t in wave_tags) {
+                                let entry = wave_results[t];
+                                let is_ok = (type(entry) == "object" && entry.message == null && entry.error == null && int(entry.delay || 0) > 0);
+                                if (is_ok)
+                                    all_wave_results[t] = int(entry.delay);
+                                else
+                                    failed++;
+                                count++;
+                            }
+                            if (progress_path != "")
+                                module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
+                        }
+                    }
+                }
+
+                if (batch_supported) {
+                    let wave_step = probe_chunk_size * parallel_chunks;
+                    for (let w = wave_step; w < length(batch_proxy_tags); w += wave_step) {
+                        let w_tags = slice(batch_proxy_tags, w, w + wave_step);
+                        let wave_cmds = [];
+                        let wave_chunks = [];
+                        for (let c = 0; c < length(w_tags); c += probe_chunk_size) {
+                            let c_tags = slice(w_tags, c, c + probe_chunk_size);
+                            let chunk_idx = int((w + c) / probe_chunk_size);
+                            let req_file = tmp_dir + "/batch_req_" + chunk_idx + ".json";
+                            let res_file = tmp_dir + "/batch_res_" + chunk_idx + ".json";
+                            common.write_json_file(req_file, {
+                                names: c_tags,
+                                url: test_url,
+                                timeout: int(timeout_ms)
+                            });
+                            let b_args = [ "curl", "-s", "-m", as_string(int(max_time) + 5), "-X", "POST", "-H", "Content-Type: application/json" ];
+                            for (let item in auth) push(b_args, item);
+                            push(b_args, "-d", "@" + req_file, base_url + "/tachyon/delay-batch", "-o", res_file);
+                            push(wave_cmds, command_from_args(b_args));
+                            push(wave_chunks, { tags: c_tags, req: req_file, res: res_file });
+                        }
+                        if (length(wave_cmds) > 0) {
+                            common.command_status("{ " + join(" & ", wave_cmds) + " & wait; }");
+                            let wave_results = {};
+                            for (let ch in wave_chunks) {
+                                let content = fs.readfile(ch.res);
+                                try { fs.unlink(ch.req); } catch(e) {}
+                                try { fs.unlink(ch.res); } catch(e) {}
+                                let parsed = parse_json_or_null(content);
+                                if (type(parsed) == "object" && type(parsed.results) == "object") {
+                                    for (let k, v in parsed.results)
+                                        wave_results[k] = v;
+                                }
+                            }
+                            let retry_tags = [];
+                            let any_ok = false;
+                            for (let t in w_tags) {
+                                let entry = wave_results[t];
+                                let is_ok = (type(entry) == "object" && entry.message == null && entry.error == null && int(entry.delay || 0) > 0);
+                                if (is_ok)
+                                    any_ok = true;
+                                else if (lc(as_string(proxy_types[t])) != "urltest")
+                                    push(retry_tags, t);
+                            }
+                            if (!any_ok && length(retry_tags) > 0)
+                                retry_failed_batch(retry_tags, wave_results, w);
+                            for (let t in w_tags) {
+                                let entry = wave_results[t];
+                                let is_ok = (type(entry) == "object" && entry.message == null && entry.error == null && int(entry.delay || 0) > 0);
+                                if (is_ok)
+                                    all_wave_results[t] = int(entry.delay);
+                                else
+                                    failed++;
+                                count++;
+                            }
+                            if (progress_path != "")
+                                module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
+                        }
+                    }
+
+                    let skipped_urltests = length(non_urltest_tags) > 0;
+                    for (let gt in urltest_only_tags) {
+                        let ginfo = object_or_empty(proxy_info[gt]);
+                        let gall = type(ginfo.all) == "array" ? ginfo.all : [];
+                        let best_child = "";
+                        let best_delay = 0;
+                        for (let m in gall) {
+                            let mt = as_string(m);
+                            let d = int(all_wave_results[mt] || 0);
+                            if (d > 0 && (best_delay <= 0 || d < best_delay)) {
+                                best_delay = d;
+                                best_child = mt;
+                            }
+                        }
+                        if (best_child != "") {
+                            all_wave_results[gt] = best_delay;
+                            let cur_now = trim(as_string(ginfo.now || ""));
+                            let cur_delay = int(all_wave_results[cur_now] || 0);
+                            if (cur_now == "" || cur_delay <= 0 || best_delay + 50 < cur_delay) {
+                                let put_payload = status_output([ "clash-set-group-proxy-payload", best_child ], null);
+                                let put_args = [ "curl", "-X", "PUT", "-s", "--connect-timeout", "2", "-m", "3", base_url + "/proxies/" + clash_urlencode(gt) ];
+                                for (let item in auth) push(put_args, item);
+                                push(put_args, "--data-raw", put_payload);
+                                common.command_status(command_from_args(put_args));
+                            }
+                        } else if (skipped_urltests) {
+                            failed++;
+                        }
+                        if (skipped_urltests)
                             count++;
+                    }
+                    if (skipped_urltests && length(urltest_only_tags) > 0 && progress_path != "")
+                        module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
+                }
+                else {
+                    let batch_size = 64;
+                    for (let i = 0; i < length(ordered_proxy_tags); i += batch_size) {
+                        let cmds = [];
+                        let batch_tags = [];
+                        for (let j = i; j < i + batch_size && j < length(ordered_proxy_tags); j++) {
+                            let proxy_tag = ordered_proxy_tags[j];
+                            push(batch_tags, { tag: proxy_tag, index: j });
+                            let out_file = tmp_dir + "/" + j + ".json";
+                            let args = [ "curl", "-G", "-s", "--connect-timeout", "2", "-m", max_time, clash_latency_endpoint(base_url, proxy_tag, proxy_types[proxy_tag]) ];
+                            for (let item in auth) push(args, item);
+                            push(args, "--data-urlencode");
+                            push(args, "url=" + test_url);
+                            push(args, "--data-urlencode");
+                            push(args, "timeout=" + timeout_ms);
+                            push(cmds, command_from_args(args) + " > " + shell_quote(out_file) + " 2>/dev/null &");
+                        }
+                        if (length(cmds) > 0) {
+                            system("{ " + join(" ", cmds) + " wait; }");
+                            for (let item in batch_tags) {
+                                let out_file = tmp_dir + "/" + item.index + ".json";
+                                let content = fs.readfile(out_file);
+                                try { fs.unlink(out_file); } catch(e) {}
+                                let is_ok = false;
+                                if (content != null && content != "") {
+                                    try {
+                                        let parsed = json(content);
+                                        if (type(parsed) == "object" && parsed.message == null && parsed.error == null)
+                                            is_ok = true;
+                                    }
+                                    catch (e) {}
+                                }
+                                if (!is_ok)
+                                    failed++;
+                                count++;
+                            }
                             if (progress_path != "")
                                 module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
                         }
@@ -2022,10 +2408,163 @@ function clash_api(action, arg1, arg2, arg3) {
     if (action == "get_group_latency") {
         if (as_string(arg1) == "")
             return clash_json_error("group_tag required");
-        let args = [ "curl", "-G", "-s", base_url + "/group/" + clash_urlencode(arg1) + "/delay" ];
+        let group_tag = as_string(arg1);
+        let timeout_ms = as_string(arg2 || "3500");
+        let raw_arg3 = trim(as_string(arg3 || ""));
+        let is_custom_url = index(raw_arg3, "http://") == 0 || index(raw_arg3, "https://") == 0;
+        let group_test_url = is_custom_url ? raw_arg3 : test_url;
+        let progress_path = is_custom_url ? "" : raw_arg3;
+        if (getenv("FAKE_CURL_LOG") == null && getenv("TACHYON_SEQUENTIAL_LATENCY") != "1") {
+            let proxies = clash_proxy_info_map(base_url, auth);
+            let grp = object_or_empty(proxies[group_tag]);
+            let members = type(grp.all) == "array" ? grp.all : [];
+            if (length(members) > 1) {
+                let tmp_dir = trim(command_output_from_args([ "mktemp", "-d", "/tmp/tachyon-glat.XXXXXX" ]));
+                if (tmp_dir != "") {
+                    let probe_tags = [];
+                    for (let m in members) {
+                        let mt = as_string(m);
+                        if (mt != "" && mt != group_tag)
+                            push(probe_tags, mt);
+                    }
+                    push(probe_tags, group_tag);
+                    let probe_chunk_size = 48;
+                    let parallel_chunks = 1;
+                    let retry_failed_group_batch = function(failed_tags, target_out_map, wave_id) {
+                        if (length(failed_tags) == 0)
+                            return;
+                        let r_req = tmp_dir + "/gretry_req_" + wave_id + ".json";
+                        let r_res = tmp_dir + "/gretry_res_" + wave_id + ".json";
+                        let retry_timeout = 2000;
+                        common.write_json_file(r_req, {
+                            names: failed_tags,
+                            url: group_test_url,
+                            timeout: retry_timeout
+                        });
+                        let r_args = [ "curl", "-s", "-m", as_string(int((retry_timeout + 1999) / 1000) + 5), "-X", "POST", "-H", "Content-Type: application/json" ];
+                        for (let item in auth) push(r_args, item);
+                        push(r_args, "-d", "@" + r_req, base_url + "/tachyon/delay-batch", "-o", r_res);
+                        common.command_status(command_from_args(r_args));
+                        let r_content = fs.readfile(r_res);
+                        try { fs.unlink(r_req); } catch(e) {}
+                        try { fs.unlink(r_res); } catch(e) {}
+                        let r_parsed = parse_json_or_null(r_content);
+                        if (type(r_parsed) == "object" && type(r_parsed.results) == "object") {
+                            for (let k, v in r_parsed.results) {
+                                if (type(v) == "object" && v.message == null && v.error == null && int(v.delay || 0) > 0) {
+                                    target_out_map[k] = int(v.delay);
+                                }
+                            }
+                        }
+                    };
+                    let wave_step = probe_chunk_size * parallel_chunks;
+                    let max_time = int((int(timeout_ms) + 1999) / 1000) + 5;
+                    if (max_time < 8) max_time = 8;
+                    let batch_ok = true;
+                    let out_map = {};
+                    let count = 0;
+                    let failed = 0;
+                    let total = length(probe_tags);
+                    if (progress_path != "")
+                        module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
+                    for (let w = 0; w < length(probe_tags); w += wave_step) {
+                        let w_tags = slice(probe_tags, w, w + wave_step);
+                        let wave_cmds = [];
+                        let wave_chunks = [];
+                        for (let c = 0; c < length(w_tags); c += probe_chunk_size) {
+                            let c_tags = slice(w_tags, c, c + probe_chunk_size);
+                            let chunk_idx = int((w + c) / probe_chunk_size);
+                            let req_file = tmp_dir + "/greq_" + chunk_idx + ".json";
+                            let res_file = tmp_dir + "/gres_" + chunk_idx + ".json";
+                            common.write_json_file(req_file, {
+                                names: c_tags,
+                                url: group_test_url,
+                                timeout: int(timeout_ms)
+                            });
+                            let b_args = [ "curl", "-s", "-m", as_string(max_time), "-X", "POST", "-H", "Content-Type: application/json" ];
+                            for (let item in auth) push(b_args, item);
+                            push(b_args, "-d", "@" + req_file, base_url + "/tachyon/delay-batch", "-o", res_file);
+                            push(wave_cmds, command_from_args(b_args));
+                            push(wave_chunks, { req: req_file, res: res_file });
+                        }
+                        if (length(wave_cmds) > 0) {
+                            common.command_status("{ " + join(" & ", wave_cmds) + " & wait; }");
+                            let wave_results = {};
+                            for (let ch in wave_chunks) {
+                                let content = fs.readfile(ch.res);
+                                try { fs.unlink(ch.req); } catch(e) {}
+                                try { fs.unlink(ch.res); } catch(e) {}
+                                let parsed = parse_json_or_null(content);
+                                if (type(parsed) == "object" && type(parsed.results) == "object") {
+                                    for (let k, v in parsed.results)
+                                        wave_results[k] = v;
+                                } else {
+                                    batch_ok = false;
+                                }
+                            }
+                            if (batch_ok) {
+                                let retry_tags = [];
+                                let any_ok = false;
+                                for (let t in w_tags) {
+                                    let entry = wave_results[t];
+                                    let is_ok = (type(entry) == "object" && entry.message == null && entry.error == null && int(entry.delay || 0) > 0);
+                                    if (is_ok) {
+                                        any_ok = true;
+                                        out_map[t] = int(entry.delay);
+                                    } else {
+                                        push(retry_tags, t);
+                                    }
+                                }
+                                if (!any_ok && length(retry_tags) > 0)
+                                    retry_failed_group_batch(retry_tags, out_map, w);
+                                for (let t in w_tags) {
+                                    count++;
+                                    if (out_map[t] == null || out_map[t] <= 0)
+                                        failed++;
+                                }
+                            }
+                            if (!batch_ok)
+                                break;
+                            if (progress_path != "")
+                                module_success(SERVICE_UI_UC, [ "latency-progress-state", progress_path, count, total, failed ]);
+                        }
+                    }
+                    common.command_status("rm -rf " + shell_quote(tmp_dir) + " >/dev/null 2>&1 || true");
+                    if (batch_ok) {
+                        let best_member = "";
+                        let best_delay = 0;
+                        for (let m in members) {
+                            let mt = as_string(m);
+                            let d = int(out_map[mt] || 0);
+                            if (d > 0 && (best_delay <= 0 || d < best_delay)) {
+                                best_delay = d;
+                                best_member = mt;
+                            }
+                        }
+                        if (best_member != "") {
+                            if (out_map[group_tag] == null || out_map[group_tag] <= 0)
+                                out_map[group_tag] = best_delay;
+                            if (lc(as_string(grp.type || "")) == "urltest") {
+                                let cur_now = trim(as_string(grp.now || ""));
+                                if (cur_now == "" || int(out_map[cur_now] || 0) <= 0) {
+                                    let put_payload = status_output([ "clash-set-group-proxy-payload", best_member ], null);
+                                    let put_args = [ "curl", "-X", "PUT", "-s", "--connect-timeout", "2", "-m", "3", base_url + "/proxies/" + clash_urlencode(group_tag) ];
+                                    for (let item in auth) push(put_args, item);
+                                    push(put_args, "--data-raw", put_payload);
+                                    common.command_status(command_from_args(put_args));
+                                }
+                            }
+                        }
+                        print(sprintf("%J\n", out_map));
+                        return 0;
+                    }
+                }
+            }
+        }
+        let args = [ "curl", "-G", "-s", "--connect-timeout", "2", "-m", "3", base_url + "/group/" + clash_urlencode(arg1) + "/delay" ];
         for (let item in auth) push(args, item);
         push(args, "--data-urlencode");
-        push(args, "url=" + test_url);
+        push(args, "url=" + group_test_url);
         push(args, "--data-urlencode");
         push(args, "timeout=" + as_string(arg2 || "5000"));
         return clash_json_output(args);
@@ -2034,14 +2573,17 @@ function clash_api(action, arg1, arg2, arg3) {
     if (action == "set_group_proxy") {
         if (as_string(arg1) == "" || as_string(arg2) == "")
             return clash_json_error("group_tag and proxy_tag required");
+        let target_group_tag = as_string(arg1);
+        if (match(target_group_tag, /-urltest-out$/))
+            target_group_tag = replace(target_group_tag, /-urltest-out$/, "-out");
         let payload = status_output([ "clash-set-group-proxy-payload", arg2 ], null);
-        let args = [ "curl", "-X", "PUT", "-s", "-w", "\n%{http_code}", base_url + "/proxies/" + clash_urlencode(arg1) ];
+        let args = [ "curl", "-X", "PUT", "-s", "--connect-timeout", "2", "-m", "3", "-w", "\n%{http_code}", base_url + "/proxies/" + clash_urlencode(target_group_tag) ];
         for (let item in auth) push(args, item);
         push(args, "--data-raw");
         push(args, payload);
-        let result = status_capture([ "clash-set-group-proxy-result", arg1, arg2 ], command_output(command_from_args(args)));
-        if (result.status == 0) {
-            save_persistent_selector_choice(arg1, arg2);
+        let result = status_capture([ "clash-set-group-proxy-result", target_group_tag, arg2 ], command_output(command_from_args(args)));
+        if (result.status == 0 && as_string(arg3) != "ephemeral") {
+            save_persistent_selector_choice(target_group_tag, arg2);
         }
         if (result.output != "")
             print(result.output);
@@ -2053,12 +2595,14 @@ function clash_api(action, arg1, arg2, arg3) {
         let state = common.read_json_file(path);
         if (type(state) != "object" || length(keys(state)) == 0)
             return 0;
-        let proxies_res = clash_json_data([ "curl", "-s", base_url + "/proxies" ], auth);
+        let proxies_res = clash_json_data([ "curl", "-s", "--connect-timeout", "2", "-m", "3", base_url + "/proxies" ], auth);
         let proxies = object_or_empty(object_or_empty(proxies_res).proxies);
         for (let group, selected in state) {
+            if (index(as_string(group), "-priority-") >= 0)
+                continue;
             let grp = proxies[group];
             if (type(grp) == "object" && lc(as_string(grp.type || "")) == "selector" && index(grp.all, selected) >= 0 && as_string(grp.now || "") != selected) {
-                clash_api("set_group_proxy", group, selected);
+                clash_api("set_group_proxy", group, selected, "ephemeral");
             }
         }
         return 0;
@@ -2067,7 +2611,7 @@ function clash_api(action, arg1, arg2, arg3) {
     if (action == "close_connection") {
         if (as_string(arg1) == "")
             return clash_json_error("connection_id required");
-        let args = [ "curl", "-X", "DELETE", "-s", "-w", "\n%{http_code}", base_url + "/connections/" + clash_urlencode(arg1) ];
+        let args = [ "curl", "-X", "DELETE", "-s", "--connect-timeout", "2", "-m", "3", "-w", "\n%{http_code}", base_url + "/connections/" + clash_urlencode(arg1) ];
         for (let item in auth) push(args, item);
         let result = status_capture([ "clash-close-connection-result", arg1 ], command_output(command_from_args(args)));
         if (result.output != "")
@@ -2076,7 +2620,7 @@ function clash_api(action, arg1, arg2, arg3) {
     }
 
     if (action == "close_all_connections") {
-        let args = [ "curl", "-X", "DELETE", "-s", "-w", "\n%{http_code}", base_url + "/connections" ];
+        let args = [ "curl", "-X", "DELETE", "-s", "--connect-timeout", "2", "-m", "3", "-w", "\n%{http_code}", base_url + "/connections" ];
         for (let item in auth) push(args, item);
         let result = status_capture([ "clash-close-all-connections-result" ], command_output(command_from_args(args)));
         if (result.output != "")
@@ -2097,6 +2641,7 @@ return {
     server_runtime_type_for_protocol,
     server_effective_listen_port,
     server_listen_requires_firewall,
+    firewall_required_protocols_open_cached,
     firewall_required_protocols_open,
     resolve_public_host_ips,
     public_host_flags,
@@ -2108,7 +2653,6 @@ return {
     check_nft,
     nft_chain_counter_status,
     nft_table_has_other_mark_rules,
-    nft_steer_chain_has_rules,
     check_nft_rules,
     clash_json_output,
     clash_json_data,
@@ -2120,12 +2664,8 @@ return {
     clash_latency_endpoint,
     latency_test_url,
     save_persistent_selector_choice,
-    steer_get_cached_latencies,
-    steer_set_cached_latency,
-    steer_set_cached_latencies_bulk,
-    steer_lookup_latency,
-    steer_reload_vless_workers,
-    steer_apply_best_nodes,
-    steer_build_section_context,
+    connection_tuple_key,
+    build_conntrack_mark_map,
+    read_conntrack_connections,
     clash_api
 };

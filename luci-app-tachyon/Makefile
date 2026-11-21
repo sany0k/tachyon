@@ -17,13 +17,11 @@ PKG_PO_VERSION:=$(PKG_VERSION)
 
 LUCI_TITLE:=LuCI Tachyon app
 LUCI_DEPENDS:=+luci-base +tachyon
-LUCI_PROVIDES:=luci-app-forkop
-LUCI_REPLACES:=luci-app-forkop
 LUCI_PKGARCH:=all
 LUCI_LANG.ru:=Русский (Russian)
 LUCI_LANG.en:=English
 LUCI_MAINTAINER:=Dushnilin <dushnilin@gmail.com>
-LUCI_DESCRIPTION:=Rule-based Tachyon LuCI app with hybrid sing-box + zapret orchestration
+LUCI_DESCRIPTION:=Rule-based Tachyon LuCI app with tachyon-core orchestration
 LUCI_MINIFY_JS:=0
 
 PKG_LICENSE:=GPL-2.0-or-later

@@ -2,12 +2,14 @@
 
 let common = require("core.common");
 let core_ip = require("core.ip");
+let uci_core = require("core.uci");
 let runtime_constants = require("tachyon_core.constants");
 let runtime_url = require("core.url");
 let fs = require("fs");
 
 let as_string = common.as_string;
 let bool_option = common.bool_option;
+let command_output_from_args = common.command_output_from_args;
 let list_option = common.list_option;
 let object_or_empty = common.object_or_empty;
 let option = common.option;
@@ -17,20 +19,99 @@ const DNS_FAILOVER_STATE_FILE = getenv("TACHYON_DNS_FAILOVER_STATE_FILE") || "/v
 const DNS_HEALTH_ADDRESS = getenv("TACHYON_DNS_HEALTH_ADDRESS") || "127.0.0.42";
 const DNS_HEALTH_PORT_BASE = int(getenv("TACHYON_DNS_HEALTH_PORT_BASE") || "10053");
 
+function push_wan_dns_ip(result, seen, raw_ip) {
+    let ip = trim(as_string(raw_ip));
+    if (ip == "" || ip == "0.0.0.0" || ip == "::" || ip == "::1" || substr(ip, 0, 4) == "127.")
+        return;
+    if (!core_ip.valid_ip_with_zone(ip) || seen[ip])
+        return;
+    seen[ip] = true;
+    push(result, ip);
+}
+
+function collect_wan_dns_from_resolv_text(result, seen, text) {
+    if (!text)
+        return;
+    for (let line in split(as_string(text), "\n")) {
+        let hash = index(line, "#");
+        if (hash >= 0)
+            line = substr(line, 0, hash);
+        let parts = split(trim(line), /[ \t]+/);
+        if (length(parts) >= 2 && parts[0] == "nameserver")
+            push_wan_dns_ip(result, seen, parts[1]);
+    }
+}
+
 function get_wan_dns_servers() {
     let result = [];
-    let resolv_data = fs.readfile("/tmp/resolv.conf.d/resolv.conf.auto") || fs.readfile("/tmp/resolv.conf.auto");
-    if (resolv_data) {
-        for (let line in split(resolv_data, "\n")) {
-            let parts = split(trim(line), /[ \t]+/);
-            if (length(parts) >= 2 && parts[0] == "nameserver") {
-                let ip = parts[1];
-                if (ip != "127.0.0.1" && ip != "127.0.0.42" && ip != "::1") {
-                    push(result, ip);
-                }
-            }
+    let seen = {};
+
+    let env_resolv = trim(as_string(getenv("TACHYON_WAN_RESOLV_FILE") || ""));
+    if (env_resolv != "") {
+        collect_wan_dns_from_resolv_text(result, seen, fs.readfile(env_resolv));
+        return result;
+    }
+
+    let candidates = [];
+    let cand_seen = {};
+    let dnsmasq_rf = trim(as_string(uci_core.get("dhcp", "@dnsmasq[0]", "resolvfile") || ""));
+    for (let path in [ dnsmasq_rf, "/tmp/resolv.conf.d/resolv.conf.auto", "/tmp/resolv.conf.auto" ]) {
+        if (path == "" || path == "/tmp/resolv.conf" || path == "/etc/resolv.conf" || cand_seen[path])
+            continue;
+        cand_seen[path] = true;
+        push(candidates, path);
+    }
+
+    for (let path in candidates) {
+        let resolv_data = fs.readfile(path);
+        if (resolv_data) {
+            collect_wan_dns_from_resolv_text(result, seen, resolv_data);
+            if (length(result) > 0)
+                return result;
         }
     }
+
+    let dump_raw = trim(as_string(command_output_from_args([ "ubus", "-S", "call", "network.interface", "dump" ]) || ""));
+    if (dump_raw != "") {
+        let dump = null;
+        try {
+            dump = json(dump_raw);
+        } catch (e) {
+            dump = null;
+        }
+        for (let iface in common.array_or_empty(object_or_empty(dump).interface)) {
+            if (type(iface) != "object" || iface.up !== true)
+                continue;
+            let iface_name = as_string(iface.interface || "");
+            let has_default_route = false;
+            if (iface_name != "wan" && iface_name != "wan6") {
+                for (let route in common.array_or_empty(iface.route)) {
+                    if (type(route) == "object" &&
+                        (route.target == "0.0.0.0" || route.target == "::") &&
+                        route.mask != null && int(route.mask) == 0) {
+                        has_default_route = true;
+                        break;
+                    }
+                }
+            }
+            if (iface_name != "wan" && iface_name != "wan6" && !has_default_route)
+                continue;
+            for (let dns_ip in common.array_or_empty(iface["dns-server"]))
+                push_wan_dns_ip(result, seen, dns_ip);
+        }
+    }
+
+    if (length(result) == 0) {
+        let wan_dns = uci_core.get("network", "wan", "dns");
+        if (type(wan_dns) == "array") {
+            for (let dns_ip in wan_dns)
+                push_wan_dns_ip(result, seen, dns_ip);
+        } else if (wan_dns != null && as_string(wan_dns) != "") {
+            for (let dns_ip in split(trim(as_string(wan_dns)), /[ \t,]+/))
+                push_wan_dns_ip(result, seen, dns_ip);
+        }
+    }
+
     return result;
 }
 
@@ -51,7 +132,10 @@ function server_list(settings, key, fallback) {
     }
     let fallback_key = (key == "dns_server") ? "fallback_wan_main" : "fallback_wan_bootstrap";
     if (bool_option(settings, fallback_key, false)) {
+        let ipv6_ok = common.resolve_effective_ipv6_state(settings, null).ipv6_active;
         for (let wan_ip in get_wan_dns_servers()) {
+            if (!ipv6_ok && index(wan_ip, ":") >= 0)
+                continue;
             push(result, wan_ip);
         }
     }
@@ -155,38 +239,72 @@ function active_values(settings, override_state) {
 const KNOWN_DNS_SERVER_NAMES = {
     "8.8.8.8": "dns.google",
     "8.8.4.4": "dns.google",
+    "2001:4860:4860::8888": "dns.google",
+    "2001:4860:4860::8844": "dns.google",
     "1.1.1.1": "cloudflare-dns.com",
     "1.0.0.1": "cloudflare-dns.com",
+    "2606:4700:4700::1111": "cloudflare-dns.com",
+    "2606:4700:4700::1001": "cloudflare-dns.com",
+    "2606:4700:4700::1112": "security.cloudflare-dns.com",
+    "2606:4700:4700::1113": "family.cloudflare-dns.com",
     "77.88.8.8": "common.dot.dns.yandex.net",
     "77.88.8.1": "common.dot.dns.yandex.net",
+    "2a02:6b8::feed:0ff": "common.dot.dns.yandex.net",
+    "2a02:6b8:0:1::feed:0ff": "common.dot.dns.yandex.net",
     "77.88.8.88": "safe.dot.dns.yandex.net",
     "77.88.8.2": "safe.dot.dns.yandex.net",
+    "2a02:6b8::feed:bad": "safe.dot.dns.yandex.net",
+    "2a02:6b8:0:1::feed:bad": "safe.dot.dns.yandex.net",
     "77.88.8.7": "family.dot.dns.yandex.net",
     "77.88.8.3": "family.dot.dns.yandex.net",
+    "2a02:6b8::feed:a11": "family.dot.dns.yandex.net",
+    "2a02:6b8:0:1::feed:a11": "family.dot.dns.yandex.net",
     "9.9.9.9": "dns.quad9.net",
     "149.112.112.112": "dns.quad9.net",
+    "2620:fe::fe": "dns.quad9.net",
+    "2620:fe::9": "dns.quad9.net",
     "9.9.9.10": "dns10.quad9.net",
     "149.112.112.10": "dns10.quad9.net",
+    "2620:fe::10": "dns10.quad9.net",
+    "2620:fe::fe:10": "dns10.quad9.net",
     "94.140.14.14": "dns.adguard-dns.com",
     "94.140.15.15": "dns.adguard-dns.com",
+    "2a10:50c0::ad1:ff": "dns.adguard-dns.com",
+    "2a10:50c0::ad2:ff": "dns.adguard-dns.com",
     "94.140.14.140": "unfiltered.adguard-dns.com",
     "94.140.14.141": "unfiltered.adguard-dns.com",
+    "2a10:50c0::1:ff": "unfiltered.adguard-dns.com",
+    "2a10:50c0::2:ff": "unfiltered.adguard-dns.com",
     "94.140.14.15": "family.adguard-dns.com",
     "94.140.15.16": "family.adguard-dns.com",
+    "2a10:50c0::bad1:ff": "family.adguard-dns.com",
+    "2a10:50c0::bad2:ff": "family.adguard-dns.com",
     "194.242.2.2": "dns.mullvad.net",
     "194.242.2.3": "dns.mullvad.net",
     "194.242.2.4": "dns.mullvad.net",
     "194.242.2.5": "dns.mullvad.net",
+    "2a07:e340::2": "dns.mullvad.net",
+    "2a07:e340::3": "dns.mullvad.net",
     "76.76.2.0": "freedns.controld.com",
     "76.76.10.0": "freedns.controld.com",
+    "2606:1a40::": "freedns.controld.com",
+    "2606:1a40:1::": "freedns.controld.com",
     "223.5.5.5": "dns.alidns.com",
     "223.6.6.6": "dns.alidns.com",
+    "2400:3200::1": "dns.alidns.com",
+    "2400:3200:baba::1": "dns.alidns.com",
     "208.67.222.222": "doh.opendns.com",
     "208.67.220.220": "doh.opendns.com",
+    "2620:119:35::35": "doh.opendns.com",
+    "2620:119:53::53": "doh.opendns.com",
     "185.222.222.222": "doh.dns.sb",
     "45.11.45.11": "doh.dns.sb",
+    "2a09::": "doh.dns.sb",
+    "2a11::": "doh.dns.sb",
     "185.228.168.9": "doh.cleanbrowsing.org",
-    "185.228.169.9": "doh.cleanbrowsing.org"
+    "185.228.169.9": "doh.cleanbrowsing.org",
+    "2a0d:2a00:1::": "doh.cleanbrowsing.org",
+    "2a0d:2a00:2::": "doh.cleanbrowsing.org"
 };
 
 function apply_mtls_options(result, server, mtls_settings) {
@@ -209,9 +327,17 @@ function apply_mtls_options(result, server, mtls_settings) {
     }
 }
 
+function dns_server_lookup_key(host) {
+    host = as_string(host);
+    let pct = index(host, "%");
+    return lc(pct >= 0 ? substr(host, 0, pct) : host);
+}
+
 function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settings) {
     let server = runtime_url.host(dns_server);
     let port = runtime_url.port(dns_server);
+    let is_ip = core_ip.valid_ip_with_zone(server);
+    let known_name = KNOWN_DNS_SERVER_NAMES[dns_server_lookup_key(server)];
     let result = {
         type: "udp",
         tag: tag_name,
@@ -227,9 +353,9 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
         result.type = "tls";
         result.server_port = port != "" ? int(port) : 853;
         result.tls = { enabled: true };
-        if (core_ip.valid_ip(server) && KNOWN_DNS_SERVER_NAMES[server])
-            result.tls.server_name = KNOWN_DNS_SERVER_NAMES[server];
-        else if (!core_ip.valid_ip(server))
+        if (is_ip && known_name)
+            result.tls.server_name = known_name;
+        else if (!is_ip)
             result.tls.server_name = server;
         apply_mtls_options(result, server, mtls_settings);
     }
@@ -239,9 +365,9 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
         let path = runtime_url.path(dns_server);
         result.path = (path != "" && path != "/") ? path : "/dns-query";
         result.tls = { enabled: true };
-        if (core_ip.valid_ip(server) && KNOWN_DNS_SERVER_NAMES[server])
-            result.tls.server_name = KNOWN_DNS_SERVER_NAMES[server];
-        else if (!core_ip.valid_ip(server))
+        if (is_ip && known_name)
+            result.tls.server_name = known_name;
+        else if (!is_ip)
             result.tls.server_name = server;
         apply_mtls_options(result, server, mtls_settings);
     }
@@ -249,9 +375,9 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
         result.type = "quic";
         result.server_port = port != "" ? int(port) : 784;
         result.tls = { enabled: true };
-        if (core_ip.valid_ip(server) && KNOWN_DNS_SERVER_NAMES[server])
-            result.tls.server_name = KNOWN_DNS_SERVER_NAMES[server];
-        else if (!core_ip.valid_ip(server))
+        if (is_ip && known_name)
+            result.tls.server_name = known_name;
+        else if (!is_ip)
             result.tls.server_name = server;
         apply_mtls_options(result, server, mtls_settings);
     }
@@ -259,7 +385,7 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
         return { unsupported: "unsupported dns_type " + dns_type };
     }
 
-    if (!core_ip.valid_ip(server))
+    if (!is_ip)
         result.domain_resolver = runtime_constants.BOOTSTRAP_DNS_SERVER_TAG;
     if (as_string(detour) != "")
         result.detour = as_string(detour);
@@ -268,23 +394,22 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
 }
 
 function bootstrap_server(tag_name, value) {
-    let server = runtime_url.host(value);
-    let port = runtime_url.port(value);
-    let host = server != "" ? server : value;
-    // The bootstrap server is addressed by IP (it is what resolves the DoH/DoT
-    // hostnames, so it cannot itself depend on a name). Plain UDP/53 still sent
-    // the bootstrap query in the clear on the WAN. When the IP is one we know
-    // the DoT name for, upgrade it to DoT on 853 so the query is encrypted; an
-    // unknown ISP resolver keeps plain UDP because we have no SNI to present.
-    let dot_name = core_ip.valid_ip(host) ? KNOWN_DNS_SERVER_NAMES[host] : null;
-    if (dot_name != null) {
+    let raw = as_string(value);
+    let url_scheme = runtime_url.scheme(raw);
+    let server = runtime_url.host(raw);
+    let port = runtime_url.port(raw);
+    let host = server != "" ? server : raw;
+    if (url_scheme == "tls" || url_scheme == "dot") {
+        let dot_name = core_ip.valid_ip_with_zone(host) ? KNOWN_DNS_SERVER_NAMES[dns_server_lookup_key(host)] : host;
         let result = {
             type: "tls",
             tag: tag_name,
             server: host,
             server_port: port != "" ? int(port) : 853,
-            tls: { enabled: true, server_name: dot_name }
+            tls: { enabled: true }
         };
+        if (dot_name != null && dot_name != "")
+            result.tls.server_name = dot_name;
         return result;
     }
     return {
@@ -456,12 +581,14 @@ return {
     active_values,
     arrays_equal,
     bootstrap_config,
+    bootstrap_server,
     config,
     configured_server_count,
     default_domain_resolver,
     detour_tag,
     explicit_fallback_count,
     failover_enabled,
+    get_wan_dns_servers,
     health_port,
     is_explicit_fallback_index,
     is_wan_fallback_index,

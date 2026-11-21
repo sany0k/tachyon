@@ -2,7 +2,7 @@
 
 let fs = require("fs");
 let common = require("core.common");
-let crypt4 = require("subscription.crypt4");
+let happ = require("subscription.happ");
 let wireguard = require("subscription.wireguard");
 let as_string = common.as_string;
 let object_or_empty = common.object_or_empty;
@@ -25,13 +25,21 @@ function starts_with(value, prefix) {
 
 function is_supported_share_link(line) {
     return starts_with(line, "vpn://") ||
+        starts_with(line, "amneziawg://") ||
+        starts_with(line, "awg://") ||
+        starts_with(line, "wireguard://") ||
+        starts_with(line, "wg://") ||
         starts_with(line, "ss://") ||
         starts_with(line, "vmess://") ||
         starts_with(line, "vless://") ||
         starts_with(line, "trojan://") ||
+        starts_with(line, "trojan-go://") ||
         starts_with(line, "hysteria2://") ||
         starts_with(line, "hy2://") ||
+        starts_with(line, "hysteria://") ||
+        starts_with(line, "hy://") ||
         starts_with(line, "tuic://") ||
+        starts_with(line, "tuic5://") ||
         starts_with(line, "socks://") ||
         starts_with(line, "socks4://") ||
         starts_with(line, "socks4a://") ||
@@ -42,7 +50,31 @@ function is_supported_share_link(line) {
         starts_with(line, "fptnb:") ||
         starts_with(line, "fptn://") ||
         starts_with(line, "fptnb://") ||
-        crypt4.is_crypt4(line);
+        starts_with(line, "anytls://") ||
+        starts_with(line, "naive://") ||
+        starts_with(line, "naive+https://") ||
+        starts_with(line, "naive+http2://") ||
+        starts_with(line, "naive+h2://") ||
+        starts_with(line, "naive+quic://") ||
+        starts_with(line, "naive+h3://") ||
+        starts_with(line, "snell://") ||
+        starts_with(line, "mieru://") ||
+        starts_with(line, "mierus://") ||
+        starts_with(line, "tg://proxy?") ||
+        starts_with(line, "mtproto://") ||
+        starts_with(line, "tewfai://") ||
+        starts_with(line, "trusttunnel://") ||
+        starts_with(line, "masque://") ||
+        starts_with(line, "openconnect://") ||
+        starts_with(line, "anyconnect://") ||
+        starts_with(line, "shadowtls://") ||
+        starts_with(line, "stls://") ||
+        starts_with(line, "sudoku://") ||
+        starts_with(line, "ssh://") ||
+        starts_with(lc(line), "csqtt://") ||
+        starts_with(lc(line), "wdtt://") ||
+        starts_with(lc(line), "qwdtt://") ||
+        happ.is_encrypted(line);
 }
 
 function split_csv(value) {
@@ -58,7 +90,7 @@ function tls_alpn_for_transport(alpn, transport) {
     transport = lc(as_string(transport));
     if (transport == "xhttp" && length(alpn) == 0)
         return ["h2", "http/1.1"];
-    if ((transport == "ws" || transport == "httpupgrade") && length(alpn) > 0)
+    if (transport == "ws" || transport == "httpupgrade")
         return ["http/1.1"];
     return alpn;
 }
@@ -109,23 +141,47 @@ function xhttp_copy_known_settings(target, source) {
         "xPaddingBytes",
         "x_padding_bytes",
         "noGRPCHeader",
+        "noGrpcHeader",
         "no_grpc_header",
+        "noSSEHeader",
+        "noSseHeader",
+        "no_sse_header",
         "scMaxEachPostBytes",
         "sc_max_each_post_bytes",
         "scMinPostsIntervalMs",
         "sc_min_posts_interval_ms",
         "scStreamUpServerSecs",
         "sc_stream_up_server_secs",
+        "scMaxBufferedPosts",
+        "sc_max_buffered_posts",
+        "scMaxConcurrentPosts",
+        "sc_max_concurrent_posts",
+        "serverMaxHeaderBytes",
+        "server_max_header_bytes",
         "sessionPlacement",
         "SessionIDPlacement",
         "sessionIDPlacement",
+        "sessionIdPlacement",
         "session_placement",
+        "session_id_placement",
         "sessionKey",
         "SessionIDKey",
         "sessionIDKey",
+        "sessionIdKey",
         "session_key",
-        "scMaxBufferedPosts",
-        "sc_max_buffered_posts",
+        "session_id_key",
+        "sessionTable",
+        "SessionIDTable",
+        "sessionIDTable",
+        "sessionIdTable",
+        "session_table",
+        "session_id_table",
+        "sessionLength",
+        "SessionIDLength",
+        "sessionIDLength",
+        "sessionIdLength",
+        "session_length",
+        "session_id_length",
         "seqPlacement",
         "seq_placement",
         "seqKey",
@@ -154,6 +210,9 @@ function xhttp_copy_known_settings(target, source) {
         if (xhttp_value_present(source[key]))
             target[key] = source[key];
     }
+
+    if (type(source.headers) == "object" && length(keys(source.headers)) > 0)
+        target.headers = source.headers;
 }
 
 function xhttp_merge_extra_settings(target, value) {
@@ -180,10 +239,10 @@ function xhttp_extra_settings(query) {
     return result;
 }
 
-// Xray/Remnawave spell a few xHTTP settings differently from sing-box:
+// Xray/Remnawave spell a few xHTTP settings differently from tachyon-core:
 // `uplinkHTTPMethod` (capital HTTP), and the session id fields are
 // `SessionIDPlacement` / `sessionIDPlacement` / `SessionIDKey` /
-// `sessionIDKey`. Reading only the sing-box spellings dropped them, so a node
+// `sessionIDKey`. Reading only the tachyon-core spellings dropped them, so a node
 // that needed them silently lost its session config and timed out.
 // Each alias argument accepts a list; the first present value wins.
 function xhttp_alias_keys(value) {
@@ -231,6 +290,12 @@ function xhttp_range_value(value, positive) {
     if (type(value) == "object") {
         let from = positive ? xhttp_positive_integer_value(value.from) : xhttp_non_negative_integer_value(value.from);
         let to = positive ? xhttp_positive_integer_value(value.to) : xhttp_non_negative_integer_value(value.to);
+        return from != null && to != null && from <= to ? (from == to ? as_string(from) : from + "-" + to) : null;
+    }
+
+    if (type(value) == "array" && length(value) == 2) {
+        let from = positive ? xhttp_positive_integer_value(value[0]) : xhttp_non_negative_integer_value(value[0]);
+        let to = positive ? xhttp_positive_integer_value(value[1]) : xhttp_non_negative_integer_value(value[1]);
         return from != null && to != null && from <= to ? (from == to ? as_string(from) : from + "-" + to) : null;
     }
 
@@ -308,8 +373,44 @@ function xhttp_normalize_xmux(value) {
     xhttp_optional_xmux_range(result, "max_connections", xhttp_object_setting_value(source, "maxConnections", "max_connections"));
     xhttp_optional_xmux_range(result, "c_max_reuse_times", xhttp_object_setting_value(source, "cMaxReuseTimes", "c_max_reuse_times"));
     xhttp_optional_xmux_range(result, "h_max_request_times", xhttp_object_setting_value(source, "hMaxRequestTimes", "h_max_request_times"));
-    xhttp_optional_xmux_range(result, "h_max_reusable_secs", xhttp_object_setting_value(source, "hMaxReusableSecs", "h_max_reusable_secs"));
+    let max_reusable = xhttp_object_setting_value(source, "hMaxReusableSecs", "h_max_reusable_secs");
+    if (max_reusable == null)
+        max_reusable = source.maxReusableSecs;
+    xhttp_optional_xmux_range(result, "h_max_reusable_secs", max_reusable);
     xhttp_optional_xmux_integer(result, "h_keep_alive_period", xhttp_object_setting_value(source, "hKeepAlivePeriod", "h_keep_alive_period"));
+
+    if (result.max_connections == "0" || result.max_connections == "0-0")
+        delete result.max_connections;
+    if (result.max_connections != null && (result.max_concurrency == "0" || result.max_concurrency == "0-0"))
+        delete result.max_concurrency;
+
+    return length(keys(result)) > 0 ? result : null;
+}
+
+function xhttp_normalize_headers(value) {
+    let source = xhttp_object_arg(value);
+    if (type(source) != "object")
+        return null;
+
+    let result = {};
+    for (let k, v in source) {
+        let key = trim(as_string(k));
+        if (key == "")
+            continue;
+        if (type(v) == "array") {
+            for (let item in v) {
+                let s = trim(as_string(item));
+                if (s != "") {
+                    result[key] = s;
+                    break;
+                }
+            }
+        } else if (v != null) {
+            let s = trim(as_string(v));
+            if (s != "")
+                result[key] = s;
+        }
+    }
 
     return length(keys(result)) > 0 ? result : null;
 }
@@ -342,22 +443,30 @@ function xhttp_optional_enum(object, key, value, allowed) {
 
 function xhttp_apply_v2_settings(result, primary, extra) {
     // XHTTP v2 keys (session/seq placement, uplink-data placement, X-Padding
-    // obfuscation). Every field is opt-in per the sing-box-lx contract; the
+    // obfuscation). Every field is opt-in per the tachyon-core contract; the
     // v1 wire shape stays byte-identical when none are present.
-    xhttp_optional_enum(result, "session_placement", xhttp_setting_value(primary, extra, [ "sessionPlacement", "SessionIDPlacement", "sessionIDPlacement" ], "session_placement"), [ "path", "query", "header", "cookie" ]);
-    xhttp_optional_string(result, "session_key", xhttp_setting_value(primary, extra, [ "sessionKey", "SessionIDKey", "sessionIDKey" ], "session_key"));
+    xhttp_optional_enum(result, "session_placement", xhttp_setting_value(primary, extra, [ "sessionPlacement", "SessionIDPlacement", "sessionIDPlacement", "sessionIdPlacement" ], [ "session_placement", "session_id_placement" ]), [ "path", "query", "header", "cookie" ]);
+    xhttp_optional_string(result, "session_key", xhttp_setting_value(primary, extra, [ "sessionKey", "SessionIDKey", "sessionIDKey", "sessionIdKey" ], [ "session_key", "session_id_key" ]));
+    xhttp_optional_string(result, "session_table", xhttp_setting_value(primary, extra, [ "sessionTable", "SessionIDTable", "sessionIDTable", "sessionIdTable" ], [ "session_table", "session_id_table" ]));
+    xhttp_optional_positive_range(result, "session_length", xhttp_setting_value(primary, extra, [ "sessionLength", "SessionIDLength", "sessionIDLength", "sessionIdLength" ], [ "session_length", "session_id_length" ]));
     xhttp_optional_enum(result, "seq_placement", xhttp_setting_value(primary, extra, "seqPlacement", "seq_placement"), [ "path", "query", "header", "cookie" ]);
     xhttp_optional_string(result, "seq_key", xhttp_setting_value(primary, extra, "seqKey", "seq_key"));
     xhttp_optional_enum(result, "uplink_data_placement", xhttp_setting_value(primary, extra, "uplinkDataPlacement", "uplink_data_placement"), [ "body", "auto", "header", "cookie" ]);
     xhttp_optional_string(result, "uplink_data_key", xhttp_setting_value(primary, extra, "uplinkDataKey", "uplink_data_key"));
     xhttp_optional_positive_range(result, "uplink_chunk_size", xhttp_setting_value(primary, extra, "uplinkChunkSize", "uplink_chunk_size"));
     xhttp_optional_enum(result, "uplink_http_method", xhttp_setting_value(primary, extra, [ "uplinkHttpMethod", "uplinkHTTPMethod" ], "uplink_http_method"), [ "POST", "GET" ]);
+    xhttp_optional_bool(result, "no_sse_header", xhttp_setting_value(primary, extra, [ "noSSEHeader", "noSseHeader" ], "no_sse_header"));
     xhttp_optional_positive_integer(result, "sc_max_buffered_posts", xhttp_setting_value(primary, extra, "scMaxBufferedPosts", "sc_max_buffered_posts"));
+    xhttp_optional_positive_integer(result, "sc_max_concurrent_posts", xhttp_setting_value(primary, extra, "scMaxConcurrentPosts", "sc_max_concurrent_posts"));
+    xhttp_optional_positive_integer(result, "server_max_header_bytes", xhttp_setting_value(primary, extra, "serverMaxHeaderBytes", "server_max_header_bytes"));
     xhttp_optional_bool(result, "x_padding_obfs_mode", xhttp_setting_value(primary, extra, "xPaddingObfsMode", "x_padding_obfs_mode"));
     xhttp_optional_enum(result, "x_padding_placement", xhttp_setting_value(primary, extra, "xPaddingPlacement", "x_padding_placement"), [ "cookie", "header", "query", "queryInHeader" ]);
     xhttp_optional_string(result, "x_padding_key", xhttp_setting_value(primary, extra, "xPaddingKey", "x_padding_key"));
     xhttp_optional_string(result, "x_padding_header", xhttp_setting_value(primary, extra, "xPaddingHeader", "x_padding_header"));
     xhttp_optional_enum(result, "x_padding_method", xhttp_setting_value(primary, extra, "xPaddingMethod", "x_padding_method"), [ "repeat-x", "tokenish" ]);
+    let headers = xhttp_normalize_headers(xhttp_setting_value(primary, extra, "headers", "headers"));
+    if (headers)
+        result.headers = headers;
 }
 
 function json_decode_text(text) {
@@ -380,7 +489,7 @@ function read_file(path) {
 
 
 function reality_public_key_valid(value) {
-    return match(as_string(value), /^[A-Za-z0-9_-]{43}$/) != null;
+    return match(as_string(value), /^[A-Za-z0-9_-]{43}=?$/) != null;
 }
 
 function outbound_is_unsupported_stub(outbound) {
@@ -424,12 +533,25 @@ function outbound_is_unsupported_stub(outbound) {
         index(tag, "⚠️") >= 0 ||
         index(tag, "❗") >= 0 ||
         index(tag, "❌") >= 0 ||
+        index(tag, "📊") >= 0 ||
+        index(tag, "📈") >= 0 ||
+        index(tag, "📉") >= 0 ||
+        index(tag, "📅") >= 0 ||
+        index(tag, "⏳") >= 0 ||
+        index(tag, "⏰") >= 0 ||
+        index(tag, "|") >= 0 ||
         index(tag, "warning") >= 0 ||
         index(tag, "error") >= 0 ||
         index(tag, "notice") >= 0 ||
         index(tag, "attention") >= 0 ||
         index(tag, "внимание") >= 0 ||
-        index(tag, "ошибка") >= 0
+        index(tag, "ошибка") >= 0 ||
+        index(tag, "traffic") >= 0 ||
+        index(tag, "трафик") >= 0 ||
+        index(tag, "expire") >= 0 ||
+        index(tag, "истекает") >= 0 ||
+        index(tag, "осталось") >= 0 ||
+        match(tag, /[0-9]+(\.[0-9]+)?[ \t]*(gb|mb|tb|гб|мб|тб)/) != null
     ))
         return true;
 
@@ -442,23 +564,38 @@ function validate_subscription(path) {
         return false;
 
     let usable_count = 0;
+    let filtered = [];
+    let dropped_invalid_reality = false;
     for (let outbound in value.outbounds) {
-        if (outbound_is_unsupported_stub(outbound))
+        if (outbound_is_unsupported_stub(outbound)) {
+            push(filtered, outbound);
             continue;
+        }
 
         let tls = type(outbound) == "object" && type(outbound.tls) == "object" ? outbound.tls : {};
         let reality = tls.reality;
-        if (type(reality) == "object" && reality.enabled !== false && !reality_public_key_valid(reality.public_key))
-            return false;
+        if (type(reality) == "object" && reality.enabled != false && !reality_public_key_valid(reality.public_key)) {
+            dropped_invalid_reality = true;
+            continue;
+        }
 
+        push(filtered, outbound);
         usable_count++;
     }
 
-    return usable_count > 0;
+    if (usable_count == 0)
+        return false;
+
+    if (dropped_invalid_reality) {
+        value.outbounds = filtered;
+        write_json_file(path, value);
+    }
+
+    return true;
 }
 
 
-function canonical_runtime_value(value) {
+function canonical_runtime_value(value, parent_name) {
     if (type(value) == "array") {
         let result = [];
         for (let item in value)
@@ -476,7 +613,11 @@ function canonical_runtime_value(value) {
         for (let name in names) {
             if (name == "share_link")
                 continue;
-            result[name] = canonical_runtime_value(value[name]);
+            // Panels (Marzban, Remnawave, 3x-ui) hand out a random Reality short_id from
+            // the server's list on every fetch; that alone must not reload tachyon-core.
+            if (parent_name == "reality" && name == "short_id")
+                continue;
+            result[name] = canonical_runtime_value(value[name], name);
         }
 
         return result;
@@ -540,6 +681,15 @@ function urldecode(value) {
 
     if (index(value, "+") >= 0)
         value = replace(value, /\+/g, " ");
+    if (index(value, "%") < 0)
+        return value;
+    return replace(value, /%([0-9A-Fa-f][0-9A-Fa-f])/g, function(all, hex_value) {
+        return chr(hex(hex_value));
+    });
+}
+
+function urldecode_raw_plus(value) {
+    value = as_string(value);
     if (index(value, "%") < 0)
         return value;
     return replace(value, /%([0-9A-Fa-f][0-9A-Fa-f])/g, function(all, hex_value) {
@@ -626,12 +776,15 @@ function parse_host_port(value) {
         value = substr(value, 0, length(value) - 1);
     if (starts_with(value, "[")) {
         let m = match(value, /^\[([^\]]+)\]:(.+)$/);
-        return m ? [m[1], parse_port_value(m[2])] : ["", null];
+        if (m)
+            return [m[1], parse_port_value(m[2])];
+        let m_host = match(value, /^\[([^\]]+)\]$/);
+        return m_host ? [m_host[1], null] : ["", null];
     }
 
     let colon = rindex(value, ":");
     if (colon < 0)
-        return ["", null];
+        return [value, null];
 
     let host = substr(value, 0, colon);
     let port = substr(value, colon + 1);
@@ -698,8 +851,38 @@ function normalize_utls_fingerprint(value) {
         randomizednoalpn: true
     };
 
-    value = as_string(value);
-    return allowed[value] ? value : "chrome";
+    value = lc(trim(as_string(value)));
+    if (allowed[value])
+        return value;
+    if (value == "random" || starts_with(value, "hellorandomized") || starts_with(value, "randomized"))
+        return "randomized";
+    if (starts_with(value, "hellochrome") || starts_with(value, "chrome"))
+        return "chrome";
+    if (starts_with(value, "hellofirefox") || starts_with(value, "firefox"))
+        return "firefox";
+    if (starts_with(value, "hellosafari") || starts_with(value, "safari"))
+        return "safari";
+    if (starts_with(value, "helloios") || starts_with(value, "ios"))
+        return "ios";
+    if (starts_with(value, "helloandroid") || starts_with(value, "android"))
+        return "android";
+    if (starts_with(value, "helloedge") || starts_with(value, "edge"))
+        return "edge";
+    if (starts_with(value, "hello360") || starts_with(value, "360"))
+        return "360";
+    return "chrome";
+}
+
+function finalmask_has_tcp_fragment(fm_val) {
+    if (type(fm_val) != "object")
+        return false;
+    let tcp_val = fm_val.tcp != null ? fm_val.tcp : fm_val;
+    let items = type(tcp_val) == "array" ? tcp_val : (type(tcp_val) == "object" ? [ tcp_val ] : []);
+    for (let item in items) {
+        if (type(item) == "object" && lc(as_string(item.type || "")) == "fragment")
+            return true;
+    }
+    return false;
 }
 
 function add_tls(url, security, default_tls) {
@@ -707,7 +890,8 @@ function add_tls(url, security, default_tls) {
     let sni = query.sni || query.peer || "";
     let insecure = query.allowInsecure || query.insecure || "";
     let transport = query.type || "";
-    let alpn = tls_alpn_for_transport(split_csv(query.alpn || ""), transport);
+    let raw_alpn = split_csv(query.alpn || "");
+    let alpn = tls_alpn_for_transport(raw_alpn, transport);
 
     let fingerprint = normalize_utls_fingerprint(query.fp || "");
     let public_key = query.pbk || "";
@@ -730,7 +914,7 @@ function add_tls(url, security, default_tls) {
         }
     }
     else if (security == null || security == "")
-        tls_enabled = default_tls || (int(url.port) == 443) || sni != "" || length(alpn) > 0 || fingerprint != "" || public_key != "" || certificate_pin != "";
+        tls_enabled = default_tls || (int(url.port) == 443) || sni != "" || length(raw_alpn) > 0 || fingerprint != "" || public_key != "" || certificate_pin != "";
 
     if (!tls_enabled)
         return [null, true];
@@ -754,14 +938,41 @@ function add_tls(url, security, default_tls) {
             tls.reality.public_key = public_key;
         if (short_id != "")
             tls.reality.short_id = short_id;
+        // Three spellings of the same flag are in the wild: the core
+        // snake_case one, the camelCase one some panels emit, and the
+        // kebab-case one a share link carries. Priority order is kept: the
+        // first one that is present wins, and an explicit false is never
+        // turned into true by a later spelling.
         let mlkem_preference = query.support_x25519mlkem768;
         if (mlkem_preference == null)
             mlkem_preference = query.supportX25519MLKEM768;
+        if (mlkem_preference == null)
+            mlkem_preference = query["support-x25519mlkem768"];
+        if (mlkem_preference == null)
+            mlkem_preference = query.pq;
+        if (mlkem_preference == null)
+            mlkem_preference = query.post_quantum;
+        if (mlkem_preference == null) {
+            let extra = xhttp_extra_settings(query);
+            mlkem_preference = extra.support_x25519mlkem768;
+            if (mlkem_preference == null)
+                mlkem_preference = extra.supportX25519MLKEM768;
+            if (mlkem_preference == null)
+                mlkem_preference = extra["support-x25519mlkem768"];
+            if (mlkem_preference == null && trim(as_string(extra.pqv || extra.mldsa65Verify || "")) != "")
+                mlkem_preference = "true";
+        }
+        if (mlkem_preference == null && trim(as_string(query.pqv || query.mldsa65Verify || "")) != "")
+            mlkem_preference = "true";
         if (mlkem_preference != null)
             tls.reality.support_x25519mlkem768 = is_true(mlkem_preference);
     }
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
+    let fm_raw = as_string(query.fm || query.finalmask || "");
+    if (is_true(query.fragment || query.tls_fragment) ||
+        (fm_raw != "" && finalmask_has_tcp_fragment(json_decode_text(fm_raw))))
+        tls.fragment = true;
 
     return [tls, true];
 }
@@ -851,7 +1062,7 @@ function valid_port(port) {
 }
 
 function normalize_port_number(value) {
-    value = trim(value);
+    value = trim(as_string(value));
     if (!is_integer_string(value))
         return "";
 
@@ -907,12 +1118,21 @@ function normalize_packet_encoding(value) {
     return value == "xudp" || value == "packetaddr" ? value : "";
 }
 
+function normalize_vless_flow(value) {
+    let flow = lc(trim(as_string(value)));
+    if (flow == "" || flow == "none")
+        return "";
+    if (flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443")
+        return "xtls-rprx-vision";
+    return null;
+}
+
 function process_vless(raw, url) {
     if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
         return null;
 
-    let flow = url.query.flow || "";
-    if (flow != "" && flow != "xtls-rprx-vision")
+    let flow = normalize_vless_flow(url.query.flow || "");
+    if (flow == null)
         return null;
 
     let packet_encoding = normalize_packet_encoding(url.query.packetEncoding || url.query.packet_encoding || url.query["packet-encoding"] || url.query.packetencoding || "");
@@ -940,14 +1160,38 @@ function process_vless(raw, url) {
         outbound.tls = tls_result[0];
 
     let transport = add_transport(url);
-    if (transport)
+    if (transport) {
+        if (outbound.tls == null && int(url.port) == 443 && transport.type == "xhttp" && type(transport.headers) == "object") {
+            let origin = as_string(transport.headers.Origin || transport.headers.origin || "");
+            if (starts_with(lc(origin), "https://")) {
+                let sni = as_string(transport.host || url.host);
+                let fp = lc(trim(as_string(transport.headers["User-Agent"] || transport.headers["user-agent"] || "")));
+                if (fp != "chrome" && fp != "firefox" && fp != "safari" && fp != "edge" && fp != "ios" && fp != "android")
+                    fp = "chrome";
+                outbound.tls = {
+                    enabled: true,
+                    server_name: sni,
+                    alpn: [ "h2", "http/1.1" ],
+                    utls: {
+                        enabled: true,
+                        fingerprint: fp
+                    }
+                };
+            }
+        }
         outbound.transport = transport;
+    }
     return outbound;
 }
 
 function process_trojan(raw, url) {
     if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
         return null;
+
+    if (url.scheme == "trojan-go" && (url.query.type == null || url.query.type == "") &&
+        ((url.path || "") != "" || (url.query.path || "") != "" || (url.query.host || "") != "")) {
+        url.query.type = "ws";
+    }
 
     let outbound = {
         type: "trojan",
@@ -965,8 +1209,27 @@ function process_trojan(raw, url) {
         outbound.tls = tls_result[0];
 
     let transport = add_transport(url);
-    if (transport)
+    if (transport) {
+        if (outbound.tls == null && int(url.port) == 443 && transport.type == "xhttp" && type(transport.headers) == "object") {
+            let origin = as_string(transport.headers.Origin || transport.headers.origin || "");
+            if (starts_with(lc(origin), "https://")) {
+                let sni = as_string(transport.host || url.host);
+                let fp = lc(trim(as_string(transport.headers["User-Agent"] || transport.headers["user-agent"] || "")));
+                if (fp != "chrome" && fp != "firefox" && fp != "safari" && fp != "edge" && fp != "ios" && fp != "android")
+                    fp = "chrome";
+                outbound.tls = {
+                    enabled: true,
+                    server_name: sni,
+                    alpn: [ "h2", "http/1.1" ],
+                    utls: {
+                        enabled: true,
+                        fingerprint: fp
+                    }
+                };
+            }
+        }
         outbound.transport = transport;
+    }
     return outbound;
 }
 
@@ -978,13 +1241,13 @@ function process_socks(raw, url) {
     if (url.userinfo != "") {
         let colon = index(url.userinfo, ":");
         if (colon >= 0) {
-            username = urldecode(substr(url.userinfo, 0, colon));
-            password = urldecode(substr(url.userinfo, colon + 1));
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
             if (username == password)
                 password = "";
         }
         else {
-            username = urldecode(url.userinfo);
+            username = url.userinfo;
         }
     }
 
@@ -1016,13 +1279,13 @@ function process_http(raw, url) {
     if (url.userinfo != "") {
         let colon = index(url.userinfo, ":");
         if (colon >= 0) {
-            username = urldecode(substr(url.userinfo, 0, colon));
-            password = urldecode(substr(url.userinfo, colon + 1));
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
             if (username == password)
                 password = "";
         }
         else {
-            username = urldecode(url.userinfo);
+            username = url.userinfo;
         }
     }
 
@@ -1207,11 +1470,106 @@ function process_shadowsocks(raw) {
         outbound.plugin = plugin;
     if (plugin_opts != "")
         outbound.plugin_opts = plugin_opts;
+    if (is_true(params.uot || params.udp_over_tcp || params["udp-over-tcp"]))
+        outbound.udp_over_tcp = true;
     return outbound;
 }
 
+function parse_hysteria2_packet_size_str(raw) {
+    let s = trim(as_string(raw));
+    if (s == "")
+        return null;
+    let dash = index(s, "-");
+    if (dash >= 0) {
+        let a = trim(substr(s, 0, dash));
+        let b = trim(substr(s, dash + 1));
+        if (!is_integer_string(a) || !is_integer_string(b))
+            return null;
+        let lo = int(a, 10);
+        let hi = int(b, 10);
+        return (hi > 0 && lo <= hi && hi <= 2048) ? [ lo, hi ] : null;
+    }
+    if (!is_integer_string(s))
+        return null;
+    let v = int(s, 10);
+    return (v > 0 && v <= 2048) ? [ v, v ] : null;
+}
+
+function parse_hysteria2_packet_size_value(val) {
+    if (val == null)
+        return null;
+    let vt = type(val);
+    if (vt == "string")
+        return parse_hysteria2_packet_size_str(val);
+    if (vt == "int" || vt == "double") {
+        let v = int(val);
+        return (v == val && v > 0 && v <= 2048) ? [ v, v ] : null;
+    }
+    if (vt == "object") {
+        let lo_raw = val.from != null ? val.from : val.min;
+        let hi_raw = val.to != null ? val.to : val.max;
+        let lo = xhttp_non_negative_integer_value(lo_raw);
+        let hi = xhttp_positive_integer_value(hi_raw);
+        return (lo != null && hi != null && lo <= hi && hi <= 2048) ? [ lo, hi ] : null;
+    }
+    return null;
+}
+
+function build_hysteria2_obfs(is_gecko, password, min_packet_size, max_packet_size) {
+    password = as_string(password);
+    let min_v = int(min_packet_size || 0);
+    let max_v = int(max_packet_size || 0);
+    if (is_gecko || min_v > 0 || max_v > 0) {
+        let obfs = {
+            type: "gecko",
+            password: password
+        };
+        if (min_v > 0)
+            obfs.min_packet_size = min_v;
+        if (max_v > 0)
+            obfs.max_packet_size = max_v;
+        return obfs;
+    }
+    return {
+        type: "salamander",
+        password: password
+    };
+}
+
+function parse_hysteria2_mbps(val) {
+    if (val == null)
+        return null;
+    if (type(val) == "int" || type(val) == "double") {
+        let n = int(val);
+        return n > 0 ? n : null;
+    }
+    let m = match(trim(as_string(val)), /^([0-9]+)/);
+    if (!m)
+        return null;
+    let n = int(m[1], 10);
+    return n > 0 ? n : null;
+}
+
+function normalize_hysteria2_hop_interval(val) {
+    if (val == null)
+        return "";
+    if (type(val) == "int" || type(val) == "double") {
+        let n = int(val);
+        return n > 0 ? ("" + n + "s") : "";
+    }
+    let s = trim(as_string(val));
+    if (s == "")
+        return "";
+    let dash = index(s, "-");
+    if (dash > 0)
+        s = trim(substr(s, 0, dash));
+    if (is_integer_string(s))
+        return s + "s";
+    return s;
+}
+
 function process_hysteria2(raw, url) {
-    let mport = trim(as_string(url.query.mport || ""));
+    let mport = trim(as_string(url.query.mport || url.query.ports || url.query.server_ports || ""));
     let port_value = mport != "" ? mport : url.port;
     let server_ports = parse_hysteria2_server_ports(port_value);
     let server_port = normalize_port_number(as_string(port_value));
@@ -1229,7 +1587,7 @@ function process_hysteria2(raw, url) {
         tls.insecure = true;
     if ((url.query.alpn || "") != "")
         tls.alpn = split_csv(url.query.alpn);
-    let certificate_pin = common.certificate_pin_base64(url.query.pcs || "");
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
 
@@ -1241,22 +1599,108 @@ function process_hysteria2(raw, url) {
         password: password,
         tls: tls
     };
-    if (server_ports != null)
+    if (server_ports != null) {
         outbound.server_ports = server_ports;
-    else
+        let parts = split(server_ports[0], ":");
+        let initial_port = normalize_port_number(url.port);
+        outbound.server_port = initial_port != "" ? int(initial_port, 10) : int(parts[0], 10);
+    }
+    else {
         outbound.server_port = int(server_port, 10);
+    }
 
     if ((url.query.network || "") != "")
         outbound.network = url.query.network;
-    if (is_integer_string(url.query.upmbps || ""))
-        outbound.up_mbps = int(url.query.upmbps);
-    if (is_integer_string(url.query.downmbps || ""))
-        outbound.down_mbps = int(url.query.downmbps);
-    if ((url.query.obfs || "") != "" && url.query.obfs != "none") {
-        outbound.obfs = { type: url.query.obfs };
-        if ((url.query["obfs-password"] || "") != "")
-            outbound.obfs.password = url.query["obfs-password"];
+    let up_mbps = parse_hysteria2_mbps(url.query.upmbps != null ? url.query.upmbps : (url.query.up_mbps != null ? url.query.up_mbps : url.query.up));
+    if (up_mbps != null)
+        outbound.up_mbps = up_mbps;
+    let down_mbps = parse_hysteria2_mbps(url.query.downmbps != null ? url.query.downmbps : (url.query.down_mbps != null ? url.query.down_mbps : url.query.down));
+    if (down_mbps != null)
+        outbound.down_mbps = down_mbps;
+
+    let obfs_pw = "";
+    let has_obfs = false;
+    let is_gecko = false;
+    let min_ps = 0;
+    let max_ps = 0;
+    let obfs_type = lc(trim(as_string(url.query.obfs || url.query.obfs_type || url.query["obfs-type"] || "")));
+    if (obfs_type != "" && obfs_type != "none") {
+        has_obfs = true;
+        if (obfs_type == "gecko")
+            is_gecko = true;
+        obfs_pw = as_string(url.query["obfs-password"] || url.query.obfs_password || url.query.obfspassword || "");
     }
+    let ps_raw = url.query.packetSize != null ? url.query.packetSize : (url.query.packetsize != null ? url.query.packetsize : (url.query["packet-size"] != null ? url.query["packet-size"] : url.query.packet_size));
+    let ps_pair = parse_hysteria2_packet_size_value(ps_raw);
+    if (ps_pair != null) {
+        min_ps = ps_pair[0];
+        max_ps = ps_pair[1];
+    }
+    let lo_q = xhttp_positive_integer_value(url.query.min_packet_size != null ? url.query.min_packet_size : (url.query["min-packet-size"] != null ? url.query["min-packet-size"] : (url.query.minPacketSize != null ? url.query.minPacketSize : url.query.minpacketsize)));
+    if (lo_q != null)
+        min_ps = lo_q;
+    let hi_q = xhttp_positive_integer_value(url.query.max_packet_size != null ? url.query.max_packet_size : (url.query["max-packet-size"] != null ? url.query["max-packet-size"] : (url.query.maxPacketSize != null ? url.query.maxPacketSize : url.query.maxpacketsize)));
+    if (hi_q != null)
+        max_ps = hi_q;
+
+    let fm_raw = as_string(url.query.fm || url.query.finalmask || "");
+    if (fm_raw != "") {
+        let fm_val = json_decode_text(fm_raw);
+        if (type(fm_val) == "object") {
+            let has_udp_key = fm_val.udp != null;
+            let udp_val = has_udp_key ? fm_val.udp : fm_val;
+            let udp_items = type(udp_val) == "array" ? udp_val : (type(udp_val) == "object" ? [ udp_val ] : []);
+            for (let u_obj in udp_items) {
+                if (type(u_obj) != "object")
+                    continue;
+                // A bare finalmask object without "udp" or "type" (e.g. {"quicParams":{...}})
+                // carries no obfuscation; defaulting it to salamander yields an obfs without password.
+                let utype = lc(as_string(u_obj.type || (has_udp_key ? "salamander" : "")));
+                let u_set = object_or_empty(u_obj.settings);
+                if (utype == "salamander" || utype == "gecko") {
+                    has_obfs = true;
+                    if (utype == "gecko" || lc(as_string(u_set.mode || u_obj.mode || "")) == "gecko")
+                        is_gecko = true;
+                    let pw = as_string(u_set.password || u_obj.password || "");
+                    if (pw != "")
+                        obfs_pw = pw;
+                    let fm_ps = parse_hysteria2_packet_size_value(u_set.packetSize != null ? u_set.packetSize : (u_set.packet_size != null ? u_set.packet_size : (u_obj.packetSize != null ? u_obj.packetSize : u_obj.packet_size)));
+                    if (fm_ps != null) {
+                        min_ps = fm_ps[0];
+                        max_ps = fm_ps[1];
+                    }
+                    let fm_lo = xhttp_positive_integer_value(u_set.minPacketSize != null ? u_set.minPacketSize : (u_set.min_packet_size != null ? u_set.min_packet_size : (u_obj.minPacketSize != null ? u_obj.minPacketSize : u_obj.min_packet_size)));
+                    if (fm_lo != null)
+                        min_ps = fm_lo;
+                    let fm_hi = xhttp_positive_integer_value(u_set.maxPacketSize != null ? u_set.maxPacketSize : (u_set.max_packet_size != null ? u_set.max_packet_size : (u_obj.maxPacketSize != null ? u_obj.maxPacketSize : u_obj.max_packet_size)));
+                    if (fm_hi != null)
+                        max_ps = fm_hi;
+                } else if (utype == "udphop" || utype == "udp_hop") {
+                    let hop_ports = parse_hysteria2_server_ports(as_string(u_set.ports || u_set.port || u_obj.ports || u_obj.port || ""));
+                    if (hop_ports != null)
+                        outbound.server_ports = hop_ports;
+                    let hop_iv = normalize_hysteria2_hop_interval(u_set.interval != null ? u_set.interval : u_obj.interval);
+                    if (hop_iv != "")
+                        outbound.hop_interval = hop_iv;
+                }
+            }
+        }
+    }
+
+    if (has_obfs) {
+        if (is_gecko || min_ps > 0 || max_ps > 0) {
+            outbound.obfs = build_hysteria2_obfs(true, obfs_pw, min_ps, max_ps);
+        } else {
+            outbound.obfs = { type: obfs_type != "" ? obfs_type : "salamander" };
+            if (obfs_pw != "")
+                outbound.obfs.password = obfs_pw;
+        }
+    }
+
+    let hop_q = normalize_hysteria2_hop_interval(url.query.hop_interval != null ? url.query.hop_interval : (url.query["hop-interval"] != null ? url.query["hop-interval"] : (url.query.hopinterval != null ? url.query.hopinterval : (url.query.mporthopint != null ? url.query.mporthopint : url.query.mport_hop))));
+    if (hop_q != "")
+        outbound.hop_interval = hop_q;
+
     return outbound;
 }
 
@@ -1285,7 +1729,7 @@ function process_tuic(raw, url) {
         tls.insecure = true;
     if ((url.query.alpn || "") != "")
         tls.alpn = split_csv(url.query.alpn);
-    let certificate_pin = common.certificate_pin_base64(url.query.pcs || "");
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
 
@@ -1326,7 +1770,7 @@ function string_value(value) {
     return value == null ? "" : as_string(value);
 }
 
-function process_vmess_json(raw, decoded) {
+function process_vmess_json(raw, decoded, frag_override) {
     let vmess = json_decode_text(decoded);
     if (type(vmess) != "object")
         return null;
@@ -1337,9 +1781,13 @@ function process_vmess_json(raw, decoded) {
     if (server == "" || is_dummy_server(server, port) || !valid_port(port) || uuid == "")
         return null;
 
+    let tag = trim(as_string(frag_override || ""));
+    if (tag == "")
+        tag = string_value(vmess.ps) != "" ? string_value(vmess.ps) : (server + ":" + port);
+
     let outbound = {
         type: "vmess",
-        tag: string_value(vmess.ps) != "" ? string_value(vmess.ps) : (server + ":" + port),
+        tag: tag,
         share_link: raw,
         server: server,
         server_port: port,
@@ -1356,11 +1804,16 @@ function process_vmess_json(raw, decoded) {
         outbound.packet_encoding = packet_encoding;
 
     let network = string_value(vmess.net);
-    if (vmess.tls === true || vmess.tls == "tls" || vmess.tls == "true") {
+    if (vmess.tls == true || vmess.tls == "tls" || vmess.tls == "true" || vmess.tls == "1") {
         let fingerprint = normalize_utls_fingerprint(string_value(vmess.fp));
         let tls = { enabled: true };
         if (string_value(vmess.sni) != "")
             tls.server_name = string_value(vmess.sni);
+        if (is_true(vmess.allowInsecure || vmess.insecure))
+            tls.insecure = true;
+        let certificate_pin = common.certificate_pin_base64(string_value(vmess.pcs));
+        if (certificate_pin != "")
+            tls.certificate_sha256 = [ certificate_pin ];
         let alpn = tls_alpn_for_transport(split_csv(string_value(vmess.alpn)), network);
         if (length(alpn) > 0)
             tls.alpn = alpn;
@@ -1393,14 +1846,73 @@ function process_vmess_json(raw, decoded) {
     return outbound;
 }
 
+function process_vmess_url(raw) {
+    let url = parse_url(raw);
+    if (url == null || url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let uuid = url.userinfo;
+    let security = "";
+    let colon = index(url.userinfo, ":");
+    if (colon > 0) {
+        security = substr(url.userinfo, 0, colon);
+        uuid = substr(url.userinfo, colon + 1);
+    }
+    if (security == "") {
+        let q_enc = trim(as_string(url.query.encryption || url.query.scy || ""));
+        if (q_enc == "") {
+            let q_sec = lc(trim(as_string(url.query.security || "")));
+            if (q_sec != "" && q_sec != "tls" && q_sec != "reality" && q_sec != "xtls")
+                q_enc = q_sec;
+        }
+        security = q_enc != "" ? q_enc : "auto";
+    }
+
+    let outbound = {
+        type: "vmess",
+        tag: url.fragment != "" ? url.fragment : ("vmess-" + url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        uuid: uuid,
+        security: security
+    };
+
+    let aid = int(url.query.alterId || url.query.aid || 0);
+    if (aid > 0)
+        outbound.alter_id = aid;
+
+    let packet_encoding = normalize_packet_encoding(url.query.packetEncoding || url.query.packet_encoding || url.query["packet-encoding"] || url.query.packetencoding || "");
+    if (packet_encoding != "")
+        outbound.packet_encoding = packet_encoding;
+
+    let tls_result = add_tls(url, url.query.security || "", false);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+
+    let transport = add_transport(url);
+    if (transport)
+        outbound.transport = transport;
+
+    return outbound;
+}
+
 function process_vmess(raw) {
     if (!starts_with(raw, "vmess://"))
         return null;
 
     let encoded = substr(raw, 8);
+    let frag_override = "";
     let hash_pos = index(encoded, "#");
-    if (hash_pos >= 0)
+    if (hash_pos >= 0) {
+        frag_override = urldecode_fragment(substr(encoded, hash_pos + 1));
         encoded = substr(encoded, 0, hash_pos);
+    }
+    if (index(encoded, "@") >= 0)
+        return process_vmess_url(raw);
+
     let decoded = base64_decode(encoded);
     if (!decoded)
         return null;
@@ -1409,18 +1921,1318 @@ function process_vmess(raw) {
     let trimmed = trim(decoded);
     if (substr(trimmed, 0, 1) != "{" || substr(trimmed, length(trimmed) - 1) != "}")
         return null;
-    return process_vmess_json(raw, trimmed);
+    return process_vmess_json(raw, trimmed, frag_override);
 }
 
+function from_amneziawg_share_link(line) {
+    line = trim(line);
+    let hash_pos = index(line, "#");
+    let link_part = hash_pos >= 0 ? substr(line, 0, hash_pos) : line;
+    let name = hash_pos >= 0 ? urldecode_fragment(substr(line, hash_pos + 1)) : "";
+
+    let scheme_marker = index(link_part, "://");
+    if (scheme_marker < 0)
+        return null;
+    let payload = substr(link_part, scheme_marker + 3);
+    if (payload == "")
+        return null;
+
+    if (index(payload, "?") >= 0 && index(payload, "@") >= 0) {
+        let u = parse_url(line);
+        if (u != null && u.host != "" && u.port != "" && !is_dummy_server(u.host, u.port)) {
+            let priv_k = trim(as_string(u.userinfo || u.query.privatekey || u.query.private_key || u.query.privateKey || ""));
+            let pub_k = trim(as_string(u.query.publickey || u.query.public_key || u.query.publicKey || u.query.peer_public_key || ""));
+            if (priv_k != "" && pub_k != "") {
+                let addr_v = trim(as_string(u.query.address || u.query.ip || "10.0.0.2/32"));
+                let ep_host = index(u.host, ":") >= 0 && substr(u.host, 0, 1) != "[" ? ("[" + u.host + "]") : u.host;
+                let synth = "[Interface]\nPrivateKey = " + priv_k + "\nAddress = " + addr_v + "\n";
+                if ((u.query.mtu || "") != "")
+                    synth += "MTU = " + as_string(u.query.mtu) + "\n";
+                for (let ak in [ "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5" ]) {
+                    let av = u.query[ak] != null ? u.query[ak] : u.query[uc(ak)];
+                    if (av != null && as_string(av) != "")
+                        synth += uc(ak) + " = " + as_string(av) + "\n";
+                }
+                synth += "\n[Peer]\nPublicKey = " + pub_k + "\nEndpoint = " + ep_host + ":" + as_string(u.port) + "\n";
+                let psk_v = trim(as_string(u.query.psk || u.query.presharedkey || u.query.pre_shared_key || ""));
+                if (psk_v != "")
+                    synth += "PresharedKey = " + psk_v + "\n";
+                synth += "AllowedIPs = 0.0.0.0/0, ::/0\n";
+                let ep_out = wireguard.from_conf(synth, line, name);
+                if (ep_out)
+                    return ep_out;
+            }
+        }
+    }
+
+    let conf_text = base64_decode(payload);
+    if (conf_text == null || conf_text == "") {
+        if (index(payload, "[Interface]") >= 0 || index(payload, "[interface]") >= 0)
+            conf_text = payload;
+        else
+            return null;
+    }
+
+    let endpoint = wireguard.from_conf(conf_text, line, name);
+    if (endpoint)
+        return endpoint;
+
+    try {
+        let amnezia = require("subscription.amnezia");
+        let decoded = amnezia.decode(conf_text);
+        if (decoded && decoded.text)
+            return wireguard.from_conf(decoded.text, line, name || decoded.name);
+    } catch (e) {}
+
+    return null;
+}
+
+function process_anytls(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let outbound = {
+        type: "anytls",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: url.port,
+        password: url.userinfo
+    };
+
+    if (is_integer_string(url.query.min_idle_session || ""))
+        outbound.min_idle_session = int(url.query.min_idle_session, 10);
+    if ((url.query.idle_session_check_interval || "") != "")
+        outbound.idle_session_check_interval = url.query.idle_session_check_interval;
+    if ((url.query.idle_session_timeout || "") != "")
+        outbound.idle_session_timeout = url.query.idle_session_timeout;
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_naive(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let username = "", password = "";
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            username = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "naive",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port)
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (url.scheme == "naive+quic" || url.scheme == "naive+h3" || is_true(url.query.quic))
+        outbound.quic = true;
+    if ((url.query.quic_congestion_control || "") != "")
+        outbound.quic_congestion_control = url.query.quic_congestion_control;
+    if (is_integer_string(url.query.insecure_concurrency || ""))
+        outbound.insecure_concurrency = int(url.query.insecure_concurrency, 10);
+    if (is_true(url.query.uot || url.query.udp_over_tcp))
+        outbound.udp_over_tcp = true;
+
+    let tls = { enabled: true };
+    if ((url.query.sni || "") != "")
+        tls.server_name = url.query.sni;
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
+    if (certificate_pin != "")
+        tls.certificate_sha256 = [ certificate_pin ];
+    outbound.tls = tls;
+    return outbound;
+}
+
+function process_snell(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let version = int(url.query.version || url.query.v || 5);
+    if (version < 1 || version > 6)
+        version = 5;
+
+    let outbound = {
+        type: "snell",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: url.port,
+        psk: url.userinfo,
+        version: version
+    };
+    let obfs = lc(trim(as_string(url.query.obfs || url.query.plugin || "")));
+    if (obfs == "http" || obfs == "tls") {
+        outbound.obfs = { mode: obfs };
+        if ((url.query["obfs-host"] || url.query.obfs_host || url.query.host || "") != "")
+            outbound.obfs.host = url.query["obfs-host"] || url.query.obfs_host || url.query.host;
+    }
+    if (is_true(url.query.uot || url.query.udp_over_tcp))
+        outbound.udp_over_tcp = true;
+    if (is_true(url.query.reuse))
+        outbound.reuse = true;
+    return outbound;
+}
+
+function parse_mieru_port_specs_into(raw_value, specs, seen) {
+    let text = trim(as_string(raw_value));
+    if (length(text) >= 2 && substr(text, 0, 1) == "[" && substr(text, length(text) - 1) == "]")
+        text = substr(text, 1, length(text) - 2);
+    let has_range = false;
+    for (let token in split(replace(text, /[, \t\r\n]+/g, " "), " ")) {
+        token = trim(replace(replace(token, /^["']/g, ""), /["']$/g, ""));
+        token = trim(replace(token, ":", "-"));
+        if (token == "")
+            continue;
+        let m = match(token, /^([0-9]+)-([0-9]+)$/);
+        let spec = "";
+        if (m != null) {
+            let lo = int(m[1], 10);
+            let hi = int(m[2], 10);
+            if (lo >= 1 && hi <= 65535 && lo <= hi) {
+                if (lo == hi) {
+                    spec = as_string(lo);
+                } else {
+                    has_range = true;
+                    spec = sprintf("%d-%d", lo, hi);
+                }
+            }
+        } else {
+            let p = parse_port_value(token);
+            if (valid_port(p))
+                spec = as_string(int(p));
+        }
+        if (spec != "" && !seen[spec]) {
+            seen[spec] = true;
+            push(specs, spec);
+        }
+    }
+    return has_range;
+}
+
+function process_mieru(raw, url) {
+    let raw_str = as_string(raw);
+    let scheme_pos = index(raw_str, "://");
+    let raw_rest = scheme_pos >= 0 ? substr(raw_str, scheme_pos + 3) : raw_str;
+    let raw_hash = index(raw_rest, "#");
+    if (raw_hash >= 0)
+        raw_rest = substr(raw_rest, 0, raw_hash);
+    let raw_query = "";
+    let raw_qpos = index(raw_rest, "?");
+    if (raw_qpos >= 0) {
+        raw_query = substr(raw_rest, raw_qpos + 1);
+        raw_rest = substr(raw_rest, 0, raw_qpos);
+    }
+    let raw_spos = index(raw_rest, "/");
+    if (raw_spos >= 0)
+        raw_rest = substr(raw_rest, 0, raw_spos);
+
+    let query_specs = [];
+    let seen_specs = {};
+    let has_explicit_range = false;
+    let query_traffic_pattern = "";
+    let query_handshake_mode = "";
+    let query_password = "";
+    if (raw_query != "") {
+        for (let pair in split(raw_query, "&")) {
+            if (pair == "")
+                continue;
+            let eq = index(pair, "=");
+            let k = lc(trim(urldecode(eq >= 0 ? substr(pair, 0, eq) : pair)));
+            let raw_val = eq >= 0 ? substr(pair, eq + 1) : "";
+            let v_raw_plus = trim(urldecode_raw_plus(raw_val));
+            if (v_raw_plus == "")
+                continue;
+            if (k == "port" || k == "ports" || k == "port-range" || k == "server_ports") {
+                if (k != "port")
+                    has_explicit_range = true;
+                if (parse_mieru_port_specs_into(v_raw_plus, query_specs, seen_specs))
+                    has_explicit_range = true;
+            } else if (k == "traffic-pattern" || k == "traffic_pattern") {
+                query_traffic_pattern = v_raw_plus;
+            } else if (k == "handshake-mode" || k == "handshake_mode") {
+                query_handshake_mode = v_raw_plus;
+            } else if (k == "password" || k == "pass") {
+                query_password = v_raw_plus;
+            }
+        }
+    }
+
+    let raw_at = rindex(raw_rest, "@");
+    let raw_userinfo = raw_at >= 0 ? substr(raw_rest, 0, raw_at) : "";
+    let username = "";
+    let password = "";
+    if (raw_userinfo != "") {
+        let raw_colon = index(raw_userinfo, ":");
+        if (raw_colon >= 0) {
+            username = urldecode_raw_plus(substr(raw_userinfo, 0, raw_colon));
+            password = urldecode_raw_plus(substr(raw_userinfo, raw_colon + 1));
+        } else {
+            username = urldecode_raw_plus(raw_userinfo);
+        }
+    }
+    if (username == "" && url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            username = url.userinfo;
+        }
+    }
+    if (password == "")
+        password = query_password != "" ? query_password : as_string(url.query.password || url.query.pass || "");
+    if (url.host == "" || username == "" || password == "")
+        return null;
+
+    let single_port = null;
+    let port_ranges = [];
+    if (length(query_specs) > 0) {
+        let dm = match(query_specs[0], /^([0-9]+)/);
+        let dummy_check_port = dm != null ? int(dm[1], 10) : 443;
+        if (is_dummy_server(url.host, dummy_check_port))
+            return null;
+        let single_query_port = (length(query_specs) == 1 && !has_explicit_range && match(query_specs[0], /^[0-9]+$/) != null)
+            ? int(query_specs[0], 10)
+            : 0;
+        if (single_query_port > 0) {
+            if (!valid_port(url.port) || int(url.port) == single_query_port || url.scheme == "mierus")
+                single_port = single_query_port;
+            else {
+                single_port = int(url.port);
+                port_ranges = query_specs;
+            }
+        } else {
+            port_ranges = query_specs;
+            if (valid_port(url.port))
+                single_port = int(url.port);
+        }
+    } else {
+        if (is_dummy_server(url.host, url.port) || !valid_port(url.port))
+            return null;
+        single_port = int(url.port);
+    }
+
+    let transport = uc(trim(as_string(url.query.protocol || url.query.transport || url.query.network || "TCP")));
+    if (transport != "UDP")
+        transport = "TCP";
+
+    let display_port = length(port_ranges) > 0 ? port_ranges[0] : as_string(single_port);
+    let tag_val = url.fragment != "" ? url.fragment : (url.query.profile || (url.host + ":" + display_port));
+    let outbound = {
+        type: "mieru",
+        tag: tag_val,
+        share_link: raw,
+        server: url.host,
+        username: username,
+        password: password,
+        transport: transport
+    };
+    if (length(port_ranges) > 0)
+        outbound.server_ports = port_ranges;
+    if (single_port != null)
+        outbound.server_port = int(single_port);
+    let mux = as_string(url.query.multiplexing || url.query.mux || "");
+    if (mux != "")
+        outbound.multiplexing = mux;
+    let handshake_mode = query_handshake_mode != ""
+        ? query_handshake_mode
+        : trim(as_string(url.query["handshake-mode"] || url.query.handshake_mode || ""));
+    if (handshake_mode != "")
+        outbound.handshake_mode = handshake_mode;
+    let traffic_pattern = query_traffic_pattern != ""
+        ? query_traffic_pattern
+        : trim(as_string(url.query["traffic-pattern"] || url.query.traffic_pattern || ""));
+    if (traffic_pattern != "")
+        outbound.traffic_pattern = traffic_pattern;
+    return outbound;
+}
+
+function process_mtproto(raw, url) {
+    let server = url.host;
+    let port = url.port;
+    let secret = url.userinfo;
+    if (url.scheme == "tg" || url.scheme == "http" || url.scheme == "https") {
+        server = as_string(url.query.server || "");
+        port = parse_port_value(url.query.port || "");
+        secret = as_string(url.query.secret || "");
+    } else {
+        if (secret == "")
+            secret = as_string(url.query.secret || "");
+    }
+    if (server == "" || is_dummy_server(server, port) || !valid_port(port) || secret == "")
+        return null;
+
+    let norm_secret = lc(trim(as_string(secret)));
+    let padded_prefix = false;
+    let faketls_sni = "";
+    if (length(norm_secret) >= 34 && match(norm_secret, /^(ee|dd)[0-9a-f]{32}/)) {
+        padded_prefix = substr(norm_secret, 0, 2) == "dd";
+        if (substr(norm_secret, 0, 2) == "ee" && length(norm_secret) > 34 && ((length(norm_secret) - 34) % 2) == 0) {
+            let dhex = substr(norm_secret, 34);
+            if (match(dhex, /^[0-9a-f]+$/)) {
+                let dstr = "";
+                for (let i = 0; i < length(dhex); i += 2) {
+                    let b = int(substr(dhex, i, 2), 16);
+                    if (b >= 32 && b < 127)
+                        dstr += chr(b);
+                }
+                if (trim(dstr) != "")
+                    faketls_sni = trim(dstr);
+            }
+        }
+        secret = substr(norm_secret, 2, 32);
+    } else if (length(norm_secret) == 32 && match(norm_secret, /^[0-9a-f]{32}$/)) {
+        secret = norm_secret;
+    }
+
+    let outbound = {
+        type: "mtproto",
+        tag: url.fragment != "" ? url.fragment : (server + ":" + port),
+        share_link: raw,
+        server: server,
+        server_port: int(port),
+        secret: secret
+    };
+    let transport = lc(trim(as_string(url.query.transport || "")));
+    if (transport == "abridged" || transport == "intermediate" || transport == "padded_intermediate" || transport == "full")
+        outbound.transport = transport;
+    else if (padded_prefix)
+        outbound.transport = "padded_intermediate";
+    let mode = lc(trim(as_string(url.query.mode || "")));
+    if (mode == "mtproto" || mode == "mtproxy")
+        outbound.mode = mode;
+    let sni_val = as_string(url.query.sni || url.query.faketls || faketls_sni);
+    if (sni_val != "")
+        outbound.tls = { enabled: true, server_name: sni_val };
+    return outbound;
+}
+
+function process_shadowtls(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let version = int(url.query.version || 3);
+    if (version < 1 || version > 3)
+        version = 3;
+
+    let outbound = {
+        type: "shadowtls",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        version: version,
+        password: url.userinfo
+    };
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    else
+        outbound.tls = { enabled: true, server_name: url.query.sni || url.host };
+    return outbound;
+}
+
+function process_tewfai(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let uuid = "";
+    let password = "";
+    let colon = index(url.userinfo, ":");
+    if (colon >= 0) {
+        uuid = substr(url.userinfo, 0, colon);
+        password = substr(url.userinfo, colon + 1);
+    } else {
+        uuid = url.userinfo;
+    }
+    if (uuid == "")
+        return null;
+
+    let outbound = {
+        type: "tewfai",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        uuid: uuid
+    };
+    if (password != "")
+        outbound.password = password;
+    if ((url.query.transport || "") != "") {
+        let tr_list = [];
+        for (let item in split_csv(url.query.transport)) {
+            item = lc(trim(as_string(item)));
+            if (item == "raw_tls" || item == "h2" || item == "ws") item = "tcp";
+            else if (item == "h3_stream" || item == "h3_datagram") item = "quic";
+            if (item == "tcp" || item == "quic") {
+                if (index(tr_list, item) < 0)
+                    push(tr_list, item);
+            }
+        }
+        if (length(tr_list) > 0)
+            outbound.transport = tr_list;
+    }
+    let cipher = as_string(url.query.inner_cipher || "");
+    if (cipher == "aes-256-gcm" || cipher == "none" || cipher == "null")
+        outbound.inner_cipher = cipher;
+    let morph = as_string(url.query.morph_profile || "");
+    if (morph == "auto" || morph == "adaptive" || morph == "transformer" ||
+        morph == "browsing" || morph == "video" || morph == "webrtc" || morph == "bulk")
+        outbound.morph_profile = morph;
+    if (is_true(url.query.pqc))
+        outbound.pqc = true;
+    let rot_s = int(url.query.rotate_secs || 0);
+    let rot_mb = int(url.query.rotate_mb || 0);
+    if (is_true(url.query.handover) || rot_s > 0 || rot_mb > 0) {
+        let ho = { enabled: true };
+        if (rot_s > 0) ho.rotate_secs = rot_s;
+        if (rot_mb > 0) ho.rotate_mb = rot_mb;
+        outbound.handover = ho;
+    }
+    if (is_true(url.query.fec))
+        outbound.fec = true;
+    if (is_true(url.query.desync))
+        outbound.desync = true;
+    if (is_true(url.query.shaper)) {
+        let sp = as_string(url.query.shaper_profile || "adaptive");
+        let mode = (sp == "fixed" || sp == "off") ? sp : "adaptive";
+        outbound.shaper = { mode };
+    }
+    let mtu = int(url.query.mtu || 0);
+    if (mtu >= 256)
+        outbound.mtu = mtu;
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_trusttunnel(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port))
+        return null;
+
+    let username = "", password = "";
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            password = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "trusttunnel",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port)
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (is_true(url.query.quic))
+        outbound.quic = true;
+    if ((url.query.quic_congestion_control || url.query.cc || "") != "")
+        outbound.quic_congestion_control = url.query.quic_congestion_control || url.query.cc;
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_masque(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let outbound = {
+        type: "masque",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port)
+    };
+    if ((url.query.profile || "") != "")
+        outbound.profile = url.query.profile;
+    if ((url.query.vhttp || "") != "")
+        outbound.vhttp = url.query.vhttp;
+    if ((url.query.private_key || "") != "") {
+        outbound.private_key = url.query.private_key;
+    } else if ((url.userinfo || "") != "" && index(url.userinfo, ":") < 0) {
+        outbound.private_key = url.userinfo;
+    }
+    if ((url.query.public_key || "") != "")
+        outbound.public_key = url.query.public_key;
+    if (outbound.profile == null) {
+        outbound.profile = (outbound.private_key != null && outbound.public_key != null) ? "cloudflare" : "standard";
+    }
+    if ((url.query.ip || "") != "")
+        outbound.ip = url.query.ip;
+    if ((url.query.ipv6 || "") != "")
+        outbound.ipv6 = url.query.ipv6;
+    if ((url.query.uri || "") != "")
+        outbound.uri = url.query.uri;
+    else if (outbound.profile == "standard")
+        outbound.uri = "https://" + (index(url.host, ":") >= 0 ? "[" + url.host + "]" : url.host) + ":" + int(port) + "/.well-known/masque/ip/*/*/";
+    if (is_integer_string(url.query.mtu || ""))
+        outbound.mtu = int(url.query.mtu, 10);
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_openconnect(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let username = "", password = "", cookie = as_string(url.query.cookie || "");
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else if (cookie == "") {
+            cookie = url.userinfo;
+        } else {
+            username = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "openconnect",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port),
+        flavor: as_string(url.query.flavor || "anyconnect")
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (cookie != "")
+        outbound.cookie = cookie;
+    if ((url.query.urlpath || "") != "")
+        outbound.urlpath = url.query.urlpath;
+    if ((url.query.realm || "") != "")
+        outbound.realm = url.query.realm;
+    if ((url.query.region || "") != "")
+        outbound.region = url.query.region;
+    if ((url.query.user_agent || "") != "")
+        outbound.user_agent = url.query.user_agent;
+    if ((url.query.local_hostname || "") != "")
+        outbound.local_hostname = url.query.local_hostname;
+    if ((url.query.server_cert_pin || "") != "")
+        outbound.server_cert_pin = url.query.server_cert_pin;
+    if ((url.query.address || "") != "")
+        outbound.address = split(as_string(url.query.address), "/")[0];
+    if ((url.query.address_v6 || "") != "")
+        outbound.address_v6 = split(as_string(url.query.address_v6), "/")[0];
+    if (is_true(url.query.ip))
+        outbound.ip = true;
+    if (is_true(url.query.esp))
+        outbound.esp = true;
+    if (is_true(url.query.dtls))
+        outbound.dtls = true;
+    if (is_true(url.query.hip_report))
+        outbound.hip_report = true;
+    if (is_integer_string(url.query.mtu || ""))
+        outbound.mtu = as_string(url.query.mtu);
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_sudoku(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port))
+        return null;
+    let key = as_string(url.userinfo || url.query.key || url.query.password || "");
+    if (key == "")
+        return null;
+
+    let outbound = {
+        type: "sudoku",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        key: key
+    };
+    let aead = as_string(url.query.aead || url.query.cipher || url.query.method || "");
+    if (aead != "")
+        outbound.aead_method = aead;
+    if (is_integer_string(url.query.padding_min || ""))
+        outbound.padding_min = int(url.query.padding_min, 10);
+    if (is_integer_string(url.query.padding_max || ""))
+        outbound.padding_max = int(url.query.padding_max, 10);
+    let table_type = as_string(url.query.table_type || url.query.ascii || "");
+    if (table_type != "")
+        outbound.table_type = table_type;
+    if (url.query.enable_pure_downlink != null && url.query.enable_pure_downlink != "")
+        outbound.enable_pure_downlink = is_true(url.query.enable_pure_downlink);
+    if (url.query.http_mask != null && url.query.http_mask != "")
+        outbound.disable_http_mask = !is_true(url.query.http_mask);
+    else if (url.query.disable_http_mask != null && url.query.disable_http_mask != "")
+        outbound.disable_http_mask = is_true(url.query.disable_http_mask);
+    if ((url.query.http_mask_mode || "") != "")
+        outbound.http_mask_mode = url.query.http_mask_mode;
+    if ((url.query.http_mask_host || url.query.host || "") != "")
+        outbound.http_mask_host = url.query.http_mask_host || url.query.host;
+    if ((url.query.path_root || url.query.http_mask_path_root || "") != "")
+        outbound.path_root = url.query.path_root || url.query.http_mask_path_root;
+    if (url.query.http_mask_tls != null && url.query.http_mask_tls != "")
+        outbound.http_mask_tls = is_true(url.query.http_mask_tls);
+    if ((url.query.http_mask_multiplex || url.query.mux || "") != "")
+        outbound.http_mask_multiplex = url.query.http_mask_multiplex || url.query.mux;
+    return outbound;
+}
+
+function process_ssh(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 22;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let user = "root", password = "";
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            let u = substr(url.userinfo, 0, colon);
+            if (u != "")
+                user = u;
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            user = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "ssh",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port),
+        user: user
+    };
+    if (password != "")
+        outbound.password = password;
+    if ((url.query.private_key || "") != "")
+        outbound.private_key = url.query.private_key;
+    if ((url.query.private_key_path || "") != "")
+        outbound.private_key_path = url.query.private_key_path;
+    if ((url.query.private_key_passphrase || url.query.passphrase || "") != "")
+        outbound.private_key_passphrase = url.query.private_key_passphrase || url.query.passphrase;
+    if ((url.query.host_key || "") != "")
+        outbound.host_key = split_csv(url.query.host_key);
+    if ((url.query.host_key_algorithms || "") != "")
+        outbound.host_key_algorithms = split_csv(url.query.host_key_algorithms);
+    if ((url.query.client_version || "") != "")
+        outbound.client_version = url.query.client_version;
+    return outbound;
+}
+
+function process_hysteria1(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port))
+        return null;
+    let outbound = {
+        type: "hysteria",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port)
+    };
+    let auth = as_string(url.query.auth || url.userinfo || "");
+    if (auth != "")
+        outbound.auth_str = auth;
+    let up = parse_hysteria2_mbps(url.query.upmbps || url.query.up || "");
+    if (up != null)
+        outbound.up_mbps = up;
+    let down = parse_hysteria2_mbps(url.query.downmbps || url.query.down || "");
+    if (down != null)
+        outbound.down_mbps = down;
+    let obfs = as_string(url.query.obfsParam || url.query.obfs || "");
+    if (obfs != "" && obfs != "none" && obfs != "plain")
+        outbound.obfs = obfs;
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+let parse_wdtt_via_core_cli;
+
+function split_wdtt_hashes(raw) {
+    let out = [];
+    for (let item in split(as_string(raw), /[,|;+\r\n\t ]+/)) {
+        item = trim(item);
+        if (item == "")
+            continue;
+        let join_idx = rindex(item, "/call/join/");
+        if (join_idx >= 0) {
+            let tail = substr(item, join_idx + 11);
+            let parts = split(tail, /[?#\/]/);
+            item = length(parts) > 0 ? trim(parts[0]) : "";
+        }
+        if (item != "")
+            push(out, item);
+    }
+    return out;
+}
+
+function parse_wdtt_port_val(value) {
+    if (type(value) == "int" || type(value) == "double") {
+        let p = int(value);
+        return (p >= 1 && p <= 65535) ? p : null;
+    }
+    let text = trim(as_string(value));
+    if (text == "" || match(text, /^[0-9]+$/) == null)
+        return null;
+    let p = int(text);
+    return (p >= 1 && p <= 65535) ? p : null;
+}
+
+function parse_wdtt_worker_val(value) {
+    let p = parse_wdtt_port_val(value);
+    return (p != null && p >= 1 && p <= 126) ? p : null;
+}
+
+function strip_brackets(host) {
+    host = trim(as_string(host));
+    if (substr(host, 0, 1) == "[" && substr(host, length(host) - 1) == "]")
+        return substr(host, 1, length(host) - 2);
+    return host;
+}
+
+function parse_csqtt_v2_peer(raw) {
+    let s = trim(as_string(raw));
+    if (s == "")
+        return [ "", null ];
+    if (match(s, /^[0-9]+$/) != null) {
+        let p = parse_wdtt_port_val(s);
+        if (p != null)
+            return [ "", p ];
+    }
+    if (substr(s, 0, 1) == "[") {
+        let end_br = index(s, "]:");
+        if (end_br > 1) {
+            let host = trim(substr(s, 1, end_br - 1));
+            let port = parse_wdtt_port_val(substr(s, end_br + 2));
+            return [ host, port ];
+        }
+        if (substr(s, length(s) - 1) == "]") {
+            let host = trim(substr(s, 1, length(s) - 2));
+            return [ host, null ];
+        }
+    }
+    let last_colon = rindex(s, ":");
+    if (last_colon > 0 && index(substr(s, 0, last_colon), ":") < 0) {
+        let port = parse_wdtt_port_val(substr(s, last_colon + 1));
+        if (port != null)
+            return [ trim(substr(s, 0, last_colon)), port ];
+    }
+    return [ strip_brackets(s), null ];
+}
+
+function parse_csqtt_v2_pairs(query) {
+    query = as_string(query);
+    if (index(query, "&") >= 0) {
+        let pairs = [];
+        for (let part in split(query, "&")) {
+            if (part == "")
+                continue;
+            let eq = index(part, "=");
+            if (eq > 0)
+                push(pairs, [ substr(part, 0, eq), substr(part, eq + 1) ]);
+        }
+        return pairs;
+    }
+
+    const KNOWN_KEYS = [
+        "turn_transport=", "device_id=", "srtp_mode=", "vk_token=",
+        "password=", "streams=", "workers=", "server=", "hashes=",
+        "token=", "hash=", "host=", "peer=", "port=", "pass=",
+        "obfs=", "srtp=", "mode=", "name=", "did=", "ip=", "v="
+    ];
+
+    let spans = [];
+    let qlen = length(query);
+    let i = 0;
+    while (i < qlen) {
+        let matched = null;
+        let rest_lc = lc(substr(query, i, 16));
+        for (let k in KNOWN_KEYS) {
+            if (k == "v=" && i > 0)
+                continue;
+            if (substr(rest_lc, 0, length(k)) == k) {
+                matched = k;
+                break;
+            }
+        }
+        if (matched != null) {
+            push(spans, [ i, i + length(matched) ]);
+            i += length(matched);
+        } else {
+            i += 1;
+        }
+    }
+
+    if (length(spans) == 0) {
+        let eq = index(query, "=");
+        return eq > 0 ? [ [ substr(query, 0, eq), substr(query, eq + 1) ] ] : [];
+    }
+
+    let pairs = [];
+    for (let idx = 0; idx < length(spans); idx++) {
+        let k_start = spans[idx][0];
+        let val_start = spans[idx][1];
+        let val_end = (idx + 1 < length(spans)) ? spans[idx + 1][0] : qlen;
+        let k_name = substr(query, k_start, val_start - k_start - 1);
+        let val = substr(query, val_start, val_end - val_start);
+        push(pairs, [ k_name, val ]);
+    }
+    return pairs;
+}
+
+function parse_csqtt_v2_connect_query(text, frag_tag, raw) {
+    let trimmed = trim(as_string(text));
+    let qpos = index(trimmed, "?");
+    let query = qpos >= 0 ? substr(trimmed, qpos + 1) : trimmed;
+    let params = {};
+    for (let kv in parse_csqtt_v2_pairs(query)) {
+        let k = trim(lc(kv[0]));
+        if (k == "")
+            continue;
+        let v = (k == "hashes" || k == "hash") ? urldecode_raw_plus(kv[1]) : urldecode(kv[1]);
+        params[k] = v;
+    }
+
+    let peer_info = params.peer != null ? parse_csqtt_v2_peer(params.peer) : [ "", null ];
+    let server = strip_brackets(params.host || params.server || params.ip || peer_info[0] || "");
+    if (server == "" || is_dummy_server(server, null))
+        return null;
+
+    let server_port = peer_info[1] || parse_wdtt_port_val(params.port) || 46000;
+    let pass = as_string(params.password || params.pass || "");
+    if (pass == "")
+        return null;
+
+    let mode_lc = trim(lc(as_string(params.mode || "")));
+    let mode = "csqtt";
+    if (mode_lc == "csqtt_v1" || mode_lc == "wg" || mode_lc == "raw")
+        mode = mode_lc;
+    else if (trim(as_string(params.v || "")) == "1")
+        mode = "csqtt_v1";
+
+    let tag = frag_tag != "" ? frag_tag : trim(as_string(params.name || ""));
+    if (tag == "")
+        tag = "csqtt-" + server + ":" + server_port;
+
+    let outbound = {
+        type: "wdtt",
+        tag: tag,
+        share_link: raw,
+        server: server,
+        server_port: server_port,
+        password: pass,
+        mode: mode
+    };
+
+    let did = trim(as_string(params.did || params.device_id || ""));
+    if (did != "")
+        outbound.device_id = did;
+    let obfs = trim(lc(as_string(params.obfs || "")));
+    if (obfs == "audio" || obfs == "video" || obfs == "unified")
+        outbound.obfs = obfs;
+    let srtp = trim(lc(as_string(params.srtp_mode || params.srtp || "")));
+    if (srtp == "auto" || srtp == "dtls" || srtp == "wrap" || srtp == "dtls-srtp" || srtp == "wrap-srtp")
+        outbound.srtp_mode = srtp;
+    let tt = trim(lc(as_string(params.turn_transport || "")));
+    if (tt == "auto" || tt == "tcp" || tt == "udp" || tt == "tcp_tls" || tt == "tls")
+        outbound.turn_transport = tt;
+    let token = trim(as_string(params.token || params.vk_token || ""));
+    if (token != "")
+        outbound.vk_token = token;
+    let h_raw = params.hashes != null ? params.hashes : params.hash;
+    if (h_raw != null) {
+        let hashes = split_wdtt_hashes(h_raw);
+        if (length(hashes) > 0)
+            outbound.hashes = hashes;
+    }
+    let workers = parse_wdtt_worker_val(params.workers || params.streams);
+    if (workers != null)
+        outbound.workers = workers;
+    return outbound;
+}
+
+function process_wdtt(raw) {
+    let trimmed = trim(as_string(raw));
+    let sep = index(trimmed, "://");
+    if (sep <= 0)
+        return null;
+    let scheme = lc(substr(trimmed, 0, sep));
+    let after = substr(trimmed, sep + 3);
+    let hash_pos = index(after, "#");
+    let body = hash_pos >= 0 ? trim(substr(after, 0, hash_pos)) : trim(after);
+    let frag_tag = hash_pos >= 0 ? trim(urldecode_fragment(substr(after, hash_pos + 1))) : "";
+
+    // 0. csqtt:// plaintext connect?v=2 or encrypted csqtt://<b64url>
+    if (scheme == "csqtt") {
+        if (lc(substr(body, 0, 8)) == "connect?")
+            return parse_csqtt_v2_connect_query(body, frag_tag, raw);
+        if (index(body, ":") < 0 && index(body, "?") < 0 && index(body, "@") < 0) {
+            let b64_check = base64_decode(replace(body, /\/+$/, ""));
+            let maybe_json = b64_check != null ? json_decode_text(b64_check) : null;
+            if (type(maybe_json) != "object" && parse_wdtt_via_core_cli != null) {
+                let cli_out = parse_wdtt_via_core_cli(raw);
+                if (type(cli_out) == "object")
+                    return cli_out;
+            }
+        }
+    }
+
+    // 1. qwdtt://config?ip=...&dtls=...&hashes=...&pass=<unencoded_password>
+    // Also accept the legacy wdtt://?peer=host:port&pass=... query form the
+    // old external provider UI exported. Standard wdtt://host:port?... URIs
+    // keep flowing to the regular parser below.
+    let wdtt_qmark = index(body, "?");
+    let wdtt_query_only = scheme == "wdtt" && wdtt_qmark >= 0 &&
+        index(body, "@") < 0 && (index(body, ":") < 0 || index(body, ":") > wdtt_qmark);
+    if (scheme == "qwdtt" || wdtt_query_only) {
+        let qpos = index(body, "?");
+        let query_raw = qpos >= 0 ? substr(body, qpos + 1) : body;
+        let params = {};
+        let head_q = query_raw;
+        let raw_pass = null;
+        let amp_pass = index(query_raw, "&pass=");
+        if (amp_pass >= 0) {
+            head_q = substr(query_raw, 0, amp_pass);
+            raw_pass = substr(query_raw, amp_pass + 6);
+        } else if (substr(query_raw, 0, 5) == "pass=") {
+            head_q = "";
+            raw_pass = substr(query_raw, 5);
+        }
+        for (let pair in split(head_q, "&")) {
+            if (pair == "")
+                continue;
+            let eq = index(pair, "=");
+            let k = eq >= 0 ? trim(lc(substr(pair, 0, eq))) : trim(lc(pair));
+            let v = eq >= 0 ? urldecode(substr(pair, eq + 1)) : "";
+            if (k != "")
+                params[k] = v;
+        }
+        if (raw_pass != null)
+            params.pass = urldecode_raw_plus(raw_pass);
+
+        // Older Tachyon/UI exports used peer=host:port instead of ip + dtls.
+        let server = "";
+        let peer_port = null;
+        let peer_raw = trim(as_string(params.peer || ""));
+        if (peer_raw != "") {
+            if (substr(peer_raw, 0, 1) == "[") {
+                let close = index(peer_raw, "]");
+                if (close > 0) {
+                    server = substr(peer_raw, 1, close - 1);
+                    if (substr(peer_raw, close + 1, 1) == ":")
+                        peer_port = parse_wdtt_port_val(substr(peer_raw, close + 2));
+                }
+            } else {
+                let colon = index(peer_raw, ":");
+                let tail = colon > 0 ? substr(peer_raw, colon + 1) : "";
+                if (tail != "" && match(tail, /^[0-9]+$/)) {
+                    server = substr(peer_raw, 0, colon);
+                    peer_port = parse_wdtt_port_val(tail);
+                } else {
+                    server = peer_raw;
+                }
+            }
+        }
+        if (server == "")
+            server = strip_brackets(params.ip || params.server || params.host || "");
+        let pass = as_string(params.pass || params.password || "");
+        if (server == "" || pass == "" || is_dummy_server(server, null))
+            return null;
+
+        let mode_lc = trim(lc(as_string(params.mode || params.vpn || "")));
+        let mode = (mode_lc == "raw" || mode_lc == "csqtt" || mode_lc == "csqtt_v1") ? mode_lc : "wg";
+        let dtls_port = parse_wdtt_port_val(params.dtls || params.port) || peer_port ||
+            ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000);
+        let raw_port = parse_wdtt_port_val(params.raw);
+        let server_port = (mode == "raw" && raw_port != null) ? raw_port : dtls_port;
+        let tag = frag_tag != "" ? frag_tag : trim(as_string(params.name || ""));
+        if (tag == "")
+            tag = "wdtt-" + server + ":" + server_port;
+
+        let outbound = {
+            type: "wdtt",
+            tag: tag,
+            share_link: raw,
+            server: server,
+            server_port: server_port,
+            password: pass
+        };
+        if (raw_port != null)
+            outbound.raw_port = raw_port;
+        if (mode != "wg")
+            outbound.mode = mode;
+        let obfs = trim(lc(as_string(params.obfs || "")));
+        if (obfs == "audio" || obfs == "video" || obfs == "unified")
+            outbound.obfs = obfs;
+        let srtp = trim(lc(as_string(params.srtp_mode || params.srtp || "")));
+        if (srtp == "auto" || srtp == "dtls" || srtp == "wrap" || srtp == "dtls-srtp" || srtp == "wrap-srtp")
+            outbound.srtp_mode = srtp;
+        let h_raw = params.hashes != null ? params.hashes : params.hash;
+        if (h_raw != null) {
+            let hashes = split_wdtt_hashes(h_raw);
+            if (length(hashes) > 0)
+                outbound.hashes = hashes;
+        }
+        let workers = parse_wdtt_worker_val(params.streams || params.workers);
+        if (workers != null)
+            outbound.workers = workers;
+        return outbound;
+    }
+
+    // 2. Base64 / RawBase64 JSON format: wdtt://eyJ... or csqtt://eyJ...
+    let b64_candidate = replace(body, /\/+$/, "");
+    if (index(b64_candidate, ":") < 0 && index(b64_candidate, "?") < 0 && index(b64_candidate, "@") < 0) {
+        let decoded = base64_decode(b64_candidate);
+        let jmap = decoded != null ? json_decode_text(decoded) : null;
+        if (type(jmap) == "object") {
+            let server = strip_brackets(jmap.ip || jmap.add || jmap.server || "");
+            let pass = as_string(jmap.pass || jmap.id || jmap.password || "");
+            if (server == "" || pass == "" || is_dummy_server(server, null))
+                return null;
+            let raw_mode = trim(lc(as_string(jmap.vpn || jmap.mode || "")));
+            let mode = "wg";
+            if (scheme == "csqtt")
+                mode = raw_mode == "csqtt_v1" ? "csqtt_v1" : "csqtt";
+            else if (raw_mode == "raw" || raw_mode == "csqtt" || raw_mode == "csqtt_v1")
+                mode = raw_mode;
+            let dtls_port = parse_wdtt_port_val(jmap.dtls || jmap.port) ||
+                ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000);
+            let raw_port = parse_wdtt_port_val(jmap.raw);
+            let server_port = (mode == "raw") ? (raw_port || (dtls_port + 3 <= 65535 ? dtls_port + 3 : dtls_port)) : dtls_port;
+            let tag = frag_tag != "" ? frag_tag : trim(as_string(jmap.name || jmap.ps || ""));
+            if (tag == "")
+                tag = "wdtt-" + server + ":" + server_port;
+
+            let outbound = {
+                type: "wdtt",
+                tag: tag,
+                share_link: raw,
+                server: server,
+                server_port: server_port,
+                password: pass
+            };
+            if (raw_port != null)
+                outbound.raw_port = raw_port;
+            if (mode != "wg")
+                outbound.mode = mode;
+            let did = trim(as_string(jmap.did || jmap.device_id || ""));
+            if (did != "")
+                outbound.device_id = did;
+            let obfs = trim(lc(as_string(jmap.obfs || "")));
+            if (obfs == "audio" || obfs == "video" || obfs == "unified")
+                outbound.obfs = obfs;
+            let srtp = trim(lc(as_string(jmap.srtp_mode || jmap.srtp || "")));
+            if (srtp == "auto" || srtp == "dtls" || srtp == "wrap" || srtp == "dtls-srtp" || srtp == "wrap-srtp")
+                outbound.srtp_mode = srtp;
+            let workers = parse_wdtt_worker_val(jmap.workers || jmap.streams);
+            if (workers != null)
+                outbound.workers = workers;
+            let h_val = jmap.hash != null ? jmap.hash : jmap.hashes;
+            if (type(h_val) == "string") {
+                let hashes = split_wdtt_hashes(h_val);
+                if (length(hashes) > 0)
+                    outbound.hashes = hashes;
+            } else if (type(h_val) == "array") {
+                let hashes = [];
+                for (let item in h_val) {
+                    if (type(item) == "string") {
+                        for (let h in split_wdtt_hashes(item))
+                            push(hashes, h);
+                    }
+                }
+                if (length(hashes) > 0)
+                    outbound.hashes = hashes;
+            }
+            return outbound;
+        }
+    }
+
+    // 3. Colon format: wdtt://host:dtls_port:wg_port:local_port:pass:hash1,hash2#remark
+    if (index(body, "?") < 0 && index(body, "@") < 0) {
+        let host_part = "";
+        let tail = "";
+        if (substr(body, 0, 1) == "[") {
+            let end_br = index(body, "]:");
+            if (end_br > 1) {
+                host_part = trim(substr(body, 1, end_br - 1));
+                tail = substr(body, end_br + 2);
+            }
+        } else {
+            let cpos = index(body, ":");
+            if (cpos > 0) {
+                host_part = trim(substr(body, 0, cpos));
+                tail = substr(body, cpos + 1);
+            }
+        }
+        if (host_part != "" && tail != "") {
+            let parts = split(tail, ":", 5);
+            let dtls_port = length(parts) == 5 ? parse_wdtt_port_val(parts[0]) : null;
+            if (dtls_port != null && !is_dummy_server(host_part, dtls_port)) {
+                let wg_port = parse_wdtt_port_val(parts[1]);
+                let local_port = parse_wdtt_port_val(parts[2]);
+                let pass = urldecode_raw_plus(trim(parts[3]));
+                if (pass == "")
+                    return null;
+                let hashes = split_wdtt_hashes(urldecode_raw_plus(trim(parts[4])));
+                let tag = frag_tag != "" ? frag_tag : ("wdtt-" + host_part + ":" + dtls_port);
+                let outbound = {
+                    type: "wdtt",
+                    tag: tag,
+                    share_link: raw,
+                    server: host_part,
+                    server_port: dtls_port,
+                    password: pass
+                };
+                if (wg_port != null)
+                    outbound.wg_port = wg_port;
+                if (local_port != null)
+                    outbound.local_port = local_port;
+                if (scheme == "csqtt")
+                    outbound.mode = "csqtt";
+                if (length(hashes) > 0)
+                    outbound.hashes = hashes;
+                return outbound;
+            }
+        }
+    }
+
+    // 4. Standard query URI: wdtt://[pass@]host[:port]?pass=...&hashes=...&mode=...#remark
+    let url = parse_url(trimmed);
+    if (!url || url.host == "")
+        return null;
+    let default_port = (scheme == "csqtt") ? 46000 : 56000;
+    let port = parse_wdtt_port_val(url.port) || default_port;
+    if (is_dummy_server(url.host, port))
+        return null;
+    let pass = url.userinfo != "" ? url.userinfo : as_string(url.query.pass || url.query.password || url.query.id || "");
+    if (pass == "")
+        return null;
+    let raw_mode = trim(lc(as_string(url.query.mode || url.query.vpn || "")));
+    let mode = "wg";
+    if (scheme == "csqtt")
+        mode = raw_mode == "csqtt_v1" ? "csqtt_v1" : "csqtt";
+    else if (raw_mode == "raw" || raw_mode == "csqtt" || raw_mode == "csqtt_v1")
+        mode = raw_mode;
+    let tag = frag_tag != "" ? frag_tag : trim(as_string(url.query.name || url.query.ps || ""));
+    if (tag == "")
+        tag = "wdtt-" + url.host + ":" + port;
+
+    let outbound = {
+        type: "wdtt",
+        tag: tag,
+        share_link: raw,
+        server: strip_brackets(url.host),
+        server_port: port,
+        password: pass
+    };
+    let raw_port = parse_wdtt_port_val(url.query.raw_port || url.query.raw);
+    if (raw_port != null)
+        outbound.raw_port = raw_port;
+    if (mode != "wg")
+        outbound.mode = mode;
+    let obfs = trim(lc(as_string(url.query.obfs || "")));
+    if (obfs == "audio" || obfs == "video" || obfs == "unified")
+        outbound.obfs = obfs;
+    let srtp = trim(lc(as_string(url.query.srtp_mode || url.query.srtp || "")));
+    if (srtp == "auto" || srtp == "dtls" || srtp == "wrap" || srtp == "dtls-srtp" || srtp == "wrap-srtp")
+        outbound.srtp_mode = srtp;
+    let token = trim(as_string(url.query.token || url.query.vk_token || ""));
+    if (token != "")
+        outbound.vk_token = token;
+    let did = trim(as_string(url.query.did || url.query.device_id || ""));
+    if (did != "")
+        outbound.device_id = did;
+    let h_raw = url.query.hashes != null ? url.query.hashes : url.query.hash;
+    if (h_raw != null) {
+        let hashes = split_wdtt_hashes(h_raw);
+        if (length(hashes) > 0)
+            outbound.hashes = hashes;
+    }
+    let workers = parse_wdtt_worker_val(url.query.workers || url.query.streams);
+    if (workers != null)
+        outbound.workers = workers;
+    return outbound;
+}
+
+let parse_amnezia_vpn_container;
+
 function parse_share_link(line) {
-    if (starts_with(line, "vpn://"))
-        return wireguard.from_vpn(line);
+    if (starts_with(line, "vpn://")) {
+        let wg_out = wireguard.from_vpn(line);
+        if (wg_out != null)
+            return wg_out;
+        return parse_amnezia_vpn_container ? parse_amnezia_vpn_container(line) : null;
+    }
+    if (starts_with(line, "amneziawg://") || starts_with(line, "awg://") ||
+        starts_with(line, "wireguard://") || starts_with(line, "wg://"))
+        return from_amneziawg_share_link(line);
     if (starts_with(line, "vmess://"))
         return process_vmess(line);
     if (starts_with(line, "ss://"))
         return process_shadowsocks(line);
-    if (starts_with(line, "fptn:") || starts_with(line, "fptnb:") || starts_with(line, "fptn://") || starts_with(line, "fptnb://"))
-        return { type: "fptn", token: line, share_link: line };
+    if (starts_with(line, "fptn:") || starts_with(line, "fptnb:") || starts_with(line, "fptn://") || starts_with(line, "fptnb://")) {
+        let hash_pos = index(line, "#");
+        let clean_token = hash_pos >= 0 ? substr(line, 0, hash_pos) : line;
+        let frag = hash_pos >= 0 ? urldecode_fragment(substr(line, hash_pos + 1)) : "";
+        let res = { type: "fptn", token: clean_token, share_link: line };
+        if (frag != "")
+            res.tag = frag;
+        return res;
+    }
+    if (starts_with(lc(line), "csqtt://") || starts_with(lc(line), "wdtt://") || starts_with(lc(line), "qwdtt://"))
+        return process_wdtt(line);
 
     let url = parse_url(line);
     if (!url)
@@ -1428,16 +3240,46 @@ function parse_share_link(line) {
 
     if (url.scheme == "vless")
         return process_vless(line, url);
-    if (url.scheme == "trojan")
+    if (url.scheme == "trojan" || url.scheme == "trojan-go")
         return process_trojan(line, url);
     if (url.scheme == "hysteria2" || url.scheme == "hy2")
         return process_hysteria2(line, url);
-    if (url.scheme == "tuic")
+    if (url.scheme == "hysteria" || url.scheme == "hy")
+        return process_hysteria1(line, url);
+    if (url.scheme == "tuic" || url.scheme == "tuic5")
         return process_tuic(line, url);
+    if (url.scheme == "anytls")
+        return process_anytls(line, url);
+    if (url.scheme == "naive" || url.scheme == "naive+https" || url.scheme == "naive+http2" ||
+        url.scheme == "naive+h2" || url.scheme == "naive+quic" || url.scheme == "naive+h3")
+        return process_naive(line, url);
+    if (url.scheme == "snell")
+        return process_snell(line, url);
+    if (url.scheme == "mieru" || url.scheme == "mierus")
+        return process_mieru(line, url);
+    if (url.scheme == "tg" || url.scheme == "mtproto")
+        return process_mtproto(line, url);
+    if (url.scheme == "shadowtls" || url.scheme == "stls")
+        return process_shadowtls(line, url);
+    if (url.scheme == "sudoku")
+        return process_sudoku(line, url);
+    if (url.scheme == "ssh")
+        return process_ssh(line, url);
+    if (url.scheme == "tewfai")
+        return process_tewfai(line, url);
+    if (url.scheme == "trusttunnel")
+        return process_trusttunnel(line, url);
+    if (url.scheme == "masque")
+        return process_masque(line, url);
+    if (url.scheme == "openconnect" || url.scheme == "anyconnect")
+        return process_openconnect(line, url);
     if (match(url.scheme, /^socks/))
         return process_socks(line, url);
-    if (url.scheme == "http" || url.scheme == "https")
+    if (url.scheme == "http" || url.scheme == "https") {
+        if ((url.host == "t.me" || url.host == "telegram.me") && (url.query.secret || "") != "" && (url.query.server || "") != "")
+            return process_mtproto(line, url);
         return process_http(line, url);
+    }
     return null;
 }
 
@@ -1559,7 +3401,8 @@ function empty_clash_record() {
         fields: {},
         keys: [],
         context: "",
-        context_indent: -1
+        context_indent: -1,
+        context_stack: []
     };
 }
 
@@ -1582,10 +3425,26 @@ function emit_clash_record(records, record) {
 
 let clash_nested_keys = {
     "ws-opts": true,
+    "httpupgrade-opts": true,
     "grpc-opts": true,
+    "h2-opts": true,
+    "http-opts": true,
+    "xhttp-opts": true,
+    "splithttp-opts": true,
     "reality-opts": true,
     "obfs-opts": true,
-    headers: true
+    "plugin-opts": true,
+    "amnezia-wg-option": true,
+    "amnezia_wg_option": true,
+    "amnezia-wg-opts": true,
+    "amnezia_wg_opts": true,
+    ports: true,
+    "port-range": true,
+    server_ports: true,
+    alpn: true,
+    headers: true,
+    extra: true,
+    xmux: true
 };
 
 function parse_clash_block_line(record, line) {
@@ -1601,18 +3460,24 @@ function parse_clash_block_line(record, line) {
     let key = clean_scalar(substr(text, 0, colon));
     let value = trim(substr(text, colon + 1));
 
-    if (record.context != "" && indent <= record.context_indent) {
+    while (length(record.context_stack) > 0 && indent <= record.context_stack[length(record.context_stack) - 1][0]) {
+        pop(record.context_stack);
+    }
+    if (length(record.context_stack) > 0) {
+        let top = record.context_stack[length(record.context_stack) - 1];
+        record.context_indent = top[0];
+        record.context = top[1];
+    } else {
         record.context = "";
         record.context_indent = -1;
     }
 
     if (value == "") {
         if (clash_nested_keys[key]) {
-            if (record.context != "" && indent > record.context_indent)
-                record.context = record.context + "." + key;
-            else
-                record.context = key;
+            let next_ctx = (record.context != "" && indent > record.context_indent) ? (record.context + "." + key) : key;
+            record.context = next_ctx;
             record.context_indent = indent;
+            push(record.context_stack, [ indent, next_ctx ]);
         }
         return;
     }
@@ -1658,6 +3523,16 @@ function clash_yaml_records(input_file) {
                 parse_clash_map(record, map_value, "");
                 record = emit_clash_record(records, record);
             }
+            else if (clash_record_has_fields(record) && record.context != "" && match(line, /^[ \t]*-[ \t]*/) &&
+                     (leading_indent(line) > record.context_indent ||
+                      (leading_indent(line) == record.context_indent &&
+                       find_top_level_colon(replace(line, /^[ \t]*-[ \t]*/g, "")) == null))) {
+                let item_val = clean_scalar(replace(line, /^[ \t]*-[ \t]*/g, ""));
+                if (item_val != "") {
+                    let prev_val = as_string(record.fields[record.context] || "");
+                    set_record_field(record, record.context, prev_val != "" ? (prev_val + "," + item_val) : item_val);
+                }
+            }
             else if (match(line, /^[ \t]*-[ \t]*/)) {
                 record = emit_clash_record(records, record);
                 record = empty_clash_record();
@@ -1676,7 +3551,7 @@ function clash_yaml_records(input_file) {
 }
 
 function clash_vless_flow_supported(flow) {
-    return flow == null || flow == "" || flow == "xtls-rprx-vision";
+    return normalize_vless_flow(flow) != null;
 }
 
 function normalized_clash_alpn(value) {
@@ -1684,8 +3559,9 @@ function normalized_clash_alpn(value) {
 }
 
 function add_clash_tls(outbound, options) {
+    let raw_alpn = split_csv(options.alpn);
     let enabled = options.always || is_true(options.tls) || options.sni != "" ||
-        length(tls_alpn_for_transport(split_csv(options.alpn), options.network)) > 0 ||
+        length(raw_alpn) > 0 ||
         options.fingerprint != "" || options.reality_public_key != "";
     if (!enabled)
         return;
@@ -1695,7 +3571,7 @@ function add_clash_tls(outbound, options) {
         tls.server_name = options.sni;
     if (is_true(options.skip_verify))
         tls.insecure = true;
-    let alpn = tls_alpn_for_transport(split_csv(options.alpn), options.network);
+    let alpn = tls_alpn_for_transport(raw_alpn, options.network);
     if (length(alpn) > 0)
         tls.alpn = alpn;
 
@@ -1707,6 +3583,8 @@ function add_clash_tls(outbound, options) {
         tls.reality = { enabled: true, public_key: options.reality_public_key };
         if (options.reality_short_id != "")
             tls.reality.short_id = options.reality_short_id;
+        if (options.reality_support_mlkem != null && options.reality_support_mlkem != "")
+            tls.reality.support_x25519mlkem768 = is_true(options.reality_support_mlkem);
     }
     else if (options.fingerprint != "") {
         tls.utls = { enabled: true, fingerprint: options.fingerprint };
@@ -1715,7 +3593,7 @@ function add_clash_tls(outbound, options) {
     outbound.tls = tls;
 }
 
-function add_clash_transport(outbound, options) {
+function add_clash_transport(outbound, options, record) {
     if (options.network == "ws") {
         outbound.transport = {
             type: "ws",
@@ -1723,11 +3601,61 @@ function add_clash_transport(outbound, options) {
         };
         if (options.ws_host != "")
             outbound.transport.headers = { Host: options.ws_host };
+        if (record != null) {
+            let ed = as_string(record["ws-opts.max-early-data"] || "");
+            if (is_integer_string(ed) && int(ed, 10) > 0)
+                outbound.transport.max_early_data = int(ed, 10);
+            let eh = as_string(record["ws-opts.early-data-header-name"] || "");
+            if (eh != "")
+                outbound.transport.early_data_header_name = eh;
+        }
     }
     else if (options.network == "grpc") {
         outbound.transport = { type: "grpc" };
         if (options.grpc_service_name != "")
             outbound.transport.service_name = options.grpc_service_name;
+    }
+    else if (options.network == "httpupgrade") {
+        let tr = { type: "httpupgrade" };
+        let path = record != null ? as_string(record["httpupgrade-opts.path"] || options.ws_path || "") : options.ws_path;
+        let host = record != null ? as_string(record["httpupgrade-opts.host"] || record["httpupgrade-opts.headers.Host"] || options.ws_host || "") : options.ws_host;
+        if (path != "")
+            tr.path = path;
+        if (host != "")
+            tr.host = host;
+        outbound.transport = tr;
+    }
+    else if (options.network == "h2" || options.network == "http") {
+        let tr = { type: "http" };
+        if (record != null) {
+            let path = clean_scalar(as_string(record["h2-opts.path"] || record["http-opts.path"] || ""));
+            if (substr(path, 0, 1) == "[" && substr(path, length(path) - 1) == "]") {
+                let parts = split_csv(normalized_clash_alpn(path));
+                path = length(parts) > 0 ? parts[0] : "";
+            }
+            if (path != "")
+                tr.path = path;
+            let host_raw = normalized_clash_alpn(record["h2-opts.host"] || record["http-opts.host"] || "");
+            let hosts = split_csv(host_raw);
+            if (length(hosts) > 0)
+                tr.host = hosts;
+        }
+        outbound.transport = tr;
+    }
+    else if (options.network == "xhttp" || options.network == "splithttp") {
+        let tr = { type: "xhttp" };
+        if (record != null) {
+            let path = as_string(record["xhttp-opts.path"] || record["splithttp-opts.path"] || "");
+            let host = as_string(record["xhttp-opts.host"] || record["splithttp-opts.host"] || "");
+            let mode = as_string(record["xhttp-opts.mode"] || record["splithttp-opts.mode"] || "");
+            if (path != "")
+                tr.path = path;
+            if (host != "")
+                tr.host = host;
+            if (mode != "")
+                tr.mode = mode;
+        }
+        outbound.transport = tr;
     }
 }
 
@@ -1736,9 +3664,15 @@ function parse_clash_record(record) {
     let name = as_string(record.name);
     let server = as_string(record.server);
     let port = int(record.port || 0);
-    if (name == "")
-        name = server + ":" + as_string(record.port);
-    if (proxy_type == "" || server == "" || is_dummy_server(server, port) || !valid_port(port))
+    let raw_mieru_ports = as_string(record["port-range"] || record.port_range || record.ports || record.server_ports || "");
+    let has_mieru_ports = proxy_type == "mieru" && trim(raw_mieru_ports) != "";
+    if (name == "") {
+        let port_label = valid_port(port) ? as_string(record.port) : trim(raw_mieru_ports);
+        name = port_label != "" ? (server + ":" + port_label) : server;
+    }
+    if (proxy_type == "" || server == "" ||
+        is_dummy_server(server, (has_mieru_ports && !valid_port(port)) ? null : port) ||
+        (!valid_port(port) && !has_mieru_ports))
         return null;
 
     let options = {
@@ -1751,6 +3685,9 @@ function parse_clash_record(record) {
         grpc_service_name: as_string(record["grpc-opts.grpc-service-name"]),
         reality_public_key: as_string(record["reality-opts.public-key"]),
         reality_short_id: as_string(record["reality-opts.short-id"]),
+        reality_support_mlkem: record["reality-opts.support_x25519mlkem768"] != null ? as_string(record["reality-opts.support_x25519mlkem768"]) :
+            (record["reality-opts.supportX25519MLKEM768"] != null ? as_string(record["reality-opts.supportX25519MLKEM768"]) :
+            (record["reality-opts.support-x25519mlkem768"] != null ? as_string(record["reality-opts.support-x25519mlkem768"]) : "")),
         alpn: normalized_clash_alpn(record.alpn || ""),
         fingerprint: normalize_utls_fingerprint(as_string(record["client-fingerprint"] || record.fingerprint))
     };
@@ -1783,15 +3720,15 @@ function parse_clash_record(record) {
         if (packet_encoding != "")
             outbound.packet_encoding = packet_encoding;
         add_clash_tls(outbound, options);
-        add_clash_transport(outbound, options);
+        add_clash_transport(outbound, options, record);
         return outbound;
     }
     if (proxy_type == "vless") {
         let uuid = as_string(record.uuid);
-        let flow = as_string(record.flow);
+        let flow = normalize_vless_flow(record.flow);
         let packet_encoding = normalize_packet_encoding(record["packet-encoding"] || record.packetEncoding || record.packet_encoding || record.packetencoding || "");
         let encryption = normalize_vless_encryption(record.encryption || "");
-        if (uuid == "" || !clash_vless_flow_supported(flow))
+        if (uuid == "" || flow == null)
             return null;
         let outbound = { type: "vless", tag: name, server: server, server_port: port, uuid: uuid };
         if (encryption != "")
@@ -1801,7 +3738,7 @@ function parse_clash_record(record) {
         if (packet_encoding != "")
             outbound.packet_encoding = packet_encoding;
         add_clash_tls(outbound, options);
-        add_clash_transport(outbound, options);
+        add_clash_transport(outbound, options, record);
         return outbound;
     }
     if (proxy_type == "trojan") {
@@ -1811,32 +3748,81 @@ function parse_clash_record(record) {
         let outbound = { type: "trojan", tag: name, server: server, server_port: port, password: password };
         options.always = true;
         add_clash_tls(outbound, options);
-        add_clash_transport(outbound, options);
+        add_clash_transport(outbound, options, record);
         return outbound;
     }
     if (proxy_type == "hysteria2" || proxy_type == "hy2") {
-        let password = as_string(record.password);
+        let password = as_string(record.password || record.auth || "");
         if (password == "")
             return null;
         let outbound = { type: "hysteria2", tag: name, server: server, server_port: port, password: password, tls: { enabled: true } };
         if (options.sni != "")
             outbound.tls.server_name = options.sni;
+        else
+            outbound.tls.server_name = server;
         if (is_true(options.skip_verify))
             outbound.tls.insecure = true;
         if (options.alpn != "")
             outbound.tls.alpn = split_csv(options.alpn);
-        let obfs = as_string(record.obfs);
-        let obfs_password = as_string(record["obfs-password"] || record["obfs-opts.password"]);
+        let obfs = lc(trim(as_string(record.obfs || "")));
+        let obfs_password = as_string(record["obfs-password"] || record.obfs_password || record["obfs-opts.password"] || "");
         if (obfs != "" && obfs != "none") {
-            outbound.obfs = { type: obfs };
-            if (obfs_password != "")
-                outbound.obfs.password = obfs_password;
+            let min_ps = xhttp_positive_integer_value(record["min-packet-size"] || record.min_packet_size) || 0;
+            let max_ps = xhttp_positive_integer_value(record["max-packet-size"] || record.max_packet_size) || 0;
+            let ps_pair = parse_hysteria2_packet_size_value(record["packet-size"] || record.packet_size || record.packetSize);
+            if (ps_pair != null) {
+                if (min_ps <= 0) min_ps = ps_pair[0];
+                if (max_ps <= 0) max_ps = ps_pair[1];
+            }
+            if (obfs == "gecko" || min_ps > 0 || max_ps > 0)
+                outbound.obfs = build_hysteria2_obfs(true, obfs_password, min_ps, max_ps);
+            else {
+                outbound.obfs = { type: obfs };
+                if (obfs_password != "")
+                    outbound.obfs.password = obfs_password;
+            }
         }
+        let sp = parse_hysteria2_server_ports(as_string(record.ports || record.mport || ""));
+        if (sp != null)
+            outbound.server_ports = sp;
+        let hi = normalize_hysteria2_hop_interval(record["hop-interval"] || record.hop_interval);
+        if (hi != "")
+            outbound.hop_interval = hi;
+        let up = parse_hysteria2_mbps(record.up);
+        if (up != null)
+            outbound.up_mbps = up;
+        let down = parse_hysteria2_mbps(record.down);
+        if (down != null)
+            outbound.down_mbps = down;
+        return outbound;
+    }
+    if (proxy_type == "hysteria" || proxy_type == "hy") {
+        let outbound = { type: "hysteria", tag: name, server: server, server_port: port, tls: { enabled: true } };
+        if (options.sni != "")
+            outbound.tls.server_name = options.sni;
+        else
+            outbound.tls.server_name = server;
+        if (is_true(options.skip_verify))
+            outbound.tls.insecure = true;
+        if (options.alpn != "")
+            outbound.tls.alpn = split_csv(options.alpn);
+        let auth_str = as_string(record["auth-str"] || record.auth_str || record.auth || "");
+        if (auth_str != "")
+            outbound.auth_str = auth_str;
+        let obfs = as_string(record.obfs || "");
+        if (obfs != "")
+            outbound.obfs = obfs;
+        let up = parse_hysteria2_mbps(record.up);
+        if (up != null)
+            outbound.up_mbps = up;
+        let down = parse_hysteria2_mbps(record.down);
+        if (down != null)
+            outbound.down_mbps = down;
         return outbound;
     }
     if (proxy_type == "tuic") {
-        let uuid = as_string(record.uuid || "");
-        let password = as_string(record.password || "");
+        let uuid = as_string(record.uuid || record.token || "");
+        let password = as_string(record.password || record.token || "");
         if (uuid == "")
             return null;
         let outbound = { type: "tuic", tag: name, server: server, server_port: port, uuid: uuid, tls: { enabled: true } };
@@ -1844,18 +3830,95 @@ function parse_clash_record(record) {
             outbound.password = password;
         if (options.sni != "")
             outbound.tls.server_name = options.sni;
+        else
+            outbound.tls.server_name = server;
         if (is_true(options.skip_verify) || is_true(record["skip-cert-verify"]))
             outbound.tls.insecure = true;
         if (options.alpn != "")
             outbound.tls.alpn = split_csv(options.alpn);
-        let cc = as_string(record["congestion-control"] || record.congestion_control || "");
+        let cc = as_string(record["congestion-controller"] || record["congestion-control"] || record.congestion_control || "");
         if (cc != "")
             outbound.congestion_control = cc;
         let udp_mode = as_string(record["udp-relay-mode"] || record.udp_relay_mode || "");
         if (udp_mode != "")
             outbound.udp_relay_mode = udp_mode;
-        if (is_true(record["zero-rtt-握手"]) || is_true(record["zero_rtt_handshake"]))
+        if (is_true(record["reduce-rtt"]) || is_true(record["fast-open"]) || is_true(record["zero-rtt-握手"]) || is_true(record["zero_rtt_handshake"]))
             outbound.zero_rtt_handshake = true;
+        return outbound;
+    }
+    if (proxy_type == "wireguard" || proxy_type == "amneziawg" || proxy_type == "awg") {
+        let priv_key = trim(as_string(record["private-key"] || record.private_key || ""));
+        let pub_key = trim(as_string(record["public-key"] || record.public_key || ""));
+        if (priv_key == "" || pub_key == "")
+            return null;
+        let addrs = [];
+        for (let raw_ip in [ as_string(record.ip || ""), as_string(record.ipv6 || "") ]) {
+            if (trim(raw_ip) == "")
+                continue;
+            for (let part in split(raw_ip, ",")) {
+                part = trim(part);
+                if (part == "")
+                    continue;
+                if (index(part, "/") < 0)
+                    part = part + (index(part, ":") >= 0 ? "/128" : "/32");
+                push(addrs, part);
+            }
+        }
+        if (length(addrs) == 0)
+            push(addrs, "10.0.0.2/32");
+        let peer = {
+            address: server,
+            port: port,
+            public_key: pub_key,
+            allowed_ips: [ "0.0.0.0/0", "::/0" ]
+        };
+        let outbound = {
+            type: "wireguard",
+            tag: name,
+            server: server,
+            server_port: port,
+            private_key: priv_key,
+            peer_public_key: pub_key,
+            local_address: addrs,
+            address: addrs,
+            peers: [ peer ]
+        };
+        let psk = trim(as_string(record["pre-shared-key"] || record["preshared-key"] || record.pre_shared_key || ""));
+        if (psk != "") {
+            outbound.pre_shared_key = psk;
+            peer.pre_shared_key = psk;
+        }
+        let mtu_s = trim(as_string(record.mtu || ""));
+        if (is_integer_string(mtu_s) && int(mtu_s, 10) > 0)
+            outbound.mtu = int(mtu_s, 10);
+        let prefixes = [ "amnezia-wg-option.", "amnezia_wg_option.", "amnezia-wg-opts.", "amnezia_wg_opts.", "" ];
+        for (let ik in [ "jc", "jmin", "jmax", "s1", "s2", "s3", "s4" ]) {
+            for (let pref in prefixes) {
+                let v = trim(as_string(record[pref + ik] || ""));
+                if (is_integer_string(v)) {
+                    outbound[ik] = int(v, 10);
+                    break;
+                }
+            }
+        }
+        for (let hk in [ "h1", "h2", "h3", "h4" ]) {
+            for (let pref in prefixes) {
+                let v = trim(as_string(record[pref + hk] || ""));
+                if (v != "") {
+                    outbound[hk] = is_integer_string(v) ? int(v, 10) : v;
+                    break;
+                }
+            }
+        }
+        for (let sk in [ "i1", "i2", "i3", "i4", "i5" ]) {
+            for (let pref in prefixes) {
+                let v = trim(as_string(record[pref + sk] || ""));
+                if (v != "") {
+                    outbound[sk] = v;
+                    break;
+                }
+            }
+        }
         return outbound;
     }
     if (proxy_type == "socks5" || proxy_type == "socks") {
@@ -1874,6 +3937,288 @@ function parse_clash_record(record) {
             outbound.password = as_string(record.password);
         if (proxy_type == "https" || is_true(record.tls))
             outbound.tls = { enabled: true };
+        return outbound;
+    }
+    if (proxy_type == "anytls") {
+        let password = as_string(record.password);
+        if (password == "")
+            return null;
+        let outbound = { type: "anytls", tag: name, server: server, server_port: port, password: password };
+        if (is_integer_string(as_string(record["min-idle-session"] || record.min_idle_session || "")))
+            outbound.min_idle_session = int(record["min-idle-session"] || record.min_idle_session, 10);
+        if (as_string(record["idle-session-check-interval"] || record.idle_session_check_interval || "") != "")
+            outbound.idle_session_check_interval = as_string(record["idle-session-check-interval"] || record.idle_session_check_interval);
+        if (as_string(record["idle-session-timeout"] || record.idle_session_timeout || "") != "")
+            outbound.idle_session_timeout = as_string(record["idle-session-timeout"] || record.idle_session_timeout);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "snell") {
+        let psk = as_string(record.psk || record.password || "");
+        if (psk == "")
+            return null;
+        let version = int(record.version || 5);
+        if (version < 1 || version > 6)
+            version = 5;
+        let outbound = { type: "snell", tag: name, server: server, server_port: port, psk: psk, version: version };
+        let obfs_mode = lc(as_string(record["obfs-opts.mode"] || record.obfs || ""));
+        if (obfs_mode == "http" || obfs_mode == "tls") {
+            outbound.obfs = { mode: obfs_mode };
+            let obfs_host = as_string(record["obfs-opts.host"] || record["obfs-host"] || "");
+            if (obfs_host != "")
+                outbound.obfs.host = obfs_host;
+        }
+        if (is_true(record.uot) || is_true(record.udp_over_tcp) || is_true(record["udp-over-tcp"]))
+            outbound.udp_over_tcp = true;
+        if (is_true(record.reuse))
+            outbound.reuse = true;
+        return outbound;
+    }
+    if (proxy_type == "mieru") {
+        let username = as_string(record.username || "");
+        let password = as_string(record.password || "");
+        if (username == "" || password == "")
+            return null;
+        let mieru_specs = [];
+        let mieru_seen = {};
+        let has_explicit_range = (record["port-range"] != null || record.port_range != null || record.ports != null || record.server_ports != null) && raw_mieru_ports != "";
+        let has_range_spec = raw_mieru_ports != "" ? parse_mieru_port_specs_into(raw_mieru_ports, mieru_specs, mieru_seen) : false;
+        let outbound_port = valid_port(port) ? port : null;
+        let outbound_ports = [];
+        if (length(mieru_specs) > 0) {
+            if (outbound_port == null && length(mieru_specs) == 1 && !has_range_spec && !has_explicit_range && match(mieru_specs[0], /^[0-9]+$/) != null)
+                outbound_port = int(mieru_specs[0], 10);
+            else
+                outbound_ports = mieru_specs;
+        }
+        if (outbound_port == null && length(outbound_ports) == 0)
+            return null;
+        let transport = uc(trim(as_string(record.transport || record.protocol || "TCP")));
+        if (transport != "UDP")
+            transport = "TCP";
+        let outbound = {
+            type: "mieru",
+            tag: name,
+            server: server,
+            username: username,
+            password: password,
+            transport: transport
+        };
+        if (length(outbound_ports) > 0)
+            outbound.server_ports = outbound_ports;
+        if (outbound_port != null)
+            outbound.server_port = outbound_port;
+        if (as_string(record.multiplexing || "") != "")
+            outbound.multiplexing = trim(as_string(record.multiplexing));
+        let handshake_mode = trim(as_string(record["handshake-mode"] || record.handshake_mode || ""));
+        if (handshake_mode != "")
+            outbound.handshake_mode = handshake_mode;
+        let traffic_pattern = trim(as_string(record["traffic-pattern"] || record.traffic_pattern || ""));
+        if (traffic_pattern != "")
+            outbound.traffic_pattern = traffic_pattern;
+        return outbound;
+    }
+    if (proxy_type == "shadow-tls" || proxy_type == "shadowtls") {
+        let password = as_string(record.password || "");
+        if (password == "")
+            return null;
+        let version = int(record.version || 3);
+        if (version < 1 || version > 3)
+            version = 3;
+        let outbound = {
+            type: "shadowtls",
+            tag: name,
+            server: server,
+            server_port: port,
+            version: version,
+            password: password
+        };
+        options.always = true;
+        if (options.sni == "" && as_string(record.host || "") != "")
+            options.sni = as_string(record.host);
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "mtproto" || proxy_type == "tg") {
+        let secret = as_string(record.secret || record.password || "");
+        if (secret == "")
+            return null;
+        let outbound = {
+            type: "mtproto",
+            tag: name,
+            server: server,
+            server_port: port,
+            secret: secret
+        };
+        if (as_string(record.transport || "") != "")
+            outbound.transport = lc(as_string(record.transport));
+        if (options.sni != "")
+            outbound.tls = { enabled: true, server_name: options.sni };
+        return outbound;
+    }
+    if (proxy_type == "tewfai") {
+        let uuid = as_string(record.uuid || "");
+        if (uuid == "")
+            return null;
+        let outbound = {
+            type: "tewfai",
+            tag: name,
+            server: server,
+            server_port: port,
+            uuid: uuid
+        };
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (as_string(record.transport || "") != "")
+            outbound.transport = split_csv(as_string(record.transport));
+        if (as_string(record["inner-cipher"] || record.inner_cipher || "") != "")
+            outbound.inner_cipher = as_string(record["inner-cipher"] || record.inner_cipher);
+        if (as_string(record["morph-profile"] || record.morph_profile || "") != "")
+            outbound.morph_profile = as_string(record["morph-profile"] || record.morph_profile);
+        if (is_true(record.pqc))
+            outbound.pqc = true;
+        if (is_true(record.fec))
+            outbound.fec = true;
+        if (is_true(record.desync))
+            outbound.desync = true;
+        if (is_true(record.handover))
+            outbound.handover = { enabled: true };
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "trusttunnel") {
+        let outbound = {
+            type: "trusttunnel",
+            tag: name,
+            server: server,
+            server_port: port
+        };
+        if (as_string(record.username || "") != "")
+            outbound.username = as_string(record.username);
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (is_true(record.quic))
+            outbound.quic = true;
+        if (as_string(record["congestion-control"] || record.quic_congestion_control || "") != "")
+            outbound.quic_congestion_control = as_string(record["congestion-control"] || record.quic_congestion_control);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "masque") {
+        let outbound = {
+            type: "masque",
+            tag: name,
+            server: server,
+            server_port: port
+        };
+        if (as_string(record.profile || "") != "")
+            outbound.profile = as_string(record.profile);
+        if (as_string(record.vhttp || "") != "")
+            outbound.vhttp = as_string(record.vhttp);
+        if (as_string(record["private-key"] || record.private_key || "") != "")
+            outbound.private_key = as_string(record["private-key"] || record.private_key);
+        if (as_string(record["public-key"] || record.public_key || "") != "")
+            outbound.public_key = as_string(record["public-key"] || record.public_key);
+        if (as_string(record.ip || "") != "")
+            outbound.ip = as_string(record.ip);
+        if (as_string(record.ipv6 || "") != "")
+            outbound.ipv6 = as_string(record.ipv6);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "sudoku") {
+        let key = as_string(record.key || record.password || "");
+        if (key == "")
+            return null;
+        let outbound = {
+            type: "sudoku",
+            tag: name,
+            server: server,
+            server_port: port,
+            key: key
+        };
+        let aead = as_string(record["aead-method"] || record.aead_method || record.aead || "");
+        if (aead != "")
+            outbound.aead = aead;
+        let pmin = as_string(record["padding-min"] || record.padding_min || "");
+        if (is_integer_string(pmin))
+            outbound.padding_min = int(pmin, 10);
+        let pmax = as_string(record["padding-max"] || record.padding_max || "");
+        if (is_integer_string(pmax))
+            outbound.padding_max = int(pmax, 10);
+        let tt = as_string(record["table-type"] || record.table_type || record.ascii || "");
+        if (tt != "")
+            outbound.table_type = tt;
+        let hm = record["http-mask"] != null ? record["http-mask"] : record.http_mask;
+        if (hm != null)
+            outbound.disable_http_mask = !is_true(hm);
+        let hmode = as_string(record["http-mask-mode"] || record.http_mask_mode || "");
+        let hhost = as_string(record["http-mask-host"] || record.http_mask_host || "");
+        let hpath = as_string(record["http-mask-path"] || record.http_mask_path || record.path || "");
+        if (hmode != "" || hhost != "" || hpath != "") {
+            let mask = {};
+            if (hmode != "") mask.mode = hmode;
+            if (hhost != "") mask.host = hhost;
+            if (hpath != "") mask.path_root = hpath;
+            outbound.http_mask = mask;
+        }
+        return outbound;
+    }
+    if (proxy_type == "naive") {
+        let outbound = {
+            type: "naive",
+            tag: name,
+            server: server,
+            server_port: port
+        };
+        if (as_string(record.username || "") != "")
+            outbound.username = as_string(record.username);
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (is_true(record.quic))
+            outbound.quic = true;
+        if (is_true(record.uot) || is_true(record["udp-over-tcp"]) || is_true(record.udp_over_tcp))
+            outbound.udp_over_tcp = true;
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "ssh") {
+        let outbound = {
+            type: "ssh",
+            tag: name,
+            server: server,
+            server_port: port,
+            user: as_string(record.username || record.user || "root")
+        };
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (as_string(record["private-key"] || record.private_key || "") != "")
+            outbound.private_key = as_string(record["private-key"] || record.private_key);
+        if (as_string(record["client-version"] || record.client_version || "") != "")
+            outbound.client_version = as_string(record["client-version"] || record.client_version);
+        return outbound;
+    }
+    if (proxy_type == "openconnect" || proxy_type == "anyconnect") {
+        let outbound = {
+            type: "openconnect",
+            tag: name,
+            server: server,
+            server_port: port,
+            flavor: as_string(record.flavor || "anyconnect")
+        };
+        if (as_string(record.username || "") != "")
+            outbound.username = as_string(record.username);
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (as_string(record.cookie || "") != "")
+            outbound.cookie = as_string(record.cookie);
+        options.always = true;
+        add_clash_tls(outbound, options);
         return outbound;
     }
     return null;
@@ -1927,8 +4272,8 @@ function normalize_uri_list_data(data, output_file) {
             line = replace(line, /\r/g, "");
         line = trim(line);
         if (line != "" && !starts_with(line, "#")) {
-            if (crypt4.is_crypt4(line)) {
-                let decrypted = crypt4.decrypt(line);
+            if (happ.is_encrypted(line)) {
+                let decrypted = happ.decrypt(line);
                 if (decrypted != null && decrypted != "") {
                     for (let dec_line in split(decrypted, "\n")) {
                         dec_line = trim(dec_line);
@@ -2142,7 +4487,7 @@ function decode_rfc2047(val) {
     return val;
 }
 
-function metadata_clean_text(value, max, decode_base64) {
+function metadata_clean_text(value, max, decode_base64, allow_newlines) {
     value = as_string(value);
     if (starts_with(value, "=?"))
         value = decode_rfc2047(value);
@@ -2159,7 +4504,20 @@ function metadata_clean_text(value, max, decode_base64) {
         value = decode_url_component(value);
     }
 
-    let cleaned = trim(replace(replace(value, /[\x01-\x1f\x7f]+/g, " "), / +/g, " "));
+    let cleaned = "";
+    if (allow_newlines) {
+        let norm = replace(replace(value, /\r\n/g, "\n"), /\r/g, "\n");
+        norm = replace(norm, /[\x01-\x09\x0b-\x1f\x7f]+/g, " ");
+        let lines = [];
+        for (let line in split(norm, "\n")) {
+            let cl = trim(replace(line, / +/g, " "));
+            if (cl != "")
+                push(lines, cl);
+        }
+        cleaned = join("\n", lines);
+    } else {
+        cleaned = trim(replace(replace(value, /[\x01-\x1f\x7f]+/g, " "), / +/g, " "));
+    }
     if (cleaned == "")
         return null;
     return length(cleaned) > max ? substr(cleaned, 0, max) : cleaned;
@@ -2272,7 +4630,7 @@ function metadata_ui_object(raw) {
     let title = metadata_clean_text(raw["profile-title"], 120, true);
     let web_page_url = metadata_clean_url(raw["profile-web-page-url"]);
     let support_url = metadata_clean_url(raw["support-url"]);
-    let announce = metadata_clean_text(raw["announce"], 500, true);
+    let announce = metadata_clean_text(raw["announce"], 500, true, true);
     let announce_url = metadata_clean_url(raw["announce-url"]);
     let refill_date = metadata_clean_number(raw["subscription-refill-date"]);
     let file_name = metadata_content_disposition_filename(raw["content-disposition"]);
@@ -2367,8 +4725,8 @@ function normalize_uri_list_stream(input, output_file, strip_metadata) {
         if (strip_metadata && line_no <= 20 && is_metadata_preamble_line(line))
             continue;
         if (line != "" && !starts_with(line, "#")) {
-            if (crypt4.is_crypt4(line)) {
-                let decrypted = crypt4.decrypt(line);
+            if (happ.is_encrypted(line)) {
+                let decrypted = happ.decrypt(line);
                 if (decrypted != null && decrypted != "") {
                     for (let dec_line in split(decrypted, "\n")) {
                         dec_line = trim(dec_line);
@@ -2432,7 +4790,7 @@ function file_looks_like_uri_list(input_file) {
         line = trim(line);
         if (line == "" || starts_with(line, "#") || is_metadata_preamble_line(line))
             continue;
-        if (crypt4.is_crypt4(line)) {
+        if (happ.is_encrypted(line)) {
             input.close();
             return false;
         }
@@ -2589,9 +4947,27 @@ function xray_tls_from_stream(stream, network) {
             tls.reality.public_key = public_key;
         if (short_id != "")
             tls.reality.short_id = short_id;
+        let mlkem_pref = reality.support_x25519mlkem768;
+        if (mlkem_pref == null)
+            mlkem_pref = reality.supportX25519MLKEM768;
+        if (mlkem_pref == null)
+            mlkem_pref = reality["support-x25519mlkem768"];
+        if (mlkem_pref == null)
+            mlkem_pref = settings.support_x25519mlkem768;
+        if (mlkem_pref == null)
+            mlkem_pref = settings.supportX25519MLKEM768;
+        if (mlkem_pref == null)
+            mlkem_pref = settings["support-x25519mlkem768"];
+        if (mlkem_pref == null && xray_first_string([reality.mldsa65Verify, reality.pqv, settings.mldsa65Verify, settings.pqv]) != "")
+            mlkem_pref = true;
+        if (mlkem_pref != null)
+            tls.reality.support_x25519mlkem768 = is_true(mlkem_pref);
         if (!tls.utls)
             tls.utls = { enabled: true, fingerprint: "chrome" };
     }
+    if (is_true(settings.fragment || settings.tls_fragment) ||
+        finalmask_has_tcp_fragment(stream.finalmask))
+        tls.fragment = true;
 
     return tls;
 }
@@ -2646,6 +5022,8 @@ function xray_transport_from_stream(stream) {
 
     if (network == "xhttp") {
         let settings = object_or_empty(stream.xhttpSettings);
+        let extra_settings = {};
+        xhttp_merge_extra_settings(extra_settings, settings);
         let result = {
             type: "xhttp",
             mode: as_string(settings.mode || "auto"),
@@ -2659,15 +5037,15 @@ function xray_transport_from_stream(stream) {
             result.mode = "auto";
         if (as_string(settings.host || "") != "")
             result.host = as_string(settings.host);
-        xhttp_optional_positive_range(result, "x_padding_bytes", xhttp_setting_value(settings, settings, "xPaddingBytes", "x_padding_bytes"));
-        xhttp_optional_bool(result, "no_grpc_header", xhttp_setting_value(settings, settings, "noGRPCHeader", "no_grpc_header"));
-        xhttp_optional_positive_range(result, "sc_max_each_post_bytes", xhttp_setting_value(settings, settings, "scMaxEachPostBytes", "sc_max_each_post_bytes"));
-        xhttp_optional_range(result, "sc_min_posts_interval_ms", xhttp_setting_value(settings, settings, "scMinPostsIntervalMs", "sc_min_posts_interval_ms"));
-        xhttp_optional_range(result, "sc_stream_up_server_secs", xhttp_setting_value(settings, settings, "scStreamUpServerSecs", "sc_stream_up_server_secs"));
-        let xmux = xhttp_normalize_xmux(settings.xmux);
+        xhttp_optional_positive_range(result, "x_padding_bytes", xhttp_setting_value(settings, extra_settings, "xPaddingBytes", "x_padding_bytes"));
+        xhttp_optional_bool(result, "no_grpc_header", xhttp_setting_value(settings, extra_settings, [ "noGRPCHeader", "noGrpcHeader" ], "no_grpc_header"));
+        xhttp_optional_positive_range(result, "sc_max_each_post_bytes", xhttp_setting_value(settings, extra_settings, "scMaxEachPostBytes", "sc_max_each_post_bytes"));
+        xhttp_optional_range(result, "sc_min_posts_interval_ms", xhttp_setting_value(settings, extra_settings, "scMinPostsIntervalMs", "sc_min_posts_interval_ms"));
+        xhttp_optional_range(result, "sc_stream_up_server_secs", xhttp_setting_value(settings, extra_settings, "scStreamUpServerSecs", "sc_stream_up_server_secs"));
+        let xmux = xhttp_normalize_xmux(xhttp_setting_value(settings, extra_settings, "xmux", "xmux"));
         if (xmux)
             result.xmux = xmux;
-        xhttp_apply_v2_settings(result, settings, settings);
+        xhttp_apply_v2_settings(result, settings, extra_settings);
         return result;
     }
 
@@ -2714,15 +5092,30 @@ function xray_tag_base(original_tag, config_index, config_count) {
 
 function xray_protocol_supported(protocol) {
     protocol = lc(as_string(protocol));
-    return protocol == "vless" || protocol == "socks" || protocol == "hysteria";
+    return protocol == "vless" || protocol == "vmess" || protocol == "trojan" ||
+        protocol == "shadowsocks" || protocol == "ss" || protocol == "socks" ||
+        protocol == "http" || protocol == "hysteria" || protocol == "hysteria2" ||
+        protocol == "hy2";
+}
+
+function xray_apply_stream_tls_transport(result, outbound) {
+    let stream = object_or_empty(outbound.streamSettings);
+    let transport = xray_transport_from_stream(stream);
+    let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+    if (tls)
+        result.tls = tls;
+    if (transport)
+        result.transport = transport;
+    return result;
 }
 
 function convert_xray_vless(outbound, tag) {
-    let vnext = xray_first_array_object(object_or_empty(outbound.settings).vnext);
+    let settings = object_or_empty(outbound.settings);
+    let vnext = xray_first_array_object(settings.vnext);
     let user = xray_first_array_object(vnext.users);
-    let server = as_string(vnext.address || "");
-    let port = xray_valid_port_value(vnext.port);
-    let uuid = as_string(user.id || "");
+    let server = as_string(vnext.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(vnext.port != null ? vnext.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let uuid = as_string(user.id || outbound.uuid || outbound.id || settings.id || "");
     if (server == "" || is_dummy_server(server, port) || port == null || uuid == "")
         return null;
 
@@ -2734,28 +5127,136 @@ function convert_xray_vless(outbound, tag) {
         uuid: uuid
     };
 
-    let flow = as_string(user.flow || "");
+    let flow = normalize_vless_flow(user.flow || outbound.flow || settings.flow || "");
+    if (flow == null)
+        return null;
     if (flow != "")
         result.flow = flow;
-    let encryption = normalize_vless_encryption(user.encryption || "");
+    let encryption = normalize_vless_encryption(user.encryption || outbound.encryption || settings.encryption || "");
     if (encryption != "")
         result.encryption = encryption;
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_vmess(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let vnext = xray_first_array_object(settings.vnext);
+    let user = xray_first_array_object(vnext.users);
+    let server = as_string(vnext.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(vnext.port != null ? vnext.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let uuid = as_string(user.id || outbound.uuid || outbound.id || settings.id || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || uuid == "")
+        return null;
+
+    let security = as_string(user.security || outbound.security || settings.security || "auto");
+    let result = {
+        type: "vmess",
+        tag: tag,
+        server: server,
+        server_port: port,
+        uuid: uuid,
+        security: security != "" ? security : "auto"
+    };
+
+    let alter_id = user.alterId != null ? user.alterId : (outbound.alter_id != null ? outbound.alter_id : (outbound.alterId != null ? outbound.alterId : (settings.alterId != null ? settings.alterId : settings.alter_id)));
+    if (alter_id != null && as_string(alter_id) != "")
+        result.alter_id = int(alter_id);
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_trojan(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let srv = xray_first_array_object(settings.servers);
+    let server = as_string(srv.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(srv.port != null ? srv.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let password = as_string(srv.password || outbound.password || settings.password || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || password == "")
+        return null;
+
+    let result = {
+        type: "trojan",
+        tag: tag,
+        server: server,
+        server_port: port,
+        password: password
+    };
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_shadowsocks(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let srv = xray_first_array_object(settings.servers);
+    let server = as_string(srv.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(srv.port != null ? srv.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let method = normalize_shadowsocks_method(srv.method || srv.cipher || outbound.method || outbound.cipher || settings.method || settings.cipher || "");
+    let password = as_string(srv.password || outbound.password || settings.password || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || !valid_shadowsocks_password(method, password))
+        return null;
+
+    let result = {
+        type: "shadowsocks",
+        tag: tag,
+        server: server,
+        server_port: port,
+        method: method,
+        password: password
+    };
+
+    let plugin = as_string(srv.plugin || outbound.plugin || settings.plugin || "");
+    let plugin_opts = as_string(srv.pluginOpts || srv.plugin_opts || outbound.plugin_opts || outbound.pluginOpts || settings.pluginOpts || settings.plugin_opts || "");
+    if (plugin != "")
+        result.plugin = plugin;
+    if (plugin_opts != "")
+        result.plugin_opts = plugin_opts;
 
     let stream = object_or_empty(outbound.streamSettings);
     let transport = xray_transport_from_stream(stream);
     let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
-    if (tls)
-        result.tls = tls;
-    if (transport)
-        result.transport = transport;
+    if (transport != null && transport.type == "ws" && result.plugin == null) {
+        result.plugin = "v2ray-plugin";
+        let opts = [ "mode=websocket" ];
+        if (tls != null && tls.enabled === true) {
+            push(opts, "tls");
+            if (as_string(tls.server_name || "") != "")
+                push(opts, "host=" + as_string(tls.server_name));
+        }
+        let ws_host = as_string(object_or_empty(transport.headers).Host || object_or_empty(transport.headers).host || "");
+        if (ws_host != "" && (tls == null || as_string(tls.server_name || "") == ""))
+            push(opts, "host=" + ws_host);
+        else if (ws_host != "" && tls != null && as_string(tls.server_name || "") != "" && ws_host != as_string(tls.server_name)) {
+            let filtered = [];
+            for (let item in opts) {
+                if (substr(item, 0, 5) != "host=")
+                    push(filtered, item);
+            }
+            opts = filtered;
+            push(opts, "host=" + ws_host);
+        }
+        let ws_path = as_string(transport.path || "/");
+        if (ws_path != "")
+            push(opts, "path=" + ws_path);
+        result.plugin_opts = join(";", opts);
+    } else {
+        if (tls)
+            result.tls = tls;
+        if (transport)
+            result.transport = transport;
+    }
+
+    if (is_true(srv.uot || outbound.uot || outbound.udp_over_tcp || settings.uot))
+        result.udp_over_tcp = true;
 
     return result;
 }
 
 function convert_xray_socks(outbound, tag) {
-    let server_config = xray_first_array_object(object_or_empty(outbound.settings).servers);
-    let server = as_string(server_config.address || "");
-    let port = xray_valid_port_value(server_config.port);
+    let settings = object_or_empty(outbound.settings);
+    let server_config = xray_first_array_object(settings.servers);
+    let server = as_string(server_config.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(server_config.port != null ? server_config.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
     if (server == "" || is_dummy_server(server, port) || port == null)
         return null;
 
@@ -2768,10 +5269,43 @@ function convert_xray_socks(outbound, tag) {
     };
 
     let user = xray_first_array_object(server_config.users);
-    if (as_string(user.user || "") != "")
-        result.username = as_string(user.user);
-    if (as_string(user.pass || user.password || "") != "")
-        result.password = as_string(user.pass || user.password);
+    let username = as_string(user.user || outbound.username || settings.user || "");
+    let password = as_string(user.pass || user.password || outbound.password || settings.pass || settings.password || "");
+    if (username != "")
+        result.username = username;
+    if (password != "")
+        result.password = password;
+
+    return result;
+}
+
+function convert_xray_http(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let server_config = xray_first_array_object(settings.servers);
+    let server = as_string(server_config.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(server_config.port != null ? server_config.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    if (server == "" || is_dummy_server(server, port) || port == null)
+        return null;
+
+    let result = {
+        type: "http",
+        tag: tag,
+        server: server,
+        server_port: port
+    };
+
+    let user = xray_first_array_object(server_config.users);
+    let username = as_string(user.user || outbound.username || settings.user || "");
+    let password = as_string(user.pass || user.password || outbound.password || settings.pass || settings.password || "");
+    if (username != "")
+        result.username = username;
+    if (password != "")
+        result.password = password;
+
+    let stream = object_or_empty(outbound.streamSettings);
+    let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+    if (tls)
+        result.tls = tls;
 
     return result;
 }
@@ -2780,13 +5314,14 @@ function convert_xray_hysteria2(outbound, tag) {
     let settings = object_or_empty(outbound.settings);
     let stream = object_or_empty(outbound.streamSettings);
     let hysteria_settings = object_or_empty(stream.hysteriaSettings);
-    let version = int(settings.version || hysteria_settings.version || 0);
+    let protocol = lc(as_string(outbound.protocol || ""));
+    let version = int(settings.version || hysteria_settings.version || (protocol == "hysteria2" || protocol == "hy2" ? 2 : 0));
     if (version != 2)
         return null;
 
-    let server = as_string(settings.address || settings.server || "");
-    let port = xray_valid_port_value(settings.port);
-    let password = as_string(hysteria_settings.auth || settings.auth || settings.password || "");
+    let server = as_string(settings.address || settings.server || outbound.server || outbound.address || "");
+    let port = xray_valid_port_value(settings.port != null ? settings.port : (outbound.server_port != null ? outbound.server_port : outbound.port));
+    let password = as_string(hysteria_settings.auth || settings.auth || settings.password || outbound.password || "");
     if (server == "" || is_dummy_server(server, port) || port == null || password == "")
         return null;
 
@@ -2810,20 +5345,103 @@ function convert_xray_hysteria2(outbound, tag) {
         result.tls.alpn = alpn;
 
     // Xray keeps the hysteria2 obfuscation out of hysteriaSettings and hangs it
-    // off streamSettings.finalmask instead. Dropping it means the salamander
-    // handshake is never sent, the server discards every QUIC packet and the
-    // node reports as unreachable.
-    let mask_entries = type(object_or_empty(stream.finalmask).udp) == "array"
-        ? stream.finalmask.udp
-        : [];
+    // off streamSettings.finalmask instead. Dropping it means the salamander or
+    // gecko handshake is never sent, the server discards every QUIC packet and
+    // the node reports as unreachable.
+    let finalmask = object_or_empty(stream.finalmask);
+    let quic_params = object_or_empty(finalmask.quicParams);
+    let mask_udp = finalmask.udp;
+    let mask_entries = type(mask_udp) == "array"
+        ? mask_udp
+        : (type(mask_udp) == "object" ? [ mask_udp ] : []);
+    let obfs_pw = "";
+    let is_gecko = false;
+    let min_ps = 0;
+    let max_ps = 0;
+    let fm_hop_obj = null;
+
     for (let entry in mask_entries) {
-        if (type(entry) != "object" || as_string(entry.type || "") != "salamander")
+        if (type(entry) != "object")
             continue;
-        let mask_password = as_string(object_or_empty(entry.settings).password || "");
-        if (mask_password != "") {
-            result.obfs = { type: "salamander", password: mask_password };
-            break;
+        let utype = lc(as_string(entry.type || "salamander"));
+        let u_set = object_or_empty(entry.settings);
+        if (utype == "salamander" || utype == "gecko") {
+            if (utype == "gecko" || lc(as_string(u_set.mode || entry.mode || "")) == "gecko")
+                is_gecko = true;
+            let pw = as_string(u_set.password || entry.password || "");
+            if (pw != "")
+                obfs_pw = pw;
+            let ps = parse_hysteria2_packet_size_value(u_set.packetSize != null ? u_set.packetSize : (u_set.packet_size != null ? u_set.packet_size : (entry.packetSize != null ? entry.packetSize : entry.packet_size)));
+            if (ps != null) {
+                min_ps = ps[0];
+                max_ps = ps[1];
+            }
+            let lo = xhttp_positive_integer_value(u_set.minPacketSize != null ? u_set.minPacketSize : (u_set.min_packet_size != null ? u_set.min_packet_size : (entry.minPacketSize != null ? entry.minPacketSize : entry.min_packet_size)));
+            if (lo != null)
+                min_ps = lo;
+            let hi = xhttp_positive_integer_value(u_set.maxPacketSize != null ? u_set.maxPacketSize : (u_set.max_packet_size != null ? u_set.max_packet_size : (entry.maxPacketSize != null ? entry.maxPacketSize : entry.max_packet_size)));
+            if (hi != null)
+                max_ps = hi;
+        } else if (utype == "udphop" || utype == "udp_hop") {
+            fm_hop_obj = length(keys(u_set)) > 0 ? u_set : entry;
         }
+    }
+
+    if (obfs_pw == "") {
+        for (let src in [ hysteria_settings, settings ]) {
+            if (type(src) != "object")
+                continue;
+            if (type(src.obfs) == "object") {
+                let o_obj = src.obfs;
+                if (lc(as_string(o_obj.type || o_obj.mode || "")) == "gecko")
+                    is_gecko = true;
+                let ps = parse_hysteria2_packet_size_value(o_obj.packetSize != null ? o_obj.packetSize : o_obj.packet_size);
+                if (ps != null) {
+                    min_ps = ps[0];
+                    max_ps = ps[1];
+                }
+                let lo = xhttp_positive_integer_value(o_obj.min_packet_size != null ? o_obj.min_packet_size : o_obj.minPacketSize);
+                if (lo != null)
+                    min_ps = lo;
+                let hi = xhttp_positive_integer_value(o_obj.max_packet_size != null ? o_obj.max_packet_size : o_obj.maxPacketSize);
+                if (hi != null)
+                    max_ps = hi;
+                let pw = as_string(o_obj.password || "");
+                if (pw != "") {
+                    obfs_pw = pw;
+                    break;
+                }
+            } else {
+                let pw = as_string(src.obfsPassword || src.obfs_password || src["obfs-password"] || "");
+                if (pw != "") {
+                    obfs_pw = pw;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (obfs_pw != "")
+        result.obfs = build_hysteria2_obfs(is_gecko, obfs_pw, min_ps, max_ps);
+
+    let up_mbps = parse_hysteria2_mbps(quic_params.brutalUp != null ? quic_params.brutalUp : (quic_params.up != null ? quic_params.up : (hysteria_settings.up != null ? hysteria_settings.up : hysteria_settings.upMbps)));
+    if (up_mbps != null)
+        result.up_mbps = up_mbps;
+    let down_mbps = parse_hysteria2_mbps(quic_params.brutalDown != null ? quic_params.brutalDown : (quic_params.down != null ? quic_params.down : (hysteria_settings.down != null ? hysteria_settings.down : hysteria_settings.downMbps)));
+    if (down_mbps != null)
+        result.down_mbps = down_mbps;
+
+    let hop_obj = type(quic_params.udpHop) == "object" ? quic_params.udpHop
+        : (type(quic_params.udphop) == "object" ? quic_params.udphop
+        : (type(hysteria_settings.udphop) == "object" ? hysteria_settings.udphop
+        : (type(hysteria_settings.udpHop) == "object" ? hysteria_settings.udpHop : fm_hop_obj)));
+    if (type(hop_obj) == "object") {
+        let hop_ports = parse_hysteria2_server_ports(as_string(hop_obj.ports || hop_obj.port || ""));
+        if (hop_ports != null)
+            result.server_ports = hop_ports;
+        let hop_iv = normalize_hysteria2_hop_interval(hop_obj.interval);
+        if (hop_iv != "")
+            result.hop_interval = hop_iv;
     }
 
     return result;
@@ -2833,9 +5451,17 @@ function convert_xray_outbound(outbound, tag) {
     let protocol = lc(as_string(outbound.protocol || ""));
     if (protocol == "vless")
         return convert_xray_vless(outbound, tag);
+    if (protocol == "vmess")
+        return convert_xray_vmess(outbound, tag);
+    if (protocol == "trojan")
+        return convert_xray_trojan(outbound, tag);
+    if (protocol == "shadowsocks" || protocol == "ss")
+        return convert_xray_shadowsocks(outbound, tag);
     if (protocol == "socks")
         return convert_xray_socks(outbound, tag);
-    if (protocol == "hysteria")
+    if (protocol == "http")
+        return convert_xray_http(outbound, tag);
+    if (protocol == "hysteria" || protocol == "hysteria2" || protocol == "hy2")
         return convert_xray_hysteria2(outbound, tag);
     return null;
 }
@@ -2847,7 +5473,11 @@ function xray_outbound_detour(outbound) {
         return as_string(sockopt.dialerProxy);
 
     sockopt = object_or_empty(outbound.sockopt);
-    return as_string(sockopt.dialerProxy || "");
+    if (as_string(sockopt.dialerProxy || "") != "")
+        return as_string(sockopt.dialerProxy);
+
+    let proxy_settings = object_or_empty(outbound.proxySettings);
+    return as_string(proxy_settings.tag || proxy_settings.Tag || "");
 }
 
 function xray_supported_source_tags(source_outbounds) {
@@ -2904,6 +5534,42 @@ function xray_urltest_option_string(value) {
     return value != "" ? value : "";
 }
 
+function xray_duration_seconds(raw) {
+    let text = trim(as_string(raw));
+    if (text == "")
+        return null;
+    if (match(text, /^[0-9]+(\.[0-9]+)?$/))
+        return double(text);
+    let total = 0.0;
+    let found = false;
+    let rest = text;
+    while (rest != "") {
+        let m = match(rest, /^([0-9]+(\.[0-9]+)?)(ns|us|µs|ms|s|m|h|d)(.*)$/);
+        if (m == null)
+            return null;
+        let num = double(m[1]);
+        let unit = m[3];
+        if (unit == "d") total += num * 86400.0;
+        else if (unit == "h") total += num * 3600.0;
+        else if (unit == "m") total += num * 60.0;
+        else if (unit == "s") total += num;
+        else if (unit == "ms") total += num / 1000.0;
+        else if (unit == "us" || unit == "µs") total += num / 1000000.0;
+        else if (unit == "ns") total += num / 1000000000.0;
+        found = true;
+        rest = m[4];
+    }
+    return found ? total : null;
+}
+
+function xray_clamp_probe_interval(raw) {
+    let val = as_string(raw);
+    let secs = xray_duration_seconds(val);
+    if (secs != null && secs < 30.0)
+        return "30s";
+    return val;
+}
+
 function xray_config_urltest_options(config) {
     let observatory = object_or_empty(config.observatory);
     let burst_observatory = object_or_empty(config.burstObservatory || config.burst_observatory);
@@ -2926,7 +5592,7 @@ function xray_config_urltest_options(config) {
         observatory.probe_interval
     ]);
     if (interval != "")
-        result.interval = interval;
+        result.interval = xray_clamp_probe_interval(interval);
 
     return result;
 }
@@ -3026,25 +5692,105 @@ function xray_retag_planned_outbound(planned, tag_map, source_tag, new_base, con
     }
 }
 
-function xray_add_converted_outbound(result, item, tag_map, visible, display_name) {
+function xray_freedom_tcp_fragment(outbound) {
+    if (type(outbound) != "object" || lc(as_string(outbound.protocol || "")) != "freedom")
+        return null;
+
+    let settings = object_or_empty(outbound.settings);
+    let frag = type(settings.fragment) == "object" ? settings.fragment : null;
+    if (frag == null) {
+        let fm = object_or_empty(outbound.streamSettings).finalmask;
+        if (type(fm) == "object") {
+            let tcp_val = fm.tcp != null ? fm.tcp : fm;
+            let items = type(tcp_val) == "array" ? tcp_val : (type(tcp_val) == "object" ? [ tcp_val ] : []);
+            for (let item in items) {
+                if (type(item) == "object" && lc(as_string(item.type || "")) == "fragment") {
+                    frag = type(item.settings) == "object" ? item.settings : item;
+                    break;
+                }
+            }
+        }
+    }
+    if (type(frag) != "object")
+        return null;
+
+    let packets = lc(trim(as_string(frag.packets || "")));
+    if (packets == "" || packets == "tlshello" || packets == "1-1" ||
+        match(packets, /^[1-9][0-9]*(-[1-9][0-9]*)?$/) == null)
+        packets = "tlshello";
+
+    let frag_len = xhttp_range_value(frag.length != null ? frag.length : frag.lengths, true) || "20-60";
+
+    let raw_delay = frag.interval != null ? frag.interval : (frag.delay != null ? frag.delay : frag.delays);
+    let frag_delay = "0-2ms";
+    if (raw_delay != null) {
+        let num_range = xhttp_range_value(raw_delay, false);
+        if (num_range != null) {
+            frag_delay = num_range + "ms";
+        } else {
+            let ds = trim(as_string(raw_delay));
+            if (match(ds, /^[0-9]+(-[0-9]+)?(ms|s)$/) != null)
+                frag_delay = ds;
+        }
+    }
+
+    return {
+        enabled: true,
+        packets: packets,
+        length: frag_len,
+        delay: frag_delay
+    };
+}
+
+function xray_freedom_fragment_map(source_outbounds) {
+    let map = {};
+    for (let outbound in array_or_empty(source_outbounds)) {
+        if (type(outbound) != "object")
+            continue;
+        let tag = as_string(outbound.tag || "");
+        if (tag == "")
+            continue;
+        let frag = xray_freedom_tcp_fragment(outbound);
+        if (frag != null)
+            map[tag] = frag;
+    }
+    return map;
+}
+
+function xray_add_converted_outbound(result, item, tag_map, freedom_fragments, visible, display_name) {
     let converted = convert_xray_outbound(item.outbound, item.tag);
     if (!converted)
         return;
 
-    if (visible && display_name != "")
+    if (display_name != "")
         converted.remark = display_name;
     if (!visible)
         converted.__tachyon_hidden = true;
 
     let detour = xray_outbound_detour(item.outbound);
-    if (detour != "" && tag_map[detour])
-        converted.detour = tag_map[detour];
+    if (detour != "") {
+        if (tag_map[detour]) {
+            converted.detour = tag_map[detour];
+        } else if (freedom_fragments != null && freedom_fragments[detour] != null &&
+            converted.tcp_fragment == null && converted.fragment == null &&
+            converted.type != "hysteria2" && converted.type != "hysteria" &&
+            converted.type != "tuic" && converted.type != "wireguard") {
+            let src_frag = freedom_fragments[detour];
+            converted.tcp_fragment = {
+                enabled: true,
+                packets: src_frag.packets,
+                length: src_frag.length,
+                delay: src_frag.delay
+            };
+        }
+    }
 
     push(result, converted);
 }
 
 function xray_config_outbounds(config, config_index, config_count, taken) {
     let source_outbounds = array_or_empty(config.outbounds);
+    let freedom_fragments = xray_freedom_fragment_map(source_outbounds);
     let plan = xray_plan_config_outbounds(config, config_index, config_count, taken);
     let planned = array_or_empty(plan.planned);
     let tag_map = object_or_empty(plan.tag_map);
@@ -3101,7 +5847,7 @@ function xray_config_outbounds(config, config_index, config_count, taken) {
             let item_display_name = visible && display_name != ""
                 ? display_name
                 : xray_display_name(item.original_tag);
-            xray_add_converted_outbound(result, item, tag_map, !hidden, item_display_name);
+            xray_add_converted_outbound(result, item, tag_map, freedom_fragments, !hidden, item_display_name);
         }
     }
 
@@ -3137,7 +5883,7 @@ function normalize_xray_configs(configs) {
     return outbounds;
 }
 
-function normalize_sing_box_xhttp_transport(outbound) {
+function normalize_core_xhttp_transport(outbound) {
     if (type(outbound) != "object" || type(outbound.transport) != "object")
         return outbound;
     if (outbound.transport.type != "xhttp")
@@ -3164,7 +5910,7 @@ function normalize_sing_box_xhttp_transport(outbound) {
     return outbound;
 }
 
-function normalize_sing_box_hysteria2_outbound(outbound) {
+function normalize_core_hysteria2_outbound(outbound) {
     if (type(outbound) == "object" &&
         lc(as_string(outbound.type || "")) == "hysteria2" &&
         type(outbound.tls) == "object" &&
@@ -3174,7 +5920,7 @@ function normalize_sing_box_hysteria2_outbound(outbound) {
     return outbound;
 }
 
-function normalize_sing_box_tuic_outbound(outbound) {
+function normalize_core_tuic_outbound(outbound) {
     if (type(outbound) == "object" &&
         lc(as_string(outbound.type || "")) == "tuic" &&
         type(outbound.tls) == "object" &&
@@ -3184,29 +5930,536 @@ function normalize_sing_box_tuic_outbound(outbound) {
     return outbound;
 }
 
-function sing_box_urltest_group(outbound) {
+function core_urltest_group(outbound) {
     return type(outbound) == "object" && lc(as_string(outbound.type || "")) == "urltest";
 }
 
-function sing_box_outbound_tag(outbound) {
+function core_outbound_tag(outbound) {
     return type(outbound) == "object" ? as_string(outbound.tag || "") : "";
 }
 
-function normalize_sing_box_json_outbounds(candidates) {
+parse_amnezia_vpn_container = function(line) {
+    let amnezia = require("subscription.amnezia");
+    if (type(amnezia) != "object" || type(amnezia.decompress) != "function")
+        return null;
+    let text = amnezia.decompress(line);
+    if (type(text) != "string" || substr(trim(text), 0, 1) != "{")
+        return null;
+    let data = json_decode_text(text);
+    if (type(data) != "object" || type(data.containers) != "array" || length(data.containers) == 0 || length(data.containers) > 16)
+        return null;
+    let host_fallback = trim(as_string(data.hostName || data.host || ""));
+    let desc_name = trim(as_string(data.description || data.name || ""));
+    let clean_desc = "";
+    if (length(desc_name) <= 200) {
+        for (let i = 0; i < length(desc_name); i++) {
+            let n = ord(substr(desc_name, i, 1));
+            if (n >= 32 && n != 127)
+                clean_desc += chr(n);
+        }
+    }
+    let hash_pos = index(line, "#");
+    let frag = hash_pos >= 0 ? trim(urldecode_fragment(substr(line, hash_pos + 1))) : "";
+    let def_kind = as_string(data.defaultContainer || "");
+    let candidates = [];
+    for (let c in data.containers) {
+        if (type(c) == "object" && as_string(c.container || "") == def_kind)
+            push(candidates, c);
+    }
+    for (let c in data.containers) {
+        if (type(c) == "object" && as_string(c.container || "") != def_kind)
+            push(candidates, c);
+    }
+    for (let container in candidates) {
+        let kind = lc(trim(as_string(container.container || "")));
+        if (kind == "amnezia-xray" || kind == "xray" || kind == "xray-reality" || kind == "amnezia-ssxray" || kind == "ssxray" ||
+            (kind == "" && (container.xray != null || container["amnezia-xray"] != null || container["xray-reality"] != null || container["amnezia-ssxray"] != null || container.ssxray != null))) {
+            let xray_sec = json_decode_text(container.xray) || json_decode_text(container["amnezia-xray"]) ||
+                json_decode_text(container["xray-reality"]) || json_decode_text(container["amnezia-ssxray"]) ||
+                json_decode_text(container.ssxray) || json_decode_text(container.params) ||
+                ((container.last_config != null || container.config != null) ? container : null);
+            if (type(xray_sec) != "object")
+                continue;
+            let raw_last = xray_sec.last_config != null ? xray_sec.last_config : xray_sec.config;
+            let last_cfg = json_decode_text(raw_last) || xray_sec;
+            if (type(last_cfg) == "object" && !is_xray_config(last_cfg) && last_cfg.config != null) {
+                let inner_cfg = json_decode_text(last_cfg.config);
+                if (type(inner_cfg) == "object")
+                    last_cfg = inner_cfg;
+            }
+            if (!is_xray_config(last_cfg))
+                continue;
+            let outbounds = normalize_xray_configs([ last_cfg ]);
+            for (let ob in outbounds) {
+                if (type(ob) != "object" || ob.__tachyon_hidden || core_urltest_group(ob))
+                    continue;
+                if ((as_string(ob.server || "") == "" || ob.server == "$REMOTE_HOST" || ob.server == "$SERVER_IP_ADDRESS") && host_fallback != "")
+                    ob.server = host_fallback;
+                if (ob.type == "vless" && ob.flow != null) {
+                    let nf = normalize_vless_flow(ob.flow);
+                    if (nf == null)
+                        continue;
+                    if (nf == "")
+                        delete ob.flow;
+                    else
+                        ob.flow = nf;
+                }
+                ob = normalize_core_xhttp_transport(ob);
+                let tag_nm = frag != "" ? frag : (clean_desc != "" ? clean_desc : as_string(ob.remark || ob.tag || "Amnezia-Xray"));
+                ob.tag = tag_nm;
+                ob.remark = tag_nm;
+                ob.share_link = line;
+                return ob;
+            }
+        } else if (kind == "amnezia-shadowsocks" || kind == "shadowsocks" || kind == "amnezia-ss" || kind == "ss" ||
+            (kind == "" && (container.shadowsocks != null || container["amnezia-shadowsocks"] != null || container.ss != null))) {
+            let ss_sec = json_decode_text(container.shadowsocks) || json_decode_text(container["amnezia-shadowsocks"]) ||
+                json_decode_text(container.ss) || json_decode_text(container.params) ||
+                ((container.last_config != null || container.config != null) ? container : null);
+            if (type(ss_sec) != "object")
+                continue;
+            let raw_last = ss_sec.last_config != null ? ss_sec.last_config : ss_sec.config;
+            let last_cfg = json_decode_text(raw_last) || ss_sec;
+            if (type(last_cfg) == "object" && last_cfg.config != null && last_cfg.password == null) {
+                let inner_cfg = json_decode_text(last_cfg.config);
+                if (type(inner_cfg) == "object")
+                    last_cfg = inner_cfg;
+            }
+            if (type(last_cfg) != "object")
+                continue;
+            let srv = trim(as_string(last_cfg.server || last_cfg.hostName || last_cfg.host || host_fallback));
+            if (srv == "$REMOTE_HOST" || srv == "$SERVER_IP_ADDRESS")
+                srv = host_fallback;
+            let prt = int(last_cfg.server_port || last_cfg.port || ss_sec.port || data.port || 0);
+            let pw = as_string(last_cfg.password || ss_sec.password || "");
+            let method = trim(as_string(last_cfg.method || last_cfg.cipher || ss_sec.method || ss_sec.cipher || "chacha20-ietf-poly1305"));
+            if (srv != "" && !is_dummy_server(srv, prt) && valid_port(prt) && pw != "") {
+                let tag_nm = frag != "" ? frag : (clean_desc != "" ? clean_desc : (srv + ":" + prt));
+                return {
+                    type: "shadowsocks",
+                    tag: tag_nm,
+                    remark: tag_nm,
+                    share_link: line,
+                    server: srv,
+                    server_port: prt,
+                    method: method,
+                    password: pw
+                };
+            }
+        }
+    }
+    return null;
+};
+
+function decode_base64_or_raw_conf_text(raw_config) {
+    let text = trim(as_string(raw_config));
+    if (text == "")
+        return "";
+    if (index(lc(text), "[interface]") >= 0)
+        return text;
+    let payload = replace(replace(text, /[\r\n \t]+/g, ""), /-/g, "+");
+    payload = replace(payload, /_/g, "/");
+    if (match(payload, /^[A-Za-z0-9+\/]*={0,2}$/) && length(payload) % 4 != 1) {
+        while (length(payload) % 4)
+            payload += "=";
+        try {
+            let decoded = b64dec(payload);
+            if (decoded != null && decoded != "")
+                return decoded;
+        } catch (e) {}
+    }
+    return text;
+}
+
+let last_normalize_error_reason = "";
+
+function get_last_normalize_error() {
+    return last_normalize_error_reason;
+}
+
+function extract_peer_params_from_object(obj) {
+    if (type(obj) != "object")
+        return { public_key: "", endpoint: "", pre_shared_key: "", allowed_ips: null };
+
+    let sub = type(obj.peer) == "object" ? obj.peer :
+        (type(obj.server) == "object" ? obj.server :
+        (type(obj.wireguard) == "object" ? obj.wireguard :
+        (type(obj.amnezia) == "object" ? obj.amnezia :
+        (type(obj.awg) == "object" ? obj.awg : {}))));
+    if (type(obj.peers) == "array" && length(obj.peers) > 0 && type(obj.peers[0]) == "object")
+        sub = obj.peers[0];
+
+    let peer_pub = trim(as_string(
+        obj.public_key || obj.publicKey || obj.peer_public_key || obj.peerPublicKey || obj.server_public_key || obj.serverPublicKey ||
+        sub.public_key || sub.publicKey || sub.peer_public_key || sub.peerPublicKey || sub.server_public_key || sub.serverPublicKey || ""
+    ));
+    let peer_ep = trim(as_string(obj.endpoint || obj.server_endpoint || sub.endpoint || sub.server_endpoint || ""));
+    if (peer_ep == "") {
+        let srv = trim(as_string(obj.server || obj.host || obj.hostname || sub.server || sub.host || sub.address || ""));
+        let prt = trim(as_string(obj.server_port || obj.port || sub.server_port || sub.port || ""));
+        if (srv != "" && prt != "")
+            peer_ep = (index(srv, ":") >= 0 && substr(srv, 0, 1) != "[") ? ("[" + srv + "]:" + prt) : (srv + ":" + prt);
+    }
+    let psk = trim(as_string(
+        obj.pre_shared_key || obj.preshared_key || obj.presharedKey || obj.psk ||
+        sub.pre_shared_key || sub.preshared_key || sub.presharedKey || sub.psk || ""
+    ));
+    let allowed = obj.allowed_ips != null ? obj.allowed_ips : (obj.allowedIps != null ? obj.allowedIps : (sub.allowed_ips != null ? sub.allowed_ips : sub.allowedIps));
+    return {
+        public_key: peer_pub,
+        endpoint: peer_ep,
+        pre_shared_key: psk,
+        allowed_ips: allowed
+    };
+}
+
+function extract_peer_params_from_headers_file(headers_file) {
+    let result = { public_key: "", endpoint: "", pre_shared_key: "", allowed_ips: null };
+    if (as_string(headers_file) == "")
+        return result;
+    let data = read_file(headers_file);
+    if (data == null || data == "")
+        return result;
+    let host = "", port = "";
+    for (let line in split(as_string(data), "\n")) {
+        line = trim(replace(line, /\r$/g, ""));
+        let colon = index(line, ":");
+        if (colon <= 0)
+            continue;
+        let k = lc(trim(substr(line, 0, colon)));
+        let v = trim(substr(line, colon + 1));
+        if (v == "")
+            continue;
+        if (k == "x-peer-public-key" || k == "x-wg-public-key" || k == "x-awg-public-key" || k == "x-server-public-key" || k == "peer-public-key")
+            result.public_key = v;
+        else if (k == "x-peer-endpoint" || k == "x-wg-endpoint" || k == "x-awg-endpoint" || k == "x-endpoint" || k == "peer-endpoint")
+            result.endpoint = v;
+        else if (k == "x-peer-host" || k == "x-server-host")
+            host = v;
+        else if (k == "x-peer-port" || k == "x-server-port")
+            port = v;
+        else if (k == "x-preshared-key" || k == "x-pre-shared-key")
+            result.pre_shared_key = v;
+    }
+    if (result.endpoint == "" && host != "" && port != "")
+        result.endpoint = (index(host, ":") >= 0 && substr(host, 0, 1) != "[") ? ("[" + host + "]:" + port) : (host + ":" + port);
+    return result;
+}
+
+function is_json_candidate_container(item) {
+    if (type(item) != "object")
+        return false;
+    if (type(item.servers) == "array" || type(item.configs) == "array" ||
+        type(item.nodes) == "array" || type(item.items) == "array" ||
+        type(item.endpoints) == "array")
+        return true;
+    if (type(item.outbounds) == "array" && !core_urltest_group(item) && lc(as_string(item.type || "")) != "selector") {
+        for (let ob in item.outbounds) {
+            if (type(ob) == "object")
+                return true;
+        }
+    }
+    return false;
+}
+
+function extract_container_candidates(container, fallback_peer) {
+    let result = [];
+    let item_peer = extract_peer_params_from_object(container);
+    let child_peer = {};
+    if (type(fallback_peer) == "object") {
+        for (let k, v in fallback_peer)
+            child_peer[k] = v;
+    }
+    if (item_peer.public_key != "") child_peer.public_key = item_peer.public_key;
+    if (item_peer.endpoint != "") child_peer.endpoint = item_peer.endpoint;
+    if (item_peer.pre_shared_key != "") child_peer.pre_shared_key = item_peer.pre_shared_key;
+    if (item_peer.allowed_ips != null) child_peer.allowed_ips = item_peer.allowed_ips;
+
+    let container_name = trim(as_string(container.name || container.tag || container.remark || ""));
+
+    let sub_lists = [
+        container.servers,
+        container.configs,
+        container.nodes,
+        container.items,
+        container.endpoints,
+        container.outbounds
+    ];
+
+    for (let list in sub_lists) {
+        if (type(list) != "array")
+            continue;
+        for (let i = 0; i < length(list); i++) {
+            let child = list[i];
+            if (type(child) == "object") {
+                if (child.__fallback_peer == null && length(keys(child_peer)) > 0)
+                    child.__fallback_peer = child_peer;
+                if (container_name != "" && as_string(child.name || child.tag || child.remark || "") == "")
+                    child.name = length(list) == 1 ? container_name : sprintf("%s (%d)", container_name, i + 1);
+                push(result, child);
+            }
+        }
+    }
+    return result;
+}
+
+function flatten_json_candidate_items(candidates, fallback_peer, depth) {
+    depth = int(depth || 0);
+    if (depth > 5)
+        return candidates;
+    let result = [];
+    let has_container = false;
+    for (let item in candidates) {
+        if (type(item) != "object")
+            continue;
+        if (is_json_candidate_container(item)) {
+            has_container = true;
+            let eff_peer = item.__fallback_peer || fallback_peer;
+            let children = extract_container_candidates(item, eff_peer);
+            for (let child in children)
+                push(result, child);
+        } else {
+            push(result, item);
+        }
+    }
+    if (has_container)
+        return flatten_json_candidate_items(result, fallback_peer, depth + 1);
+    return result;
+}
+
+function expand_json_config_outbound_items(item, fallback_peer) {
+    if (type(item) != "object")
+        return null;
+
+    if (is_json_candidate_container(item)) {
+        let eff_peer = item.__fallback_peer || fallback_peer;
+        delete item.__fallback_peer;
+        let children = extract_container_candidates(item, eff_peer);
+        let result = [];
+        for (let child in children) {
+            let child_peer = child.__fallback_peer || eff_peer;
+            delete child.__fallback_peer;
+            let child_res = expand_json_config_outbound_items(child, child_peer);
+            if (type(child_res) == "array") {
+                for (let ep in child_res)
+                    push(result, ep);
+            }
+        }
+        if (length(result) > 0)
+            return result;
+    }
+
+    let raw_cfg = as_string(item.config || item.awg_config || item.wg_config || "");
+    if (raw_cfg == "")
+        return null;
+
+    let item_name = trim(as_string(item.name || item.tag || item.remark || ""));
+    let endpoints = null;
+    if (starts_with(trim(raw_cfg), "vpn://")) {
+        endpoints = wireguard.from_vpn_endpoints(trim(raw_cfg));
+    } else {
+        let conf_text = decode_base64_or_raw_conf_text(raw_cfg);
+        if (conf_text != "" && index(lc(conf_text), "[peer]") < 0) {
+            let item_peer = extract_peer_params_from_object(item);
+            let fb = type(fallback_peer) == "object" ? fallback_peer : {};
+            let peer_pub = item_peer.public_key != "" ? item_peer.public_key : as_string(fb.public_key || "");
+            let peer_ep = item_peer.endpoint != "" ? item_peer.endpoint : as_string(fb.endpoint || "");
+            let psk = item_peer.pre_shared_key != "" ? item_peer.pre_shared_key : as_string(fb.pre_shared_key || "");
+            let allowed = item_peer.allowed_ips != null ? item_peer.allowed_ips : fb.allowed_ips;
+            if (peer_pub != "" && peer_ep != "") {
+                conf_text += "\n[Peer]\nPublicKey = " + peer_pub + "\nEndpoint = " + peer_ep + "\n";
+                if (psk != "")
+                    conf_text += "PresharedKey = " + psk + "\n";
+                if (type(allowed) == "array" && length(allowed) > 0)
+                    conf_text += "AllowedIPs = " + join(", ", allowed) + "\n";
+                else if (type(allowed) == "string" && trim(allowed) != "")
+                    conf_text += "AllowedIPs = " + trim(allowed) + "\n";
+            } else if (index(lc(conf_text), "[interface]") >= 0) {
+                last_normalize_error_reason = "incomplete_awg_missing_peer";
+            }
+        }
+        let share = "vpn://" + replace(replace(replace(b64enc(conf_text), /\+/g, "-"), /\//g, "_"), /=+$/, "");
+        endpoints = wireguard.from_conf_endpoints(conf_text, share, item_name);
+    }
+
+    if (type(endpoints) != "array" || length(endpoints) == 0)
+        return [];
+
+    let result = [];
+    for (let i = 0; i < length(endpoints); i++) {
+        let ep = endpoints[i];
+        if (item_name != "") {
+            ep.tag = i == 0 ? item_name : sprintf("%s (%d)", item_name, i + 1);
+            ep.remark = ep.tag;
+        }
+        push(result, ep);
+    }
+    return result;
+}
+
+function normalize_core_wireguard_outbound(outbound) {
+    if (type(outbound) != "object")
+        return outbound;
+    let out_type = lc(trim(as_string(outbound.type || "")));
+    if (out_type != "wireguard" && out_type != "amneziawg" && out_type != "awg")
+        return outbound;
+
+    outbound.type = "wireguard";
+    let tag_val = trim(as_string(outbound.tag || outbound.name || outbound.remark || ""));
+    if (tag_val != "")
+        outbound.tag = tag_val;
+
+    if (outbound.address == null && outbound.local_address != null) {
+        outbound.address = type(outbound.local_address) == "array" ? outbound.local_address : [ as_string(outbound.local_address) ];
+        delete outbound.local_address;
+    } else if (type(outbound.address) == "string") {
+        outbound.address = [ outbound.address ];
+    }
+
+    if (type(outbound.peers) != "array" || length(outbound.peers) == 0) {
+        let srv = trim(as_string(outbound.server || outbound.host || ""));
+        let prt = int(outbound.server_port || outbound.port || 0);
+        let pub = trim(as_string(outbound.peer_public_key || outbound.public_key || outbound.publicKey || ""));
+        if (srv != "" && prt > 0 && pub != "") {
+            let peer = {
+                address: srv,
+                port: prt,
+                public_key: pub,
+                allowed_ips: type(outbound.allowed_ips) == "array" && length(outbound.allowed_ips) > 0
+                    ? outbound.allowed_ips
+                    : [ "0.0.0.0/0", "::/0" ]
+            };
+            let psk = trim(as_string(outbound.pre_shared_key || outbound.preshared_key || ""));
+            if (psk != "")
+                peer.pre_shared_key = psk;
+            if (outbound.reserved != null)
+                peer.reserved = outbound.reserved;
+            if (outbound.persistent_keepalive_interval != null)
+                peer.persistent_keepalive_interval = outbound.persistent_keepalive_interval;
+            outbound.peers = [ peer ];
+            delete outbound.server;
+            delete outbound.server_port;
+            delete outbound.peer_public_key;
+            delete outbound.pre_shared_key;
+            delete outbound.preshared_key;
+            delete outbound.reserved;
+            delete outbound.allowed_ips;
+            delete outbound.persistent_keepalive_interval;
+        }
+    } else {
+        for (let peer in outbound.peers) {
+            if (type(peer) != "object")
+                continue;
+            if (peer.address == null && peer.server != null) {
+                peer.address = peer.server;
+                delete peer.server;
+            }
+            if (peer.port == null && peer.server_port != null) {
+                peer.port = int(peer.server_port);
+                delete peer.server_port;
+            }
+            if (peer.public_key == null && peer.peer_public_key != null) {
+                peer.public_key = peer.peer_public_key;
+                delete peer.peer_public_key;
+            }
+            if (peer.allowed_ips == null)
+                peer.allowed_ips = [ "0.0.0.0/0", "::/0" ];
+        }
+    }
+
+    if (type(outbound.amnezia) == "object") {
+        for (let k, v in outbound.amnezia) {
+            if (outbound[k] == null)
+                outbound[k] = v;
+        }
+        delete outbound.amnezia;
+    }
+
+    if (outbound.mtu == null)
+        outbound.mtu = 1280;
+
+    return outbound;
+}
+
+function normalize_core_json_outbounds(candidates, fallback_peer) {
+    candidates = flatten_json_candidate_items(candidates, fallback_peer);
     let outbounds = [];
     let urltest_refs = {};
     let detour_refs = {};
+    let idx = 0;
 
     for (let outbound in candidates) {
+        idx++;
         if (type(outbound) != "object" || outbound_is_unsupported_stub(outbound))
             continue;
-        outbound = normalize_sing_box_hysteria2_outbound(outbound);
-        outbound = normalize_sing_box_tuic_outbound(outbound);
-        push(outbounds, normalize_sing_box_xhttp_transport(outbound));
+        let eff_peer = outbound.__fallback_peer || fallback_peer;
+        delete outbound.__fallback_peer;
+        let expanded_cfg = expand_json_config_outbound_items(outbound, eff_peer);
+        if (expanded_cfg != null) {
+            for (let ep in expanded_cfg)
+                push(outbounds, ep);
+            continue;
+        }
+        if ((outbound.type == null || as_string(outbound.type) == "") &&
+            (outbound.protocol != null || outbound.streamSettings != null || outbound.settings != null)) {
+            let xray_tag = xray_source_tag(outbound, lc(as_string(outbound.protocol || "server")) + "-" + idx);
+            let converted = convert_xray_outbound(outbound, xray_tag);
+            if (converted == null)
+                continue;
+            let disp = xray_display_name(as_string(outbound.remarks || outbound.remark || outbound.ps || outbound.name || outbound.tag || ""));
+            if (disp != "")
+                converted.remark = disp;
+            let detour = xray_outbound_detour(outbound);
+            if (detour != "")
+                converted.detour = detour;
+            outbound = converted;
+        }
+        else if (outbound.streamSettings != null && outbound.transport == null) {
+            let stream = object_or_empty(outbound.streamSettings);
+            let transport = xray_transport_from_stream(stream);
+            let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+            if (lc(as_string(outbound.type || "")) == "shadowsocks" && transport != null && transport.type == "ws" && outbound.plugin == null) {
+                outbound.plugin = "v2ray-plugin";
+                let opts = [ "mode=websocket" ];
+                if (tls != null && tls.enabled === true) {
+                    push(opts, "tls");
+                    if (as_string(tls.server_name || "") != "")
+                        push(opts, "host=" + as_string(tls.server_name));
+                }
+                let ws_host = as_string(object_or_empty(transport.headers).Host || object_or_empty(transport.headers).host || "");
+                if (ws_host != "" && (tls == null || as_string(tls.server_name || "") == ""))
+                    push(opts, "host=" + ws_host);
+                let ws_path = as_string(transport.path || "/");
+                if (ws_path != "")
+                    push(opts, "path=" + ws_path);
+                outbound.plugin_opts = join(";", opts);
+            } else {
+                if (tls != null && outbound.tls == null)
+                    outbound.tls = tls;
+                if (transport != null && outbound.transport == null)
+                    outbound.transport = transport;
+            }
+            delete outbound.streamSettings;
+        }
+        outbound = normalize_core_wireguard_outbound(outbound);
+        if (outbound.type == "wireguard" && (type(outbound.peers) != "array" || length(outbound.peers) == 0))
+            continue;
+        if (lc(as_string(outbound.type || "")) == "vless" && outbound.flow != null) {
+            let norm_flow = normalize_vless_flow(outbound.flow);
+            if (norm_flow == null)
+                continue;
+            if (norm_flow == "")
+                delete outbound.flow;
+            else
+                outbound.flow = norm_flow;
+        }
+        outbound = normalize_core_hysteria2_outbound(outbound);
+        outbound = normalize_core_tuic_outbound(outbound);
+        push(outbounds, normalize_core_xhttp_transport(outbound));
     }
 
     for (let outbound in outbounds) {
-        if (sing_box_urltest_group(outbound)) {
+        if (core_urltest_group(outbound)) {
             for (let tag_name in array_or_empty(outbound.outbounds)) {
                 tag_name = as_string(tag_name);
                 if (tag_name != "")
@@ -3220,8 +6473,8 @@ function normalize_sing_box_json_outbounds(candidates) {
     }
 
     for (let outbound in outbounds) {
-        let tag_name = sing_box_outbound_tag(outbound);
-        if (sing_box_urltest_group(outbound)) {
+        let tag_name = core_outbound_tag(outbound);
+        if (core_urltest_group(outbound)) {
             outbound.__tachyon_allow_group = true;
             continue;
         }
@@ -3232,7 +6485,7 @@ function normalize_sing_box_json_outbounds(candidates) {
     return outbounds;
 }
 
-function normalize_sing_box_json_value(value, output_file) {
+function normalize_core_json_value(value, output_file, headers_file) {
     let candidates = [];
     let outbounds = [];
 
@@ -3244,19 +6497,33 @@ function normalize_sing_box_json_value(value, output_file) {
     if (length(outbounds) > 0) {
         return write_json_file(output_file, {
             version: 1,
-            format: "sing-box-json",
+            format: "tachyon-core-json",
             outbounds: outbounds
         });
     }
 
-    if (type(value) == "object" && type(value.outbounds) == "array")
-        candidates = value.outbounds;
+    let fallback_peer = extract_peer_params_from_headers_file(headers_file);
+    if (type(value) == "object") {
+        let top_peer = extract_peer_params_from_object(value);
+        if (top_peer.public_key != "")
+            fallback_peer.public_key = top_peer.public_key;
+        if (top_peer.endpoint != "")
+            fallback_peer.endpoint = top_peer.endpoint;
+        if (top_peer.pre_shared_key != "")
+            fallback_peer.pre_shared_key = top_peer.pre_shared_key;
+        if (top_peer.allowed_ips != null)
+            fallback_peer.allowed_ips = top_peer.allowed_ips;
+    }
+
+    if (type(value) == "object" && is_json_candidate_container(value)) {
+        candidates = extract_container_candidates(value, fallback_peer);
+    }
     else if (type(value) == "array")
         candidates = value;
-    else if (type(value) == "object" && type(value.type) == "string")
+    else if (type(value) == "object" && (type(value.type) == "string" || type(value.protocol) == "string" || value.config != null || value.awg_config != null || value.wg_config != null))
         candidates = [value];
 
-    outbounds = normalize_sing_box_json_outbounds(candidates);
+    outbounds = normalize_core_json_outbounds(candidates, fallback_peer);
 
     if (length(outbounds) == 0) {
         fs.unlink(output_file);
@@ -3265,7 +6532,7 @@ function normalize_sing_box_json_value(value, output_file) {
 
     return write_json_file(output_file, {
         version: 1,
-        format: "sing-box-json",
+        format: "tachyon-core-json",
         outbounds: outbounds
     });
 }
@@ -3348,23 +6615,28 @@ function extract_ui_metadata_file(headers_file, body_file, output_file) {
     return true;
 }
 
-function normalize_content_data(data, output_file, depth) {
+function normalize_content_data(data, output_file, depth, headers_file) {
     data = as_string(data);
     if (index(data, "\r") >= 0)
         data = replace(data, /\r/g, "");
     data = strip_metadata_preamble_data(data);
 
-    if (depth < 2 && crypt4.is_crypt4(data)) {
-        let decrypted = crypt4.decrypt(data);
+    if (depth < 2 && happ.is_encrypted(data)) {
+        let decrypted = happ.decrypt(data);
         if (decrypted != null && decrypted != "")
-            return normalize_content_data(decrypted, output_file, depth + 1);
+            return normalize_content_data(decrypted, output_file, depth + 1, headers_file);
     }
 
     let first = first_non_ws_char(data);
     if (first == "{" || first == "[") {
         let decoded_json = json_decode_text(data);
         if (decoded_json != null)
-            return normalize_sing_box_json_value(decoded_json, output_file);
+            return normalize_core_json_value(decoded_json, output_file, headers_file);
+    }
+
+    if (index(lc(data), "[interface]") >= 0 && match(data, /(^|\n)[ \t]*\[[Ii]nterface\][ \t]*(\n|$)/) != null) {
+        if (normalize_core_json_value({ config: data }, output_file, headers_file))
+            return true;
     }
 
     if (index(data, "proxies:") >= 0 && content_is_clash_yaml(data)) {
@@ -3385,21 +6657,233 @@ function normalize_content_data(data, output_file, depth) {
         let compact = replace(data, /[\r\n\t ]/g, "");
         let decoded = base64_decode(compact);
         if (decoded != null && decoded != "")
-            return normalize_content_data(decoded, output_file, depth + 1);
+            return normalize_content_data(decoded, output_file, depth + 1, headers_file);
     }
 
     return false;
 }
 
-function normalize_content_file(input_file, output_file) {
-    if (file_looks_like_uri_list(input_file))
-        return normalize_uri_list_file(input_file, output_file, true);
+let _core_subscription_cli_supported = null;
+let _core_subscription_cli_bin = "";
 
-    let data = read_file(input_file);
-    return data == null ? false : normalize_content_data(data, output_file, 0);
+function core_subscription_bin_path() {
+    return as_string(getenv("TACHYON_CORE_BIN") || "/usr/bin/tachyon-core");
 }
 
-function normalize_content_validated(input_file, output_file) {
+function core_subscription_cli_supported() {
+    let bin = core_subscription_bin_path();
+    let st = fs.stat(bin);
+    if (st == null || st.type != "file" || (int(st.mode || 0) & 73) == 0) {
+        _core_subscription_cli_supported = false;
+        _core_subscription_cli_bin = bin;
+        return false;
+    }
+
+    let stamp = bin + "|" + as_string(st.size || 0) + "|" + as_string(st.mtime || 0);
+    if (_core_subscription_cli_supported != null && _core_subscription_cli_bin == stamp)
+        return _core_subscription_cli_supported;
+
+    let stamp_file = "/var/run/tachyon/core-subscription-cli.stamp";
+    if (getenv("TACHYON_CORE_BIN") == null) {
+        let cached_stamp = trim(as_string(read_file(stamp_file) || ""));
+        if (cached_stamp == stamp + "|1") {
+            _core_subscription_cli_bin = stamp;
+            _core_subscription_cli_supported = true;
+            return true;
+        }
+        if (cached_stamp == stamp + "|0") {
+            _core_subscription_cli_bin = stamp;
+            _core_subscription_cli_supported = false;
+            return false;
+        }
+    }
+
+    let cap = common.command_capture(common.command_from_args([ bin, "subscription", "hwid" ]) + " 2>/dev/null");
+    _core_subscription_cli_bin = stamp;
+    _core_subscription_cli_supported = cap != null && int(cap.status) == 0;
+    if (getenv("TACHYON_CORE_BIN") == null && fs.stat("/var/run/tachyon") != null)
+        common.write_file(stamp_file, stamp + "|" + (_core_subscription_cli_supported ? "1" : "0") + "\n");
+    return _core_subscription_cli_supported;
+}
+
+function content_requires_ucode_normalizer(input_file, headers_file) {
+    let data = read_file(input_file);
+    if (data == null || data == "")
+        return true;
+
+    if (index(data, "fptn:") >= 0 || index(data, "fptnb:") >= 0)
+        return true;
+
+    return false;
+}
+
+function extract_mieru_uri_outbounds_from_file(input_file) {
+    let result = { has_mieru: false, outbounds: [] };
+    let data = read_file(input_file);
+    if (data == null || data == "")
+        return result;
+
+    let text = strip_metadata_preamble_data(replace(as_string(data), /\r/g, ""));
+    if (index(text, "://") < 0) {
+        let compact = replace(text, /[\r\n\t ]/g, "");
+        let decoded = base64_decode(compact);
+        if (decoded == null || index(decoded, "://") < 0)
+            return result;
+        text = strip_metadata_preamble_data(replace(as_string(decoded), /\r/g, ""));
+    }
+
+    for (let raw_line in split(replace(text, /\r/g, ""), "\n")) {
+        let line = trim(raw_line);
+        if (line == "" || starts_with(line, "#") || starts_with(line, "//"))
+            continue;
+        if (happ.is_encrypted(line)) {
+            let dec = happ.decrypt(line);
+            if (dec != null && dec != "") {
+                for (let dec_raw in split(replace(dec, /\r/g, ""), "\n")) {
+                    let dec_line = trim(dec_raw);
+                    let dec_lc = lc(dec_line);
+                    if (starts_with(dec_lc, "mieru://") || starts_with(dec_lc, "mierus://")) {
+                        result.has_mieru = true;
+                        let parsed = parse_share_link(dec_line);
+                        if (type(parsed) == "object" && !outbound_is_unsupported_stub(parsed))
+                            push(result.outbounds, parsed);
+                    }
+                }
+            }
+            continue;
+        }
+        let line_lc = lc(line);
+        if (starts_with(line_lc, "mieru://") || starts_with(line_lc, "mierus://")) {
+            result.has_mieru = true;
+            let parsed = parse_share_link(line);
+            if (type(parsed) == "object" && !outbound_is_unsupported_stub(parsed))
+                push(result.outbounds, parsed);
+        }
+    }
+    return result;
+}
+
+function try_normalize_with_core_cli(input_file, output_file, headers_file, force_allow) {
+    if (!core_subscription_cli_supported())
+        return false;
+    if (!force_allow && content_requires_ucode_normalizer(input_file, headers_file))
+        return false;
+
+    let core_tmp = temp_path("tachyon-subscription-core-parse");
+    let args = [
+        core_subscription_bin_path(),
+        "subscription",
+        "parse",
+        input_file,
+        "--format",
+        "outbounds",
+        "-o",
+        core_tmp
+    ];
+    if (as_string(headers_file) != "" && fs.stat(as_string(headers_file)) != null) {
+        push(args, "--headers");
+        push(args, as_string(headers_file));
+    }
+    let parse_cap = common.command_capture(common.command_from_args(args) + " 2>/dev/null");
+    if (parse_cap == null || int(parse_cap.status) != 0) {
+        fs.unlink(core_tmp);
+        return false;
+    }
+
+    let parsed = read_json_file(core_tmp);
+    fs.unlink(core_tmp);
+    if (type(parsed) != "array" || length(parsed) == 0)
+        return false;
+
+    let mieru_override = extract_mieru_uri_outbounds_from_file(input_file);
+    if (mieru_override.has_mieru) {
+        let core_mieru_count = 0;
+        for (let item in parsed) {
+            if (type(item) == "object" && lc(as_string(item.type || "")) == "mieru")
+                core_mieru_count++;
+        }
+        if (core_mieru_count == 0 || core_mieru_count != length(mieru_override.outbounds))
+            return false;
+        let mieru_idx = 0;
+        for (let i = 0; i < length(parsed); i++) {
+            if (type(parsed[i]) == "object" && lc(as_string(parsed[i].type || "")) == "mieru") {
+                parsed[i] = mieru_override.outbounds[mieru_idx];
+                mieru_idx++;
+            }
+        }
+    }
+
+    let fallback_peer = extract_peer_params_from_headers_file(headers_file);
+    let outbounds = normalize_core_json_outbounds(parsed, fallback_peer);
+    if (length(outbounds) == 0)
+        return false;
+
+    return write_json_file(output_file, {
+        version: 1,
+        format: "tachyon-core-json",
+        outbounds: outbounds
+    });
+}
+
+parse_wdtt_via_core_cli = function(raw_line) {
+    if (!core_subscription_cli_supported())
+        return null;
+    let in_tmp = temp_path("tachyon-wdtt-in");
+    let out_tmp = temp_path("tachyon-wdtt-out");
+    if (!fs.writefile(in_tmp, as_string(raw_line) + "\n")) {
+        fs.unlink(in_tmp);
+        return null;
+    }
+    let args = [
+        core_subscription_bin_path(),
+        "subscription",
+        "parse",
+        in_tmp,
+        "--format",
+        "outbounds",
+        "-o",
+        out_tmp
+    ];
+    let parse_cap = common.command_capture(common.command_from_args(args) + " 2>/dev/null");
+    fs.unlink(in_tmp);
+    if (parse_cap == null || int(parse_cap.status) != 0) {
+        fs.unlink(out_tmp);
+        return null;
+    }
+    let parsed = read_json_file(out_tmp);
+    fs.unlink(out_tmp);
+    if (type(parsed) != "array" || length(parsed) == 0 || type(parsed[0]) != "object")
+        return null;
+    let obj = parsed[0];
+    if (lc(as_string(obj.type || "")) != "wdtt")
+        return null;
+    obj.share_link = as_string(raw_line);
+    return obj;
+};
+
+function normalize_content_file(input_file, output_file, headers_file, engine_mode) {
+    last_normalize_error_reason = "";
+    let eff_engine = lc(trim(as_string(engine_mode || getenv("TACHYON_SUBSCRIPTION_ENGINE") || "")));
+    if (eff_engine == "core" && try_normalize_with_core_cli(input_file, output_file, headers_file, false))
+        return true;
+
+    let ok = false;
+    if (file_looks_like_uri_list(input_file))
+        ok = normalize_uri_list_file(input_file, output_file, true);
+    else {
+        let data = read_file(input_file);
+        ok = data == null ? false : normalize_content_data(data, output_file, 0, headers_file);
+    }
+    if (ok && validate_subscription(output_file))
+        return true;
+    if (last_normalize_error_reason != "incomplete_awg_missing_peer" &&
+        try_normalize_with_core_cli(input_file, output_file, headers_file, true))
+        return true;
+    return ok;
+}
+
+function normalize_content_validated(input_file, output_file, headers_file, engine_mode) {
+    last_normalize_error_reason = "";
     let normalize_input = input_file;
     let decoded_tmp = temp_path("tachyon-subscription-gzip");
     let decoded = gzip_decode_file(input_file, decoded_tmp);
@@ -3408,7 +6892,7 @@ function normalize_content_validated(input_file, output_file) {
     else
         fs.unlink(decoded_tmp);
 
-    let ok = normalize_content_file(normalize_input, output_file);
+    let ok = normalize_content_file(normalize_input, output_file, headers_file, engine_mode);
     if (decoded)
         fs.unlink(decoded_tmp);
     if (!ok)
@@ -3454,8 +6938,8 @@ function parse_subscription_source_entry(entry) {
     if (index(entry, "|") >= 0)
         return subscription_source_entry_result(false, "", "", "Configure User-Agent in the subscription item settings");
 
-    if (!(substr(entry, 0, 7) == "http://" || substr(entry, 0, 8) == "https://" || crypt4.is_crypt4(entry)))
-        return subscription_source_entry_result(false, "", "", "Subscription URL must start with http:// or https://");
+    if (!(substr(entry, 0, 7) == "http://" || substr(entry, 0, 8) == "https://" || happ.is_encrypted(entry)))
+        return subscription_source_entry_result(false, "", "", "Subscription URL must start with http://, https:// or a supported Happ crypt link");
 
     return subscription_source_entry_result(true, entry, "", "");
 }
@@ -3470,8 +6954,13 @@ function module_exports() {
         parse_share_link,
         add_transport,
         parse_subscription_source_entry,
+        extract_peer_params_from_headers_file,
+        normalize_core_json_outbounds,
         validate_subscription,
         normalize_content_validated,
+        core_subscription_cli_supported,
+        try_normalize_with_core_cli,
+        get_last_normalize_error,
         normalized_skipped_message,
         try_decode_gzip_content_file,
         extract_ui_metadata_file,
@@ -3497,9 +6986,9 @@ else if (mode == "normalize-uri-list")
 else if (mode == "normalize-clash-yaml")
     ok = normalize_clash_yaml(ARGV[1], ARGV[2]);
 else if (mode == "normalize-content")
-    ok = normalize_content_file(ARGV[1], ARGV[2]);
+    ok = normalize_content_file(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
 else if (mode == "normalize-content-validated")
-    ok = normalize_content_validated(ARGV[1], ARGV[2]);
+    ok = normalize_content_validated(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
 else if (mode == "try-decode-gzip-content")
     ok = try_decode_gzip_content_file(ARGV[1]);
 else if (mode == "runtime-outbounds-equal")

@@ -24,7 +24,7 @@ function group_members(job) {
     if (marker < 0 || split(substr(stat, marker + 2), " ")[2] != pid) return [];
     let members = [], directory = fs.opendir("/proc"), entry;
     while ((entry = directory.read()) != null) {
-        if (!match(entry, /^[0-9]+$/)) continue;
+        if (ltrim(entry, "0123456789") != "") continue;
         stat = fs.readfile("/proc/" + entry + "/stat") || "";
         marker = rindex(stat, ") ");
         if (marker >= 0 && split(substr(stat, marker + 2), " ")[2] == pid)
@@ -68,13 +68,19 @@ function poll(job) {
     if (time() - int(job?.started || 0) > 35 || !exec.identity_alive(job?.identity)) return {defer:true};
     return null;
 }
+function probe_runner(args) {
+    let res = common.command_capture(common.command_from_args(args));
+    if (!res) return { status: 255, http_code: 0 };
+    let code = int(trim(res.output));
+    return { status: res.status, http_code: code };
+}
 function worker(id) {
     let request = common.read_json_file(DIR + "/request.json");
     if (request?.id != id) return 1;
     let decision = {defer:true};
     try {
         decision = plus.probe(request.domain, request.item, request.proxy_addr,
-            request.direct_flags, detect.probe_status);
+            request.direct_flags, probe_runner);
     } catch (e) {}
     return save(DIR + "/result.json", {id, decision}) ? 0 : 1;
 }

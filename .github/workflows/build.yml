@@ -17,6 +17,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-release-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   preparation:
     name: Setup build version
@@ -53,6 +57,14 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+
+      - name: Cache OpenWrt host packaging tools
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/tachyon/openwrt-sdk/host-tools-v1
+          key: openwrt-host-tools-v1-25.12.3
+          restore-keys: |
+            openwrt-host-tools-v1-
 
       - name: Build release artifacts
         shell: bash

@@ -17,6 +17,20 @@ let command_from_args = common.command_from_args;
 let command_capture = common.command_capture;
 let command_output_from_args = common.command_output_from_args;
 
+function utf8_prefix(text, limit) {
+    text = as_string(text);
+    limit = int(limit || 0);
+    if (limit <= 0)
+        return "";
+    let len = length(text);
+    if (len <= limit)
+        return text;
+    let end = limit;
+    while (end > 0 && end < len && ord(text, end) >= 128 && ord(text, end) < 192)
+        end--;
+    return substr(text, 0, end);
+}
+
 function get_t() {
     let cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
     return i18n.bind(cfg.language || "en");
@@ -82,7 +96,32 @@ let setting_schema = {
         route_router_traffic_section: "route_router_traffic_section",
         shutdown_correctly: "shutdown_correctly",
         smart_detect: "smart_detect",
-        smart_detect_sections: "smart_detect_sections"
+        smart_detect_mode: "smart_detect_mode",
+        smart_detect_expand_to_root: "smart_detect_expand_to_root",
+        smart_detect_sections: "smart_detect_sections",
+        qos_priority_engine: "qos_priority_engine",
+        tcp_bbr: "tcp_bbr",
+        fakeip_enabled: "fakeip_enabled",
+        ipv6_leak_guard: "ipv6_leak_guard",
+        dns_intercept_all: "dns_intercept_all",
+        dns_local_cache: "dns_local_cache",
+        webrtc_leak_protect: "webrtc_leak_protect",
+        game_console_optimizer: "game_console_optimizer",
+        wifi_calling_direct: "wifi_calling_direct",
+        wan_failover_enabled: "wan_failover_enabled",
+        eco_mode: "eco_mode",
+        enable_watchdog: "enable_watchdog",
+        enable_ai_doctor: "enable_ai_doctor",
+        ai_proxy_health_enabled: "ai_proxy_health_enabled",
+        ai_dns_continuous_enabled: "ai_dns_continuous_enabled",
+        emergency_direct_bypass: "emergency_direct_bypass",
+        component_auto_update_enabled: "component_auto_update_enabled",
+        enable_yacd_wan_access: "enable_yacd_wan_access",
+        tun_gso: "tun_gso",
+        tun_endpoint_independent_nat: "tun_endpoint_independent_nat",
+        selector_auto_failover: "selector_auto_failover",
+        smart_queue: "smart_queue",
+        direct_bypass_enabled: "direct_bypass_enabled"
     },
     telegram: {
         enabled: "enabled",
@@ -90,12 +129,20 @@ let setting_schema = {
         bot_token: "bot_token",
         admin_ids: "admin_ids",
         poll_interval: "poll_interval",
+        bot_proxy_section: "bot_proxy_section",
         notify_crash: "notify_crash",
         notify_restart: "notify_restart",
         notify_server_switch: "notify_server_switch",
         notify_subscription: "notify_subscription",
         notify_cert: "notify_cert",
         notify_dns_leak: "notify_dns_leak",
+        notify_auto_update: "notify_auto_update",
+        notify_smart_detect: "notify_smart_detect",
+        notify_failover: "notify_failover",
+        notify_wan: "notify_wan",
+        notify_update_available: "notify_update_available",
+        notify_parental: "notify_parental",
+        notify_route_alert: "notify_route_alert",
         daily_report_enabled: "daily_report_enabled",
         daily_report_hour: "daily_report_hour",
         quiet_hours_enabled: "quiet_hours_enabled",
@@ -129,6 +176,85 @@ let setting_schema = {
         enabled: "enabled",
         protocol: "protocol",
         routing_mode: "routing_mode"
+    },
+    section: {
+        label: "label",
+        enabled: "enabled",
+        action: "action",
+        routing_mode: "routing_mode",
+        target: "target",
+        dns_type: "dns_type",
+        dns_server: "dns_server",
+        condition_refs: "condition_refs",
+        condition_expression: "condition_expression",
+        outbound_source_refs: "outbound_source_refs",
+        outbound_group_refs: "outbound_group_refs",
+        balancer_refs: "balancer_refs",
+        group_members: "group_members",
+        match_all: "match_all",
+        geoip_country: "geoip_country",
+        geoip_mode: "geoip_mode",
+        ports: "ports"
+    },
+    condition: {
+        label: "label",
+        condition_expression: "condition_expression",
+        match_all: "match_all",
+        user_domains: "user_domains",
+        domain_suffix: "domain_suffix",
+        domain: "domain",
+        domain_keyword: "domain_keyword",
+        domain_regex: "domain_regex",
+        ip_cidr: "ip_cidr",
+        subnets: "subnets",
+        source_ip_cidr: "source_ip_cidr",
+        fully_routed_ips: "fully_routed_ips",
+        excluded_ips: "excluded_ips",
+        devices: "devices",
+        device_ip: "device_ip",
+        device_mac: "device_mac",
+        source_macs: "source_macs",
+        ports: "ports",
+        dscp: "dscp",
+        community_lists: "community_lists",
+        rule_set: "rule_set",
+        domain_ip_lists: "domain_ip_lists",
+        geoip_country: "geoip_country",
+        geoip_mode: "geoip_mode"
+    },
+    outbound_source: {
+        label: "label",
+        enabled: "enabled",
+        source_type: "source_type",
+        url: "url",
+        proxy_links: "proxy_links",
+        interface: "interface",
+        desync_mode: "desync_mode",
+        subscription_update_enabled: "subscription_update_enabled",
+        subscription_update_interval: "subscription_update_interval",
+        download_via_proxy_enabled: "download_via_proxy_enabled",
+        prefix_nodes: "prefix_nodes",
+        node_prefix: "node_prefix",
+        include_urltest_groups: "include_urltest_groups"
+    },
+    outbound_group: {
+        label: "label",
+        enabled: "enabled",
+        source_refs: "source_refs",
+        server_refs: "server_refs",
+        name_filter_regex: "name_filter_regex",
+        name_exclude_regex: "name_exclude_regex"
+    },
+    balancer: {
+        label: "label",
+        enabled: "enabled",
+        mode: "mode",
+        source_refs: "source_refs",
+        group_refs: "group_refs",
+        testing_url: "testing_url",
+        check_interval: "check_interval",
+        tolerance: "tolerance",
+        idle_timeout: "idle_timeout"
     }
 };
 
@@ -139,6 +265,56 @@ function get_schema_label(stype, key, custom_t) {
     return t(key);
 }
 
+let NOTIFICATION_KEYS = [
+    "notify_smart_detect",
+    "notify_crash",
+    "notify_restart",
+    "notify_server_switch",
+    "notify_failover",
+    "notify_wan",
+    "notify_dns_leak",
+    "notify_subscription",
+    "notify_update_available",
+    "notify_auto_update",
+    "notify_parental",
+    "notify_cert",
+    "notify_route_alert"
+];
+
+let TOGGLE_FEATURE_SPEC = [
+    { key: "smart_detect", group: "core", reload: "none" },
+    { key: "smart_detect_expand_to_root", group: "core", reload: "none" },
+    { key: "qos_priority_engine", group: "core", reload: "firewall" },
+    { key: "tcp_bbr", group: "core", reload: "reload" },
+    { key: "eco_mode", group: "core", reload: "none" },
+    { key: "enable_yacd", group: "core", reload: "reload" },
+    { key: "enable_watchdog", group: "core", reload: "watchdog" },
+    { key: "wan_failover_enabled", group: "core", reload: "none" },
+    { key: "list_update_enabled", group: "core", reload: "reload" },
+    { key: "component_update_check_enabled", group: "core", reload: "reload" },
+    { key: "component_auto_update_enabled", group: "core", reload: "reload" },
+    { key: "enable_ai_doctor", group: "core", reload: "none" },
+    { key: "fakeip_enabled", group: "net", reload: "reload" },
+    { key: "block_doh", group: "net", reload: "reload" },
+    { key: "dns_intercept_all", group: "net", reload: "reload" },
+    { key: "dns_local_cache", group: "net", reload: "reload" },
+    { key: "dns_detour_enabled", group: "net", reload: "reload" },
+    { key: "ipv6_leak_guard", group: "net", reload: "reload" },
+    { key: "webrtc_leak_protect", group: "net", reload: "firewall" },
+    { key: "route_router_traffic", group: "net", reload: "reload" },
+    { key: "isolate_p2p", group: "net", reload: "reload" },
+    { key: "game_console_optimizer", group: "net", reload: "firewall" },
+    { key: "wifi_calling_direct", group: "net", reload: "firewall" },
+    { key: "direct_bypass_enabled", group: "net", reload: "reload" },
+    { key: "tun_gso", group: "net", reload: "reload" },
+    { key: "tun_endpoint_independent_nat", group: "net", reload: "reload" },
+    { key: "selector_auto_failover", group: "net", reload: "reload" },
+    { key: "smart_queue", group: "net", reload: "firewall" },
+    { key: "ai_proxy_health_enabled", group: "watchdog", reload: "none" },
+    { key: "ai_dns_continuous_enabled", group: "watchdog", reload: "none" },
+    { key: "emergency_direct_bypass", group: "watchdog", reload: "none" }
+];
+
 function is_boolean_key(key) {
     // disable_quic is a three-mode value (off/tunneled/all), not a flag: a
     // checkbox would render both new modes as "off" and a toggle would erase
@@ -147,18 +323,71 @@ function is_boolean_key(key) {
              "download_via_proxy_enabled", "show_dashboard_metadata", "prefix_nodes",
              "include_urltest_groups", "hide_urltest_group_outbounds", "hide_detour_outbounds",
              "dns_detour_enabled", "enable_output_network_interface", "enable_badwan_interface_monitoring",
-             "enable_yacd", "block_doh", "list_update_enabled", "component_update_check_enabled",
-             "download_lists_via_proxy", "download_components_via_proxy", "dont_touch_dhcp",
+             "enable_yacd", "enable_yacd_wan_access", "block_doh", "list_update_enabled", "component_update_check_enabled",
+             "component_auto_update_enabled", "download_lists_via_proxy", "download_components_via_proxy", "dont_touch_dhcp",
              "isolate_p2p", "exclude_ntp", "route_router_traffic", "shutdown_correctly", "smart_detect",
+             "smart_detect_expand_to_root", "qos_priority_engine", "tcp_bbr", "fakeip_enabled",
+             "ipv6_leak_guard", "dns_intercept_all", "dns_local_cache", "webrtc_leak_protect",
+             "game_console_optimizer", "wifi_calling_direct", "wan_failover_enabled", "eco_mode",
+             "enable_watchdog", "enable_ai_doctor", "ai_proxy_health_enabled", "ai_dns_continuous_enabled",
+             "emergency_direct_bypass", "tun_gso", "tun_endpoint_independent_nat",
+             "selector_auto_failover", "smart_queue", "direct_bypass_enabled", "notify",
              "notify_crash", "notify_restart", "notify_server_switch", "notify_subscription", "notify_cert", "notify_dns_leak",
-             "daily_report_enabled", "quiet_hours_enabled"];
+             "notify_auto_update", "notify_smart_detect", "notify_failover", "notify_wan",
+             "notify_update_available", "notify_parental", "notify_route_alert",
+             "daily_report_enabled", "quiet_hours_enabled", "match_all"];
     for (let x in b) if (x == key) return true;
     return false;
 }
 
+function bool_default_for_key(stype, key) {
+    for (let nk in NOTIFICATION_KEYS) {
+        if (key == nk) return true;
+    }
+    if (stype == "settings") {
+        let def_true = [
+            "qos_priority_engine", "tcp_bbr", "fakeip_enabled", "ipv6_leak_guard",
+            "list_update_enabled", "component_update_check_enabled",
+            "smart_detect_expand_to_root", "enable_watchdog", "ai_proxy_health_enabled",
+            "ai_dns_continuous_enabled", "emergency_direct_bypass", "tun_auto_route",
+            "ai_reload_dedup_enabled", "ai_metrics_enabled", "ai_smart_cooldowns_enabled",
+            "ai_config_validation_enabled", "ai_graceful_degradation_enabled",
+            "ai_persistent_smart_detect", "ai_adaptive_intervals_enabled",
+            "ai_anomaly_detection_enabled", "enable_rag"
+        ];
+        for (let k in def_true) {
+            if (key == k) return true;
+        }
+    }
+    if (stype == "profile" && key == "enabled") return true;
+    if (stype == "schedule" && key == "enabled") return true;
+    return false;
+}
+
+function effective_bool_value(section_obj, stype, key) {
+    let raw = section_obj ? section_obj[key] : null;
+    if (raw == "1" || raw == "true") return true;
+    if (raw == "0" || raw == "false") return false;
+    return bool_default_for_key(stype, key);
+}
+
+function toggle_feature_reload_mode(key) {
+    for (let item in TOGGLE_FEATURE_SPEC) {
+        if (item.key == key) return item.reload;
+    }
+    return null;
+}
+
 function is_list_key(key) {
     let l = ["dns_server", "bootstrap_dns_server", "source_network_interfaces",
-             "badwan_monitored_interfaces", "smart_detect_sections"];
+             "badwan_monitored_interfaces", "smart_detect_sections", "admin_ids",
+             "condition_refs", "outbound_source_refs", "outbound_group_refs", "balancer_refs", "group_members",
+             "source_refs", "group_refs", "server_refs",
+             "user_domains", "domain", "domain_suffix", "domain_keyword", "domain_regex",
+             "ip_cidr", "ip", "subnets", "source_ip_cidr", "fully_routed_ips", "excluded_ips",
+             "devices", "device_ip", "device_mac", "source_macs", "ports", "port", "dscp",
+             "community_lists", "rule_set", "rule_set_with_subnets", "domain_ip_lists",
+             "geoip_country", "proxy_links"];
     for (let x in l) if (x == key) return true;
     return false;
 }
@@ -170,7 +399,7 @@ let safe_exec_patterns = {
         bin: "/usr/bin/tachyon",
         min_args: 0,
         max_args: 1,
-        usage: "tachyon [get_status|doctor|show_sing_box_version|show_version]"
+        usage: "tachyon [get_status|doctor|show_tachyon_core_version|show_version|restore_native_internet|failsafe_restore|stop|restart|reload]"
     },
     logread: {
         bin: "/sbin/logread",
@@ -270,7 +499,19 @@ function safe_execute(exec_text, custom_t) {
                 if (!match(arg, policy.extra_pattern)) return { status: 1, output: t("err_arg_not_allowed", arg) };
         }
         if (base == "tachyon" && length(rest) == 1) {
-            let allowed_sub = { get_status: 1, doctor: 1, show_version: 1, show_sing_box_version: 1, show_config: 1, get_system_info: 1 };
+            let allowed_sub = {
+                get_status: 1,
+                doctor: 1,
+                show_version: 1,
+                show_tachyon_core_version: 1,
+                show_config: 1,
+                get_system_info: 1,
+                restore_native_internet: 1,
+                failsafe_restore: 1,
+                stop: 1,
+                restart: 1,
+                reload: 1
+            };
             if (!allowed_sub[rest[0]]) return { status: 1, output: t("err_subcmd_not_allowed", rest[0]) };
         }
     }
@@ -385,13 +626,360 @@ function valid_updatable_component(name) {
     name = as_string(name);
     let allowed = {
         tachyon: 1,
-        sing_box: 1,
-        "sing-box": 1,
-        zapret: 1,
-        zapret2: 1,
-        byedpi: 1
+        tachyon_core: 1,
+        "tachyon-core": 1,
+        torrserver_direct: 1
     };
     return allowed[name];
+}
+
+function component_display_title(comp) {
+    if (type(comp) == "object") {
+        let name = as_string(comp.component || "");
+        if (name == "tachyon_core" || name == "tachyon-core")
+            return "tachyon-core";
+        return name;
+    }
+    let sname = as_string(comp || "");
+    if (sname == "tachyon_core" || sname == "tachyon-core")
+        return "tachyon-core";
+    return sname;
+}
+
+function clean_release_notes(raw_notes) {
+    let text = trim(replace(as_string(raw_notes || ""), /\r/g, ""));
+    if (text == "")
+        return "";
+    let lines = split(text, "\n");
+    let out = [];
+    for (let line in lines) {
+        let trimmed = trim(line);
+        if (index(trimmed, "img.shields.io") >= 0 || match(trimmed, /^\[!\[.*\]\(https?:\/\/.*\)\]\(https?:\/\/.*\)$/))
+            continue;
+        if (trimmed == "---" && length(out) <= 2)
+            continue;
+        push(out, line);
+    }
+    return trim(join("\n", out));
+}
+
+// ---------------------------------------------------------------------------
+// The modular layout: conditions, outbound sources and balancers
+// ---------------------------------------------------------------------------
+//
+// A section no longer carries its conditions and its server sources itself.
+// The conditions live in reusable "condition" sections the section points
+// at, the sources in "outbound_source" sections, and the auto-selection
+// rules in "balancer" sections. A bot that only reads the section's own
+// fields therefore sees empty lists.
+//
+// These helpers read the section the way the generator reads it: the
+// section's own fields plus the ones its linked conditions carry.
+
+// The condition sections a section is built from: the ones it references
+// and the ones they are composed of (recursively traversing composite
+// condition_expression and condition_refs).
+function section_condition_sections(section) {
+    let result = [];
+    let seen = {};
+    if (type(section) != "object")
+        return result;
+
+    let visit = null;
+    visit = function(cond) {
+        if (type(cond) != "object")
+            return;
+        let name = common.option(cond, ".name", "");
+        if (name == "" || seen[name])
+            return;
+        seen[name] = true;
+        push(result, cond);
+
+        for (let ref in common.list_option(cond, "condition_refs"))
+            visit(uci_core.get_all(CONFIG_NAME, ref));
+
+        let c_expr = trim(as_string(common.option(cond, "condition_expression", "")));
+        if (c_expr != "") {
+            for (let tok in split(c_expr, /[^A-Za-z0-9_]+/)) {
+                let ut = uc(tok);
+                if (tok == "" || ut == "AND" || ut == "OR" || ut == "NOT")
+                    continue;
+                let sub = uci_core.get_all(CONFIG_NAME, tok);
+                if (type(sub) == "object" && (sub[".type"] == "condition" || sub[".type"] == null))
+                    visit(sub);
+            }
+        }
+    };
+
+    // A section may reference its conditions by name, or name them in a
+    // free-text expression - both are how the interface writes them.
+    for (let ref in common.list_option(section, "condition_refs"))
+        visit(uci_core.get_all(CONFIG_NAME, ref));
+
+    let expr = trim(as_string(common.option(section, "condition_expression", "")));
+    if (expr != "") {
+        for (let tok in split(expr, /[^A-Za-z0-9_]+/)) {
+            let ut = uc(tok);
+            if (tok == "" || ut == "AND" || ut == "OR" || ut == "NOT")
+                continue;
+            let sub = uci_core.get_all(CONFIG_NAME, tok);
+            if (type(sub) == "object" && (sub[".type"] == "condition" || sub[".type"] == null))
+                visit(sub);
+        }
+        let c = uci_core.cursor();
+        if (c) {
+            c.load(CONFIG_NAME);
+            let conditions = c.get_all(CONFIG_NAME, "condition");
+            for (let name in conditions) {
+                if (match(expr, name) != null || match(expr, name + " ") != null)
+                    visit(conditions[name]);
+            }
+        }
+    }
+
+    return result;
+}
+
+// The condition sections a section is built from, plus the section itself.
+// The section's own fields count - a config from before the modular layout
+// still holds them there.
+function section_own_and_conditions(section) {
+    let result = [];
+    if (type(section) == "object")
+        push(result, section);
+    for (let cond in section_condition_sections(section))
+        push(result, cond);
+    return result;
+}
+
+// The primary atomic condition linked to a section (if any), where new rule
+// items added via the Telegram bot should be stored.
+function section_primary_atomic_condition(section) {
+    let conds = section_condition_sections(section);
+    for (let cond in conds) {
+        if (trim(as_string(common.option(cond, "condition_expression", ""))) == "")
+            return cond;
+    }
+    return length(conds) > 0 ? conds[0] : null;
+}
+
+function section_match_all_enabled(section) {
+    for (let src in section_own_and_conditions(section)) {
+        if (as_string(common.option(src, "match_all", "0")) == "1")
+            return true;
+    }
+    return false;
+}
+
+// The values of one condition key across the section and its conditions.
+function section_condition_values(section, key) {
+    let result = [];
+    let seen = {};
+    let add_val = function(v) {
+        v = trim(as_string(v));
+        if (v == "" || seen[v])
+            return;
+        seen[v] = true;
+        push(result, v);
+    };
+
+    let keys_to_read = [ key ];
+    if (key == "src_ip" || key == "source_ip_cidr")
+        keys_to_read = [ "src_ip", "source_ip_cidr", "fully_routed_ips", "device_ip" ];
+    else if (key == "src_mac" || key == "source_macs")
+        keys_to_read = [ "src_mac", "source_macs", "device_mac" ];
+    else if (key == "src_device" || key == "devices")
+        keys_to_read = [ "src_device", "devices" ];
+    else if (key == "ports" || key == "port")
+        keys_to_read = [ "ports", "port" ];
+
+    for (let src in section_own_and_conditions(section)) {
+        for (let k in keys_to_read) {
+            for (let value in common.list_option(src, k)) {
+                for (let tok in split(as_string(value), /[\r\n,;\t ]+/)) {
+                    if (tok == "")
+                        continue;
+                    if (key == "domain" && (substr(tok, 0, 7) == "domain:" || substr(tok, 0, 8) == "keyword:" || substr(tok, 0, 6) == "regex:" || substr(tok, 0, 7) == "regexp:"))
+                        continue;
+                    if (key == "domain" && substr(tok, 0, 5) == "full:")
+                        tok = substr(tok, 5);
+                    else if (key == "domain_suffix" && substr(tok, 0, 7) == "domain:")
+                        tok = substr(tok, 7);
+                    else if (key == "domain_keyword" && substr(tok, 0, 8) == "keyword:")
+                        tok = substr(tok, 8);
+                    else if (key == "domain_regex" && (substr(tok, 0, 6) == "regex:" || substr(tok, 0, 7) == "regexp:"))
+                        tok = substr(tok, index(tok, ":") + 1);
+                    add_val(tok);
+                }
+            }
+            let text_val = trim(as_string(common.option(src, k + "_text", "")));
+            if (text_val != "") {
+                for (let tok in split(text_val, /[\r\n,;\t ]+/)) {
+                    if (tok != "")
+                        add_val(tok);
+                }
+            }
+        }
+
+        // Also extract prefixed or bare domain entries stored in user_domains / domain
+        if (key == "domain_suffix" || key == "domain" || key == "domain_keyword" || key == "domain_regex") {
+            let extra_tokens = [];
+            for (let uk in [ "user_domains", "domain" ]) {
+                for (let v in common.list_option(src, uk)) {
+                    for (let t in split(as_string(v), /[\r\n,;\t ]+/))
+                        if (t != "") push(extra_tokens, { src_key: uk, val: t });
+                }
+                let ut = trim(as_string(common.option(src, uk + "_text", "")));
+                if (ut != "") {
+                    for (let t in split(ut, /[\r\n,;\t ]+/))
+                        if (t != "") push(extra_tokens, { src_key: uk, val: t });
+                }
+            }
+            for (let item in extra_tokens) {
+                let tok = item.val;
+                if (substr(tok, 0, 5) == "full:") {
+                    if (key == "domain") add_val(substr(tok, 5));
+                } else if (substr(tok, 0, 7) == "domain:") {
+                    if (key == "domain_suffix") add_val(substr(tok, 7));
+                } else if (substr(tok, 0, 8) == "keyword:") {
+                    if (key == "domain_keyword") add_val(substr(tok, 8));
+                } else if (substr(tok, 0, 6) == "regex:" || substr(tok, 0, 7) == "regexp:") {
+                    if (key == "domain_regex") add_val(substr(tok, index(tok, ":") + 1));
+                } else if (item.src_key == "user_domains" && key == "domain_suffix") {
+                    let cleaned = substr(tok, 0, 1) == "." ? substr(tok, 1) : tok;
+                    add_val(cleaned);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+// The server sources a section draws from: the outbound_source sections it
+// references directly, via outbound_group_refs, or via balancer_refs, plus
+// the legacy subscription_url children it still carries.
+function section_outbound_sources(section) {
+    let result = [];
+    let seen = {};
+    if (type(section) != "object")
+        return result;
+
+    let add = function(src) {
+        if (type(src) != "object")
+            return;
+        let name = common.option(src, ".name", "");
+        if (name == "" || seen[name])
+            return;
+        seen[name] = true;
+        push(result, src);
+    };
+
+    let add_group = function(grp) {
+        if (type(grp) != "object")
+            return;
+        for (let sref in common.list_option(grp, "source_refs"))
+            add(uci_core.get_all(CONFIG_NAME, sref));
+    };
+
+    for (let ref in common.list_option(section, "outbound_source_refs"))
+        add(uci_core.get_all(CONFIG_NAME, ref));
+
+    for (let gref in common.list_option(section, "outbound_group_refs"))
+        add_group(uci_core.get_all(CONFIG_NAME, gref));
+
+    for (let bref in common.list_option(section, "balancer_refs")) {
+        let bal = uci_core.get_all(CONFIG_NAME, bref);
+        if (type(bal) != "object")
+            continue;
+        for (let sref in common.list_option(bal, "source_refs"))
+            add(uci_core.get_all(CONFIG_NAME, sref));
+        for (let gref in common.list_option(bal, "group_refs"))
+            add_group(uci_core.get_all(CONFIG_NAME, gref));
+        for (let lvl in common.list_option(bal, "outbound_group_levels")) {
+            for (let part in split(as_string(lvl), /[,;\t ]+/)) {
+                if (substr(part, 0, 7) == "source:")
+                    add(uci_core.get_all(CONFIG_NAME, substr(part, 7)));
+                else if (substr(part, 0, 6) == "group:")
+                    add_group(uci_core.get_all(CONFIG_NAME, substr(part, 6)));
+            }
+        }
+    }
+
+    let c = uci_core.cursor();
+    if (c) {
+        c.load(CONFIG_NAME);
+        let all = c.get_all(CONFIG_NAME);
+        for (let name in all) {
+            if (all[name][".type"] == "subscription_url" && all[name].section == common.option(section, ".name", ""))
+                add(all[name]);
+        }
+    }
+
+    return result;
+}
+
+function section_has_fptn(section) {
+    if (type(section) != "object")
+        return false;
+    if (as_string(common.option(section, "action", "")) == "fptn")
+        return true;
+    for (let src in section_outbound_sources(section)) {
+        if (as_string(common.option(src, "source_type", "")) == "fptn")
+            return true;
+    }
+    return false;
+}
+
+function section_fptn_token(section) {
+    if (type(section) != "object")
+        return "";
+    let tok = trim(as_string(common.option(section, "access_token", "")));
+    if (tok != "")
+        return tok;
+    for (let src in section_outbound_sources(section)) {
+        if (as_string(common.option(src, "source_type", "")) == "fptn") {
+            let st = trim(as_string(common.option(src, "access_token", "")));
+            if (st != "")
+                return st;
+        }
+    }
+    return "";
+}
+
+// The balancers a section uses: the reusable ones it references and the
+// legacy urltest/priority_group children it still carries.
+function section_balancers(section) {
+    let result = [];
+    let seen = {};
+    if (type(section) != "object")
+        return result;
+
+    let add = function(bal) {
+        if (type(bal) != "object")
+            return;
+        let name = common.option(bal, ".name", "");
+        if (name == "" || seen[name])
+            return;
+        seen[name] = true;
+        push(result, bal);
+    };
+
+    for (let ref in common.list_option(section, "balancer_refs"))
+        add(uci_core.get_all(CONFIG_NAME, ref));
+
+    let c = uci_core.cursor();
+    if (c) {
+        c.load(CONFIG_NAME);
+        let all = c.get_all(CONFIG_NAME);
+        let sec_name = common.option(section, ".name", "");
+        for (let name in all) {
+            let child = all[name];
+            if ((child[".type"] == "urltest" || child[".type"] == "priority_group") && child.section == sec_name)
+                add(child);
+        }
+    }
+
+    return result;
 }
 
 return {
@@ -403,7 +991,12 @@ return {
     format_bytes,
     setting_schema,
     get_schema_label,
+    NOTIFICATION_KEYS,
+    TOGGLE_FEATURE_SPEC,
     is_boolean_key,
+    bool_default_for_key,
+    effective_bool_value,
+    toggle_feature_reload_mode,
     is_list_key,
     safe_exec_patterns,
     parse_command_words,
@@ -411,6 +1004,15 @@ return {
     safe_execute,
     extract_clean_fptn_token,
     mask_fptn_token,
+    section_condition_sections,
+    section_own_and_conditions,
+    section_primary_atomic_condition,
+    section_match_all_enabled,
+    section_condition_values,
+    section_outbound_sources,
+    section_has_fptn,
+    section_fptn_token,
+    section_balancers,
     backup_archive_members,
     backup_archive_safe,
     backup_extract_dir,
@@ -420,5 +1022,8 @@ return {
     build_identity_key,
     normalize_mac,
     find_mac_block_rules,
-    valid_updatable_component
+    valid_updatable_component,
+    component_display_title,
+    clean_release_notes,
+    utf8_prefix
 };

@@ -47,6 +47,28 @@ function endpoint(value, proto) {
             resolve: null
         };
     }
+    if (proto == "dot" || proto == "doq") {
+        if (index(value, "://") >= 0 || index(value, "/") >= 0)
+            return null;
+        let host = url.host(value);
+        let port = url.port(value);
+        if (!ip.valid_ip(host) && !valid_domain(lc(host)))
+            return null;
+        if (port != "" && (match(port, /^[0-9]+$/) == null || int(port) < 1 || int(port) > 65535))
+            return null;
+        let server = dns.server_from_options("speed-test", proto, value, "");
+        if (!server || !server.server)
+            return null;
+        let default_port = proto == "doq" ? 784 : 853;
+        return {
+            value,
+            kind: proto,
+            address: server.server,
+            port: int(server.server_port || default_port),
+            sni: (server.tls && server.tls.server_name) ? server.tls.server_name : host,
+            resolve: null
+        };
+    }
     if (index(value, "://") >= 0 && substr(value, 0, 8) != "https://")
         return null;
     let host = url.host(value);
@@ -66,7 +88,8 @@ function endpoint(value, proto) {
 }
 
 function validate_request(request) {
-    if (type(request) != "object" || (request.protocol != "doh" && request.protocol != "udp") ||
+    if (type(request) != "object" ||
+        (request.protocol != "doh" && request.protocol != "udp" && request.protocol != "dot" && request.protocol != "doq") ||
         type(request.servers) != "array" || type(request.domains) != "array" ||
         (request.udp_servers != null && type(request.udp_servers) != "array") ||
         length(request.domains) < 1 || length(request.domains) > MAX_DOMAINS)
@@ -216,24 +239,101 @@ function probe_udp_domain(server, domain) {
                 return { ok: true, ms: elapsed >= 0 ? elapsed : 0.0, error: null };
             }
         }
-        t0 = clock();
-        let res2 = exec.run({ argv: [ "nslookup", domain, server_arg ], timeout: 4, capture: false });
-        t1 = clock();
-        if (res2.status == 0 && t0 && t1) {
-            let elapsed = (t1[0] - t0[0]) * 1000.0 + (t1[1] - t0[1]) / 1000000.0;
-            return { ok: true, ms: elapsed >= 0 ? elapsed : 0.0, error: null };
-        }
     }
 
     return { ok: false, ms: null, error: { kind: "transport", code: 28 } };
 }
 
 function measure_udp(server, domains) {
-    if (length(domains) > 0)
-        probe_udp_domain(server, domains[0]);
     let samples = [];
+    let consecutive_fails = 0;
+    let last_error = { kind: "transport", code: 28 };
+    if (length(domains) > 0) {
+        let warm = probe_udp_domain(server, domains[0]);
+        if (!warm.ok) {
+            consecutive_fails++;
+            if (warm.error) last_error = warm.error;
+        }
+    }
     for (let domain in domains) {
+        if (consecutive_fails >= 2) {
+            push(samples, { domain, ok: false, ms: null, error: last_error });
+            continue;
+        }
         let p = probe_udp_domain(server, domain);
+        if (!p.ok) {
+            consecutive_fails++;
+            if (p.error) last_error = p.error;
+        } else {
+            consecutive_fails = 0;
+        }
+        push(samples, { domain, ok: p.ok, ms: p.ms, error: p.error });
+    }
+    return { server: server.value, samples, stats: summarize(samples) };
+}
+
+let _has_kdig = null;
+function has_kdig() {
+    if (_has_kdig == null)
+        _has_kdig = exec.command_success_from_args([ "command", "-v", "kdig" ]);
+    return _has_kdig;
+}
+
+function probe_dot_or_doq_domain(server, domain) {
+    let target = "@" + server.address;
+    let port = as_string(server.port || (server.kind == "doq" ? 784 : 853));
+    let proto_flag = server.kind == "doq" ? "+quic" : "+tls";
+
+    if (has_kdig()) {
+        let args = [ "kdig", target, "-p", port, proto_flag ];
+        if (server.sni && !ip.valid_ip(server.sni))
+            push(args, "+tls-host=" + server.sni);
+        push(args, domain, "A", "+time=2", "+retry=0", "+stats");
+        let res = exec.run({ argv: args, timeout: 3 });
+        let out = as_string(res.output);
+        if (res.status == 0 && match(out, /status: NOERROR/)) {
+            let m = match(out, /in ([0-9]+(\.[0-9]+)?) ms/);
+            if (m && m[1])
+                return { ok: true, ms: double(m[1]), error: null };
+        }
+    }
+
+    if (server.kind == "dot" && has_dig()) {
+        let res = exec.run({
+            argv: [ "dig", target, "-p", port, "+tls", domain, "A", "+time=2", "+tries=1", "+stats" ],
+            timeout: 3
+        });
+        let out = as_string(res.output);
+        if (res.status == 0 && match(out, /status: NOERROR/)) {
+            let m = match(out, /Query time: ([0-9]+) msec/);
+            if (m && m[1])
+                return { ok: true, ms: double(int(m[1])), error: null };
+        }
+    }
+
+    return probe_udp_domain({
+        value: server.value,
+        address: server.address,
+        port: 53
+    }, domain);
+}
+
+function measure_dot_or_doq(server, domains) {
+    let samples = [];
+    let consecutive_fails = 0;
+    let last_error = { kind: "transport", code: 28 };
+    for (let domain in domains) {
+        if (consecutive_fails >= 2) {
+            push(samples, { domain, ok: false, ms: null, error: last_error });
+            continue;
+        }
+        let p = probe_dot_or_doq_domain(server, domain);
+        if (!p.ok) {
+            consecutive_fails++;
+            if (p.error) last_error = p.error;
+        } else {
+            consecutive_fails = 0;
+        }
         push(samples, { domain, ok: p.ok, ms: p.ms, error: p.error });
     }
     return { server: server.value, samples, stats: summarize(samples) };
@@ -242,22 +342,50 @@ function measure_udp(server, domains) {
 function measure(server, domains) {
     if (server.kind == "udp")
         return measure_udp(server, domains);
-    let args = [ "curl", "--disable" ];
+    if (server.kind == "dot" || server.kind == "doq")
+        return measure_dot_or_doq(server, domains);
     let count = length(domains);
+    if (count > 0) {
+        let probe_path = STATE_DIR + "/answer-probe";
+        let probe_query = replace(replace(replace(b64enc(dns_query(domains[0])), /\+/g, "-"), /\//g, "_"), /=+$/, "");
+        let probe_args = [
+            "curl", "--disable", "--silent", "--globoff", "--noproxy", "*", "--proto", "=https",
+            "--connect-timeout", "2", "--max-time", "3", "--max-filesize", "65535",
+            "--header", "accept: application/dns-message", "--header", "cache-control: no-cache",
+            "--output", probe_path,
+            "--write-out", "0|%{http_code}|%{time_total}|%{content_type}|%{size_download}|%{exitcode}\n"
+        ];
+        if (server.resolve != null) push(probe_args, "--resolve", server.resolve);
+        push(probe_args, "--url", server.address + "?dns=" + probe_query);
+        let probe_res = exec.run({ argv: probe_args, timeout: 4 });
+        fs.unlink(probe_path);
+        let probe_parts = split(trim(as_string(probe_res.output)), "|");
+        let probe_ok = length(probe_parts) == 6 && probe_parts[1] == "200" && probe_parts[5] == "0";
+        if (!probe_ok) {
+            let err = length(probe_parts) != 6 ? { kind: "transport", code: 28 } :
+                probe_parts[5] != "0" ? { kind: "transport", code: int(probe_parts[5]) } :
+                { kind: "http", code: int(probe_parts[1]) };
+            let failed_samples = [];
+            for (let d in domains)
+                push(failed_samples, { domain: d, ok: false, ms: null, error: err });
+            return { server: server.value, samples: failed_samples, stats: summarize(failed_samples) };
+        }
+    }
+    let args = [ "curl", "--disable" ];
     // One curl process keeps its connection cache for warm-up and measured requests.
     // Unlike the browser's concurrent fetches, transfers are serial to limit router load.
     for (let i = 0; i < count * 2; i++) {
         if (i > 0) push(args, "--next");
         let query = replace(replace(replace(b64enc(dns_query(domains[i % count])), /\+/g, "-"), /\//g, "_"), /=+$/, "");
         push(args, "--silent", "--globoff", "--noproxy", "*", "--proto", "=https",
-            "--connect-timeout", "5", "--max-time", "5", "--max-filesize", "65535",
+            "--connect-timeout", "2", "--max-time", "3", "--max-filesize", "65535",
             "--header", "accept: application/dns-message", "--header", "cache-control: no-cache",
             "--output", STATE_DIR + "/answer-" + i,
             "--write-out", sprintf("%d|%%{http_code}|%%{time_total}|%%{content_type}|%%{size_download}|%%{exitcode}\n", i));
         if (server.resolve != null) push(args, "--resolve", server.resolve);
         push(args, "--url", server.address + "?dns=" + query);
     }
-    let output = exec.run({ argv: args, timeout: count * 10 + 10 }).output;
+    let output = exec.run({ argv: args, timeout: 15 }).output;
     let reports = {};
     for (let line in split(as_string(output), "\n")) {
         let parts = split(line, "|");

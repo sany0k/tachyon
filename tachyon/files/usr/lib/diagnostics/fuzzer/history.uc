@@ -112,7 +112,31 @@ function ensure_state_dir() {
 
 function save_fuzzer_state(state) {
     ensure_state_dir();
+    if (state && type(state) == "object") {
+        let force = state._force === true;
+        delete state._force;
+        if (!force) {
+            let cur = read_json_file(STATE_FILE);
+            if (cur && type(cur) == "object") {
+                if (cur.job_id && state.job_id && cur.job_id != state.job_id)
+                    return false;
+                if (cur.aborted === true && state.aborted !== true)
+                    return false;
+            }
+        }
+    }
     return write_json_file(STATE_FILE, state) != null;
+}
+
+function is_job_aborted(job_id) {
+    let cur = read_json_file(STATE_FILE);
+    if (!cur || type(cur) != "object")
+        return false;
+    if (cur.aborted === true)
+        return true;
+    if (job_id && cur.job_id && cur.job_id != job_id)
+        return true;
+    return false;
 }
 
 function get_fuzzer_state() {
@@ -121,7 +145,7 @@ function get_fuzzer_state() {
         return {
             running: false,
             job_id: null,
-            engine: "zapret2",
+            engine: "desync",
             target: "youtube_suite",
             progress_pct: 0,
             current_index: 0,
@@ -155,8 +179,25 @@ function get_fuzzer_state() {
         }
         if (!is_alive) {
             state.running = false;
-            if (!state.error && state.progress_pct < 100)
-                state.error = "Worker process exited unexpectedly";
+            if (!state.error && state.progress_pct < 100) {
+                let err_detail = "";
+                if (state.job_id) {
+                    let j_dir = get_job_dir(state.job_id);
+                    let wlog = j_dir ? fs.readfile(j_dir + "/worker.log") : null;
+                    if (wlog) {
+                        for (let ln in split(trim(as_string(wlog)), "\n")) {
+                            let tl = trim(ln);
+                            if (tl != "") {
+                                err_detail = tl;
+                                break;
+                            }
+                        }
+                    }
+                }
+                state.error = err_detail != ""
+                    ? ("Worker process exited unexpectedly: " + substr(err_detail, 0, 180))
+                    : "Worker process exited unexpectedly";
+            }
             if (state.finished_at == 0)
                 state.finished_at = clock()[0];
             save_fuzzer_state(state);
@@ -193,6 +234,7 @@ function module_exports() {
         clear_history,
         ensure_state_dir,
         save_fuzzer_state,
+        is_job_aborted,
         get_fuzzer_state,
         safe_json_parse
     };

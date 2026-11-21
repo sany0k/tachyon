@@ -12,8 +12,35 @@ let i18n = require("service.i18n");
 
 let rendering = require("service.telegram.rendering");
 let transport = require("service.telegram.transport");
-let commands = require("service.telegram.commands");
-let callbacks = require("service.telegram.callbacks");
+let update_jobs = require("service.telegram.update_jobs");
+let notifications = require("service.telegram.notifications");
+let _commands = null;
+function get_commands() {
+    if (_commands == null) _commands = require("service.telegram.commands");
+    return _commands;
+}
+let _callbacks = null;
+function get_callbacks() {
+    if (_callbacks == null) _callbacks = require("service.telegram.callbacks");
+    return _callbacks;
+}
+let commands = {
+    view_set_cat: function(...args) { return get_commands().view_set_cat(...args); },
+    view_sec_list: function(...args) { return get_commands().view_sec_list(...args); },
+    view_test_rule: function(...args) { return get_commands().view_test_rule(...args); },
+    view_quiet_hours: function(...args) { return get_commands().view_quiet_hours(...args); },
+    view_set_arr: function(...args) { return get_commands().view_set_arr(...args); },
+    view_section_editor: function(...args) { return get_commands().view_section_editor(...args); },
+    view_sec_conds: function(...args) { return get_commands().view_sec_conds(...args); },
+    resolve_component_installed_version: function(...args) { return get_commands().resolve_component_installed_version(...args); }
+};
+let callbacks = {
+    handle_fptn_token_update: function(...args) { return get_callbacks().handle_fptn_token_update(...args); },
+    handle_sec_sub_add: function(...args) { return get_callbacks().handle_sec_sub_add(...args); },
+    handle_router_name_set: function(...args) { return get_callbacks().handle_router_name_set(...args); },
+    apply_backup_restore: function(...args) { return get_callbacks().apply_backup_restore(...args); },
+    dispatch_command: function(...args) { return get_callbacks().dispatch_command(...args); }
+};
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
@@ -21,6 +48,7 @@ const BIN_PATH = getenv("TACHYON_BIN") || "/usr/bin/tachyon";
 const NFT_TABLE_NAME = getenv("NFT_TABLE_NAME") || "TachyonTable";
 const PID_FILE = "/var/run/tachyon_telegram.pid";
 const OFFSET_FILE = getenv("TACHYON_TELEGRAM_OFFSET_FILE") || "/var/run/tachyon_telegram_offset";
+const OFFSET_BOT_FILE = OFFSET_FILE + ".bot";
 const COMPONENT_UPDATE_CHECK_TIMESTAMP = "/var/run/tachyon/component-update-check.timestamp";
 // Carried over from the monolithic service/telegram.uc by the split in
 // 57c7e2b0. Left behind, the reference below resolved to nothing and ucode
@@ -44,11 +72,16 @@ let shell_quote = common.shell_quote;
 // again - the bot answered in stutters instead of immediately.
 let build_identity_key = rendering.build_identity_key;
 let build_transition = rendering.build_transition;
+let component_display_title = rendering.component_display_title;
+let clean_release_notes = rendering.clean_release_notes;
 let safe_execute = rendering.safe_execute;
+let section_primary_atomic_condition = rendering.section_primary_atomic_condition;
 let view_set_cat = commands.view_set_cat;
 let view_sec_list = commands.view_sec_list;
 let view_test_rule = commands.view_test_rule;
 let view_quiet_hours = commands.view_quiet_hours;
+let view_sec_conds = commands.view_sec_conds;
+let resolve_component_installed_version = commands.resolve_component_installed_version;
 let handle_fptn_token_update = callbacks.handle_fptn_token_update;
 let handle_sec_sub_add = callbacks.handle_sec_sub_add;
 let handle_router_name_set = callbacks.handle_router_name_set;
@@ -86,10 +119,12 @@ let write_heartbeat = transport.write_heartbeat;
 let rotate_log_if_needed = transport.rotate_log_if_needed;
 let alert_route_failure = transport.alert_route_failure;
 let settings = transport.settings;
+let in_quiet_hours = transport.in_quiet_hours;
 let register_bot_commands = transport.register_bot_commands;
 
 let format_bytes = rendering.format_bytes;
 let escape_html = rendering.escape_html;
+let utf8_prefix = rendering.utf8_prefix;
 let apply_backup_restore = callbacks.apply_backup_restore;
 let dispatch_command = callbacks.dispatch_command;
 let view_set_arr = commands.view_set_arr;
@@ -97,20 +132,6 @@ let view_section_editor = commands.view_section_editor;
 
 let t = i18n.bind("en");
 
-function in_quiet_hours(cfg) {
-    if (cfg.quiet_hours_enabled != "1") return false;
-    let start = int(cfg.quiet_hours_start || "23");
-    let end = int(cfg.quiet_hours_end || "7");
-    if (start == end) return false;
-    let tm = localtime(time());
-    if (!tm) return false;
-    let hr = int(tm.hour);
-    if (start <= end) {
-        return hr >= start && hr < end;
-    } else {
-        return hr >= start || hr < end;
-    }
-}
 
 function send_api(message, smart_entries) {
     let cfg = settings();
@@ -120,17 +141,17 @@ function send_api(message, smart_entries) {
     if (!is_critical && in_quiet_hours(cfg)) return 0;
     
     let admins = split(cfg.admin_ids, /,/);
+    let accepted = true;
+    let recipients = 0;
     for (let admin in admins) {
         let chat_id = trim(admin);
         if (chat_id != "") {
-            let actions = smart_entries ? require("service.telegram.smart_detect_actions") : null;
-            let id = actions ? actions.create(smart_entries, chat_id) : null;
-            let res = send_message(cfg.bot_token, chat_id, message, "Markdown", id ? actions.keyboard(id, i18n.bind(cfg.language)) : null);
-            if (id && res?.ok && res.result?.message_id)
-                actions.bind_message(id, chat_id, res.result.message_id);
+            recipients++;
+            if (!notifications.submit(cfg.bot_token, chat_id, message, "Markdown", null, smart_entries))
+                accepted = false;
         }
     }
-    return 0;
+    return accepted && recipients > 0 ? 0 : 1;
 }
 
 function send_daily_digest(token, admin_ids) {
@@ -147,13 +168,51 @@ function send_daily_digest(token, admin_ids) {
     }
     
     let admins = split(admin_ids, /,/);
+    let accepted = true;
+    let recipients = 0;
     for (let admin in admins) {
         let chat_id = trim(admin);
-        if (chat_id != "") send_message(token, chat_id, text, "HTML", null);
+        if (chat_id == "") continue;
+        recipients++;
+        if (!notifications.submit(token, chat_id, text, "HTML", null)) accepted = false;
     }
+    return accepted && recipients > 0;
+}
+
+function normalize_component_name(component) {
+    component = as_string(component);
+    if (component == "tachyon-core" || component == "tachyon_core" || component == "tachyoncore")
+        return "tachyon-core";
+    if (component == "torrserver_direct" || component == "torrserver-direct" || component == "torrserver")
+        return "torrserver_direct";
+    return component;
+}
+
+function is_component_auto_update_active(comp_name) {
+    let s = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let enabled = s.component_auto_update_enabled;
+    if (enabled != "1" && enabled != 1 && enabled != true)
+        return false;
+    let targets = s.component_auto_update_targets;
+    if (targets == null || targets == "" || (type(targets) == "array" && length(targets) == 0))
+        return true;
+    let norm_comp = normalize_component_name(comp_name);
+    if (type(targets) == "string") {
+        if (targets == "all" || normalize_component_name(targets) == norm_comp)
+            return true;
+        targets = split(targets, /[ \t,]+/);
+    }
+    if (type(targets) == "array") {
+        for (let t in targets) {
+            if (t == "all" || normalize_component_name(t) == norm_comp)
+                return true;
+        }
+    }
+    return false;
 }
 
 function check_notified_updates(token, admin_ids) {
+    if (settings().notify_update_available == "0") return;
     let out = command_output_from_args(["/usr/bin/tachyon", "component_update_check_cache"]);
     if (!out || out == "") return;
     try {
@@ -166,11 +225,14 @@ function check_notified_updates(token, admin_ids) {
         
         let changed = false;
         let results = data.results || [];
+        let sys_info = null;
         for (let comp in results) {
             let name = comp.component || "";
             if (name == "") continue;
             if (comp.success !== true) continue;
             if (comp.status == "outdated" || comp.status == "outdated_same_release") {
+                if (is_component_auto_update_active(name))
+                    continue;
                 let latest = comp.latest_version;
                 // Keyed by version *and* build: a rebuild under an existing tag
                 // leaves the version untouched, so a version-only key would
@@ -179,8 +241,16 @@ function check_notified_updates(token, admin_ids) {
                 let identity = build_identity_key(comp);
                 let key = as_string(latest) + (identity != "" ? ":" + identity : "");
                 if (notified[name] != key) {
-                    let title = (name == "sing_box") ? "sing-box" : name;
-                    let cur = comp.current_version || "?";
+                    let title = component_display_title(comp);
+                    let cur = trim(as_string(comp.current_version || ""));
+                    if (cur == "" || cur == "?") {
+                        if (sys_info == null) {
+                            let raw_sys = common.command_output_from_args([ BIN_PATH, "get_system_info" ]);
+                            try { sys_info = json(raw_sys || "{}"); } catch (e) { sys_info = {}; }
+                        }
+                        cur = resolve_component_installed_version(name, sys_info);
+                    }
+                    if (cur == "") cur = "?";
                     let msg;
                     if (comp.status == "outdated_same_release") {
                         let transition = build_transition(comp);
@@ -189,10 +259,10 @@ function check_notified_updates(token, admin_ids) {
                     } else {
                         msg = "📦 <b>" + t("update_available") + "</b>\n" + title + ": <code>" + escape_html(cur) + "</code> ➡️ <code>" + escape_html(as_string(latest)) + "</code>";
                     }
-                    let notes = trim(replace(as_string(comp.release_notes || ""), /\r/g, ""));
+                    let notes = clean_release_notes(comp.release_notes);
                     if (notes != "") {
                         if (length(notes) > 1200)
-                            notes = substr(notes, 0, 1200) + "\n...";
+                            notes = utf8_prefix(notes, 1200) + "\n...";
                         msg += "\n\n📋 <b>" + t("update_whats_new") + ":</b>\n<pre>" + escape_html(notes) + "</pre>";
                     }
                     if (as_string(comp.release_url || "") != "") {
@@ -201,12 +271,18 @@ function check_notified_updates(token, admin_ids) {
                     let kb = [[{text: t("btn_update_component") + " " + title, callback_data: "/update_component " + name}]];
 
                     let admins = split(admin_ids, /,/);
+                    let accepted = true;
+                    let recipients = 0;
                     for (let admin in admins) {
                         let cid = trim(admin);
-                        if (cid != "") send_message(token, cid, msg, "HTML", kb);
+                        if (cid == "") continue;
+                        recipients++;
+                        if (!notifications.submit(token, cid, msg, "HTML", kb)) accepted = false;
                     }
-                    notified[name] = key;
-                    changed = true;
+                    if (accepted && recipients > 0) {
+                        notified[name] = key;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -222,13 +298,108 @@ function check_notified_updates(token, admin_ids) {
 function notify_updates_cli() {
     let cfg = settings();
     if (cfg.enabled != "1" || !cfg.bot_token || !cfg.admin_ids) return 0;
+    if (cfg.notify_update_available == "0") return 0;
     check_notified_updates(cfg.bot_token, cfg.admin_ids);
     return 0;
 }
 
+function notify_auto_update_cli(component, old_ver, new_ver) {
+    let cfg = settings();
+    if (cfg.enabled != "1" || !cfg.bot_token || !cfg.admin_ids) return 0;
+    if (cfg.notify_auto_update == "0") return 0;
+
+    component = as_string(component || "");
+    old_ver = as_string(old_ver || "");
+    new_ver = as_string(new_ver || "");
+
+    let title = component;
+    if (component == "tachyon-core" || component == "tachyon_core") {
+        title = "tachyon-core";
+    }
+
+    let lang = cfg.language;
+    if (!lang || lang == "") {
+        try {
+            let luci_lang = uci_core.get("luci", "main", "lang");
+            if (luci_lang == "ru" || match(luci_lang, /^ru/))
+                lang = "ru";
+        } catch(e) {}
+    }
+    let local_t = i18n.bind(lang || "ru");
+
+    let msg = "🚀 <b>" + local_t("auto_update_header") + "</b>\n" +
+        local_t("component_label") + ": <code>" + escape_html(title) + "</code>\n";
+
+    if (old_ver != "" && new_ver != "" && old_ver != new_ver) {
+        msg += local_t("auto_update_from_to", "<code>" + escape_html(old_ver) + "</code>", "<code>" + escape_html(new_ver) + "</code>");
+    } else if (new_ver != "" && old_ver == new_ver) {
+        msg += local_t("auto_update_rebuild", "<code>" + escape_html(new_ver) + "</code>");
+    } else if (new_ver != "") {
+        msg += local_t("auto_update_to", "<code>" + escape_html(new_ver) + "</code>");
+    } else if (old_ver != "") {
+        msg += local_t("version_label") + ": <code>" + escape_html(old_ver) + "</code>";
+    }
+
+    let admins = split(cfg.admin_ids, /,/);
+    let accepted = true;
+    let recipients = 0;
+    for (let admin in admins) {
+        let cid = trim(admin);
+        if (cid == "") continue;
+        recipients++;
+        if (!notifications.submit(cfg.bot_token, cid, msg, "HTML", null)) accepted = false;
+    }
+    return accepted && recipients > 0 ? 0 : 1;
+}
+
+function notify_auto_update_failed_cli(component, old_ver, error_msg) {
+    let cfg = settings();
+    if (cfg.enabled != "1" || !cfg.bot_token || !cfg.admin_ids) return 0;
+    if (cfg.notify_auto_update == "0") return 0;
+
+    component = as_string(component || "");
+    old_ver = as_string(old_ver || "");
+    error_msg = as_string(error_msg || "");
+
+    let title = component;
+    if (component == "tachyon-core" || component == "tachyon_core") {
+        title = "tachyon-core";
+    }
+
+    let lang = cfg.language;
+    if (!lang || lang == "") {
+        try {
+            let luci_lang = uci_core.get("luci", "main", "lang");
+            if (luci_lang == "ru" || match(luci_lang, /^ru/))
+                lang = "ru";
+        } catch(e) {}
+    }
+    let local_t = i18n.bind(lang || "ru");
+
+    let msg = "⚠️ <b>" + (lang == "ru" ? "Ошибка автообновления" : "Auto-update failed") + "</b>\n" +
+        local_t("component_label") + ": <code>" + escape_html(title) + "</code>\n";
+    if (old_ver != "")
+        msg += local_t("version_label") + ": <code>" + escape_html(old_ver) + "</code>\n";
+    if (error_msg != "")
+        msg += (lang == "ru" ? "Ошибка" : "Error") + ": <code>" + escape_html(error_msg) + "</code>\n";
+
+    let kb = [[{text: local_t("btn_update_component") + " " + title, callback_data: "/update_component " + component}]];
+
+    let admins = split(cfg.admin_ids, /,/);
+    let accepted = true;
+    let recipients = 0;
+    for (let admin in admins) {
+        let cid = trim(admin);
+        if (cid == "") continue;
+        recipients++;
+        if (!notifications.submit(cfg.bot_token, cid, msg, "HTML", kb)) accepted = false;
+    }
+    return accepted && recipients > 0 ? 0 : 1;
+}
+
 function block_schedules_with_notify() {
     let result = [];
-    for (let s in uci_core.sections(CONFIG_NAME, "schedule")) {
+    for (let s in uci_core.section_objects(CONFIG_NAME, "schedule")) {
         s = object_or_empty(s);
         if (option(s, "enabled", "1") != "0" &&
             option(s, "notify", "0") == "1" &&
@@ -280,7 +451,7 @@ function check_blocked_activity(cfg) {
             continue;
         current[label] = total;
         let prev = int(previous[label] || "0");
-        if (total > prev) {
+        if (total > prev && cfg.notify_parental != "0") {
             let delta = total - prev;
             let admins = split(cfg.admin_ids || "", /,/);
             for (let admin in admins) {
@@ -309,6 +480,16 @@ function check_blocked_activity(cfg) {
 // can duplicate an update is the handling itself and not the rest of the batch.
 // At-most-once is the right trade for a status bot: losing one reply beats sending
 // fifteen.
+function extract_bot_id(token) {
+    let raw = trim(as_string(token));
+    if (raw == "")
+        return "";
+    let colon = index(raw, ":");
+    if (colon <= 0)
+        return raw;
+    return substr(raw, 0, colon);
+}
+
 function persist_offset(offset) {
     if (fs.writefile(OFFSET_FILE, as_string(offset)) != null)
         return true;
@@ -319,9 +500,59 @@ function persist_offset(offset) {
     return false;
 }
 
-function process_updates(token, admin_ids) {
+function sync_offset_for_bot(token) {
+    let bot_id = extract_bot_id(token);
+    let saved_bot_id = trim(fs.readfile(OFFSET_BOT_FILE) || "");
     let offset = int(trim(fs.readfile(OFFSET_FILE) || "0"));
-    let res = tg_request(token, "getUpdates", { offset: offset, timeout: 50 });
+    if (offset < 0)
+        offset = 0;
+
+    if (bot_id != "" && saved_bot_id != "" && saved_bot_id != bot_id) {
+        offset = 0;
+        persist_offset(0);
+        try { fs.writefile(OFFSET_BOT_FILE, bot_id); } catch (e) {}
+        command_success_from_args(["logger", "-t", "tachyon-telegram",
+            "[info] Bot token changed; reset Telegram update offset"]);
+        return 0;
+    }
+
+    if (bot_id != "" && saved_bot_id == "") {
+        try { fs.writefile(OFFSET_BOT_FILE, bot_id); } catch (e) {}
+    }
+
+    return offset;
+}
+
+let chat_admin_cache = {};
+const CHAT_ADMIN_CACHE_MAX = 128;
+
+function is_chat_admin_cached(token, chat_id, user_id) {
+    if (!token || !chat_id || !user_id) return false;
+    let chat_num = int(chat_id);
+    if (chat_num >= 0) return false;
+    let cache_key = sprintf("%s:%s", as_string(chat_id), as_string(user_id));
+    let now = time();
+    let cached = chat_admin_cache[cache_key];
+    if (cached && (now - cached.time) < 300)
+        return cached.is_admin;
+
+    for (let k in keys(chat_admin_cache)) {
+        if ((now - int(chat_admin_cache[k]?.time || 0)) >= 300)
+            delete chat_admin_cache[k];
+    }
+    if (length(keys(chat_admin_cache)) >= CHAT_ADMIN_CACHE_MAX)
+        chat_admin_cache = {};
+
+    let res = tg_request(token, "getChatMember", { chat_id: chat_num, user_id: int(user_id) });
+    let status = res?.ok ? res.result?.status : null;
+    let is_adm = (status == "creator" || status == "administrator");
+    chat_admin_cache[cache_key] = { is_admin: is_adm, time: now };
+    return is_adm;
+}
+
+function process_updates(token, admin_ids) {
+    let offset = sync_offset_for_bot(token);
+    let res = tg_request(token, "getUpdates", { offset: offset, timeout: 25 });
     
     // A Telegram answer with ok:false is the API talking, not a broken
     // request. 409 ("terminated by other getUpdates request") and 429 (rate
@@ -336,23 +567,50 @@ function process_updates(token, admin_ids) {
         if (error_code == 429) {
             let params = object_or_empty(res.parameters);
             let retry_after = int(params.retry_after || 0);
-            if (retry_after > 0 && retry_after <= 60)
-                sleep(retry_after * 1000);
+            let wait_sec = retry_after > 0 ? min(retry_after, 120) : 10;
+            sleep(wait_sec * 1000);
+        } else {
+            sleep(10000);
         }
         command_success_from_args(["logger", "-t", "tachyon-telegram",
             "[info] Telegram declined getUpdates (" + as_string(res.error_code || "?") + " " + as_string(res.description || "") + "), not counted as a poll failure"]);
         return true;
     }
     if (length(res.result) == 0) return true;
-    
+
+    let stale_batch = false;
+    let batch_max = -1;
     for (let upd in res.result) {
-        let update_id = upd.update_id;
+        let uid = int(upd.update_id || 0);
+        if (uid > batch_max)
+            batch_max = uid;
+        if (offset > 0 && uid < offset)
+            stale_batch = true;
+    }
+    if (stale_batch && batch_max >= 0) {
+        offset = batch_max + 1;
+        if (!persist_offset(offset))
+            return false;
+        command_success_from_args(["logger", "-t", "tachyon-telegram",
+            "[warn] Resynchronized stale Telegram update offset to " + as_string(offset) + "; skipping stale batch"]);
+        return true;
+    }
+
+    let seen_updates = {};
+    for (let upd in res.result) {
+        let update_id = int(upd.update_id || 0);
+        let update_key = as_string(update_id);
+        if (seen_updates[update_key])
+            continue;
+        seen_updates[update_key] = true;
+
         if (update_id >= offset) {
             offset = update_id + 1;
         }
 
         // Acknowledge first, answer second. See persist_offset().
-        persist_offset(offset);
+        if (!persist_offset(offset))
+            return false;
 
         try {
         let cb = upd.callback_query;
@@ -365,7 +623,7 @@ function process_updates(token, admin_ids) {
             }
             if (index(as_string(cb.data), "/sd ") == 0) {
                 // A permitted group chat does not authorize every group member.
-                if (!cb.message || !is_admin(cb.from?.id, admin_ids)) {
+                if (!cb.message || (!is_admin(cb.from?.id, admin_ids) && !is_chat_admin_cached(token, chat_id, cb.from?.id))) {
                     tg_request(token, "answerCallbackQuery", { callback_query_id: cb.id, text: "Access Denied" });
                     continue;
                 }
@@ -381,12 +639,12 @@ function process_updates(token, admin_ids) {
                 }
                 continue;
             }
+            tg_request(token, "answerCallbackQuery", { callback_query_id: cb.id });
             try {
                 dispatch_command(token, chat_id, cb.data, cb.message ? cb.message.message_id : null);
             } catch (e) {
                 send_message(token, chat_id, "❌ " + t("exec_cmd_error") + " " + escape_html(as_string(e)), "HTML");
             }
-            tg_request(token, "answerCallbackQuery", { callback_query_id: cb.id });
             continue;
         }
 
@@ -444,7 +702,7 @@ function process_updates(token, admin_ids) {
                     send_message(token, chat_id, "⏳ " + t("exec_whitelist_msg") + "\n<code>" + escape_html(exec_cmd) + "</code>", "HTML");
                     let out = safe_execute(exec_cmd);
                     let result_text = "<b>Выполнено (код " + out.status + "):</b>\n<pre>" + escape_html(out.output || t("exec_no_output")) + "</pre>";
-                    if (length(result_text) > 4000) result_text = substr(result_text, 0, 4000) + "...</pre>";
+                    if (length(result_text) > 4000) result_text = utf8_prefix(result_text, 4000) + "...</pre>";
                     send_message(token, chat_id, result_text, "HTML");
                     continue;
                 }
@@ -500,9 +758,15 @@ function process_updates(token, admin_ids) {
                     let new_sec = trim(msg.text);
                     if (match(new_sec, /^[a-zA-Z0-9_]+$/)) {
                         c.set(CONFIG_NAME, new_sec, "section");
-                        c.set(CONFIG_NAME, new_sec, "action", "proxy");
+                        c.set(CONFIG_NAME, new_sec, "action", "connection");
                         c.set(CONFIG_NAME, new_sec, "enabled", "1");
                         c.set(CONFIG_NAME, new_sec, "label", new_sec);
+                        let cond_name = new_sec + "_cond";
+                        if (!c.get_all(CONFIG_NAME, cond_name)) {
+                            c.set(CONFIG_NAME, cond_name, "condition");
+                            c.set(CONFIG_NAME, cond_name, "label", new_sec);
+                            c.set(CONFIG_NAME, new_sec, "condition_refs", [ cond_name ]);
+                        }
                         c.commit(CONFIG_NAME);
                         set_tg_state(chat_id, null);
                         send_message(token, chat_id, "✅ Секция создана!");
@@ -511,6 +775,49 @@ function process_updates(token, admin_ids) {
                         set_tg_state(chat_id, state);
                         send_message(token, chat_id, "❌ Неверное имя. Разрешены только буквы, цифры и подчеркивания.");
                     }
+                }
+                else if (state.action == "sec_cond_new") {
+                    let new_cond = trim(msg.text);
+                    if (match(new_cond, /^[a-zA-Z0-9_]+$/)) {
+                        c.set(CONFIG_NAME, new_cond, "condition");
+                        c.set(CONFIG_NAME, new_cond, "label", new_cond);
+                        if (state.sec && c.get_all(CONFIG_NAME, state.sec)) {
+                            c.add_list(CONFIG_NAME, state.sec, "condition_refs", new_cond);
+                        }
+                        c.commit(CONFIG_NAME);
+                        set_tg_state(chat_id, null);
+                        send_message(token, chat_id, "✅ Условие <code>" + escape_html(new_cond) + "</code> создано!", "HTML");
+                        if (state.sec)
+                            view_sec_conds(token, chat_id, null, state.sec);
+                        else
+                            view_set_cat(token, chat_id, null, "condition", new_cond, 0);
+                    } else {
+                        set_tg_state(chat_id, state);
+                        send_message(token, chat_id, "❌ Неверное имя. Разрешены только буквы, цифры и подчеркивания.");
+                    }
+                }
+                else if (state.action == "sec_dns_edit") {
+                    let raw = trim(msg.text);
+                    let parts = split(raw, /[ \t]+/);
+                    let dtype = "doh";
+                    let dsrv = raw;
+                    if (length(parts) >= 2 && (parts[0] == "doh" || parts[0] == "dot" || parts[0] == "udp" || parts[0] == "tcp")) {
+                        dtype = parts[0];
+                        dsrv = join(" ", slice(parts, 1));
+                    } else if (match(raw, /^https?:\/\//i)) {
+                        dtype = "doh";
+                    } else if (match(raw, /^tls:\/\//i)) {
+                        dtype = "dot";
+                        dsrv = replace(raw, /^tls:\/\//i, "");
+                    } else {
+                        dtype = "udp";
+                    }
+                    c.set(CONFIG_NAME, state.sec, "dns_type", dtype);
+                    c.set(CONFIG_NAME, state.sec, "dns_server", dsrv);
+                    c.commit(CONFIG_NAME);
+                    set_tg_state(chat_id, null);
+                    send_message(token, chat_id, "✅ DNS сервер установлен: <code>" + escape_html(dtype + "://" + dsrv) + "</code>", "HTML");
+                    view_section_editor(token, chat_id, null, state.sec);
                 }
                 else if (state.action == "sec_rename") {
                     let new_label = trim(msg.text);
@@ -534,14 +841,53 @@ function process_updates(token, admin_ids) {
                     for (let x in items) if (trim(x) != "") push(valid_items, trim(x));
 
                     if (length(valid_items) > 0) {
-                        let field = "domain_suffix";
-                        if (state.list == "ip") field = "ip_cidr";
-                        else if (state.list == "src") field = "src_ip";
-                        else if (state.list == "ruleset") field = "community_lists";
+                        let sec_obj = c.get_all(CONFIG_NAME, state.sec);
+                        let cond_obj = section_primary_atomic_condition(sec_obj);
+                        let holder = (cond_obj && cond_obj[".name"]) ? cond_obj[".name"] : state.sec;
+                        let holder_obj = c.get_all(CONFIG_NAME, holder) || {};
 
-                        let current = common.list_option(c.get_all(CONFIG_NAME, state.sec), field);
-                        for (let x in valid_items) push(current, x);
-                        c.set(CONFIG_NAME, state.sec, field, current);
+                        let append_to_field = function(fname, val) {
+                            let cur = common.list_option(c.get_all(CONFIG_NAME, holder), fname);
+                            let exists = false;
+                            for (let e in cur) if (e == val) { exists = true; break; }
+                            if (!exists) {
+                                push(cur, val);
+                                c.set(CONFIG_NAME, holder, fname, cur);
+                            }
+                        };
+
+                        for (let x in valid_items) {
+                            if (state.list == "domain") {
+                                if (substr(x, 0, 5) == "full:")
+                                    append_to_field("domain", substr(x, 5));
+                                else if (substr(x, 0, 7) == "domain:")
+                                    append_to_field("domain_suffix", substr(x, 7));
+                                else if (substr(x, 0, 8) == "keyword:")
+                                    append_to_field("domain_keyword", substr(x, 8));
+                                else if (substr(x, 0, 6) == "regex:" || substr(x, 0, 7) == "regexp:")
+                                    append_to_field("domain_regex", substr(x, index(x, ":") + 1));
+                                else if (length(common.list_option(holder_obj, "user_domains")) > 0 && length(common.list_option(holder_obj, "domain_suffix")) == 0)
+                                    append_to_field("user_domains", x);
+                                else
+                                    append_to_field("domain_suffix", x);
+                            } else if (state.list == "ip") {
+                                append_to_field("ip_cidr", x);
+                            } else if (state.list == "src") {
+                                if (match(x, /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/))
+                                    append_to_field("source_macs", lc(replace(x, "-", ":")));
+                                else if (match(x, /^[0-9.]+\/?[0-9]*$/) || index(x, ":") >= 0)
+                                    append_to_field("source_ip_cidr", x);
+                                else
+                                    append_to_field("devices", x);
+                            } else if (state.list == "ruleset") {
+                                append_to_field("community_lists", x);
+                            } else if (state.list == "ports") {
+                                append_to_field("ports", x);
+                            } else if (state.list == "geoip") {
+                                append_to_field("geoip_country", uc(x));
+                            }
+                        }
+
                         c.commit(CONFIG_NAME);
                         set_tg_state(chat_id, null);
                         send_message(token, chat_id, "✅ Добавлено " + length(valid_items) + " элементов.");
@@ -564,6 +910,8 @@ function process_updates(token, admin_ids) {
                         let sec = parts[0];
                         let url = join(" ", slice(parts, 1));
                         handle_sec_sub_add(token, chat_id, msg_id, sec, url);
+                    } else if (state.sec && length(parts) == 1 && parts[0] != "") {
+                        handle_sec_sub_add(token, chat_id, msg_id, state.sec, parts[0]);
                     } else {
                         set_tg_state(chat_id, state);
                         send_message(token, chat_id, "❌ Формат: <code>секция URL</code>\nНапример: <code>Main https://...</code>", "HTML");
@@ -604,6 +952,22 @@ function process_updates(token, admin_ids) {
     return true;
 }
 
+function sleep_with_heartbeat(total_seconds) {
+    let remaining = int(total_seconds || 0);
+    if (remaining <= 0) {
+        write_heartbeat();
+        return;
+    }
+    while (remaining > 0) {
+        let chunk = remaining > 15 ? 15 : remaining;
+        sleep(chunk * 1000);
+        remaining -= chunk;
+        write_heartbeat();
+        if (settings().enabled != "1")
+            break;
+    }
+}
+
 function worker() {
     let cfg = settings();
     if (cfg.enabled != "1" || !cfg.bot_token) return 0;
@@ -627,10 +991,10 @@ function worker() {
     let poll_interval = int(cfg.poll_interval || "5");
     if (poll_interval < 1) poll_interval = 1;
 
-    let last_report_day = -1;
     let last_update_check = 0;
     let last_update_check_mtime = 0;
     let last_blocked_check = 0;
+    let last_job_check = 0;
     let consecutive_failures = 0;
     let route_alert_sent = false;
     let last_log_check = 0;
@@ -641,39 +1005,19 @@ function worker() {
             if (cfg.enabled != "1") break;
             t = i18n.bind(cfg.language);
             write_heartbeat();
-            let res = process_updates(cfg.bot_token, cfg.admin_ids);
-
-            if (res === false) {
-                consecutive_failures++;
-                let backoff = poll_interval * (1 << min(consecutive_failures - 1, 4));
-                if (backoff > 300) backoff = 300;
-                let log_level = consecutive_failures >= 3 ? "[warn]" : "[info]";
-                command_success_from_args(["logger", "-t", "tachyon-telegram", log_level + " API poll retry " + as_string(consecutive_failures) + ", backing off " + as_string(backoff) + "s"]);
-
-                // Tell the admin once per failure episode that the usual
-                // proxy route is down and the direct fallback carries the
-                // bot meanwhile.
-                if (!route_alert_sent && consecutive_failures >= 5) {
-                    route_alert_sent = true;
-                    alert_route_failure(consecutive_failures, mixed_port_alive());
-                }
-
-                sleep(backoff * 1000);
-                continue;
-            }
-            consecutive_failures = 0;
-            route_alert_sent = false;
-            write_heartbeat();
-
             let now = time();
             // localtime() yields { sec, min, hour, mday, mon, year, ... }.
             // clock() returns [seconds, microseconds] and has no calendar fields.
             let tm = localtime(now);
             let daily_hour = int(cfg.daily_report_hour || "8");
 
-            if (cfg.daily_report_enabled == "1" && tm && tm.hour == daily_hour && tm.mday != last_report_day) {
-                last_report_day = tm.mday;
-                send_daily_digest(cfg.bot_token, cfg.admin_ids);
+            let report_day = tm ? sprintf("%d:%d:%d", tm.year, tm.mon, tm.mday) : "";
+            common.ensure_dir("/var/run/tachyon");
+            let daily_marker = "/var/run/tachyon/telegram-daily-" + split(cfg.bot_token, /:/)[0] + ".date";
+            if (cfg.daily_report_enabled == "1" && tm && tm.hour == daily_hour &&
+                trim(fs.readfile(daily_marker) || "") != report_day) {
+                if (send_daily_digest(cfg.bot_token, cfg.admin_ids))
+                    common.write_file(daily_marker, report_day + "\n");
             }
             
             let ts_stat = fs.stat(COMPONENT_UPDATE_CHECK_TIMESTAMP);
@@ -692,14 +1036,39 @@ function worker() {
                 last_blocked_check = now;
             }
 
-            if (now - last_log_check > 3600) {
+            // Background component updates: report the outcome to the chat that
+            // started them. Polled often: the job finishes within a couple of
+            // minutes and the user is waiting for the result.
+            if (now - last_job_check >= 5) {
+                update_jobs.poll(cfg.bot_token, cfg.language);
+                last_job_check = now;
+            }
+
+            if (now - last_log_check >= 300) {
                 rotate_log_if_needed();
+                if (type(gc) == "function")
+                    gc();
                 last_log_check = now;
             }
+            notifications.drain(cfg.bot_token);
+            write_heartbeat();
+            let res = process_updates(cfg.bot_token, cfg.admin_ids);
+            if (res === false) {
+                consecutive_failures++;
+                let backoff = min(300, poll_interval * (1 << min(consecutive_failures - 1, 4)));
+                let log_level = consecutive_failures >= 3 ? "[warn]" : "[info]";
+                command_success_from_args(["logger", "-t", "tachyon-telegram", log_level + " API poll retry " + as_string(consecutive_failures) + ", backing off " + as_string(backoff) + "s"]);
+                if (!route_alert_sent && consecutive_failures >= 5)
+                    route_alert_sent = alert_route_failure(consecutive_failures, mixed_port_alive()) === true;
+                sleep_with_heartbeat(backoff);
+                continue;
+            }
+            consecutive_failures = 0;
+            route_alert_sent = false;
         } catch (e) {
             consecutive_failures++;
             command_success_from_args(["logger", "-t", "tachyon-telegram", "[err] Worker loop error: " + as_string(e)]);
-            sleep(poll_interval * 1000);
+            sleep_with_heartbeat(poll_interval);
         }
     }
     return 0;
@@ -735,7 +1104,7 @@ function start_runtime() {
     write_heartbeat();
     let command = common.background_command_with_pid(
         command_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/service/telegram.uc", "worker" ]),
-        ">/var/log/tachyon_telegram.log", ">" + shell_quote(PID_FILE));
+        ">>/var/log/tachyon_telegram.log", ">" + shell_quote(PID_FILE));
     return command_status(command);
 }
 
@@ -770,12 +1139,13 @@ function diagnose() {
         ok = false;
     }
 
-    // 3. sing-box running
-    let sb_running = core_binary_running();
+    // 3. Routing engine running
+    let engine_name = "tachyon-core";
+    let core_running = core_binary_running();
     push(checks, {
-        name: "sing_box",
-        ok: sb_running,
-        message: sb_running ? "sing-box is running" : "sing-box is NOT running — proxy routing unavailable"
+        name: "tachyon_core",
+        ok: core_running,
+        message: core_running ? (engine_name + " is running") : (engine_name + " is NOT running — proxy routing unavailable")
     });
 
     // 4. Mixed proxy port
@@ -794,14 +1164,14 @@ function diagnose() {
         push(checks, {
             name: "proxy_port",
             ok: true,
-            message: "Mixed proxy is not configured in sing-box — bot will use direct connection"
+            message: "Mixed proxy is not configured in " + engine_name + " — bot will use direct connection"
         });
     }
 
     // 5. DNS resolution
     let dns_check = command_capture("nslookup api.telegram.org 2>/dev/null");
     let dns_out = (dns_check && dns_check.output) || "";
-    // Accept real IPs (149.154/91.108) or sing-box FakeIP range (198.18.x.x/198.19.x.x)
+    // Accept real IPs (149.154/91.108) or tachyon-core FakeIP range (198.18.x.x/198.19.x.x)
     let dns_ok = dns_check && dns_check.status === 0 && index(dns_out, "Address") >= 0
         && (index(dns_out, "149.154") >= 0 || index(dns_out, "91.108") >= 0
             || index(dns_out, "198.18.") >= 0 || index(dns_out, "198.19.") >= 0);
@@ -830,7 +1200,7 @@ function diagnose() {
 
     // 7. Proxy API test
     let p_ok = false;
-    if (cfg.bot_token && sb_running && proxy_info && port_ok) {
+    if (cfg.bot_token && core_running && proxy_info && port_ok) {
         let proxied = command_capture(command_from_args([
             "curl", "-s", "-4", "--connect-timeout", "5", "--max-time", "8",
             "--proxy", "http://" + proxy_ep,
@@ -841,7 +1211,7 @@ function diagnose() {
         push(checks, {
             name: "proxy_api",
             ok: p_ok,
-            message: p_ok ? "Proxy route (" + proxy_ep + ") to Telegram API works" : "Proxy route failed — check sing-box outbound for Telegram"
+            message: p_ok ? "Proxy route (" + proxy_ep + ") to Telegram API works" : ("Proxy route failed — check " + engine_name + " outbound for Telegram")
         });
     } else if (proxy_info && !port_ok) {
         push(checks, {
@@ -859,7 +1229,8 @@ function diagnose() {
     if (cfg.bot_token && cfg.admin_ids) {
         let first_admin = trim(split(cfg.admin_ids, /,/)[0] || "");
         if (first_admin !== "") {
-            let s_ok = send_message(cfg.bot_token, first_admin, "✅ Tachyon connection test passed");
+            let send_result = send_message(cfg.bot_token, first_admin, "✅ Tachyon connection test passed");
+            let s_ok = send_result && send_result.ok === true;
             push(checks, {
                 name: "send_message",
                 ok: s_ok,
@@ -881,11 +1252,14 @@ return {
     send_daily_digest,
     check_notified_updates,
     notify_updates_cli,
+    notify_auto_update_cli,
+    notify_auto_update_failed_cli,
     block_schedules_with_notify,
     load_blocked_counts,
     save_blocked_counts,
     check_blocked_activity,
     process_updates,
+    sleep_with_heartbeat,
     worker,
     stop_runtime,
     start_runtime,

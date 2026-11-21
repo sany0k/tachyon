@@ -9,8 +9,8 @@ const UI_ACTION_RPC_TIMEOUT_MS = 15000;
 const UI_ACTION_TRANSIENT_RPC_GRACE_MS = 30000;
 const SERVICE_ACTION_TIMEOUT_MS = 2 * 60 * 1000;
 const SERVICE_ACTION_POLL_INTERVAL_MS = 1000;
-const LATENCY_TEST_TIMEOUT_MS = 30 * 1000;
-const LATENCY_TEST_POLL_INTERVAL_MS = 1000;
+const LATENCY_TEST_TIMEOUT_MS = 60 * 1000;
+const LATENCY_TEST_POLL_INTERVAL_MS = 500;
 const COMPONENT_ACTION_RPC_TIMEOUT_MS = 45000;
 const COMPONENT_ACTION_POLL_INTERVAL_MS = 1000;
 const COMPONENT_ACTION_SELF_UPDATE_SETTLE_MS = 2000;
@@ -19,7 +19,9 @@ const COMPONENT_ACTION_MIN_ELAPSED_FOR_SELF_UPDATE_MS = 2000;
 const COMPONENT_ACTION_SELF_UPDATE_HARD_TIMEOUT_MS = 120000;
 const COMPONENT_ACTION_GENERAL_HARD_TIMEOUT_MS = 15 * 60 * 1000;
 const COMPONENT_ACTION_STATE_DIR = '/var/run/tachyon/component-actions';
-const GET_UI_STATE_RPC_TIMEOUT_MS = 3000;
+// Status collection can take several seconds on MIPS routers. A 3s deadline
+// discarded healthy responses and left the UI showing its initial stopped state.
+const GET_UI_STATE_RPC_TIMEOUT_MS = 15000;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -245,18 +247,6 @@ export const TachyonShellMethods = {
     callBaseMethod<Tachyon.NftRulesCheckResult>(
       Tachyon.AvailableMethods.CHECK_NFT_RULES,
     ),
-  checkZapretRuntime: async () =>
-    callBaseMethod<Tachyon.ZapretCheckResult>(
-      Tachyon.AvailableMethods.CHECK_ZAPRET_RUNTIME,
-    ),
-  checkZapret2Runtime: async () =>
-    callBaseMethod<Tachyon.Zapret2CheckResult>(
-      Tachyon.AvailableMethods.CHECK_ZAPRET2_RUNTIME,
-    ),
-  checkByedpiRuntime: async () =>
-    callBaseMethod<Tachyon.ByedpiCheckResult>(
-      Tachyon.AvailableMethods.CHECK_BYEDPI_RUNTIME,
-    ),
   checkInboundsConfig: async () =>
     callBaseMethod<Tachyon.InboundsConfigCheckResult>(
       Tachyon.AvailableMethods.CHECK_INBOUNDS_CONFIG,
@@ -272,21 +262,19 @@ export const TachyonShellMethods = {
     callBaseMethod<
       Tachyon.SubscriptionMetadata | Tachyon.SubscriptionMetadata[]
     >(Tachyon.AvailableMethods.GET_SUBSCRIPTION_METADATA, [section]),
-  checkSingBox: async () =>
-    callBaseMethod<Tachyon.SingBoxCheckResult>(
-      Tachyon.AvailableMethods.CHECK_SING_BOX,
-    ),
-  checkSteer: async () =>
-    callBaseMethod<Tachyon.SteerCheckResult>(
-      Tachyon.AvailableMethods.CHECK_STEER,
+  checkTachyonCore: async () =>
+    callBaseMethod<Tachyon.TachyonCoreCheckResult>(
+      Tachyon.AvailableMethods.CHECK_TACHYON_CORE,
     ),
   checkInbounds: async () =>
     callBaseMethod<Tachyon.InboundsCheckResult>(
       Tachyon.AvailableMethods.CHECK_INBOUNDS,
+      [],
+      { timeout: 30000 },
     ),
-  getSingBoxStatus: async () =>
-    callBaseMethod<Tachyon.GetSingBoxStatus>(
-      Tachyon.AvailableMethods.GET_SING_BOX_STATUS,
+  getTachyonCoreStatus: async () =>
+    callBaseMethod<Tachyon.GetTachyonCoreStatus>(
+      Tachyon.AvailableMethods.GET_TACHYON_CORE_STATUS,
       [],
       { allowNonZeroWithStdout: true },
     ),
@@ -296,60 +284,141 @@ export const TachyonShellMethods = {
       [],
       { allowNonZeroWithStdout: true },
     ),
-  getTailscalePeers: async () =>
-    callBaseMethod<Tachyon.GetTailscalePeers>(
-      Tachyon.AvailableMethods.GET_TAILSCALE_PEERS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getZapretStatus: async () =>
-    callBaseMethod<Tachyon.GetZapretStatus>(
-      Tachyon.AvailableMethods.GET_ZAPRET_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getZapret2Status: async () =>
-    callBaseMethod<Tachyon.GetZapret2Status>(
-      Tachyon.AvailableMethods.GET_ZAPRET2_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getByedpiStatus: async () =>
-    callBaseMethod<Tachyon.GetByedpiStatus>(
-      Tachyon.AvailableMethods.GET_BYEDPI_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getWdttStatus: async () =>
-    callBaseMethod<Tachyon.GetWdttStatus>(
-      Tachyon.AvailableMethods.GET_WDTT_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getOlcrtcStatus: async () =>
-    callBaseMethod<Tachyon.GetOlcrtcStatus>(
-      Tachyon.AvailableMethods.GET_OLCRTC_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getFptnStatus: async () =>
-    callBaseMethod<Tachyon.GetFptnStatus>(
-      Tachyon.AvailableMethods.GET_FPTN_STATUS,
-      [],
-      { allowNonZeroWithStdout: true },
-    ),
-  getClashApiProxies: async () =>
-    callBaseMethod<ClashAPI.Proxies>(Tachyon.AvailableMethods.CLASH_API, [
-      Tachyon.AvailableClashAPIMethods.GET_PROXIES,
-    ]),
-  getClashApiConnections: async () =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.CLASH_API, [
-      Tachyon.AvailableClashAPIMethods.GET_CONNECTIONS,
-    ]),
-  getClashApiProxyLatency: async (tag: string, timeout = '5000') =>
+  getClashApiProxies: async () => {
+    const res = await callBaseMethod<ClashAPI.Proxies>(
+      Tachyon.AvailableMethods.CLASH_API,
+      [Tachyon.AvailableClashAPIMethods.GET_PROXIES],
+    );
+    if (res.success && res.data?.proxies) {
+      return res;
+    }
+    try {
+      if (typeof fs !== 'undefined') {
+        const fsWithDirect = fs as unknown as {
+          read_direct?: (path: string, type?: string) => Promise<string>;
+        };
+        const readFn =
+          typeof fsWithDirect.read_direct === 'function'
+            ? (p: string) => fsWithDirect.read_direct!(p, 'text')
+            : typeof fs.read === 'function'
+              ? (p: string) => fs.read(p)
+              : null;
+        if (readFn) {
+          const raw = await readFn(
+            '/var/run/tachyon/ui-state/clash-proxies.json',
+          );
+          const parsed = parseJsonObjectOutput<ClashAPI.Proxies>(
+            typeof raw === 'string' ? raw : '',
+          );
+          if (parsed?.proxies) {
+            return { success: true as const, data: parsed };
+          }
+        }
+      }
+    } catch (_error) {
+      // Fallback file unavailable
+    }
+    return res;
+  },
+  getClashApiConnections: async () => {
+    const res = await callBaseMethod<unknown>(
+      Tachyon.AvailableMethods.CLASH_API,
+      [Tachyon.AvailableClashAPIMethods.GET_CONNECTIONS],
+    );
+    const dataObj = res.success
+      ? (res.data as { connections?: unknown[]; truncated?: boolean } | null)
+      : null;
+    if (
+      res.success &&
+      Array.isArray(dataObj?.connections) &&
+      !dataObj?.truncated
+    ) {
+      return res;
+    }
+    try {
+      if (typeof fs !== 'undefined') {
+        const fsWithDirect = fs as unknown as {
+          read_direct?: (path: string, type?: string) => Promise<string>;
+        };
+        const readFn =
+          typeof fsWithDirect.read_direct === 'function'
+            ? (p: string) => fsWithDirect.read_direct!(p, 'text')
+            : typeof fs.read === 'function'
+              ? (p: string) => fs.read(p)
+              : null;
+        if (readFn) {
+          const raw = await readFn(
+            '/var/run/tachyon/ui-state/clash-connections.json',
+          );
+          const parsed = parseJsonObjectOutput<{ connections?: unknown[] }>(
+            typeof raw === 'string' ? raw : '',
+          );
+          if (Array.isArray(parsed?.connections)) {
+            return { success: true as const, data: parsed };
+          }
+        }
+      }
+    } catch (_error) {
+      // Fallback file unavailable
+    }
+    return res;
+  },
+  getConntrackConnections: async () => {
+    const res = await callBaseMethod<unknown>(
+      Tachyon.AvailableMethods.CLASH_API,
+      [Tachyon.AvailableClashAPIMethods.GET_CONNECTIONS, 'conntrack'],
+    );
+    const dataObj = res.success
+      ? (res.data as { connections?: unknown[]; truncated?: boolean } | null)
+      : null;
+    if (
+      res.success &&
+      Array.isArray(dataObj?.connections) &&
+      !dataObj?.truncated
+    ) {
+      return res;
+    }
+    try {
+      if (typeof fs !== 'undefined') {
+        const fsWithDirect = fs as unknown as {
+          read_direct?: (path: string, type?: string) => Promise<string>;
+        };
+        const readFn =
+          typeof fsWithDirect.read_direct === 'function'
+            ? (p: string) => fsWithDirect.read_direct!(p, 'text')
+            : typeof fs.read === 'function'
+              ? (p: string) => fs.read(p)
+              : null;
+        if (readFn) {
+          const raw = await readFn(
+            '/var/run/tachyon/ui-state/clash-conntrack.json',
+          );
+          const parsed = parseJsonObjectOutput<{ connections?: unknown[] }>(
+            typeof raw === 'string' ? raw : '',
+          );
+          if (Array.isArray(parsed?.connections)) {
+            return { success: true as const, data: parsed };
+          }
+        }
+      }
+    } catch (_error) {
+      // Fallback file unavailable
+    }
+    return res;
+  },
+  getClashApiProxyLatency: async (
+    tag: string,
+    timeout = '5000',
+    url?: string,
+  ) =>
     callBaseMethod<Tachyon.GetClashApiProxyLatency>(
       Tachyon.AvailableMethods.CLASH_API,
-      [Tachyon.AvailableClashAPIMethods.GET_PROXY_LATENCY, tag, timeout],
+      [
+        Tachyon.AvailableClashAPIMethods.GET_PROXY_LATENCY,
+        tag,
+        timeout,
+        ...(url ? [url] : []),
+      ],
     ),
   getClashApiProxyLatencies: async (tags: string[]) =>
     callBaseMethod<Tachyon.GetClashApiProxyLatencies>(
@@ -360,10 +429,19 @@ export const TachyonShellMethods = {
         '5000',
       ],
     ),
-  getClashApiGroupLatency: async (tag: string) =>
+  getClashApiGroupLatency: async (
+    tag: string,
+    timeout = '10000',
+    url?: string,
+  ) =>
     callBaseMethod<Tachyon.GetClashApiGroupLatency>(
       Tachyon.AvailableMethods.CLASH_API,
-      [Tachyon.AvailableClashAPIMethods.GET_GROUP_LATENCY, tag, '10000'],
+      [
+        Tachyon.AvailableClashAPIMethods.GET_GROUP_LATENCY,
+        tag,
+        timeout,
+        ...(url ? [url] : []),
+      ],
     ),
   setClashApiGroupProxy: async (group: string, proxy: string) =>
     callBaseMethod<unknown>(Tachyon.AvailableMethods.CLASH_API, [
@@ -381,9 +459,13 @@ export const TachyonShellMethods = {
       Tachyon.AvailableClashAPIMethods.CLOSE_ALL_CONNECTIONS,
     ]),
   enable: async () =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.ENABLE, []),
+    callBaseMethod<void>(Tachyon.AvailableMethods.ENABLE, [], {
+      allowEmptyStdout: true,
+    }),
   disable: async () =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.DISABLE, []),
+    callBaseMethod<void>(Tachyon.AvailableMethods.DISABLE, [], {
+      allowEmptyStdout: true,
+    }),
   globalCheck: async (masked = true) =>
     callBaseMethod<unknown>(Tachyon.AvailableMethods.GLOBAL_CHECK, [
       masked ? 'masked' : 'raw',
@@ -396,10 +478,60 @@ export const TachyonShellMethods = {
         timeout: 60000,
       },
     ),
-  aiDoctor: async () =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.AI_DOCTOR, [], {
-      timeout: 60000,
-    }),
+  aiDoctor: async (query?: string) => {
+    const startArgs = ['--async'];
+    if (query) startArgs.push(query);
+    const startRes = await callBaseMethod<{
+      success?: boolean;
+      async?: boolean;
+      running?: boolean;
+      job_id?: string;
+    }>(Tachyon.AvailableMethods.AI_DOCTOR, startArgs, {
+      timeout: 15000,
+    });
+
+    if (
+      startRes.success &&
+      startRes.data &&
+      typeof startRes.data === 'object'
+    ) {
+      if (startRes.data.async) {
+        const deadline = Date.now() + 170000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1500));
+          const pollRes = await callBaseMethod<
+            Record<string, unknown> & { running?: boolean; success?: boolean }
+          >(Tachyon.AvailableMethods.AI_DOCTOR, ['--status'], {
+            timeout: 10000,
+          });
+          if (
+            pollRes.success &&
+            pollRes.data &&
+            typeof pollRes.data === 'object'
+          ) {
+            if (pollRes.data.running === true) continue;
+            return {
+              success: pollRes.data.success !== false,
+              data: pollRes.data,
+            };
+          }
+        }
+      } else if (startRes.data.success !== undefined) {
+        return {
+          success: startRes.data.success !== false,
+          data: startRes.data,
+        };
+      }
+    }
+
+    return callBaseMethod<unknown>(
+      Tachyon.AvailableMethods.AI_DOCTOR,
+      query ? [query] : [],
+      {
+        timeout: 120000,
+      },
+    );
+  },
   aiDoctorLast: async () =>
     callBaseMethod<unknown>(Tachyon.AvailableMethods.AI_DOCTOR_LAST, [], {
       timeout: 10000,
@@ -425,14 +557,14 @@ export const TachyonShellMethods = {
       mode: 'proxied' | 'direct';
       message: string;
     }>(Tachyon.AvailableMethods.TOGGLE_CLIENT_BYPASS, [ip], { timeout: 15000 }),
-  showSingBoxConfig: async (masked = true) =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.SHOW_SING_BOX_CONFIG, [
+  showTachyonCoreConfig: async (masked = true) =>
+    callBaseMethod<unknown>(Tachyon.AvailableMethods.SHOW_TACHYON_CORE_CONFIG, [
       masked ? 'masked' : 'raw',
     ]),
   checkLogs: async () =>
     callBaseMethod<unknown>(Tachyon.AvailableMethods.CHECK_LOGS),
-  checkSingBoxLogs: async () =>
-    callBaseMethod<unknown>(Tachyon.AvailableMethods.CHECK_SING_BOX_LOGS),
+  checkTachyonCoreLogs: async () =>
+    callBaseMethod<unknown>(Tachyon.AvailableMethods.CHECK_TACHYON_CORE_LOGS),
   getSystemInfo: async () =>
     callBaseMethod<Tachyon.GetSystemInfo>(
       Tachyon.AvailableMethods.GET_SYSTEM_INFO,
@@ -444,12 +576,6 @@ export const TachyonShellMethods = {
       Tachyon.AvailableMethods.ENGINE_INFO,
       [],
       { timeout: GET_UI_STATE_RPC_TIMEOUT_MS },
-    ),
-  getEnginePlan: async (engine: string) =>
-    callBaseMethod<Tachyon.EngineSwitchPlan>(
-      Tachyon.AvailableMethods.ENGINE_PLAN,
-      [engine],
-      { timeout: UI_ACTION_RPC_TIMEOUT_MS },
     ),
   getServerCapabilities: async () =>
     callBaseMethod<Tachyon.GetServerCapabilities>(
@@ -463,6 +589,16 @@ export const TachyonShellMethods = {
     callBaseMethod<Tachyon.UiState>(Tachyon.AvailableMethods.GET_UI_STATE, [], {
       timeout: GET_UI_STATE_RPC_TIMEOUT_MS,
     }),
+  getLiteMode: async () =>
+    callBaseMethod<{ success: boolean; lite_mode: number }>(
+      Tachyon.AvailableMethods.GET_LITE_MODE,
+    ),
+  setLiteMode: async (enabled: boolean) =>
+    callBaseMethod<{
+      success: boolean;
+      lite_mode: number;
+      message?: string;
+    }>(Tachyon.AvailableMethods.SET_LITE_MODE, [enabled ? '1' : '0']),
   serviceActionStart: async (action: Tachyon.ServiceAction) => {
     const response = await executeShellCommand({
       command: '/usr/bin/tachyon',
@@ -588,7 +724,11 @@ export const TachyonShellMethods = {
       data: parsedResponse,
     } as Tachyon.MethodSuccessResponse<Tachyon.LatencyActionState>;
   },
-  waitLatencyTestJob: async (jobId: string, startedAt = Date.now()) => {
+  waitLatencyTestJob: async (
+    jobId: string,
+    startedAt = Date.now(),
+    onProgress?: (state: Tachyon.LatencyActionState) => void,
+  ) => {
     const transientRpc = createTransientRpcGraceTracker(
       UI_ACTION_TRANSIENT_RPC_GRACE_MS,
     );
@@ -607,6 +747,9 @@ export const TachyonShellMethods = {
       }
 
       transientRpc.reset();
+      if (onProgress) {
+        onProgress(response.data);
+      }
       if (response.data.running) {
         continue;
       }
@@ -1180,7 +1323,7 @@ export const TachyonShellMethods = {
   },
 
   startFuzzer: async (
-    engine: Tachyon.FuzzerEngine = 'zapret2',
+    engine: Tachyon.FuzzerEngine = 'desync',
     target: Tachyon.FuzzerTarget = 'youtube',
     customUrl?: string,
     ruleSection?: string,
@@ -1199,8 +1342,10 @@ export const TachyonShellMethods = {
     else args.push('');
     if (customFile) args.push(customFile);
     else args.push('');
-    if (mode) args.push(mode);
-    if (timeoutSeconds) args.push(String(timeoutSeconds));
+    if (mode || timeoutSeconds !== undefined) args.push(mode || '');
+    if (timeoutSeconds !== undefined && timeoutSeconds !== null) {
+      args.push(String(timeoutSeconds));
+    }
 
     const response = await executeShellCommand({
       command: '/usr/bin/tachyon',
@@ -1293,24 +1438,16 @@ export const TachyonShellMethods = {
   ): Promise<
     Tachyon.MethodResponse<{
       available_engines?: {
-        zapret2: boolean;
-        zapret: boolean;
-        byedpi: boolean;
+        desync?: boolean;
       };
-      zapret2: Tachyon.FuzzerStrategyDefinition[];
-      zapret: Tachyon.FuzzerStrategyDefinition[];
-      byedpi: Tachyon.FuzzerStrategyDefinition[];
+      desync?: Tachyon.FuzzerStrategyDefinition[];
     }>
   > => {
     type FuzzerStrategiesData = {
       available_engines?: {
-        zapret2: boolean;
-        zapret: boolean;
-        byedpi: boolean;
+        desync?: boolean;
       };
-      zapret2: Tachyon.FuzzerStrategyDefinition[];
-      zapret: Tachyon.FuzzerStrategyDefinition[];
-      byedpi: Tachyon.FuzzerStrategyDefinition[];
+      desync?: Tachyon.FuzzerStrategyDefinition[];
     };
     const args: string[] = [Tachyon.AvailableMethods.FUZZER_STRATEGIES];
     if (mode) args.push(mode);
@@ -1339,6 +1476,88 @@ export const TachyonShellMethods = {
     customUrl?: string,
     userPrompt?: string,
   ): Promise<Tachyon.MethodResponse<Tachyon.FuzzerAiSynthesizeResponse>> => {
+    const asyncArgs: string[] = [
+      Tachyon.AvailableMethods.FUZZER_AI_SYNTHESIZE,
+      'async',
+      engine,
+      target,
+      customUrl || '',
+    ];
+    if (userPrompt) asyncArgs.push(userPrompt);
+
+    const startRes = await executeShellCommand({
+      command: '/usr/bin/tachyon',
+      args: asyncArgs,
+      timeout: 15000,
+    });
+
+    let startParsed:
+      | (Tachyon.FuzzerAiSynthesizeResponse & {
+          async?: boolean;
+          running?: boolean;
+        })
+      | null = null;
+    try {
+      startParsed = JSON.parse(startRes?.stdout?.trim() || '{}');
+    } catch {
+      startParsed = null;
+    }
+
+    if ((startRes?.code ?? 1) === 0 && startParsed && startParsed.async) {
+      const deadline = Date.now() + 170000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const pollRes = await executeShellCommand({
+          command: '/usr/bin/tachyon',
+          args: [Tachyon.AvailableMethods.FUZZER_AI_SYNTHESIZE, 'status'],
+          timeout: 10000,
+        });
+        let pollParsed:
+          | (Tachyon.FuzzerAiSynthesizeResponse & { running?: boolean })
+          | null = null;
+        try {
+          pollParsed = JSON.parse(pollRes?.stdout?.trim() || '{}');
+        } catch {
+          pollParsed = null;
+        }
+        if (!pollParsed) continue;
+        if (pollParsed.running === true) continue;
+        if (pollParsed.success) {
+          return {
+            success: true,
+            data: pollParsed,
+          };
+        }
+        return {
+          success: false,
+          error: pollParsed.error || _('Failed to synthesize AI strategies'),
+        };
+      }
+      return {
+        success: false,
+        error: _('AI synthesis timed out waiting for LLM response'),
+      };
+    }
+
+    if (
+      (startRes?.code ?? 1) === 0 &&
+      startParsed &&
+      startParsed.success === true &&
+      Array.isArray(startParsed.strategies)
+    ) {
+      return {
+        success: true,
+        data: startParsed,
+      };
+    }
+
+    if (startParsed && startParsed.success === false && startParsed.error) {
+      return {
+        success: false,
+        error: startParsed.error,
+      };
+    }
+
     const args: string[] = [
       Tachyon.AvailableMethods.FUZZER_AI_SYNTHESIZE,
       engine,
@@ -1351,19 +1570,19 @@ export const TachyonShellMethods = {
     const response = await executeShellCommand({
       command: '/usr/bin/tachyon',
       args,
-      timeout: 65000,
+      timeout: 120000,
     });
 
     let parsed: Tachyon.FuzzerAiSynthesizeResponse | null = null;
     try {
       parsed = JSON.parse(
-        response.stdout?.trim() || '{}',
+        response?.stdout?.trim() || '{}',
       ) as Tachyon.FuzzerAiSynthesizeResponse;
     } catch {
       parsed = null;
     }
 
-    if ((response.code ?? 1) === 0 && parsed && parsed.success) {
+    if ((response?.code ?? 1) === 0 && parsed && parsed.success) {
       return {
         success: true,
         data: parsed,
@@ -1373,7 +1592,7 @@ export const TachyonShellMethods = {
       success: false,
       error:
         parsed?.error ||
-        response.stderr ||
+        response?.stderr ||
         _('Failed to synthesize AI strategies'),
     };
   },

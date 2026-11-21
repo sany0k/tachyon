@@ -1,6 +1,8 @@
 import { prettyBytes } from '../../../helpers/prettyBytes';
-import { getOutboundTagBySection } from '../../runtimeTags';
+import { tr } from '../../helpers/i18n';
+import { cleanBalancerTagId, getOutboundTagBySection } from '../../runtimeTags';
 import { Tachyon } from '../../types';
+import { getDashboardSectionTypeFilter } from '../dashboard/dashboardLayout';
 import {
   formatDuration,
   formatEndpoint,
@@ -9,6 +11,8 @@ import {
 } from './formatters';
 
 export type MonitoringTabId = 'active' | 'closed';
+export type ConnectionDataSource = 'core' | 'conntrack';
+export type ConnectionSourceFilter = 'all' | 'core' | 'conntrack';
 
 export type LocalDeviceChoices = Record<string, string>;
 
@@ -17,8 +21,11 @@ export interface ClashConnectionMetadata {
   destinationIP?: string;
   destinationPort?: string | number;
   host?: string;
+  inbound?: string;
   network?: string;
   processPath?: string;
+  protocol?: string;
+  sniffProtocol?: string;
   sourceIP?: string;
   sourcePort?: string | number;
   type?: string;
@@ -26,6 +33,7 @@ export interface ClashConnectionMetadata {
 
 export interface ClashConnection {
   chains?: string[];
+  dataSource?: ConnectionDataSource;
   download?: number;
   id?: string;
   metadata?: ClashConnectionMetadata;
@@ -43,6 +51,70 @@ export interface MonitoredConnection extends ClashConnection {
   id: string;
   closedAt?: number;
   lastSeenAt: number;
+  startedAtMs?: number;
+}
+
+export function getConnectionDataSource(
+  connection: ClashConnection,
+): ConnectionDataSource {
+  if (
+    connection.dataSource === 'conntrack' ||
+    normalizeString(connection.id).startsWith('ct:') ||
+    normalizeString(connection.metadata?.type).toLowerCase() === 'conntrack'
+  ) {
+    return 'conntrack';
+  }
+  return 'core';
+}
+
+export function getConnectionTupleKey(connection: ClashConnection): string {
+  const meta = connection.metadata || {};
+  const proto = normalizeString(meta.network || 'tcp').toLowerCase();
+  const src = normalizeString(meta.sourceIP);
+  const sport = normalizeString(meta.sourcePort);
+  const dst = normalizeString(meta.destinationIP);
+  const dport = normalizeString(meta.destinationPort);
+  if (!src || !sport || !dst || !dport) {
+    return '';
+  }
+  return `${proto}|${src}|${sport}|${dst}|${dport}`;
+}
+
+export function mergeCoreAndConntrackConnections(
+  coreConnections: ClashConnection[] = [],
+  conntrackConnections: ClashConnection[] = [],
+): ClashConnection[] {
+  const result: ClashConnection[] = [];
+  const seenTuples = new Set<string>();
+  const seenIds = new Set<string>();
+
+  for (const conn of coreConnections) {
+    if (!conn || typeof conn !== 'object') continue;
+    const id = normalizeString(conn.id);
+    if (id) seenIds.add(id);
+    const tkey = getConnectionTupleKey(conn);
+    if (tkey) seenTuples.add(tkey);
+    result.push({
+      ...conn,
+      dataSource: getConnectionDataSource(conn),
+    });
+  }
+
+  for (const ct of conntrackConnections) {
+    if (!ct || typeof ct !== 'object') continue;
+    const id = normalizeString(ct.id);
+    if (id && seenIds.has(id)) continue;
+    const tkey = getConnectionTupleKey(ct);
+    if (tkey && seenTuples.has(tkey)) continue;
+    if (id) seenIds.add(id);
+    if (tkey) seenTuples.add(tkey);
+    result.push({
+      ...ct,
+      dataSource: 'conntrack',
+    });
+  }
+
+  return result;
 }
 
 export function normalizeConnectionsPayload(
@@ -80,10 +152,11 @@ export function getUrlTestIds(section: Tachyon.ConfigSection): string[] {
 }
 
 export function getUrlTestTag(sectionName: string, id: string): string {
+  const cleanId = cleanBalancerTagId(sectionName, id);
   return getOutboundTagBySection(
-    id === 'urltest'
+    cleanId === 'urltest'
       ? `${sectionName}-urltest`
-      : `${sectionName}-urltest-${id}`,
+      : `${sectionName}-urltest-${cleanId}`,
   );
 }
 
@@ -124,6 +197,48 @@ export function setRouteDisplayNames(
   routeSections = sections;
 }
 
+export function isExcludedRoutingName(name: string, action = ''): boolean {
+  const lower = normalizeString(name).toLowerCase();
+  const act = normalizeString(action).toLowerCase();
+  if (!lower || lower === '-') return true;
+  if (act === 'connection') {
+    return false;
+  }
+  if (
+    !act &&
+    routeSections.some(
+      (s) =>
+        s.displayName.toLowerCase() === lower ||
+        s.sectionName.toLowerCase() === lower,
+    )
+  ) {
+    return false;
+  }
+  if (act === 'desync' || lower.includes('desync')) {
+    return false;
+  }
+  return (
+    act === 'block' ||
+    act === 'reject' ||
+    act === 'bypass' ||
+    act === 'direct' ||
+    act === 'dns' ||
+    lower === 'block' ||
+    lower === 'reject' ||
+    lower === 'bypass' ||
+    lower === 'direct' ||
+    lower === 'dns' ||
+    lower === 'wan' ||
+    lower.includes('failover') ||
+    lower.includes('block') ||
+    lower.includes('reject') ||
+    lower.includes('bypass') ||
+    lower.includes('direct') ||
+    lower.includes('dns') ||
+    lower.includes('wan')
+  );
+}
+
 export function buildRouteDisplayNames(sections: Tachyon.ConfigSection[]): {
   routeDisplayNames: Record<string, string>;
   serverDisplayNames: Record<string, string>;
@@ -131,7 +246,21 @@ export function buildRouteDisplayNames(sections: Tachyon.ConfigSection[]): {
 } {
   const map: Record<string, string> = {
     'bypass-out': 'Bypass',
+    bypass: 'Bypass',
     'direct-out': 'direct',
+    direct: 'direct',
+    'lo-direct-out': 'direct',
+    'lan-direct-out': 'direct',
+    'block-out': 'block',
+    block: 'block',
+    reject: 'block',
+    'dns-out': 'DNS',
+    dns: 'DNS',
+    'hijack-dns': 'DNS',
+    'main-dns-server': 'DNS',
+    'bootstrap-dns-server': 'DNS',
+    'fallback-dns-server': 'DNS',
+    'fakeip-dns-server': 'DNS',
     'tachyon-failover': 'Failover',
   };
   const serverMap: Record<string, string> = {};
@@ -154,19 +283,46 @@ export function buildRouteDisplayNames(sections: Tachyon.ConfigSection[]): {
       ]);
     });
 
+  const DPI_SECTION_ACTIONS = new Set(['desync']);
+
   sections
     .filter((section) => section['.type'] === 'section')
     .filter((section) => section.enabled !== '0')
     .forEach((section) => {
       const sectionName = section['.name'];
       const displayName = getDisplayName(section);
+      const action = normalizeString(section.action).toLowerCase();
+      const lowerName = normalizeString(sectionName).toLowerCase();
+      const lowerDisplayName = normalizeString(displayName).toLowerCase();
 
       if (!sectionName || !displayName) {
         return;
       }
 
-      routeSectionItems.push({ sectionName, displayName });
+      const isDpiSection =
+        DPI_SECTION_ACTIONS.has(action) ||
+        lowerName.includes('desync') ||
+        lowerDisplayName.includes('desync');
+
+      const typeFilter = getDashboardSectionTypeFilter();
+      let isCategoryAllowed = true;
+      if (isDpiSection) {
+        isCategoryAllowed = typeFilter.dpi !== false;
+      } else if (
+        isExcludedRoutingName(sectionName, action) ||
+        isExcludedRoutingName(displayName, action)
+      ) {
+        isCategoryAllowed = false;
+      } else {
+        isCategoryAllowed = typeFilter.proxy !== false;
+      }
+
+      if (isCategoryAllowed) {
+        routeSectionItems.push({ sectionName, displayName });
+      }
       map[getOutboundTagBySection(sectionName)] = displayName;
+      map[`${sectionName}-dns-server`] = displayName;
+      map[`dns-${sectionName}`] = displayName;
       const urltestIds =
         urltestsBySection.get(sectionName) || getUrlTestIds(section);
       urltestIds.forEach((id) => {
@@ -211,18 +367,44 @@ export function getRouteDisplayNameByTag(tag: string): string {
   }
 
   const manualSection = routeSections.find(({ sectionName }) => {
-    if (tag === sectionName) {
+    if (
+      tag === sectionName ||
+      tag === `${sectionName}-dns-server` ||
+      tag === `dns-${sectionName}`
+    ) {
       return true;
     }
     return tag.startsWith(`${sectionName}-`) && tag.endsWith('-out');
   });
 
-  return manualSection?.displayName || '';
+  if (manualSection?.displayName) {
+    return manualSection.displayName;
+  }
+
+  if (tag.endsWith('-dns-server') || tag.startsWith('dns-')) {
+    return 'DNS';
+  }
+
+  return '';
 }
 
 export function getRouteTagFromRule(rule?: string): string {
-  const match = normalizeString(rule).match(/=>\s*route\(([^)]+)\)/);
-  return normalizeString(match?.[1]).replace(/^['"]|['"]$/g, '');
+  const norm = normalizeString(rule);
+  const match = norm.match(/=>\s*route\(([^)]+)\)/);
+  if (match?.[1]) {
+    return normalizeString(match[1]).replace(/^['"]|['"]$/g, '');
+  }
+  const directMatch = norm.match(
+    /=>\s*(hijack-dns|reject|direct-out|bypass-out|block-out|dns-out|direct|bypass|block|dns)\b/i,
+  );
+  if (directMatch?.[1]) {
+    return directMatch[1].toLowerCase();
+  }
+  const outboundMatch = norm.match(/\boutbound=([^\s,)]+)/i);
+  if (outboundMatch?.[1]) {
+    return normalizeString(outboundMatch[1]).replace(/^['"]|['"]$/g, '');
+  }
+  return '';
 }
 
 export function formatConnectionDuration(
@@ -244,6 +426,11 @@ export function getConnectionSourceIp(connection: ClashConnection): string {
 }
 
 export function getConnectionInboundTag(connection: ClashConnection): string {
+  const inbound = normalizeString(connection.metadata?.inbound);
+  if (inbound) {
+    return inbound;
+  }
+
   const metadataType = normalizeString(connection.metadata?.type);
   const metadataTypeParts = metadataType.split('/');
   const metadataTag = normalizeString(
@@ -314,12 +501,9 @@ export function getDeviceFilterLabel(
   localDeviceChoices: LocalDeviceChoices = {},
 ): string {
   const serverName = getServerSourceNameByIp(ip, connections);
-  if (serverName) {
-    return serverName;
-  }
-
   const deviceName = getDeviceName(ip, localDeviceChoices);
-  return deviceName ? `${deviceName} (${ip})` : ip;
+  const label = deviceName ? `${deviceName} (${ip})` : ip;
+  return serverName ? `${label} · ${serverName}` : label;
 }
 
 export function getSourceCellParts(
@@ -330,32 +514,18 @@ export function getSourceCellParts(
   const ip = getConnectionSourceIp(connection);
   const inboundTag = getConnectionInboundTag(connection);
   const serverName = getServerDisplayNameByInboundTag(inboundTag);
-
-  if (serverName) {
-    return {
-      primary: serverName,
-      ip: '',
-      copyValue: serverName,
-      searchValue: [serverName, ip, inboundTag].filter(Boolean).join(' '),
-    };
-  }
-
   const deviceName = getDeviceName(ip, localDeviceChoices);
-
-  if (deviceName) {
-    return {
-      primary: deviceName,
-      ip: ip,
-      copyValue: `${deviceName} (${ip})`,
-      searchValue: `${deviceName} ${ip}`,
-    };
-  }
+  const primary = (ip ? deviceName || ip : serverName || inboundTag) || '-';
+  const copyValue = deviceName ? `${deviceName} (${ip})` : primary;
 
   return {
-    primary: ip || '-',
-    ip: '',
-    copyValue: ip || '-',
-    searchValue: ip,
+    primary,
+    ip: deviceName ? ip : '',
+    inbound: serverName || inboundTag,
+    copyValue,
+    searchValue: [deviceName, ip, serverName, inboundTag]
+      .filter(Boolean)
+      .join(' '),
   };
 }
 
@@ -394,7 +564,99 @@ export function getRoute(connection: MonitoredConnection): string {
 }
 
 export function getNetwork(connection: MonitoredConnection): string {
-  return normalizeString(connection.metadata?.network).toLowerCase() || '-';
+  const metadata = connection.metadata || {};
+  const rawNet = normalizeString(metadata.network).toLowerCase();
+  const proto = normalizeString(metadata.protocol).toLowerCase();
+  const sniffProto = normalizeString(metadata.sniffProtocol).toLowerCase();
+  const metaType = normalizeString(metadata.type).toLowerCase();
+  const ruleStr = normalizeString(connection.rule).toLowerCase();
+
+  if (
+    rawNet === 'quic' ||
+    proto === 'quic' ||
+    sniffProto === 'quic' ||
+    metaType.includes('quic') ||
+    /\bprotocol=quic\b/.test(ruleStr)
+  ) {
+    return 'quic';
+  }
+
+  if (rawNet === 'udp') {
+    const portNum = Number(metadata.destinationPort);
+    const hasSniffedHost = Boolean(normalizeString(metadata.host));
+    if (portNum === 443 && hasSniffedHost) {
+      return 'quic';
+    }
+  }
+
+  return rawNet || '-';
+}
+
+function extractReadableRulePart(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/\binbound=\[[^\]]+\]\s*/gi, '')
+    .replace(/\binbound=[^\s]+\s*/gi, '')
+    .replace(/([a-z0-9_.-]+)-community-([a-z0-9_.-]+)-rs\b/gi, 'community:$2')
+    .replace(/\bcommunity-([a-z0-9_.-]+)-rs\b/gi, 'community:$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function formatMatchedRuleSummary(
+  connection: MonitoredConnection,
+): string {
+  const payload = normalizeString(connection.rulePayload);
+  const rule = normalizeString(connection.rule);
+  if (payload) {
+    return extractReadableRulePart(payload);
+  }
+  if (rule) {
+    return extractReadableRulePart(rule);
+  }
+  return '';
+}
+
+export function getRouteTooltip(
+  connection: MonitoredConnection,
+  routeLabel?: string,
+): string {
+  const resolvedRoute = routeLabel || getRoute(connection);
+  const lines: string[] = [];
+  if (resolvedRoute && resolvedRoute !== '-') {
+    lines.push(`${tr('Секция', 'Section')}: ${resolvedRoute}`);
+  }
+
+  const payload = normalizeString(connection.rulePayload);
+  const rule = normalizeString(connection.rule);
+  if (payload) {
+    lines.push(
+      `${tr('Сработавшее условие', 'Matched condition')}: ${extractReadableRulePart(payload)}`,
+    );
+  }
+  if (rule) {
+    const cleanedRule = extractReadableRulePart(rule);
+    if (cleanedRule && cleanedRule !== extractReadableRulePart(payload)) {
+      lines.push(`${tr('Правило', 'Rule')}: ${cleanedRule}`);
+    }
+  }
+
+  const chains = Array.isArray(connection.chains)
+    ? connection.chains
+    : Array.isArray(connection.metadata?.chains)
+      ? connection.metadata.chains
+      : [];
+  const leafNode = normalizeString(chains[chains.length - 1]);
+  if (
+    leafNode &&
+    leafNode !== resolvedRoute &&
+    leafNode !== `${resolvedRoute}-out` &&
+    !leafNode.endsWith('-out')
+  ) {
+    lines.push(`${tr('Узел', 'Node')}: ${leafNode}`);
+  }
+
+  return lines.join('\n') || resolvedRoute || '-';
 }
 
 export function sortConnections(
@@ -427,11 +689,17 @@ export function getSearchValues(
     localDeviceChoices,
   );
 
+  const net = getNetwork(connection);
+  const dstPort = normalizeString(connection.metadata?.destinationPort);
   return [
     connection.id,
+    getConnectionDataSource(connection),
     target.primary,
-    getNetwork(connection),
+    dstPort,
+    net,
+    net === 'quic' ? 'udp' : '',
     getRoute(connection),
+    // Rule expressions can list unrelated candidate rule sets for this route.
     formatConnectionDuration(connection, pausedAt),
     formatBytes(connection.download),
     formatBytes(connection.upload),
@@ -442,8 +710,12 @@ export function getSearchValues(
 }
 
 export interface FilterConnectionsOptions {
-  deviceFilter: string;
-  routeFilter: string;
+  dataSourceFilter?: ConnectionSourceFilter;
+  deviceFilter?: string;
+  routeFilter?: string;
+  deviceFilters?: Iterable<string>;
+  routeFilters?: Iterable<string>;
+  networkFilters?: Iterable<string>;
   searchQuery: string;
   tab: MonitoringTabId;
   activeConnections: MonitoredConnection[];
@@ -453,12 +725,35 @@ export interface FilterConnectionsOptions {
   pausedAt?: number | null;
 }
 
+function normalizeMultiFilterSet(
+  multiValues: Iterable<string> | undefined,
+  singleValue: string | undefined,
+  allFilterValue: string,
+): Set<string> {
+  const result = new Set<string>();
+  if (multiValues) {
+    for (const item of multiValues) {
+      const normalized = normalizeString(item);
+      if (normalized && normalized !== allFilterValue) {
+        result.add(normalized);
+      }
+    }
+  } else if (singleValue && singleValue !== allFilterValue) {
+    result.add(singleValue);
+  }
+  return result;
+}
+
 export function filterVisibleConnections(
   options: FilterConnectionsOptions,
 ): MonitoredConnection[] {
   const {
+    dataSourceFilter = 'all',
     deviceFilter,
     routeFilter,
+    deviceFilters,
+    routeFilters,
+    networkFilters,
     searchQuery,
     tab,
     activeConnections,
@@ -468,22 +763,57 @@ export function filterVisibleConnections(
     pausedAt,
   } = options;
 
+  const normalizedSourceFilter: ConnectionSourceFilter =
+    dataSourceFilter === 'core' || dataSourceFilter === 'conntrack'
+      ? dataSourceFilter
+      : 'all';
+
+  const activeDeviceSet = normalizeMultiFilterSet(
+    deviceFilters,
+    deviceFilter,
+    allFilterValue,
+  );
+  const activeRouteSet = normalizeMultiFilterSet(
+    routeFilters,
+    routeFilter,
+    allFilterValue,
+  );
+  const activeNetworkSet = new Set<string>();
+  if (networkFilters) {
+    for (const net of networkFilters) {
+      const normalized = normalizeString(net).toLowerCase();
+      if (normalized && normalized !== allFilterValue) {
+        activeNetworkSet.add(normalized);
+      }
+    }
+  }
+
   const allConnections = [...activeConnections, ...closedConnections];
   const sourceList = tab === 'active' ? activeConnections : closedConnections;
   const sorted = sortConnections(sourceList, tab);
   const normalizedSearch = normalizeSearchValue(searchQuery);
 
   return sorted.filter((connection) => {
-    const sourceIp = getConnectionSourceIp(connection);
-    const isMatchingDevice =
-      deviceFilter === allFilterValue || sourceIp === deviceFilter;
-
-    let isMatchingRoute = routeFilter === allFilterValue;
-    if (!isMatchingRoute && getRoute(connection) === routeFilter) {
-      isMatchingRoute = true;
+    if (
+      normalizedSourceFilter !== 'all' &&
+      getConnectionDataSource(connection) !== normalizedSourceFilter
+    ) {
+      return false;
     }
 
-    if (!isMatchingDevice || !isMatchingRoute) {
+    const sourceIp = getConnectionSourceIp(connection);
+    const isMatchingDevice =
+      activeDeviceSet.size === 0 || activeDeviceSet.has(sourceIp);
+
+    const connRoute = getRoute(connection);
+    const isMatchingRoute =
+      activeRouteSet.size === 0 || activeRouteSet.has(connRoute);
+
+    const connNet = (getNetwork(connection) || '').toLowerCase();
+    const isMatchingNetwork =
+      activeNetworkSet.size === 0 || activeNetworkSet.has(connNet);
+
+    if (!isMatchingDevice || !isMatchingRoute || !isMatchingNetwork) {
       return false;
     }
 

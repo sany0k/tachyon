@@ -15,24 +15,22 @@ PKG_VERSION:=$(or $(TACHYON_HAS_RELEASE_VERSION),0.0.0)
 PKG_RELEASE:=
 
 PKG_MAINTAINER:=Dushnilin <dushnilin@gmail.com>
-PKG_LICENSE:=GPL-2.0-or-later
+PKG_LICENSE:=GPL-2.0-or-later Apache-2.0
 
 include $(INCLUDE_DIR)/package.mk
 
 define Package/tachyon
 	SECTION:=net
 	CATEGORY:=Network
-	DEPENDS:=+ca-bundle +curl +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +coreutils-base64 +coreutils-timeout +bind-dig +nftables +ip-full +kmod-nft-tproxy +kmod-tun +kmod-inet-diag
+	DEPENDS:=+ca-bundle +curl +openssl-util +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +coreutils-base64 +coreutils-timeout +bind-dig +nftables +ip-full +kmod-nft-tproxy +kmod-tun +kmod-inet-diag
 	CONFLICTS:=https-dns-proxy nextdns luci-app-passwall luci-app-passwall2
-	PROVIDES:=forkop
-	REPLACES:=forkop
 	TITLE:=Tachyon backend service
 	URL:=https://github.com/Dushnilin/tachyon
 	PKGARCH:=all
 endef
 
 define Package/tachyon/description
-	Rule-based Tachyon backend with hybrid sing-box + zapret orchestration
+	Rule-based Tachyon backend with tachyon-core orchestration
 endef
 
 define Build/Configure
@@ -82,6 +80,109 @@ ps 2>/dev/null | grep -F '/etc/init.d/tachyon' | awk '{print $$1}' | while read 
     kill -9 "$$_pid" 2>/dev/null
 done
 
+_backup_external_configs() {
+	_bdir="/etc/tachyon/external-configs-backup"
+	for _comp in zapret zapret2 byedpi wdtt qwdtt olcrtc sing-box; do
+		_cdir="$$_bdir/$$_comp"
+		case "$$_comp" in
+			zapret) _srcs="/etc/config/zapret /opt/zapret/config /opt/zapret/ipset" ;;
+			zapret2) _srcs="/etc/config/zapret2 /opt/zapret2/config /opt/zapret2/ipset" ;;
+			byedpi) _srcs="/etc/config/byedpi /etc/byedpi" ;;
+			wdtt|qwdtt) _srcs="/etc/config/wdtt /etc/wdtt /etc/qwdtt" ;;
+			olcrtc) _srcs="/etc/config/olcrtc /etc/olcrtc" ;;
+			sing-box) _srcs="/etc/sing-box/config.json /etc/config/sing-box" ;;
+		esac
+		_has_src=0
+		for _s in $$_srcs; do [ -e "$$_s" ] && _has_src=1 && break; done
+		[ "$$_has_src" -eq 0 ] && continue
+		mkdir -p "$$_cdir" 2>/dev/null || continue
+		for _s in $$_srcs; do
+			[ -e "$$_s" ] || continue
+			_dst="$$_cdir/$$(basename "$$_s")"
+			if [ -d "$$_s" ]; then
+				cp -a -n "$$_s" "$$_dst" 2>/dev/null || cp -a "$$_s" "$${_dst}.new" 2>/dev/null || true
+			else
+				[ -f "$$_dst" ] && cmp -s "$$_s" "$$_dst" 2>/dev/null && continue
+				cp -a "$$_s" "$$_dst" 2>/dev/null || true
+			fi
+		done
+	done
+}
+_is_tachyon_managed() {
+	_comp="$$1"
+	[ -f "/etc/init.d/$$_comp" ] && grep -q "Tachyon managed" "/etc/init.d/$$_comp" 2>/dev/null && return 0
+	[ -d "/etc/tachyon/component-backups/$$_comp" ] && return 0
+	[ -d "/var/run/tachyon/$$_comp" ] && return 0
+	return 1
+}
+
+_backup_external_configs
+
+# Stop and clean Tachyon internal steer subsystem
+for _steer_svc in tachyon-steer-zapret steer; do
+	if [ -f "/etc/init.d/$${_steer_svc}" ]; then
+		"/etc/init.d/$${_steer_svc}" stop >/dev/null 2>&1 || true
+		"/etc/init.d/$${_steer_svc}" disable >/dev/null 2>&1 || true
+		rm -f "/etc/init.d/$${_steer_svc}" 2>/dev/null || true
+	fi
+done
+rm -rf /etc/rc.d/*steer* /etc/steer /usr/lib/tachyon/steer /usr/sbin/steer /usr/bin/steer /var/run/tachyon/*steer* /tmp/*steer* 2>/dev/null || true
+killall -9 steer >/dev/null 2>&1 || true
+nft delete table inet steer >/dev/null 2>&1 || true
+
+# Selective cleanup of external components only if Tachyon-managed
+if [ -f /etc/init.d/tailscale ] && grep -q "Tachyon managed" /etc/init.d/tailscale 2>/dev/null; then
+	/etc/init.d/tailscale stop >/dev/null 2>&1 || true
+	/etc/init.d/tailscale disable >/dev/null 2>&1 || true
+	rm -f /etc/init.d/tailscale /etc/rc.d/*tailscale* 2>/dev/null || true
+	rm -rf /var/run/tachyon/tailscale /etc/tachyon/tailscale/*/native /etc/tachyon/component-backups/tailscale 2>/dev/null || true
+	nft delete table inet tachyon_tailscale >/dev/null 2>&1 || true
+fi
+for _comp in zapret zapret2 byedpi wdtt-client qwdtt olcrtc; do
+	_comp_marker="$$_comp"
+	case "$$_comp" in wdtt-client) _comp_marker="wdtt" ;; esac
+	if _is_tachyon_managed "$$_comp_marker"; then
+		if [ -f "/etc/init.d/$${_comp}" ]; then
+			"/etc/init.d/$${_comp}" stop >/dev/null 2>&1 || true
+			"/etc/init.d/$${_comp}" disable >/dev/null 2>&1 || true
+			rm -f "/etc/init.d/$${_comp}" "/etc/rc.d/*$${_comp}*" 2>/dev/null || true
+		fi
+		case "$$_comp_marker" in
+			zapret)
+				killall -9 nfqws >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws 2>/dev/null || true
+				rm -rf /opt/zapret /etc/config/zapret /var/run/tachyon/zapret* /etc/tachyon/component-backups/zapret /var/run/tachyon/component-update-checks/zapret.json 2>/dev/null || true
+				for _tbl in zapret; do nft delete table inet "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			zapret2)
+				killall -9 nfqws2 >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws2 2>/dev/null || true
+				rm -rf /opt/zapret2 /etc/config/zapret2 /etc/tachyon/component-backups/zapret2 /var/run/tachyon/component-update-checks/zapret2.json 2>/dev/null || true
+				for _tbl in zapret2; do nft delete table inet "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			byedpi)
+				killall -9 ciadpi >/dev/null 2>&1 || true
+				rm -f /usr/bin/ciadpi 2>/dev/null || true
+				rm -rf /etc/config/byedpi /var/run/tachyon/byedpi /etc/tachyon/component-backups/byedpi /var/run/tachyon/component-update-checks/byedpi.json 2>/dev/null || true
+				;;
+			wdtt)
+				killall -9 wdtt qwdtt-client >/dev/null 2>&1 || true
+				rm -f /usr/bin/wdtt /usr/bin/qwdtt-client /usr/sbin/wdtt-genlists /usr/sbin/wdtt-resolve 2>/dev/null || true
+				rm -rf /etc/qwdtt /etc/wdtt /etc/config/wdtt /var/run/tachyon/wdtt /var/run/qwdtt /etc/tachyon/component-backups/wdtt /var/run/tachyon/component-update-checks/wdtt.json 2>/dev/null || true
+				;;
+			olcrtc)
+				killall -9 olcrtc >/dev/null 2>&1 || true
+				rm -f /usr/bin/olcrtc 2>/dev/null || true
+				rm -rf /etc/olcrtc /etc/config/olcrtc /var/run/tachyon/olcrtc /etc/tachyon/component-backups/olcrtc /var/run/tachyon/component-update-checks/olcrtc.json 2>/dev/null || true
+				;;
+		esac
+	fi
+done
+
+# LuCI cache touch invalidation
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$$_f" ] && touch "$$_f" 2>/dev/null || true; done
+touch /www/luci-static/resources/luci.js /www/luci-static/resources/view/tachyon /www/luci-static/resources 2>/dev/null || true
+
 # Start via tachyon binary (lifecycle.uc) which registers with procd directly,
 # bypassing rc.common and its flock entirely.
 /usr/bin/tachyon start >/dev/null 2>&1 || true
@@ -107,53 +208,115 @@ define Package/tachyon/postinst
 
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 
-# Stop and disable legacy forkop / podkop / netshift services to prevent boot conflicts
-for legacy_svc in podkop forkop netshift podkop_plus forkop_plus; do
-	if [ -f "/etc/init.d/$${legacy_svc}" ]; then
-		"/etc/init.d/$${legacy_svc}" stop >/dev/null 2>&1 || true
-		"/etc/init.d/$${legacy_svc}" disable >/dev/null 2>&1 || true
+_backup_external_configs() {
+	_bdir="/etc/tachyon/external-configs-backup"
+	for _comp in zapret zapret2 byedpi wdtt qwdtt olcrtc sing-box; do
+		_cdir="$$_bdir/$$_comp"
+		case "$$_comp" in
+			zapret) _srcs="/etc/config/zapret /opt/zapret/config /opt/zapret/ipset" ;;
+			zapret2) _srcs="/etc/config/zapret2 /opt/zapret2/config /opt/zapret2/ipset" ;;
+			byedpi) _srcs="/etc/config/byedpi /etc/byedpi" ;;
+			wdtt|qwdtt) _srcs="/etc/config/wdtt /etc/wdtt /etc/qwdtt" ;;
+			olcrtc) _srcs="/etc/config/olcrtc /etc/olcrtc" ;;
+			sing-box) _srcs="/etc/sing-box/config.json /etc/config/sing-box" ;;
+		esac
+		_has_src=0
+		for _s in $$_srcs; do [ -e "$$_s" ] && _has_src=1 && break; done
+		[ "$$_has_src" -eq 0 ] && continue
+		mkdir -p "$$_cdir" 2>/dev/null || continue
+		for _s in $$_srcs; do
+			[ -e "$$_s" ] || continue
+			_dst="$$_cdir/$$(basename "$$_s")"
+			if [ -d "$$_s" ]; then
+				cp -a -n "$$_s" "$$_dst" 2>/dev/null || cp -a "$$_s" "$${_dst}.new" 2>/dev/null || true
+			else
+				[ -f "$$_dst" ] && cmp -s "$$_s" "$$_dst" 2>/dev/null && continue
+				cp -a "$$_s" "$$_dst" 2>/dev/null || true
+			fi
+		done
+	done
+}
+_is_tachyon_managed() {
+	_comp="$$1"
+	[ -f "/etc/init.d/$$_comp" ] && grep -q "Tachyon managed" "/etc/init.d/$$_comp" 2>/dev/null && return 0
+	[ -d "/etc/tachyon/component-backups/$$_comp" ] && return 0
+	[ -d "/var/run/tachyon/$$_comp" ] && return 0
+	return 1
+}
+
+_backup_external_configs
+
+# Stop and clean Tachyon internal steer subsystem
+for _steer_svc in tachyon-steer-zapret steer; do
+	if [ -f "/etc/init.d/$${_steer_svc}" ]; then
+		"/etc/init.d/$${_steer_svc}" stop >/dev/null 2>&1 || true
+		"/etc/init.d/$${_steer_svc}" disable >/dev/null 2>&1 || true
+		rm -f "/etc/init.d/$${_steer_svc}" 2>/dev/null || true
 	fi
 done
-rm -f /etc/rc.d/*podkop* /etc/rc.d/*forkop* /etc/rc.d/*netshift* 2>/dev/null || true
-nft delete table inet podkop >/dev/null 2>&1 || true
-nft delete table inet PodkopTable >/dev/null 2>&1 || true
-nft delete table inet forkop >/dev/null 2>&1 || true
-nft delete table inet ForkopTable >/dev/null 2>&1 || true
-nft delete table inet netshift >/dev/null 2>&1 || true
-nft delete table inet NetShiftTable >/dev/null 2>&1 || true
+rm -rf /etc/rc.d/*steer* /etc/steer /usr/lib/tachyon/steer /usr/sbin/steer /usr/bin/steer /var/run/tachyon/*steer* /tmp/*steer* 2>/dev/null || true
+killall -9 steer >/dev/null 2>&1 || true
+nft delete table inet steer >/dev/null 2>&1 || true
 
-# Clean up legacy package files
-rm -rf /usr/lib/lua/luci/i18n/forkop.* /www/luci-static/resources/i18n/forkop.* \
-       /usr/share/luci/menu.d/luci-app-forkop.json /usr/share/rpcd/acl.d/luci-app-forkop.json \
-       /etc/uci-defaults/50_luci-forkop \
-       /usr/lib/lua/luci/i18n/netshift.* /www/luci-static/resources/i18n/netshift.* \
-       /usr/share/luci/menu.d/luci-app-netshift.json /usr/share/rpcd/acl.d/luci-app-netshift.json \
-       /etc/uci-defaults/50_luci-netshift 2>/dev/null || true
-
-# Migration from NetShift, Forkop or Podkop
-if [ -f /etc/config/netshift ]; then
-	mv /etc/config/netshift /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/forkop ]; then
-	mv /etc/config/forkop /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/forkop_plus ]; then
-	mv /etc/config/forkop_plus /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/podkop ]; then
-	mv /etc/config/podkop /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/podkop_plus ]; then
-	mv /etc/config/podkop_plus /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-else
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate
+# Selective cleanup of external components only if Tachyon-managed
+if [ -f /etc/init.d/tailscale ] && grep -q "Tachyon managed" /etc/init.d/tailscale 2>/dev/null; then
+	/etc/init.d/tailscale stop >/dev/null 2>&1 || true
+	/etc/init.d/tailscale disable >/dev/null 2>&1 || true
+	rm -f /etc/init.d/tailscale /etc/rc.d/*tailscale* 2>/dev/null || true
+	rm -rf /var/run/tachyon/tailscale /etc/tachyon/tailscale/*/native /etc/tachyon/component-backups/tailscale 2>/dev/null || true
+	nft delete table inet tachyon_tailscale >/dev/null 2>&1 || true
 fi
+for _comp in zapret zapret2 byedpi wdtt-client qwdtt olcrtc; do
+	_comp_marker="$$_comp"
+	case "$$_comp" in wdtt-client) _comp_marker="wdtt" ;; esac
+	if _is_tachyon_managed "$$_comp_marker"; then
+		if [ -f "/etc/init.d/$${_comp}" ]; then
+			"/etc/init.d/$${_comp}" stop >/dev/null 2>&1 || true
+			"/etc/init.d/$${_comp}" disable >/dev/null 2>&1 || true
+			rm -f "/etc/init.d/$${_comp}" "/etc/rc.d/*$${_comp}*" 2>/dev/null || true
+		fi
+		case "$$_comp_marker" in
+			zapret)
+				killall -9 nfqws >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws 2>/dev/null || true
+				rm -rf /opt/zapret /etc/config/zapret /var/run/tachyon/zapret* /etc/tachyon/component-backups/zapret /var/run/tachyon/component-update-checks/zapret.json 2>/dev/null || true
+				for _tbl in zapret; do nft delete table inet "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			zapret2)
+				killall -9 nfqws2 >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws2 2>/dev/null || true
+				rm -rf /opt/zapret2 /etc/config/zapret2 /etc/tachyon/component-backups/zapret2 /var/run/tachyon/component-update-checks/zapret2.json 2>/dev/null || true
+				for _tbl in zapret2; do nft delete table inet "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			byedpi)
+				killall -9 ciadpi >/dev/null 2>&1 || true
+				rm -f /usr/bin/ciadpi 2>/dev/null || true
+				rm -rf /etc/config/byedpi /var/run/tachyon/byedpi /etc/tachyon/component-backups/byedpi /var/run/tachyon/component-update-checks/byedpi.json 2>/dev/null || true
+				;;
+			wdtt)
+				killall -9 wdtt qwdtt-client >/dev/null 2>&1 || true
+				rm -f /usr/bin/wdtt /usr/bin/qwdtt-client /usr/sbin/wdtt-genlists /usr/sbin/wdtt-resolve 2>/dev/null || true
+				rm -rf /etc/qwdtt /etc/wdtt /etc/config/wdtt /var/run/tachyon/wdtt /var/run/qwdtt /etc/tachyon/component-backups/wdtt /var/run/tachyon/component-update-checks/wdtt.json 2>/dev/null || true
+				;;
+			olcrtc)
+				killall -9 olcrtc >/dev/null 2>&1 || true
+				rm -f /usr/bin/olcrtc 2>/dev/null || true
+				rm -rf /etc/olcrtc /etc/config/olcrtc /var/run/tachyon/olcrtc /etc/tachyon/component-backups/olcrtc /var/run/tachyon/component-update-checks/olcrtc.json 2>/dev/null || true
+				;;
+		esac
+	fi
+done
+
+TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate
 
 # Ensure autostart is enabled
 /etc/init.d/tachyon enable >/dev/null 2>&1 || true
 
 /usr/bin/tachyon package_postinst
+
+# LuCI cache touch invalidation
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$$_f" ] && touch "$$_f" 2>/dev/null || true; done
+touch /www/luci-static/resources/luci.js /www/luci-static/resources/view/tachyon /www/luci-static/resources 2>/dev/null || true
 
 # The rpcd ACL for this binary ships here rather than in luci-app-tachyon, so
 # the policy and the executable it governs are installed in the same package and
@@ -176,13 +339,7 @@ if [ -d /www/cgi-bin ]; then
 		rm -f /www/cgi-bin/tachyon-agent 2>/dev/null || true
 	fi
 fi
-
-# Neutralize legacy unshielded postrm scripts on disk if upgrading from 1.3.21/1.3.22
-for p in /usr/lib/opkg/info/tachyon.postrm /usr/lib/opkg/info/luci-app-tachyon.postrm /usr/lib/opkg/info/luci-i18n-tachyon-ru.postrm; do
-	if [ -f "$$p" ] && ! grep -q '\[ "$$1" = "upgrade" \]' "$$p"; then
-		sed -i '2i[ "$$1" = "upgrade" ] && exit 0' "$$p" 2>/dev/null || true
-	fi
-done
+exit 0
 endef
 
 define Package/tachyon/postrm
@@ -190,6 +347,7 @@ define Package/tachyon/postrm
 
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 [ "$$1" = "upgrade" ] && exit 0
+[ -x /usr/bin/tachyon ] && exit 0
 if [ "$$1" != "remove" ] && [ "$$1" != "purge" ]; then
 	exit 0
 fi
@@ -200,6 +358,9 @@ fi
 
 rm -f /www/cgi-bin/tachyon-agent /etc/hotplug.d/iface/99-tachyon-wan-monitor 2>/dev/null || true
 rm -f /usr/share/nftables.d/chain-pre/input/10-tachyon.nft 2>/dev/null || true
+rm -f /usr/share/nftables.d/ruleset-post/90-tachyon-kill-switch.nft 2>/dev/null || true
+nft delete table inet TachyonKillSwitch >/dev/null 2>&1 || true
+for pref in 9499 9500 9501; do for fam in -4 -6; do while ip $$fam rule del pref $$pref >/dev/null 2>&1; do :; done; done; done
 rm -rf /tmp/ai_doctor* /tmp/tg_* /tmp/warp_* 2>/dev/null || true
 rm -rf /var/run/tachyon/section-cache /var/run/tachyon/ui-state 2>/dev/null || true
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall restart >/dev/null 2>&1 || true
@@ -216,10 +377,12 @@ define Package/tachyon/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/tachyon $(1)/etc/init.d/tachyon
 	$(INSTALL_BIN) ./files/etc/init.d/tachyon-torrserver-direct $(1)/etc/init.d/tachyon-torrserver-direct
-	$(INSTALL_BIN) ./files/etc/init.d/olcrtc-yaml $(1)/etc/init.d/olcrtc-yaml
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/tachyon $(1)/etc/config/tachyon
+
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/tachyon $(1)/lib/upgrade/keep.d/tachyon
 
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/tachyon $(1)/usr/bin/tachyon
@@ -228,6 +391,8 @@ define Package/tachyon/install
 
 	$(INSTALL_DIR) $(1)/usr/lib/tachyon
 	$(CP) ./files/usr/lib/. $(1)/usr/lib/tachyon/
+	$(INSTALL_DIR) $(1)/usr/lib/tachyon/bin
+	$(INSTALL_BIN) ./files/usr/lib/bin/wget $(1)/usr/lib/tachyon/bin/wget
 
 	$(INSTALL_DIR) $(1)/usr/lib/tachyon/defaults
 	$(INSTALL_CONF) ./files/etc/config/tachyon $(1)/usr/lib/tachyon/defaults/config
@@ -238,6 +403,8 @@ define Package/tachyon/install
 	# AI Agent API CGI handler (executable shell wrapper for uhttpd)
 	$(INSTALL_DIR) $(1)/usr/lib/cgi-bin
 	$(INSTALL_BIN) ./files/usr/lib/cgi-bin/tachyon-agent $(1)/usr/lib/cgi-bin/tachyon-agent
+	$(INSTALL_DIR) $(1)/www/cgi-bin
+	$(INSTALL_BIN) ./files/www/cgi-bin/tachyon-sub $(1)/www/cgi-bin/tachyon-sub
 	# The /www/cgi-bin symlink is NOT created here: it is published at service
 	# start only when agent_api_token is set (issue #76). The handler itself
 	# is always installed, so enabling the gateway needs no reinstall.
@@ -248,19 +415,13 @@ define Package/tachyon/install
 	# Registrable-domain boundaries for Smart Detect Plus (ICANN + PRIVATE, MPL-2.0).
 	$(INSTALL_DATA) ./files/usr/share/tachyon/public-suffix-list.dat $(1)/usr/share/tachyon/public-suffix-list.dat
 
-	# Curated DPI bypass strategy presets (zapret4rocket / homeproxy-hiddify / Tachyon)
+	# Curated strategy presets (Tachyon)
 	$(INSTALL_DATA) ./files/usr/share/tachyon/dpi-presets.json $(1)/usr/share/tachyon/dpi-presets.json
 	# rpcd ACL for /usr/bin/tachyon and /usr/bin/tachyon-read. Owned by this
 	# package, not by luci-app-tachyon: the read role must reach only the
 	# read-only entry point, and the two files have to arrive together.
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/luci-app-tachyon.json $(1)/usr/share/rpcd/acl.d/luci-app-tachyon.json
-	$(INSTALL_BIN) ./files/usr/sbin/steer-nfqws $(1)/usr/share/tachyon/steer-nfqws
-
-	# Zapret handler supervisor: steer 1.5.x init scripts do not spawn the
-	# kind: zapret handlers, so Tachyon (the control layer) runs them itself.
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/etc/init.d/tachyon-steer-zapret $(1)/etc/init.d/tachyon-steer-zapret
 
 	sed -i -e 's/__COMPILED_VERSION_VARIABLE__/$(TACHYON_COMPILED_VERSION)/g' \
 		-e 's/__COMPILED_COMMIT_SHA__/$(shell git -C $(TOPDIR)/../ rev-parse --short HEAD 2>/dev/null || echo unknown)/g' \

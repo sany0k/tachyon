@@ -7,16 +7,30 @@
 let fs = require("fs");
 let common = require("core.common");
 let uci_core = require("core.uci");
-let connections = require("config.connections");
 let helpers = require("core.helpers");
 let api = require("service.api");
-let dns_presets = require("tachyon_core.dns_presets");
 let i18n = require("service.i18n");
 
 let rendering = require("service.telegram.rendering");
 let transport = require("service.telegram.transport");
-let commands = require("service.telegram.commands");
-let callbacks = require("service.telegram.callbacks");
+let _commands = null;
+function get_commands() {
+    if (_commands == null) _commands = require("service.telegram.commands");
+    return _commands;
+}
+let _callbacks = null;
+function get_callbacks() {
+    if (_callbacks == null) _callbacks = require("service.telegram.callbacks");
+    return _callbacks;
+}
+let commands = {
+    view_guest_mode: function(...args) { return get_commands().view_guest_mode(...args); }
+};
+let callbacks = {
+    handle_guest_toggle: function(...args) { return get_callbacks().handle_guest_toggle(...args); },
+    handle_lang_set: function(...args) { return get_callbacks().handle_lang_set(...args); },
+    dispatch_command: function(...args) { return get_callbacks().dispatch_command(...args); }
+};
 let runtime = require("service.telegram.runtime");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
@@ -142,6 +156,14 @@ function notify_updates_cli() {
     return runtime.notify_updates_cli();
 }
 
+function notify_auto_update_cli(component, old_ver, new_ver) {
+    return runtime.notify_auto_update_cli(component, old_ver, new_ver);
+}
+
+function notify_auto_update_failed_cli(component, old_ver, error_msg) {
+    return runtime.notify_auto_update_failed_cli(component, old_ver, error_msg);
+}
+
 function process_updates(token, admin_ids) {
     // Idle poll guard invariant:
     // if (!res || !res.ok || !res.result) return false;
@@ -161,7 +183,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
 
 // ─── CLI Entrypoint ──────────────────────────────────────────────────────────
 
-if (length(ARGV) > 0) {
+if ((sourcepath(1) == null || sourcepath(1) == "") && length(ARGV) > 0) {
     let mode = (ARGV[0] == "" || ARGV[0] == null) ? ARGV[1] : ARGV[0];
     if (!mode) mode = "";
 
@@ -177,6 +199,20 @@ if (length(ARGV) > 0) {
         exit(diagnose());
     else if (mode == "notify-updates")
         exit(notify_updates_cli());
+    else if (mode == "notify-auto-update") {
+        let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
+        let comp = ARGV[start_arg];
+        let old_v = ARGV[start_arg + 1];
+        let new_v = ARGV[start_arg + 2];
+        exit(notify_auto_update_cli(comp, old_v, new_v));
+    }
+    else if (mode == "notify-auto-update-failed") {
+        let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
+        let comp = ARGV[start_arg];
+        let old_v = ARGV[start_arg + 1];
+        let err_v = ARGV[start_arg + 2];
+        exit(notify_auto_update_failed_cli(comp, old_v, err_v));
+    }
     else if (mode == "send-smart") {
         let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
         let entries = null;
@@ -226,6 +262,8 @@ return {
     diagnose,
     send_api,
     notify_updates_cli,
+    notify_auto_update_cli,
+    notify_auto_update_failed_cli,
     process_updates,
     dispatch_command,
     rendering,

@@ -10,7 +10,6 @@ let common = require("core.common");
 let uci_core = require("core.uci");
 let constants = require("core.constants");
 let helpers = require("core.helpers");
-let api = require("service.api");
 let i18n = require("service.i18n");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
@@ -21,6 +20,8 @@ const LOG_FILE = "/var/log/tachyon_telegram.log";
 const LOG_MAX_BYTES = 524288;
 const LOG_KEEP_BYTES = 102400;
 const MIXED_PORT_PROBE_TTL = 30;
+const ROUTE_ALERT_STAMP_FILE = getenv("TACHYON_TG_ROUTE_ALERT_STAMP") || "/var/run/tachyon/telegram-route-alert.stamp";
+const ROUTE_ALERT_COOLDOWN = int(getenv("TACHYON_TG_ROUTE_ALERT_COOLDOWN") || "21600");
 
 let as_string = common.as_string;
 let object_or_empty = common.object_or_empty;
@@ -30,6 +31,20 @@ let command_output_from_args = common.command_output_from_args;
 let command_success_from_args = common.command_success_from_args;
 let core_binary_running = common.core_binary_running;
 let write_text_file = helpers.write_text_file;
+
+function utf8_prefix(text, limit) {
+    text = as_string(text);
+    limit = int(limit || 0);
+    if (limit <= 0)
+        return "";
+    let len = length(text);
+    if (len <= limit)
+        return text;
+    let end = limit;
+    while (end > 0 && end < len && ord(text, end) >= 128 && ord(text, end) < 192)
+        end--;
+    return substr(text, 0, end);
+}
 
 let cb_map_cache = null;
 let mixed_port_alive_cached = null;
@@ -113,45 +128,88 @@ function settings() {
     return object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
 }
 
+function in_quiet_hours(cfg) {
+    if (!cfg || cfg.quiet_hours_enabled != "1") return false;
+    let start = int(cfg.quiet_hours_start || "23");
+    let end = int(cfg.quiet_hours_end || "7");
+    if (start == end) return false;
+    let tm = localtime(time());
+    if (!tm) return false;
+    let hr = int(tm.hour);
+    if (start <= end) {
+        return hr >= start && hr < end;
+    } else {
+        return hr >= start || hr < end;
+    }
+}
+
+let cached_mixed_proxy_path = "";
+let cached_mixed_proxy_mtime = null;
+let cached_mixed_proxy_size = null;
+let cached_mixed_proxy_info = null;
+
 function get_mixed_proxy_info() {
     let settings_data = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
     let config_path = trim(as_string(settings_data.config_path || "")) || "/etc/tachyon-core/config.json";
+    let st = fs.stat(config_path);
+    if (!st)
+        return null;
+    if (cached_mixed_proxy_path == config_path &&
+        cached_mixed_proxy_mtime == st.mtime &&
+        cached_mixed_proxy_size == st.size)
+        return cached_mixed_proxy_info;
+
     let data = fs.readfile(config_path);
     if (data == null) return null;
     let parsed;
     try { parsed = json(data); } catch (e) { return null; }
     if (parsed == null || parsed.inbounds == null) return null;
 
+    let info = null;
     for (let inbound in parsed.inbounds) {
         if (inbound.tag == "service-mixed-in" && inbound.listen_port != null) {
             let port = int(inbound.listen_port, 10);
             if (port > 0) {
                 let host = as_string(inbound.listen || "127.0.0.1");
                 if (host == "0.0.0.0" || host == "::" || host == "") host = "127.0.0.1";
-                return { host: host, port: port, tag: inbound.tag };
+                info = { host: host, port: port, tag: inbound.tag };
+                break;
             }
         }
     }
-    for (let inbound in parsed.inbounds) {
-        if ((inbound.type == "mixed" || inbound.type == "http") && inbound.listen_port != null) {
-            let listen = as_string(inbound.listen || "");
-            if (listen == "127.0.0.1" || listen == "0.0.0.0" || listen == "::" || listen == "") {
+    if (!info) {
+        for (let inbound in parsed.inbounds) {
+            if ((inbound.type == "mixed" || inbound.type == "http") && inbound.listen_port != null) {
+                let listen = as_string(inbound.listen || "");
+                if (listen == "127.0.0.1" || listen == "0.0.0.0" || listen == "::" || listen == "") {
+                    let port = int(inbound.listen_port, 10);
+                    if (port > 0) {
+                        info = { host: "127.0.0.1", port: port, tag: inbound.tag };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!info) {
+        for (let inbound in parsed.inbounds) {
+            if ((inbound.type == "mixed" || inbound.type == "http") && inbound.listen_port != null) {
                 let port = int(inbound.listen_port, 10);
-                if (port > 0) return { host: "127.0.0.1", port: port, tag: inbound.tag };
+                if (port > 0) {
+                    let host = as_string(inbound.listen || "127.0.0.1");
+                    if (host == "0.0.0.0" || host == "::" || host == "") host = "127.0.0.1";
+                    info = { host: host, port: port, tag: inbound.tag };
+                    break;
+                }
             }
         }
     }
-    for (let inbound in parsed.inbounds) {
-        if ((inbound.type == "mixed" || inbound.type == "http") && inbound.listen_port != null) {
-            let port = int(inbound.listen_port, 10);
-            if (port > 0) {
-                let host = as_string(inbound.listen || "127.0.0.1");
-                if (host == "0.0.0.0" || host == "::" || host == "") host = "127.0.0.1";
-                return { host: host, port: port, tag: inbound.tag };
-            }
-        }
-    }
-    return null;
+
+    cached_mixed_proxy_path = config_path;
+    cached_mixed_proxy_mtime = st.mtime;
+    cached_mixed_proxy_size = st.size;
+    cached_mixed_proxy_info = info;
+    return info;
 }
 
 function get_mixed_port() {
@@ -198,11 +256,6 @@ function get_proxy_args() {
                 return [];
             return [ "--proxy", "http://" + ep ];
         }
-        let bot_section = cfg.bot_proxy_section ? trim(cfg.bot_proxy_section) : "";
-        if (bot_section != "") {
-            let tag = bot_section + "-out";
-            api.clash_request("PUT", "proxies/GLOBAL", { name: tag });
-        }
         return [ "--proxy", "http://" + ep ];
     }
     if (cfg.fallback_socks && trim(cfg.fallback_socks) != "") {
@@ -238,13 +291,26 @@ function rotate_log_if_needed() {
 function tg_request_via(token, method, payload, proxy_args) {
     if (!token) return null;
     let url = "https://api.telegram.org/bot" + token + "/" + method;
-    let body = sprintf("%J", payload);
     let is_poll = (method == "getUpdates");
-    let max_time = is_poll ? "65" : "12";
-    let conn_timeout = is_poll ? "15" : "5";
-    let args = [ "curl", "-s", "-m", max_time, "--connect-timeout", conn_timeout,
-                 "-X", "POST", "-H", "Content-Type: application/json",
-                 "-d", body ];
+    let poll_wait = (is_poll && payload && payload.timeout != null) ? int(payload.timeout) : 0;
+    let max_time = is_poll ? as_string(max(15, poll_wait + 10)) : "12";
+    let conn_timeout = is_poll ? "8" : "5";
+    let args = [ "curl", "-s", "-m", max_time, "--connect-timeout", conn_timeout ];
+
+    if (is_poll) {
+        // Telegram Bot API ignores `timeout` in JSON body on POST /getUpdates,
+        // returning immediately (timeout=0 short polling). Passing form-urlencoded
+        // parameters activates server-side long polling without altering the endpoint URL.
+        let parts = [];
+        if (payload && payload.offset != null) push(parts, "offset=" + as_string(payload.offset));
+        if (payload && payload.timeout != null) push(parts, "timeout=" + as_string(payload.timeout));
+        if (payload && payload.limit != null) push(parts, "limit=" + as_string(payload.limit));
+        let body = join("&", parts);
+        push(args, "-X", "POST", "-d", body);
+    } else {
+        let body = sprintf("%J", payload);
+        push(args, "-X", "POST", "-H", "Content-Type: application/json", "-d", body);
+    }
     for (let p in proxy_args) push(args, p);
     push(args, url);
     let res = command_capture(command_from_args(args));
@@ -260,8 +326,29 @@ function tg_request(token, method, payload) {
     if (res != null)
         return res;
 
-    if (direct_fallback_enabled() && length(proxy_args) > 0)
+    // An idle long-poll getUpdates connection can be dropped before timeout
+    // by an intermediate hop while short requests through the proxy succeed.
+    if (method == "getUpdates" && length(proxy_args) > 0) {
+        let probe = tg_request_via(token, "getMe", {}, proxy_args);
+        if (probe != null && probe.ok === true) {
+            sleep(2000);
+            return { ok: true, result: [] };
+        }
+    }
+
+    if (direct_fallback_enabled() && length(proxy_args) > 0) {
+        if (method == "getUpdates") {
+            let fallback_payload = {};
+            if (type(payload) == "object") {
+                for (let k in payload)
+                    fallback_payload[k] = payload[k];
+            }
+            let requested = (payload && payload.timeout != null) ? int(payload.timeout) : 5;
+            fallback_payload.timeout = min(5, max(0, requested));
+            payload = fallback_payload;
+        }
         res = tg_request_via(token, method, payload, []);
+    }
 
     return res;
 }
@@ -298,7 +385,7 @@ function send_message(token, chat_id, text, parse_mode, keyboard) {
     let t = get_t();
     text = apply_router_prefix(text, parse_mode);
     if (length(text) > 3900) {
-        text = substr(text, 0, 3900) + "\n... " + t("msg_truncated");
+        text = utf8_prefix(text, 3900) + "\n... " + t("msg_truncated");
         if (parse_mode == "HTML") {
             if (index(text, "<pre>") >= 0 && index(text, "</pre>") < 0) text += "</pre>";
             if (index(text, "<code>") >= 0 && index(text, "</code>") < 0) text += "</code>";
@@ -318,9 +405,22 @@ function send_message(token, chat_id, text, parse_mode, keyboard) {
     return res;
 }
 
+function route_alert_recent() {
+    if (ROUTE_ALERT_COOLDOWN <= 0) return false;
+    let raw = fs.readfile(ROUTE_ALERT_STAMP_FILE);
+    if (raw == null) return false;
+    let ts = int(trim(raw));
+    if (ts <= 0) return false;
+    let elapsed = time() - ts;
+    return elapsed >= 0 && elapsed < ROUTE_ALERT_COOLDOWN;
+}
+
 function alert_route_failure(attempt, proxy_alive) {
     let t = get_t();
     let cfg = settings();
+    if (cfg.notify_route_alert == "0") return false;
+    if (in_quiet_hours(cfg)) return false;
+    if (route_alert_recent()) return true;
     let token = trim(as_string(cfg.bot_token || ""));
     if (token == "") return;
     let admins = split(trim(as_string(cfg.admin_ids || "")), /,/);
@@ -335,14 +435,23 @@ function alert_route_failure(attempt, proxy_alive) {
         t("route_reason") + " " + hint + ".\n" +
         t("route_fallback_hint") + "\n" +
         t("route_heal_hint");
-    send_message(token, chat_id, text, "HTML", null);
+    let submitted = require("service.telegram.notifications").submit(
+        token, chat_id, text, "HTML", null, null, "route_alert"
+    );
+    if (submitted) {
+        let stamp_dir = common.parent_dir(ROUTE_ALERT_STAMP_FILE);
+        if (stamp_dir != "")
+            common.ensure_dir(stamp_dir);
+        write_text_file(ROUTE_ALERT_STAMP_FILE, as_string(time()) + "\n");
+    }
+    return submitted;
 }
 
 function edit_message(token, chat_id, message_id, text, parse_mode, keyboard) {
     let t = get_t();
     text = apply_router_prefix(text, parse_mode);
     if (length(text) > 3900) {
-        text = substr(text, 0, 3900) + "\n... " + t("msg_truncated");
+        text = utf8_prefix(text, 3900) + "\n... " + t("msg_truncated");
         if (parse_mode == "HTML") {
             if (index(text, "<pre>") >= 0 && index(text, "</pre>") < 0) text += "</pre>";
             if (index(text, "<code>") >= 0 && index(text, "</code>") < 0) text += "</code>";
@@ -396,6 +505,10 @@ function register_bot_commands(token) {
         { command: "sections",  description: t("cmd_sections") },
         { command: "instances", description: t("cmd_instances") },
         { command: "guest",     description: t("cmd_guest") },
+        { command: "toggles",   description: t("cmd_toggles") },
+        { command: "notifications", description: t("cmd_notifications") },
+        { command: "profiles",  description: t("cmd_profiles") },
+        { command: "schedules", description: t("cmd_schedules") },
         { command: "speed",     description: t("cmd_speed") },
         { command: "ping",      description: t("cmd_ping") },
         { command: "test",      description: t("cmd_test") },
@@ -404,6 +517,8 @@ function register_bot_commands(token) {
         { command: "connections", description: t("cmd_connections") },
         { command: "test_rule", description: t("cmd_test_rule") },
         { command: "help",      description: t("cmd_help") },
+        { command: "update_subs", description: t("cmd_update_subs") },
+        { command: "update_lists", description: t("cmd_update_lists") },
         { command: "check_updates", description: t("cmd_check_updates") },
         { command: "close_connections", description: t("cmd_close_connections") },
         { command: "doctor",    description: t("cmd_doctor") },
@@ -457,12 +572,15 @@ return {
     LOG_MAX_BYTES,
     LOG_KEEP_BYTES,
     MIXED_PORT_PROBE_TTL,
+    ROUTE_ALERT_STAMP_FILE,
+    ROUTE_ALERT_COOLDOWN,
     get_t,
     cb_map_load,
     cb_map_store,
     cb_map_get,
     cb_data,
     settings,
+    in_quiet_hours,
     router_name,
     apply_router_prefix,
     get_mixed_proxy_info,

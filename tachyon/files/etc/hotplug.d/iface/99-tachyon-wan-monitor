@@ -1,12 +1,157 @@
 #!/bin/sh
 # Hotplug handler for WAN retry on boot and interface state monitoring
 
+RELOAD_LOCK_DIR="${TACHYON_RELOAD_LOCK_DIR:-/var/run/tachyon.reload.lock}"
+HUP_LOCK_TIMEOUT="${TACHYON_HUP_LOCK_TIMEOUT:-10}"
+
+schedule_core_hup() {
+    sh -c '
+        delay="${1:-1}"
+        lock_dir="$2"
+        timeout_sec="${3:-10}"
+        [ "$delay" -gt 0 ] 2>/dev/null && sleep "$delay"
+        case "$timeout_sec" in ""|*[!0-9]*) timeout_sec=10 ;; esac
+        acquired=0
+        cleanup() {
+            if [ "$acquired" = "1" ]; then
+                acquired=0
+                rm -f "$lock_dir/pid" "$lock_dir/pid.tmp.$$" 2>/dev/null
+                rmdir "$lock_dir" 2>/dev/null
+            fi
+        }
+        trap cleanup EXIT
+        trap '\''cleanup; exit 130'\'' INT
+        trap '\''cleanup; exit 143'\'' TERM
+        elapsed=0
+        while ! mkdir "$lock_dir" 2>/dev/null; do
+            holder_pid=""
+            if [ -r "$lock_dir/pid" ]; then
+                read -r holder_pid <"$lock_dir/pid" 2>/dev/null || holder_pid=""
+            fi
+            case "$holder_pid" in
+                ""|*[!0-9]*)
+                    if [ "$elapsed" -ge 5 ] && [ ! -e "$lock_dir/pid" ]; then
+                        stale_dir="${lock_dir}.stale.$$.${elapsed}"
+                        if mv "$lock_dir" "$stale_dir" 2>/dev/null; then
+                            rm -rf "$stale_dir" 2>/dev/null
+                            continue
+                        fi
+                    fi
+                    ;;
+                *)
+                    if ! kill -0 "$holder_pid" 2>/dev/null; then
+                        stale_dir="${lock_dir}.stale.$$.${elapsed}"
+                        if mv "$lock_dir" "$stale_dir" 2>/dev/null; then
+                            rm -rf "$stale_dir" 2>/dev/null
+                            continue
+                        fi
+                    fi
+                    ;;
+            esac
+            if [ "$elapsed" -ge "$timeout_sec" ]; then
+                logger -t tachyon "[warn] skipping hotplug SIGHUP: reload lock busy ($lock_dir)" 2>/dev/null || true
+                exit 0
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        acquired=1
+        pid_tmp="$lock_dir/pid.tmp.$$"
+        if ! { printf "%s\n" "$$" >"$pid_tmp" 2>/dev/null && mv -f "$pid_tmp" "$lock_dir/pid" 2>/dev/null; }; then
+            rm -f "$pid_tmp" 2>/dev/null
+            exit 1
+        fi
+        for p in $(pidof tachyon-core 2>/dev/null); do
+            kill -HUP "$p" 2>/dev/null
+        done
+    ' _ "${1:-1}" "$RELOAD_LOCK_DIR" "$HUP_LOCK_TIMEOUT" >/dev/null 2>&1 &
+}
+
 case "$INTERFACE" in
-    wan*|wwan*|lte*|modem*)
+    wan*|wwan*|secondwan*|tethering*|lte*|modem*|pppoe*|usb*|*_6|6in4*|6to4*|he*|dslite*|v6*|ipv6*)
+        mkdir -p /var/run/tachyon 2>/dev/null
+        case "$ACTION" in
+            ifup)
+                case "$INTERFACE" in
+                    wan*|wwan*|secondwan*|tethering*|lte*|modem*|pppoe*|usb*)
+                        # Fail-closed setups: block LAN->WAN until Tachyon's interception
+                        # table exists (boot runs this long before Tachyon itself starts).
+                        ucode -L /usr/lib/tachyon -e 'require("service.kill_switch").boot()' >/dev/null 2>&1
+                        echo "up" > "/var/run/tachyon/wan_transport_${INTERFACE}" 2>/dev/null
+                        date +%s > /var/run/tachyon/wan-event.timestamp 2>/dev/null
+                        /etc/init.d/tachyon retry_start_on_wan_up >/dev/null 2>&1 &
+                        schedule_core_hup 1
+                        ;;
+                esac
+                ;;
+            ifdown)
+                case "$INTERFACE" in
+                    wan*|wwan*|secondwan*|tethering*|lte*|modem*|pppoe*|usb*)
+                        echo "down" > "/var/run/tachyon/wan_transport_${INTERFACE}" 2>/dev/null
+                        date +%s > /var/run/tachyon/wan-event.timestamp 2>/dev/null
+                        schedule_core_hup 1
+                        ;;
+                esac
+                ;;
+        esac
+
+        case "$ACTION" in
+            ifup|ifdown|ifupdate)
+                TACHYON_LIB="${TACHYON_LIB:-/usr/lib/tachyon}"
+                if [ -r "${TACHYON_LIB}/core/common.uc" ] && command -v ucode >/dev/null 2>&1; then
+                    run_wan6_hotplug_sync() {
+                        STATE_DIR="${TACHYON_RUNTIME_STATE_DIR:-/var/run/tachyon}"
+                        mkdir -p "$STATE_DIR" 2>/dev/null
+                        V6_LOCK="${STATE_DIR}/wan6_hotplug.lock"
+                        if mkdir "$V6_LOCK" 2>/dev/null; then
+                            trap 'rm -rf "$V6_LOCK" 2>/dev/null' EXIT INT TERM
+                            DELAY_SEC="${TACHYON_WAN6_HOTPLUG_DELAY:-1}"
+                            [ "$DELAY_SEC" = "0" ] || sleep "$DELAY_SEC"
+                            V6_STATE_FILE="${STATE_DIR}/wan6_hotplug_state"
+                            PREV_FILE_SIG=""
+                            [ -f "$V6_STATE_FILE" ] && PREV_FILE_SIG="$(cat "$V6_STATE_FILE" 2>/dev/null)"
+                            OUT_LINE="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" -e '
+                                let common = require("core.common");
+                                let uci_core = require("core.uci");
+                                let prev = common.read_cached_ipv6_state();
+                                let prev_sig = type(prev) == "object" ? (common.as_string(prev.effective || "") + "|" + join(",", common.array_or_empty(prev.wan6_pd)) + "|" + common.as_string(prev.ipv6_mode || "")) : "";
+                                let settings = uci_core.get_all(getenv("TACHYON_CONFIG_NAME") || "tachyon", "settings") || {};
+                                let wan6 = common.wan6_live_status();
+                                let eff = common.resolve_effective_ipv6_state(settings, wan6);
+                                common.cache_ipv6_runtime_state(eff);
+                                let cur_sig = eff.effective + "|" + join(",", eff.wan6_pd) + "|" + eff.ipv6_mode;
+                                print(prev_sig, "\t", cur_sig);
+                            ' 2>/dev/null)"
+                            PREV_CACHE_SIG="$(printf '%s' "$OUT_LINE" | awk -F'\t' '{print $1}')"
+                            CUR_SIG="$(printf '%s' "$OUT_LINE" | awk -F'\t' '{print $2}')"
+                            if [ -n "$CUR_SIG" ]; then
+                                PREV_SIG="$PREV_FILE_SIG"
+                                [ -n "$PREV_SIG" ] || PREV_SIG="$PREV_CACHE_SIG"
+                                if [ "$CUR_SIG" != "$PREV_SIG" ]; then
+                                    printf '%s\n' "$CUR_SIG" > "$V6_STATE_FILE" 2>/dev/null
+                                    INIT_SCRIPT="${TACHYON_SERVICE_INIT:-/etc/init.d/tachyon}"
+                                    if [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" status >/dev/null 2>&1; then
+                                        "$INIT_SCRIPT" reload ipv6_state_change >/dev/null 2>&1
+                                    fi
+                                elif [ ! -f "$V6_STATE_FILE" ]; then
+                                    printf '%s\n' "$CUR_SIG" > "$V6_STATE_FILE" 2>/dev/null
+                                fi
+                            fi
+                        fi
+                    }
+                    if [ "${TACHYON_WAN6_HOTPLUG_SYNC:-0}" = "1" ]; then
+                        run_wan6_hotplug_sync >/dev/null 2>&1
+                    else
+                        run_wan6_hotplug_sync >/dev/null 2>&1 &
+                    fi
+                fi
+                ;;
+        esac
+        ;;
+    lan*)
         case "$ACTION" in
             ifup)
                 /etc/init.d/tachyon retry_start_on_wan_up >/dev/null 2>&1 &
-                [ -f /usr/lib/tachyon/providers/fptn/runtime.uc ] && ucode -L /usr/lib/tachyon /usr/lib/tachyon/providers/fptn/runtime.uc ensure-routing >/dev/null 2>&1 &
                 ;;
         esac
         ;;
@@ -20,10 +165,7 @@ esac
 # 1. Check if interface monitoring is enabled in settings
 [ "$(uci -q get tachyon.settings.enable_badwan_interface_monitoring)" = "1" ] || exit 0
 
-# 2. Check if Telegram bot is enabled
-[ "$(uci -q get tachyon.telegram.enabled)" = "1" ] || exit 0
-
-# 3. Check if current interface is in badwan_monitored_interfaces (defaults to wan)
+# 2. Check if current interface is in badwan_monitored_interfaces (defaults to wan)
 MONITORED="$(uci -q get tachyon.settings.badwan_monitored_interfaces)"
 [ -n "$MONITORED" ] || MONITORED="wan"
 
@@ -35,6 +177,16 @@ for iface in $MONITORED; do
     fi
 done
 [ "$MATCHED" -eq 1 ] || exit 0
+
+case "$INTERFACE" in
+    wan*|wwan*|secondwan*|tethering*|lte*|modem*|pppoe*|usb*) ;;
+    *)
+        schedule_core_hup 1
+        ;;
+esac
+
+# 3. Check if Telegram bot is enabled
+[ "$(uci -q get tachyon.telegram.enabled)" = "1" ] || exit 0
 
 # 4. Handle debounce, state tracking, and notifications in background to avoid blocking hotplug queue
 (
@@ -90,17 +242,23 @@ done
     TACHYON_BIN="$(command -v tachyon 2>/dev/null || echo /usr/bin/tachyon)"
     [ -x "$TACHYON_BIN" ] || TACHYON_BIN="/usr/bin/tachyon"
 
+    NOTIFY_WAN="$(uci -q get tachyon.telegram.notify_wan)"
+
     if [ "$CURRENT_STATE" = "up" ]; then
         if [ "$PREV_STATE" = "down" ]; then
             echo "up" > "$STATE_FILE"
-            "$TACHYON_BIN" telegram send "🟢 Интерфейс *${INTERFACE}* поднялся!"
+            if [ "$NOTIFY_WAN" != "0" ]; then
+                "$TACHYON_BIN" telegram send "🟢 Интерфейс *${INTERFACE}* поднялся!"
+            fi
         elif [ -z "$PREV_STATE" ]; then
             echo "up" > "$STATE_FILE"
         fi
     elif [ "$CURRENT_STATE" = "down" ]; then
         if [ "$PREV_STATE" = "up" ]; then
             echo "down" > "$STATE_FILE"
-            "$TACHYON_BIN" telegram send "⚠️ Интерфейс *${INTERFACE}* упал!"
+            if [ "$NOTIFY_WAN" != "0" ]; then
+                "$TACHYON_BIN" telegram send "⚠️ Интерфейс *${INTERFACE}* упал!"
+            fi
         elif [ -z "$PREV_STATE" ]; then
             echo "down" > "$STATE_FILE"
         fi

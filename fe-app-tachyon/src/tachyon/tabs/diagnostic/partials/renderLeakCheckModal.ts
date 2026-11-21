@@ -1,6 +1,10 @@
 import { TachyonShellMethods } from '../../../methods/shell';
 import { renderButton } from '../../../../partials';
-import { renderRotateCcwIcon24 } from '../../../../icons';
+import {
+  renderRotateCcwIcon24,
+  renderGlobeIcon,
+  renderSearchIcon24,
+} from '../../../../icons';
 import { Tachyon } from '../../../types';
 
 export function renderLeakCheckModal() {
@@ -28,7 +32,7 @@ export function renderLeakCheckModal() {
 
   const progressBar = E('div', {
     style:
-      'width: 0%; height: 6px; background: linear-gradient(90deg, #007bff, #28a745); border-radius: 3px; transition: width 0.4s ease;',
+      'width: 0%; height: 6px; background: var(--tachyon-accent, #5b8af0); border-radius: 3px; transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);',
   });
 
   const progressContainer = E(
@@ -143,14 +147,25 @@ export function renderLeakCheckModal() {
     resultsContainer.innerHTML = '';
     const { ip_leak, dns_leak } = data;
 
+    const v6 = data.ipv6_leak;
+    const directIpv6 =
+      v6?.direct_ipv6 ?? data.direct_ipv6 ?? ip_leak.direct_ipv6 ?? '';
+    const proxyIpv6 =
+      v6?.proxy_ipv6 ?? data.proxy_ipv6 ?? ip_leak.proxy_ipv6 ?? '';
+    const rawIpv6Leaked =
+      v6?.ipv6_leaked ?? data.ipv6_leaked ?? ip_leak.ipv6_leaked;
+    const rawIpv6Guard =
+      v6?.ipv6_leak_guard ?? data.ipv6_leak_guard ?? ip_leak.ipv6_leak_guard;
+
     // --- 1. IP Leak Section ---
     const isDirectRouting =
       ip_leak.proxy_online &&
       (ip_leak.leaked || ip_leak.direct_ip === ip_leak.proxy_ip);
+    const hasIpv6Leak = Boolean(rawIpv6Leaked);
 
     const ipAlertClass = !ip_leak.proxy_online
       ? 'alert-message info'
-      : isDirectRouting
+      : isDirectRouting || hasIpv6Leak
         ? 'alert-message warning'
         : 'alert-message success';
 
@@ -158,9 +173,13 @@ export function renderLeakCheckModal() {
       ? _('Proxy outbound is inactive or not configured for local testing.')
       : isDirectRouting
         ? _(
-            'ℹ️ Direct connection (WAN): Public IP matches your ISP. Under selective routing (by domains or blocklists), unblocked resources bypass the proxy — this is standard operation.',
+            'Direct connection (WAN): Public IP matches your ISP. Under selective routing (by domains or blocklists), unblocked resources bypass the proxy — this is standard operation.',
           )
-        : _('🛡️ SECURE: Public IP is concealed behind the proxy outbound.');
+        : hasIpv6Leak
+          ? _(
+              'IPv6 egress leak detected: IPv4 traffic is concealed, but direct WAN IPv6 matches proxy IPv6.',
+            )
+          : _('SECURE: Public IP is concealed behind the proxy outbound.');
 
     const ipTable = E(
       'table',
@@ -269,22 +288,88 @@ export function renderLeakCheckModal() {
       ],
     );
 
+    const hasIpv6Telemetry =
+      Boolean(directIpv6) ||
+      Boolean(proxyIpv6) ||
+      typeof rawIpv6Leaked === 'boolean' ||
+      typeof rawIpv6Guard === 'boolean';
+
+    const ipv6StatusRow = hasIpv6Telemetry
+      ? (() => {
+          const ipv6Leaked = Boolean(rawIpv6Leaked);
+          const ipv6GuardOn = Boolean(rawIpv6Guard);
+          const ipv6Tunneled = Boolean(proxyIpv6) && proxyIpv6 !== directIpv6;
+          const badgeStyle = ipv6Leaked
+            ? 'background: #dc3545; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px;'
+            : ipv6GuardOn || ipv6Tunneled
+              ? 'background: #28a745; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px;'
+              : 'background: #6c757d; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px;';
+          const badgeText = ipv6Leaked
+            ? _('IPv6 LEAKED')
+            : ipv6GuardOn && !ipv6Tunneled
+              ? _('IPv6 LEAK GUARD')
+              : ipv6Tunneled
+                ? _('IPv6 TUNNELED')
+                : _('IPv6 N/A');
+
+          return E(
+            'div',
+            {
+              style:
+                'margin-top: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-color, rgba(128,128,128,0.22)); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px;',
+            },
+            [
+              E(
+                'div',
+                { style: 'display: flex; flex-wrap: wrap; gap: 12px;' },
+                [
+                  E('span', {}, [
+                    E('strong', {}, _('Direct IPv6:') + ' '),
+                    E('code', {}, directIpv6 || '—'),
+                  ]),
+                  E('span', {}, [
+                    E('strong', {}, _('Proxy IPv6:') + ' '),
+                    E(
+                      'code',
+                      {},
+                      proxyIpv6 ||
+                        (ipv6GuardOn ? _('Guarded (Leak Guard)') : '—'),
+                    ),
+                  ]),
+                ],
+              ),
+              E('span', { class: 'badge', style: badgeStyle }, badgeText),
+            ],
+          );
+        })()
+      : null;
+
     const ipSection = E(
       'div',
       {
         class: 'cbi-section',
         style:
-          'margin-bottom: 20px; border: 1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius: 6px; padding: 12px;',
+          'margin-bottom: 20px; border: 1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius: 6px; padding: 12px; width: 100%; box-sizing: border-box;',
       },
       [
-        E('h4', { style: 'margin-top: 0; margin-bottom: 8px;' }, [
-          '🌐 ',
-          _('Public IP Address Isolation'),
-        ]),
-        E('div', { class: ipAlertClass, style: 'margin-bottom: 12px;' }, [
-          ipAlertText,
-        ]),
-        ipTable,
+        E(
+          'h4',
+          {
+            style:
+              'margin-top: 0; margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px;',
+          },
+          [renderGlobeIcon(14), _('Public IP Address Isolation')],
+        ),
+        E(
+          'div',
+          {
+            class: ipAlertClass,
+            style: 'margin-bottom: 12px; width: 100%; box-sizing: border-box;',
+          },
+          [ipAlertText],
+        ),
+        E('div', { style: 'width: 100%; overflow-x: auto;' }, [ipTable]),
+        ...(ipv6StatusRow ? [ipv6StatusRow] : []),
       ],
     );
 
@@ -424,17 +509,26 @@ export function renderLeakCheckModal() {
       {
         class: 'cbi-section',
         style:
-          'border: 1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius: 6px; padding: 12px;',
+          'border: 1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius: 6px; padding: 12px; width: 100%; box-sizing: border-box;',
       },
       [
-        E('h4', { style: 'margin-top: 0; margin-bottom: 8px;' }, [
-          '🔍 ',
-          _('DNS Upstream Resolver Analysis'),
-        ]),
-        E('div', { class: dnsAlertClass, style: 'margin-bottom: 12px;' }, [
-          dnsAlertText,
-        ]),
-        dnsTable,
+        E(
+          'h4',
+          {
+            style:
+              'margin-top: 0; margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px;',
+          },
+          [renderSearchIcon24(), _('DNS Upstream Resolver Analysis')],
+        ),
+        E(
+          'div',
+          {
+            class: dnsAlertClass,
+            style: 'margin-bottom: 12px; width: 100%; box-sizing: border-box;',
+          },
+          [dnsAlertText],
+        ),
+        E('div', { style: 'width: 100%; overflow-x: auto;' }, [dnsTable]),
         ...(data.mode === 'plus'
           ? [
               E('h4', {}, _('Plus: router DNS and configured transport')),
@@ -603,48 +697,55 @@ export function renderLeakCheckModal() {
     text: _('Close'),
   });
 
-  const modalContent = E('div', { style: 'padding: 8px;' }, [
-    E(
-      'p',
-      {
-        style:
-          'font-size: 13px; color: var(--text-color-medium, #6c757d); margin-bottom: 14px;',
-      },
-      _(
-        'Simultaneous check of your public IP address and upstream DNS resolvers to verify network visibility through direct connection and proxy.',
-      ),
-    ),
-    E('div', { style: 'margin-bottom: 14px;' }, [
+  const modalContent = E(
+    'div',
+    {
+      class: 'tachyon-leak-check-modal',
+      style: 'padding: 8px; width: 100%; box-sizing: border-box;',
+    },
+    [
       E(
-        'label',
+        'p',
         {
           style:
-            'display: inline-flex; align-items: center; gap: 8px; cursor: pointer;',
+            'font-size: 13px; color: var(--text-color-medium, #6c757d); margin-bottom: 14px;',
         },
-        [plusCheckbox, _('Plus mode')],
-      ),
-      E(
-        'div',
-        { style: 'font-size: 12px; margin-top: 6px;' },
         _(
-          'Plus tests router DNS, looks for unencrypted test queries on WAN and checks an independent DoH/TLS connection. Select the mode and re-run the test.',
+          'Simultaneous check of your public IP address and upstream DNS resolvers to verify network visibility through direct connection and proxy.',
         ),
       ),
-    ]),
-    statusLabel,
-    progressContainer,
-    resultsContainer,
-    E(
-      'div',
-      {
-        style:
-          'display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; border-top: 1px solid var(--border-color, rgba(128,128,128,0.2)); padding-top: 12px;',
-      },
-      [retryBtn, closeBtn],
-    ),
-  ]);
+      E('div', { style: 'margin-bottom: 14px;' }, [
+        E(
+          'label',
+          {
+            style:
+              'display: inline-flex; align-items: center; gap: 8px; cursor: pointer;',
+          },
+          [plusCheckbox, _('Plus mode')],
+        ),
+        E(
+          'div',
+          { style: 'font-size: 12px; margin-top: 6px;' },
+          _(
+            'Plus tests router DNS, looks for unencrypted test queries on WAN and checks an independent DoH/TLS connection. Select the mode and re-run the test.',
+          ),
+        ),
+      ]),
+      statusLabel,
+      progressContainer,
+      resultsContainer,
+      E(
+        'div',
+        {
+          style:
+            'display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; border-top: 1px solid var(--border-color, rgba(128,128,128,0.2)); padding-top: 12px;',
+        },
+        [retryBtn, closeBtn],
+      ),
+    ],
+  );
 
-  ui.showModal(`🛡️ ${_('Tachyon IP & DNS Leak Detection')}`, modalContent);
+  ui.showModal(_('Tachyon IP & DNS Leak Detection'), modalContent);
 
   // Auto-run test on open
   startTest();

@@ -16,12 +16,12 @@
 //
 // Bundle Content:
 //   - metadata.json: timestamp, versions, OpenWrt release, architecture, uptime, memory, disk
-//   - versions.json: installed packages, sing-box, zapret, byedpi, ucode versions
+//   - versions.json: installed packages, tachyon-core, ucode versions
 //   - service_status.json: service enabled/running, engine, watchdog, known-good, emergency state
-//   - config_sanitized/: /etc/config/tachyon, network, firewall, dhcp, sing-box config.json
+//   - config_sanitized/: /etc/config/tachyon, network, firewall, dhcp, tachyon-core config.json
 //   - events_and_jobs/: event journal (tail), recent job records, AI Doctor reports
 //   - network_and_routing/: routing tables (main & tachyon), policy rules, interfaces, resolv.conf
-//   - firewall_and_nftables/: TachyonTable / steer ruleset, set counts and element statistics
+//   - firewall_and_nftables/: TachyonTable ruleset, set counts and element statistics
 //   - diagnostics_and_logs/: system logread (tail 500), tachyon logs, process tree, FD counts
 //   - checksums.sha256: SHA-256 hashes of all bundled artifacts
 //
@@ -86,8 +86,8 @@ function command_output(cmd) {
 
 // ─── Secret Redaction Subsystem ───────────────────────────────────────────────
 
-const SENSITIVE_KEY_REGEX = /^(password|secret|token|bot_token|telegram_bot_token|telegram_token|api_key|auth_token|bearer|uuid|private_key|secret_key|psk|preshared_key|shadowsocks_key|vless_uuid|vmess_uuid|trojan_password|hysteria_auth)$/i;
-const SENSITIVE_KEY_SUBSTR = /(bot_token|telegram_token|private_key|secret_key|preshared_key|password)/i;
+const SENSITIVE_KEY_REGEX = /^(password|username|user|secret|token|access_token|bot_token|telegram_bot_token|telegram_token|telegram_chat_id|allowed_chats|admin_ids|api_key|ai_doctor_api_key|agent_api_token|clash_api_secret|yacd_secret_key|auth_token|auth_key|auth_str|auth|bearer|uuid|private_key|private_key_passphrase|public_key|secret_key|psk|pre_shared_key|preshared_key|key|crypto_key|sudoku_key|snell_psk|cookie|openconnect_cookie|server_cert_pin|header_protection_key|shadowsocks_key|vless_uuid|vmess_uuid|trojan_password|hysteria_auth|hwid|hwid_token|fptn_token|fptn_access_token|fptn_password|olcrtc_token|olcrtc_password|wdtt_token|wdtt_password|warp_flow_uri|uri|subscription_url|subscription_urls|proxy_string|proxy_url|proxy_urls|outbound_json|outbound_jsons|custom_json|custom_jsons|proxy_custom_json|proxy_custom_jsons|amnezia_config|amnezia_configs|selector_amnezia_configs|amnezia_conf_text|proxy_links|selector_proxy_links|urltest_proxy_links|proxy_links_text|selector_proxy_links_text|urltest_proxy_links_text)$/i;
+const SENSITIVE_KEY_SUBSTR = /(bot_token|telegram_token|private_key|secret_key|preshared_key|pre_shared_key|password|username|access_token|api_key|auth_key|hwid_token|fptn_token|outbound_json|custom_json|amnezia_conf|proxy_links|subscription_url)/i;
 
 function is_sensitive_key(key) {
     if (key == null || key == "") return false;
@@ -102,24 +102,41 @@ function redact_string(str) {
     // 1. Telegram bot tokens: e.g. 123456789:ABCdef-GHIjkl_MNOpqrsTUVwxyz1234567
     s = replace(s, /[0-9]{8,12}:[-_a-zA-Z0-9]{35}/g, "[REDACTED_TELEGRAM_TOKEN]");
 
-    // 2. Bearer tokens: e.g. Bearer eyJhbGci...
+    // 2. Bearer tokens & cloud LLM API keys: e.g. Bearer eyJhbGci..., sk-..., AIza..., gsk_..., xai-...
     s = replace(s, /Bearer[ \t]+[-_a-zA-Z0-9.+=]{16,}/gi, "Bearer [REDACTED_TOKEN]");
+    s = replace(s, /(sk-(or-v1-|ant-|proj-)?[-_a-zA-Z0-9]{16,}|AIza[-_a-zA-Z0-9]{20,}|gsk_[-_a-zA-Z0-9]{16,}|xai-[-_a-zA-Z0-9]{16,})/g, "[REDACTED_API_KEY]");
 
-    // 3. VLESS / Trojan / Hysteria UUIDs & passwords in links
+    // 3. VLESS / Trojan / Hysteria / Base64 proxy links
     s = replace(s, /vless:\/\/([^@ \t\r\n]+)@/g, "vless://[REDACTED_UUID]@");
     s = replace(s, /trojan:\/\/([^@ \t\r\n]+)@/g, "trojan://[REDACTED_PASS]@");
     s = replace(s, /hysteria2?:\/\/([^@ \t\r\n]+)@/g, "hysteria2://[REDACTED_AUTH]@");
+    s = replace(s, /(vmess|ssr|fptn|fptns|warp):\/\/[^ \t\r\n'"]+/gi, "$1://[REDACTED]");
 
     // 4. Other proxy / HTTP URLs with credentials: e.g. https://user:pass@host:port
-    s = replace(s, /:\/\/([^:@\[ \t\r\n]+)(:[^@ \t\r\n]+)?@/g, "://[REDACTED]@");
+    s = replace(s, /:\/\/([^:@[ \t\r\n]+)(:[^@ \t\r\n]+)?@/g, "://[REDACTED]@");
 
-    // 5. Standalone secret/password params in query strings
-    s = replace(s, /([?&](password|secret|key|token|auth)=)[^& \t\r\n]+/gi, "$1[REDACTED]");
+    // 5. Standalone UUIDs, subscription URL tokens, and secret/password params in query strings
+    s = replace(s, /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, "[REDACTED_UUID]");
+    s = replace(s, /([?&](password|pass|secret|key|api_key|apikey|token|access_token|auth|auth_token|uuid|id|sub|hash|sig|signature|hwid)=)[^& \t\r\n'"]+/gi, "$1[REDACTED]");
+    s = replace(s, /(https?:\/\/[^\/ \t\r\n'"]+\/(sub|subscribe|subscription|api\/v1\/client\/subscribe)\/)[-_a-zA-Z0-9]{8,}/gi, "$1[REDACTED_SUB_TOKEN]");
+    s = replace(s, /(password|passwd|secret|api_key|apikey|bot_token|agent_api_token|access_token|auth_token|private_key|preshared_key|pre_shared_key|hwid_token|fptn_token)=([^ \t\r\n'";,&]+)/gi, "$1=[REDACTED]");
 
     // 6. UCI configuration options with sensitive data
-    s = replace(s, /(option\s+([_a-zA-Z0-9]*(telegram_bot_token|bot_token|agent_api_token|api_token|token|password|secret|private_key|preshared_key|uuid|key|auth|pass)[_a-zA-Z0-9]*)\s+['"])[^'"]*(['"])/gi, "$1[REDACTED]$4");
-    s = replace(s, /(list\s+(telegram_chat_id|allowed_chats|admin_ids)\s+['"])[^'"]*(['"])/gi, "$1[REDACTED_CHAT_ID]$3");
+    s = replace(s, /(option[ \t]+([_a-zA-Z0-9]*(telegram_bot_token|bot_token|telegram_chat_id|agent_api_token|api_token|api_key|access_token|token|password|username|secret|private_key|public_key|preshared_key|pre_shared_key|psk|cookie|server_cert_pin|uuid|key|auth|pass|outbound_json|custom_json|amnezia_config|amnezia_conf_text|proxy_links_text|proxy_string|proxy_url|subscription_url|warp_flow_uri|uri|hwid)[_a-zA-Z0-9]*)[ \t]+['"])[^'"]*(['"])/gi, "$1[REDACTED]$4");
+    s = replace(s, /(list[ \t]+(telegram_chat_id|allowed_chats|admin_ids)[ \t]+['"])[^'"]*(['"])/gi, "$1[REDACTED_CHAT_ID]$3");
+    s = replace(s, /(list[ \t]+(outbound_jsons|custom_jsons|proxy_custom_jsons|amnezia_configs|selector_amnezia_configs|proxy_links|selector_proxy_links|urltest_proxy_links|proxy_urls|subscription_urls|server_users)[ \t]+['"])[^'"]*(['"])/gi, "$1[REDACTED]$3");
 
+    // 7. Inline JSON credential fields (e.g. inside outbound_jsons / outbound_json)
+    s = replace(s, /("(password|username|user|uuid|secret|token|access_token|api_key|auth_token|auth_key|auth_str|auth|private_key|private_key_passphrase|public_key|pre_shared_key|preshared_key|psk|key|cookie|server_cert_pin|header_protection_key)"[ \t]*:[ \t]*")[^"]*(")/gi, "$1[REDACTED]$3");
+
+    return s;
+}
+
+function redact_for_llm(str) {
+    if (str == null || str == "") return "";
+    let s = redact_string(str);
+    // Redact client MAC addresses before sending telemetry to external cloud LLMs
+    s = replace(s, /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/g, "[REDACTED_MAC]");
     return s;
 }
 
@@ -253,11 +270,7 @@ function collect_metadata() {
 function collect_versions() {
     let vers = {
         ucode: command_output("ucode -v"),
-        sing_box: command_output("/usr/bin/tachyon-core version"),
-        sing_box_variant: trim(as_string(read_file_safe("/etc/tachyon/tachyon-core-variant") || "")),
-        zapret: command_output("nfqws --version"),
-        zapret2: command_output("nfqws2 --version"),
-        byedpi: command_output("ciadpi -v"),
+        tachyon_core: command_output("/usr/bin/tachyon-core version"),
         nftables: command_output("nft --version"),
         iptables: command_output("iptables --version")
     };
@@ -270,10 +283,12 @@ function collect_service_status() {
         settings = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
     } catch (e) {}
 
+    let is_enabled = settings.enabled == "1" || settings.enabled == "true" || settings.enabled === true ||
+        (settings.enabled != "0" && settings.enabled != "false" && settings.enabled !== false &&
+         (settings.shutdown_correctly == "0" || common.file_exists("/etc/rc.d/S99" + CONFIG_NAME)));
     let st = {
-        enabled: settings.enabled == "1" || settings.enabled == "true" || settings.enabled == true,
-        engine: settings.engine || "sing-box",
-        is_steer: settings.engine == "steer" || settings.engine == "steer-extended",
+        enabled: is_enabled,
+        engine: "tachyon-core",
         dns_mode: settings.dns_mode || "dnsmasq",
         tproxy_port: settings.tproxy_port || "1602",
         mixed_port: settings.mixed_port || "4534",
@@ -281,9 +296,8 @@ function collect_service_status() {
         emergency_failsafe: null,
         pids: {
             watchdog: trim(as_string(read_file_safe("/var/run/tachyon_watchdog.pid") || "")),
-            sing_box: trim(as_string(read_file_safe("/var/run/sing-box.pid") || "")),
-            telegram: trim(as_string(read_file_safe("/var/run/tachyon_telegram.pid") || "")),
-            byedpi: trim(as_string(read_file_safe("/var/run/byedpi.pid") || ""))
+            tachyon_core: trim(as_string(read_file_safe("/var/run/tachyon-core.pid") || "")),
+            telegram: trim(as_string(read_file_safe("/var/run/tachyon_telegram.pid") || ""))
         }
     };
 
@@ -340,7 +354,7 @@ function collect_process_and_fd_stats() {
     // Measure FD counts for prominent daemons
     let fd_stats = {};
     let pid_files = [
-        [ "sing-box", "/var/run/sing-box.pid" ],
+        [ "tachyon-core", "/var/run/tachyon-core.pid" ],
         [ "watchdog", "/var/run/tachyon_watchdog.pid" ],
         [ "telegram", "/var/run/tachyon_telegram.pid" ],
         [ "dnsmasq", "/var/run/dnsmasq/dnsmasq.cfg01411c.pid" ]
@@ -396,14 +410,14 @@ function stage_bundle(stage_dir) {
     }
 
     // Engine config JSON (sanitized)
-    let singbox_cfg = read_file_safe("/etc/tachyon-core/config.json");
-    if (singbox_cfg == null) singbox_cfg = read_file_safe("/var/etc/tachyon-core/config.json");
-    if (singbox_cfg != null) {
+    let core_cfg = read_file_safe("/etc/tachyon-core/config.json");
+    if (core_cfg == null) core_cfg = read_file_safe("/var/etc/tachyon-core/config.json");
+    if (core_cfg != null) {
         try {
-            let parsed = json(singbox_cfg);
-            write_json_safe(stage_dir + "/config_sanitized/singbox_config.json", redact_object(parsed));
+            let parsed = json(core_cfg);
+            write_json_safe(stage_dir + "/config_sanitized/tachyon_core_config.json", redact_object(parsed));
         } catch (e) {
-            write_file_safe(stage_dir + "/config_sanitized/singbox_config.json", redact_string(singbox_cfg));
+            write_file_safe(stage_dir + "/config_sanitized/tachyon_core_config.json", redact_string(core_cfg));
         }
     }
 
@@ -421,7 +435,6 @@ function stage_bundle(stage_dir) {
 
     // 4. Firewall and nftables
     let nft_tachyon = command_output("nft list table inet TachyonTable");
-    if (nft_tachyon == "") nft_tachyon = command_output("nft list table inet steer");
     write_file_safe(stage_dir + "/firewall_and_nftables/nft_ruleset.txt", nft_tachyon);
 
     // 5. Diagnostics, Process & Log stats
@@ -430,6 +443,10 @@ function stage_bundle(stage_dir) {
 
     let logread_lines = command_output("logread | tail -n 500");
     write_file_safe(stage_dir + "/diagnostics_and_logs/system_logread.txt", redact_string(logread_lines));
+
+    let core_log = read_file_safe("/tmp/tachyon-core/tachyon-core.log");
+    if (core_log != null && core_log != "")
+        write_file_safe(stage_dir + "/diagnostics_and_logs/tachyon-core.log", redact_string(core_log));
 
     // 6. Events and AI Doctor
     write_json_safe(stage_dir + "/events_and_jobs/events_and_doctor.json", collect_events_and_jobs());
@@ -544,10 +561,12 @@ function selftest() {
     assert(index(red_vless, "vless://[REDACTED_UUID]@") >= 0, "inserted REDACTED_UUID marker");
 
     // Test 4: Redaction of UCI configuration text
-    let uci_raw = "config settings\n\toption telegram_bot_token '" + sample_token + "'\n\toption private_key 'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwgg'\n\toption normal_opt 'hello'\n";
+    let uci_raw = "config settings\n\toption telegram_bot_token '" + sample_token + "'\n\toption private_key 'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwgg'\n\tlist outbound_jsons '{\"type\":\"trusttunnel\",\"password\":\"SecretTunnelPass123\"}'\n\toption trusttunnel_password 'AnotherTunnelPass456'\n\toption normal_opt 'hello'\n";
     let uci_clean = sanitize_uci_text(uci_raw);
     assert(index(uci_clean, sample_token) < 0, "bot token redacted in UCI text");
     assert(index(uci_clean, "MIIEvgIB") < 0, "private key redacted in UCI text");
+    assert(index(uci_clean, "SecretTunnelPass123") < 0, "password inside list outbound_jsons redacted in UCI text");
+    assert(index(uci_clean, "AnotherTunnelPass456") < 0, "trusttunnel_password redacted in UCI text");
     assert(index(uci_clean, "hello") >= 0, "normal option preserved in UCI text");
 
     // Test 5: Redaction of recursive JSON object
@@ -565,7 +584,7 @@ function selftest() {
     assert(clean_obj.nested.public_value == 42, "public nested value preserved");
 
     // Test 6: Create Bundle in sandbox
-    set_test_overrides(test_dir, null);
+    set_test_overrides(test_dir, null, null);
     let target_bundle = test_dir + "/bundle.tar.gz";
     let b_res = create_bundle(target_bundle);
 
@@ -589,7 +608,7 @@ function selftest() {
 
     // Cleanup & reset
     system("rm -rf " + shell_quote(test_dir));
-    set_test_overrides(null, null);
+    set_test_overrides(null, null, null);
 
     print(sprintf("Support bundle selftest: %d passed, %d failed\n", passed, failed));
     return failed == 0 ? 0 : 1;
@@ -606,7 +625,9 @@ function module_exports() {
         collect_service_status,
         collect_events_and_jobs,
         collect_process_and_fd_stats,
+        is_sensitive_key,
         redact_string,
+        redact_for_llm,
         redact_object,
         sanitize_uci_text,
         set_test_overrides,

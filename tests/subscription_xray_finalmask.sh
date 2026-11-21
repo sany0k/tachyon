@@ -55,7 +55,7 @@ normalize "$masked_input" "$masked_output"
 
 if ! grep -Fq '"type": "hysteria2"' "$masked_output"; then
   cat "$masked_output" >&2
-  fail "Xray hysteria v2 must normalize to a sing-box hysteria2 outbound"
+  fail "Xray hysteria v2 must normalize to a core hysteria2 outbound"
 fi
 if ! grep -Fq '"obfs": { "type": "salamander", "password": "salamander-itx-2096" }' "$masked_output"; then
   cat "$masked_output" >&2
@@ -95,6 +95,109 @@ fi
 if grep -Fq '"obfs"' "$plain_output"; then
   cat "$plain_output" >&2
   fail "hysteria2 without finalmask must not grow an obfs"
+fi
+
+# Flat Xray VLESS settings (`settings.address` / `port` / `id` / `flow` without `vnext`)
+flat_vless_input="$WORK_DIR/xray-flat-vless.json"
+flat_vless_output="$WORK_DIR/xray-flat-vless-normalized.json"
+cat >"$flat_vless_input" <<'JSON'
+[
+  {
+    "remarks": "🇷🇺 Россия · XHTTP",
+    "inbounds": [],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "address": "arseniy.online",
+          "port": 8443,
+          "id": "e3e1a852-b8ed-bc84-a451-577ba0a45ec1",
+          "encryption": "none",
+          "flow": "xtls-rprx-vision"
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "api-maps.yandex.ru",
+            "publicKey": "E99v69e07uX9dY8v116750k9044m3x8037B9s5647F8",
+            "shortId": "9ef12456efbd135a",
+            "fingerprint": "firefox"
+          },
+          "xhttpSettings": {
+            "host": "api-maps.yandex.ru",
+            "path": "/xh-path",
+            "mode": "auto"
+          }
+        }
+      }
+    ]
+  }
+]
+JSON
+normalize "$flat_vless_input" "$flat_vless_output"
+
+if ! grep -Fq '"type": "vless"' "$flat_vless_output"; then
+  cat "$flat_vless_output" >&2
+  fail "Xray flat VLESS settings must normalize to a core vless outbound"
+fi
+if ! grep -Fq '"flow": "xtls-rprx-vision"' "$flat_vless_output"; then
+  cat "$flat_vless_output" >&2
+  fail "Xray flat VLESS settings must preserve settings.flow"
+fi
+if ! grep -Fq '"tag": "🇷🇺 Россия · XHTTP"' "$flat_vless_output"; then
+  cat "$flat_vless_output" >&2
+  fail "Xray flat VLESS settings must use remarks as tag when outbound tag is generic"
+fi
+
+# Xray finalmask.tcp with type=fragment must normalize to tls.fragment = true
+tcp_frag_input="$WORK_DIR/xray-tcp-finalmask.json"
+tcp_frag_output="$WORK_DIR/xray-tcp-finalmask-normalized.json"
+cat >"$tcp_frag_input" <<'JSON'
+[
+  {
+    "remarks": "🇮🇳 India",
+    "inbounds": [],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "address": "in.example.com",
+          "port": 443,
+          "id": "e3e1a852-b8ed-bc84-a451-577ba0a45ec1",
+          "encryption": "none",
+          "flow": "xtls-rprx-vision"
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "in.convexia.net",
+            "publicKey": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+            "shortId": "411d1ef7e14494cc",
+            "fingerprint": "firefox"
+          },
+          "finalmask": {
+            "tcp": [
+              {
+                "type": "fragment",
+                "settings": { "packets": "tlshello", "length": "10-20", "delay": "10-20" }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+]
+JSON
+normalize "$tcp_frag_input" "$tcp_frag_output"
+
+if ! grep -Fq '"fragment": true' "$tcp_frag_output"; then
+  cat "$tcp_frag_output" >&2
+  fail "Xray finalmask.tcp fragment must normalize to tls.fragment = true"
 fi
 
 printf 'subscription Xray finalmask checks passed\n'

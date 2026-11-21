@@ -1,6 +1,5 @@
-import { callBaseMethod } from '../../../methods/shell/callBaseMethod';
+import { TachyonShellMethods } from '../../../methods/shell';
 import { renderButton } from '../../../../partials';
-import { Tachyon } from '../../../types';
 
 interface ChatMessage {
   sender: 'user' | 'assistant';
@@ -103,7 +102,7 @@ export function renderAiChatModal() {
 
     const typingMsg: ChatMessage = {
       sender: 'assistant',
-      text: '🤖 ' + _('Thinking...'),
+      text: _('Thinking...'),
       timestamp: new Date().toLocaleTimeString([], {
         hour: '2-digit',
         minute: '2-digit',
@@ -113,11 +112,10 @@ export function renderAiChatModal() {
     renderMessages();
 
     try {
-      const res = (await callBaseMethod(
-        Tachyon.AvailableMethods.AI_DOCTOR,
-        [text],
-        { timeout: 120000 },
-      )) as { success?: boolean; data?: unknown };
+      const res = (await TachyonShellMethods.aiDoctor(text)) as {
+        success?: boolean;
+        data?: unknown;
+      };
       chatHistory.pop();
 
       let answerText = _('Failed to receive response from AI service.');
@@ -156,7 +154,7 @@ export function renderAiChatModal() {
       const errMsg = e instanceof Error ? e.message : _('Server unavailable');
       appendChatMessage({
         sender: 'assistant',
-        text: '❌ ' + _('AI service error') + ': ' + errMsg,
+        text: _('AI service error') + ': ' + errMsg,
         timestamp: new Date().toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
@@ -175,10 +173,10 @@ export function renderAiChatModal() {
   };
 
   const quickPrompts = [
-    { label: '🩺 ' + _('Check YouTube'), query: 'Check YouTube availability' },
-    { label: '🔍 ' + _('Why Discord fails?'), query: 'Why Discord fails?' },
+    { label: _('Check YouTube'), query: 'Check YouTube availability' },
+    { label: _('Why Discord fails?'), query: 'Why Discord fails?' },
     {
-      label: '🛠️ ' + _('Full System Diagnostic'),
+      label: _('Full System Diagnostic'),
       query: 'Run full system diagnostic',
     },
   ];

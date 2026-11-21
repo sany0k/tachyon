@@ -122,6 +122,10 @@ function retry_resolve(description, fn) {
     for (let attempt = 1; attempt <= 3; attempt++) {
         if (fn())
             return true;
+        if (downloader.is_github_rate_limited()) {
+            helpers.updates_log(as_string(description) + " aborted (GitHub API rate limit active)", "warn");
+            break;
+        }
         helpers.updates_log(as_string(description) + " failed (" + attempt + "/3)", "warn");
         command_success_from_args([ "sleep", "2" ]);
     }
@@ -132,6 +136,7 @@ function clear_version_caches() {
     helpers.remove_file("/tmp/tachyon.latest-version.cache");
     helpers.remove_file(SYSTEM_INFO_CACHE_FILE);
     helpers.remove_file("/tmp/tachyon/system-info.json");
+    helpers.remove_file(getenv("TACHYON_UI_CORE_VERSION_CACHE_FILE") || "/var/run/tachyon/ui-state/tachyon-core-version");
 }
 
 function opkg_arch_list() {
@@ -165,478 +170,6 @@ function resolve_arch_candidates() {
         target: as_string(fields[0]),
         candidates: as_string(fields[1])
     };
-}
-
-function resolve_zapret_release(arch, tag) {
-    let release_json = (tag != null && tag != "") ?
-        downloader.fetch_github_release_by_tag_json("remittor", "zapret-openwrt", tag) :
-        downloader.fetch_github_release_json("remittor", "zapret-openwrt");
-    if (release_json != "") {
-        let resolved = trim(helpers.helper_output_input(release_json, "release-select-arch-suffix-asset", [ "zip", arch.candidates ]));
-        let fields = split(resolved, "\t");
-        if (length(fields) >= 4) {
-            let version = versions.extract_zapret_bundle_version(fields[1]);
-            if (version == "")
-                version = trim(helpers.helper_output("string-remove-suffix", [ fields[1], ".zip" ]));
-            return {
-                arch: fields[0],
-                bundle_name: fields[1],
-                bundle_url: fields[2],
-                release_url: fields[3],
-                version
-            };
-        }
-    }
-    if (tag != null && tag != "") {
-        let tag_clean = replace(tag, /^v/, "");
-        let tag_with_v = "v" + tag_clean;
-        let bundle_name = "zapret_" + tag_with_v + "_" + arch.candidates + ".zip";
-        return {
-            arch: arch.candidates,
-            bundle_name: bundle_name,
-            bundle_url: "https://github.com/remittor/zapret-openwrt/releases/download/" + tag_with_v + "/" + bundle_name,
-            release_url: "https://github.com/remittor/zapret-openwrt/releases/tag/" + tag_with_v,
-            version: tag
-        };
-    }
-    return { fetch_failed: true };
-}
-
-function resolve_zapret2_release(arch, tag) {
-    let resolved_tag = (tag != null && tag != "") ? tag : "";
-    if (resolved_tag == "") {
-        let releases_json = downloader.fetch_github_releases_json("Dushnilin", "zapret2-openwrt", "5");
-        if (releases_json != "") {
-            try {
-                let parsed = json(releases_json);
-                if (type(parsed) == "array" && length(parsed) > 0)
-                    resolved_tag = trim(as_string(parsed[0].tag_name || ""));
-            } catch (e) {}
-        }
-    }
-    if (resolved_tag == "")
-        resolved_tag = downloader.fetch_github_release_tag_fallback("Dushnilin", "zapret2-openwrt");
-    if (resolved_tag == "")
-        return { fetch_failed: true };
-    
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let base_dl = "https://github.com/Dushnilin/zapret2-openwrt/releases/download/" + resolved_tag + "/";
-    let release_url = "https://github.com/Dushnilin/zapret2-openwrt/releases/tag/" + resolved_tag;
-    let version = replace(resolved_tag, /^v/, "");
-
-    let candidate_list = split(arch.candidates, " ");
-    for (let candidate in candidate_list) {
-        if (candidate == "") continue;
-        let pkg_name = "zapret2_" + candidate + "." + asset_ext;
-        let url = base_dl + pkg_name;
-        if (downloader.url_exists(url)) {
-            return {
-                arch: candidate,
-                package_name: pkg_name,
-                package_url: url,
-                release_url: release_url,
-                version: version
-            };
-        }
-    }
-    return null;
-}
-
-function resolve_byedpi_release(arch, tag) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let release_series = trim(helpers.helper_output("openwrt-release-series", [ "/etc/openwrt_release" ]));
-    let releases_json = (tag != null && tag != "") ?
-        downloader.fetch_github_release_by_tag_json("DPITrickster", "ByeDPI-OpenWrt", tag) :
-        downloader.fetch_github_releases_json("DPITrickster", "ByeDPI-OpenWrt", "30");
-    if (releases_json != "") {
-        let resolved = trim(helpers.helper_output_input(releases_json, "byedpi-select-asset", [ release_series, asset_ext, arch.candidates ]));
-        let fields = split(resolved, "\t");
-        if (length(fields) >= 4) {
-            return {
-                arch: fields[0],
-                package_name: fields[1],
-                package_url: fields[2],
-                release_url: fields[3],
-                version: versions.extract_arch_package_version(fields[1], fields[0])
-            };
-        }
-    }
-    if (tag != null && tag != "") {
-        let distrib_arch = helpers.read_openwrt_release_value("DISTRIB_ARCH");
-        let tag_clean = replace(tag, /^v/, "");
-        let pkg_name = "byedpi_" + tag_clean + "_openwrt_" + distrib_arch + "." + asset_ext;
-        return {
-            arch: distrib_arch,
-            package_name: pkg_name,
-            package_url: "https://github.com/DPITrickster/ByeDPI-OpenWrt/releases/download/" + tag + "/" + pkg_name,
-            release_url: "https://github.com/DPITrickster/ByeDPI-OpenWrt/releases/tag/" + tag,
-            version: tag
-        };
-    }
-    return null;
-}
-
-function resolve_wdtt_release(arch, tag) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let release_series = trim(helpers.helper_output("openwrt-release-series", [ "/etc/openwrt_release" ]));
-    let owner = "Dushnilin";
-    let repo = "qwdtt-openwrt";
-    let releases_json = (tag != null && tag != "") ?
-        downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-        downloader.fetch_github_releases_json(owner, repo, "30");
-    if (releases_json == "" || releases_json == "[]") {
-        owner = "SpaceNeuroX";
-        releases_json = (tag != null && tag != "") ?
-            downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-            downloader.fetch_github_releases_json(owner, repo, "30");
-    }
-    if (releases_json != "" && releases_json != "[]") {
-        let resolved = trim(helpers.helper_output_input(releases_json, "wdtt-select-asset", [ release_series, asset_ext, arch.candidates ]));
-        let fields = split(resolved, "\t");
-        if (length(fields) >= 4) {
-            return {
-                arch: fields[0],
-                package_name: fields[1],
-                package_url: fields[2],
-                release_url: fields[3],
-                version: versions.extract_arch_package_version(fields[1], fields[0])
-            };
-        }
-    }
-    if (tag != null && tag != "") {
-        let distrib_arch = helpers.read_openwrt_release_value("DISTRIB_ARCH");
-        let tag_clean = replace(tag, /^v/, "");
-        let pkg_name = "wdtt_" + tag_clean + "_openwrt_" + distrib_arch + "." + asset_ext;
-        let dushnilin_url = "https://github.com/Dushnilin/qwdtt-openwrt/releases/download/" + tag + "/" + pkg_name;
-        let target_owner = downloader.url_exists(dushnilin_url) ? "Dushnilin" : "SpaceNeuroX";
-        return {
-            arch: distrib_arch,
-            package_name: pkg_name,
-            package_url: "https://github.com/" + target_owner + "/qwdtt-openwrt/releases/download/" + tag + "/" + pkg_name,
-            release_url: "https://github.com/" + target_owner + "/qwdtt-openwrt/releases/tag/" + tag,
-            version: tag
-        };
-    }
-    return null;
-}
-
-function resolve_olcrtc_release(arch, tag) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let release_series = trim(helpers.helper_output("openwrt-release-series", [ "/etc/openwrt_release" ]));
-    let owner = "Dushnilin";
-    let repo = "openwrt-olcrtc";
-    let releases_json = (tag != null && tag != "") ?
-        downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-        downloader.fetch_github_releases_json(owner, repo, "30");
-    if (releases_json == "" || releases_json == "[]") {
-        owner = "alekvol";
-        releases_json = (tag != null && tag != "") ?
-            downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-            downloader.fetch_github_releases_json(owner, repo, "30");
-    }
-    if (releases_json != "" && releases_json != "[]") {
-        let resolved = trim(helpers.helper_output_input(releases_json, "olcrtc-select-asset", [ release_series, asset_ext, arch.candidates ]));
-        let fields = split(resolved, "\t");
-        if (length(fields) >= 4) {
-            return {
-                arch: fields[0],
-                package_name: fields[1],
-                package_url: fields[2],
-                release_url: fields[3],
-                version: versions.extract_arch_package_version(fields[1], fields[0])
-            };
-        }
-    }
-    if (tag != null && tag != "") {
-        let distrib_arch = helpers.read_openwrt_release_value("DISTRIB_ARCH");
-        let tag_clean = replace(tag, /^v/, "");
-        let pkg_name = "olcrtc_" + tag_clean + "_openwrt_" + distrib_arch + "." + asset_ext;
-        let dushnilin_url = "https://github.com/Dushnilin/openwrt-olcrtc/releases/download/" + tag + "/" + pkg_name;
-        let target_owner = downloader.url_exists(dushnilin_url) ? "Dushnilin" : "alekvol";
-        return {
-            arch: distrib_arch,
-            package_name: pkg_name,
-            package_url: "https://github.com/" + target_owner + "/openwrt-olcrtc/releases/download/" + tag + "/" + pkg_name,
-            release_url: "https://github.com/" + target_owner + "/openwrt-olcrtc/releases/tag/" + tag,
-            version: tag
-        };
-    }
-    return null;
-}
-
-function resolve_fptn_release(arch, tag) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let release_series = trim(helpers.helper_output("openwrt-release-series", [ "/etc/openwrt_release" ]));
-    let owner = "Dushnilin";
-    let repo = "fptn";
-    let releases_json = (tag != null && tag != "") ?
-        downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-        downloader.fetch_github_releases_json(owner, repo, "30");
-    if (releases_json == "" || releases_json == "[]") {
-        owner = "fptn-project";
-        releases_json = (tag != null && tag != "") ?
-            downloader.fetch_github_release_by_tag_json(owner, repo, tag) :
-            downloader.fetch_github_releases_json(owner, repo, "30");
-    }
-    if (releases_json != "" && releases_json != "[]") {
-        let resolved = trim(helpers.helper_output_input(releases_json, "fptn-select-asset", [ release_series, asset_ext, arch.candidates ]));
-        let fields = split(resolved, "\t");
-        if (length(fields) >= 4) {
-            let ver = versions.extract_arch_package_version(fields[1], fields[0]);
-            let m = match(ver, /^([0-9]+\.[0-9]+\.[0-9]+)/);
-            if (m) ver = m[1];
-            return {
-                arch: fields[0],
-                package_name: fields[1],
-                package_url: fields[2],
-                release_url: fields[3],
-                version: ver
-            };
-        }
-    }
-    if (tag != null && tag != "") {
-        let distrib_arch = helpers.read_openwrt_release_value("DISTRIB_ARCH");
-        let tag_clean = replace(tag, /^v/, "");
-        let pkg_name = "fptn-client-" + tag_clean + "-openwrt-" + (release_series != "" ? release_series + ".x" : "24.10.x") + "-" + distrib_arch + "." + asset_ext;
-        let dushnilin_url = "https://github.com/Dushnilin/fptn/releases/download/" + tag + "/" + pkg_name;
-        let target_owner = downloader.url_exists(dushnilin_url) ? "Dushnilin" : "fptn-project";
-        return {
-            arch: distrib_arch,
-            package_name: pkg_name,
-            package_url: "https://github.com/" + target_owner + "/fptn/releases/download/" + tag + "/" + pkg_name,
-            release_url: "https://github.com/" + target_owner + "/fptn/releases/tag/" + tag,
-            version: tag_clean
-        };
-    }
-    return null;
-}
-
-// steer / steer-extended from xyzmean/steer. Asset names look like
-// "steer-1.5.4-1_aarch64_cortex-a53.ipk" and
-// "steer-extended-1.5.4-1_aarch64_cortex-a53.apk". The extended build is a
-// separate package that supersedes the base one.
-// Both accounts publish the same releases and the same package (the control file
-// still says Maintainer: xyzmean). Hard-coding one of them means a rename takes the
-// install down with it, so the second is tried only when the first yields no usable
-// asset for this router.
-const STEER_RELEASE_OWNERS = [ "xyzmean", "splify2" ];
-const STEER_RELEASE_REPO = "steer";
-
-// steer 2.0.0 splits the engine into a core package plus feature modules, each
-// published as "steer-<module>-<version>-1_<arch>.<ext>". This is the module set
-// upstream ships; the frontend has the same list for its checkboxes and
-// tests/steer_module_selection.sh keeps the two in sync.
-const STEER_MODULES = [ "obfs", "tgws", "vless", "xsteer", "proxy", "hysteria2" ];
-
-// The module names, for callers that iterate or test membership. Read-only: do
-// not mutate the returned array.
-function steer_module_names() {
-    return STEER_MODULES;
-}
-
-// The selection stored in tachyon.settings.steer_modules. Absent means "every
-// module" (the default the install falls back to); an explicit string or list is
-// exactly what stays enabled, and an empty value means core with no modules.
-function steer_modules_from_settings(settings_sec) {
-    if (settings_sec["steer_modules"] == null)
-        return STEER_MODULES;
-    return common.list_option(settings_sec, "steer_modules");
-}
-
-// Splits "steer-<word>-<version>" out of an asset name whose "-1_<arch>.<ext>"
-// tail the caller has already verified. The shared extract_arch_package_version
-// helper only strips the zapret/byedpi prefixes and would hand back
-// "steer-obfs-2.0.0-1" here, so the split is done directly: the word ends at the
-// first dash, and a version must start with a digit.
-function steer_name_word_version(name, suffix) {
-    if (substr(name, 0, length("steer-")) != "steer-")
-        return null;
-    if (substr(name, length(name) - length(suffix)) != suffix)
-        return null;
-    let inner = substr(name, length("steer-"), length(name) - length("steer-") - length(suffix));
-    let sep = index(inner, "-");
-    if (sep <= 0)
-        return null;
-    let version = substr(inner, sep + 1);
-    if (version == "" || match(version, /^[0-9]/) == null)
-        return null;
-    return { word: substr(inner, 0, sep), version: version };
-}
-
-// Picks this build variant's asset out of one release, or null when the release does
-// not carry it for this architecture.
-function steer_asset_from_release(releases_json, extended, suffix, distrib_arch, tag_name, release_url) {
-    let assets = [];
-    try {
-        let parsed = json(releases_json);
-        if (type(parsed) == "object" && type(parsed.assets) == "array")
-            assets = parsed.assets;
-    }
-    catch (e) {
-        return null;
-    }
-
-    for (let asset in assets) {
-        let name = as_string(asset.name || "");
-        // Belt and braces alongside the exact prefixes: nothing that is not one of
-        // the two steer packages may be picked up by the shared suffix.
-        if (extended) {
-            if (!helpers.str_startswith(name, "steer-extended-")) continue;
-        } else {
-            if (!helpers.str_startswith(name, "steer-core-")) continue;
-        }
-        if (substr(name, length(name) - length(suffix)) != suffix)
-            continue;
-        let ver = versions.extract_arch_package_version(name, distrib_arch);
-        if (ver == "")
-            ver = replace(tag_name, /^v/, "");
-        return {
-            arch: distrib_arch,
-            package_name: name,
-            package_url: as_string(asset.browser_download_url || ""),
-            release_url: release_url,
-            version: ver,
-            tag: tag_name,
-            extended: !!extended
-        };
-    }
-
-    return null;
-}
-
-
-// Picks the modular set (core + every module) out of one release body, or null
-// when the release has no steer-core asset for this architecture. Split from the
-// fetching loop so tests can drive it with a fixture instead of the network.
-function steer_module_assets_from_release(releases_json, distrib_arch, suffix) {
-    let parsed = null;
-    try {
-        parsed = json(releases_json);
-    }
-    catch (e) {
-        return null;
-    }
-    if (type(parsed) != "object" || type(parsed.assets) != "array")
-        return null;
-
-    let tag_name = trim(as_string(parsed.tag_name || ""));
-    let release_url = as_string(parsed.html_url || "");
-    let core = null;
-    let modules = [];
-    for (let asset in parsed.assets) {
-        let name = as_string(asset.name || "");
-        if (substr(name, length(name) - length(suffix)) != suffix)
-            continue;
-        let parsed_name = steer_name_word_version(name, suffix);
-        if (parsed_name == null)
-            continue;
-        if (parsed_name.word == "core") {
-            core = {
-                arch: distrib_arch,
-                package_name: name,
-                package_url: as_string(asset.browser_download_url || ""),
-                release_url: release_url,
-                version: parsed_name.version,
-                tag: tag_name
-            };
-            continue;
-        }
-        for (let known in STEER_MODULES) {
-            if (known != parsed_name.word)
-                continue;
-            push(modules, {
-                module: parsed_name.word,
-                arch: distrib_arch,
-                package_name: name,
-                package_url: as_string(asset.browser_download_url || ""),
-                release_url: release_url,
-                version: parsed_name.version,
-                tag: tag_name
-            });
-            break;
-        }
-    }
-    if (core == null)
-        return null;
-    return {
-        arch: distrib_arch,
-        tag: tag_name,
-        release_url: release_url,
-        version: core.version,
-        core: core,
-        modules: modules
-    };
-}
-
-// Every steer package out of one release: the core plus each module the release
-// ships. Returns null when the release carries no "steer-core-" asset - that is a
-// 1.x release, whose single package the legacy resolve_steer_release path handles.
-function resolve_steer_module_assets(arch, tag) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    let distrib_arch = arch != null && as_string(arch.target) != "" ?
-        as_string(arch.target) : helpers.read_openwrt_release_value("DISTRIB_ARCH");
-    if (distrib_arch == "")
-        return null;
-    let suffix = "-1_" + distrib_arch + "." + asset_ext;
-
-    for (let candidate in STEER_RELEASE_OWNERS) {
-        let body = (tag != null && tag != "") ?
-            downloader.fetch_github_release_by_tag_json(candidate, STEER_RELEASE_REPO, tag) :
-            downloader.fetch_github_release_json(candidate, STEER_RELEASE_REPO);
-        if (body == "")
-            continue;
-
-        let found = steer_module_assets_from_release(body, distrib_arch, suffix);
-        if (found != null)
-            return found;
-    }
-
-    return null;
-}
-
-function resolve_steer_release(arch, tag, extended) {
-    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
-    // 2.0.0 moved the core out of the "steer" package: it ships as "steer-core",
-    // while "steer-extended" became an empty transition stub for people coming off
-    // 1.x. The plain "steer-" prefix is now ambiguous - the same release also
-    // carries "steer-hysteria2-<version>-1_<arch>.<ext>" packages, and those end
-    // with the same suffix, so the old prefix would have installed the wrong
-    // package and called it the engine.
-    let prefix = extended ? "steer-extended-" : "steer-core-";
-    let distrib_arch = arch != null && as_string(arch.target) != "" ?
-        as_string(arch.target) : helpers.read_openwrt_release_value("DISTRIB_ARCH");
-    if (distrib_arch == "")
-        return null;
-
-    let owner = STEER_RELEASE_OWNERS[0];
-    let repo = STEER_RELEASE_REPO;
-    let releases_json = "";
-    let tag_name = "";
-    let release_url = "";
-    let suffix = "-1_" + distrib_arch + "." + asset_ext;
-
-    for (let candidate in STEER_RELEASE_OWNERS) {
-        let body = (tag != null && tag != "") ?
-            downloader.fetch_github_release_by_tag_json(candidate, repo, tag) :
-            downloader.fetch_github_release_json(candidate, repo);
-        if (body == "")
-            continue;
-
-        let name_here = trim(helpers.helper_output_input(body, "object-get-default", [ "tag_name", "" ]));
-        let url_here = trim(helpers.helper_output_input(body, "object-get-default", [ "html_url", "" ]));
-        let found = steer_asset_from_release(body, extended, suffix, distrib_arch, name_here, url_here);
-        if (found != null)
-            return found;
-
-        if (releases_json == "") {
-            releases_json = body;
-            owner = candidate;
-            tag_name = name_here;
-            release_url = url_here;
-        }
-    }
-
-    return null;
 }
 
 function resolve_tachyon_release(latest_version) {
@@ -688,6 +221,119 @@ function resolve_tachyon_release(latest_version) {
     };
 }
 
+function resolve_tachyon_i18n_release(version_tag, lang_code) {
+    let lang = lc(trim(as_string(lang_code || "ru")));
+    if (match(lang, /^[a-z]{2,3}(_[a-zA-Z]{2})?$/) == null)
+        return null;
+
+    let asset_ext = helpers.is_apk() ? "apk" : "ipk";
+    let tag = trim(as_string(version_tag || ""));
+    if (tag == "")
+        tag = latest_tachyon_version();
+    if (tag == "")
+        return null;
+
+    let ver_clean = replace(tag, /^v/, "");
+    let pkg_name = "luci-i18n-tachyon-" + lang + "_" + ver_clean + "." + asset_ext;
+    let parts = split(TACHYON_RELEASE_REPO, "/");
+    let release_json = "";
+    if (length(parts) == 2 && parts[0] != "" && parts[1] != "")
+        release_json = downloader.fetch_github_release_by_tag_json(parts[0], parts[1], tag);
+    if (release_json == "")
+        release_json = latest_tachyon_release_json();
+
+    if (release_json != "") {
+        let asset_url = trim(helpers.helper_output_input(release_json, "release-asset-url", [ pkg_name ]));
+        if (asset_url != "") {
+            return {
+                tag: tag,
+                package_name: pkg_name,
+                package_url: asset_url,
+                release_url: "https://github.com/" + TACHYON_RELEASE_REPO + "/releases/tag/" + tag
+            };
+        }
+    }
+
+    let base_dl = "https://github.com/" + TACHYON_RELEASE_REPO + "/releases/download/" + tag + "/";
+    return {
+        tag: tag,
+        package_name: pkg_name,
+        package_url: base_dl + pkg_name,
+        release_url: "https://github.com/" + TACHYON_RELEASE_REPO + "/releases/tag/" + tag
+    };
+}
+
+function resolve_torrserver_arch_suffix() {
+    let host_arch = lc(trim(command_output_from_args([ "uname", "-m" ])));
+    let distrib_arch = lc(trim(helpers.read_openwrt_release_value("DISTRIB_ARCH")));
+
+    if (index(distrib_arch, "mips64el") >= 0 || index(distrib_arch, "mips64le") >= 0 || host_arch == "mips64el" || host_arch == "mips64le")
+        return "mips64le";
+    if (index(distrib_arch, "mips64") >= 0 || host_arch == "mips64")
+        return "mips64";
+    if (index(distrib_arch, "mipsel") >= 0 || index(distrib_arch, "mipsle") >= 0 || host_arch == "mipsel" || host_arch == "mipsle")
+        return "mipsle";
+    if (index(distrib_arch, "mips") >= 0 || host_arch == "mips")
+        return "mips";
+    if (host_arch == "aarch64" || host_arch == "arm64" || index(distrib_arch, "aarch64") >= 0)
+        return "arm64";
+    if (host_arch == "x86_64" || host_arch == "amd64" || index(distrib_arch, "x86_64") >= 0)
+        return "amd64";
+    if (substr(host_arch, 0, 5) == "armv7" || index(distrib_arch, "arm_cortex") >= 0)
+        return "arm7";
+    if (substr(host_arch, 0, 3) == "arm" || index(distrib_arch, "arm_") >= 0)
+        return "arm5";
+    if (host_arch == "riscv64" || index(distrib_arch, "riscv64") >= 0)
+        return "riscv64";
+    if (host_arch == "i386" || host_arch == "i686" || index(distrib_arch, "i386") >= 0)
+        return "386";
+    return "";
+}
+
+function resolve_torrserver_release(target_tag) {
+    let arch_suffix = resolve_torrserver_arch_suffix();
+    if (arch_suffix == "")
+        return null;
+    let asset_name = "TorrServer-linux-" + arch_suffix;
+    let owner = "YouROK";
+    let repo = "TorrServer";
+    let tag = trim(as_string(target_tag || ""));
+
+    if (tag == "") {
+        let rel_json = downloader.fetch_github_release_json(owner, repo);
+        if (rel_json != "") {
+            try {
+                let parsed = json(rel_json);
+                if (type(parsed) == "object" && parsed.tag_name)
+                    tag = trim(as_string(parsed.tag_name));
+            } catch (e) {}
+        }
+    }
+    if (tag == "") {
+        let rels_json = downloader.fetch_github_releases_json(owner, repo, "10");
+        if (rels_json != "" && rels_json != "[]") {
+            try {
+                let parsed = json(rels_json);
+                if (type(parsed) == "array" && length(parsed) > 0 && type(parsed[0]) == "object" && parsed[0].tag_name)
+                    tag = trim(as_string(parsed[0].tag_name));
+            } catch (e) {}
+        }
+    }
+    if (tag == "")
+        tag = downloader.fetch_github_release_tag_fallback(owner, repo);
+    if (tag == "")
+        return null;
+
+    return {
+        arch: arch_suffix,
+        tag: tag,
+        version: tag,
+        package_name: asset_name,
+        package_url: "https://github.com/" + owner + "/" + repo + "/releases/download/" + tag + "/" + asset_name,
+        release_url: "https://github.com/" + owner + "/" + repo + "/releases/tag/" + tag
+    };
+}
+
 function module_exports() {
     return {
         latest_tachyon_release_json,
@@ -701,18 +347,10 @@ function module_exports() {
         clear_version_caches,
         opkg_arch_list,
         resolve_arch_candidates,
-        resolve_zapret_release,
-        resolve_zapret2_release,
-        resolve_byedpi_release,
-        resolve_wdtt_release,
-        resolve_olcrtc_release,
-        resolve_fptn_release,
-        resolve_steer_release,
-        resolve_steer_module_assets,
-        steer_module_assets_from_release,
-        steer_module_names,
-        steer_modules_from_settings,
-        resolve_tachyon_release
+        resolve_tachyon_release,
+        resolve_tachyon_i18n_release,
+        resolve_torrserver_arch_suffix,
+        resolve_torrserver_release
     };
 }
 

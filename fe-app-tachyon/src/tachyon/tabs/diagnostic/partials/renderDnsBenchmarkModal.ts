@@ -1,5 +1,12 @@
 import { TachyonShellMethods } from '../../../methods/shell';
 import { renderButton } from '../../../../partials';
+import {
+  renderZapIcon,
+  renderLightbulbIcon,
+  renderHourglassIcon,
+  renderCheckIcon,
+  renderXIcon,
+} from '../../../../icons';
 import { Tachyon } from '../../../types';
 
 export function renderDnsBenchmarkModal() {
@@ -8,7 +15,7 @@ export function renderDnsBenchmarkModal() {
 
   const progressBar = E('div', {
     style:
-      'width: 0%; height: 6px; background: linear-gradient(90deg, #007bff, #28a745); border-radius: 3px; transition: width 0.3s ease;',
+      'width: 0%; height: 6px; background: var(--tachyon-accent, #5b8af0); border-radius: 3px; transition: width 0.3s cubic-bezier(0.22, 1, 0.36, 1);',
   });
 
   const progressContainer = E(
@@ -24,7 +31,7 @@ export function renderDnsBenchmarkModal() {
     'div',
     {
       style:
-        'font-size: 13px; font-weight: 500; margin-bottom: 10px; color: var(--text-color-medium, #6c757d);',
+        'font-size: 13px; font-weight: 500; margin-bottom: 10px; color: var(--text-color-medium, #6c757d); display: flex; align-items: center; gap: 6px;',
     },
     _('Ready to benchmark DNS providers'),
   );
@@ -138,7 +145,7 @@ export function renderDnsBenchmarkModal() {
           E(
             'span',
             {
-              style: `display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; text-transform: uppercase; background: ${
+              style: `display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; background: ${
                 r.type === 'doh' ? '#6f42c1' : '#007bff'
               }; color: #fff;`,
             },
@@ -197,10 +204,7 @@ export function renderDnsBenchmarkModal() {
           style:
             'font-size: 14px; font-weight: 600; color: #28a745; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;',
         },
-        [
-          E('span', {}, '⚡'),
-          E('span', {}, _('Recommended DNS Configuration')),
-        ],
+        [renderZapIcon(14), E('span', {}, _('Recommended DNS Configuration'))],
       ),
       E(
         'div',
@@ -259,9 +263,9 @@ export function renderDnsBenchmarkModal() {
             'div',
             {
               style:
-                'font-size: 11px; opacity: 0.8; font-style: italic; margin-top: 4px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px;',
+                'font-size: 11px; opacity: 0.8; font-style: italic; margin-top: 4px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px; display: inline-flex; align-items: center; gap: 4px;',
             },
-            `💡 ${rec.reason}`,
+            [renderLightbulbIcon(12), E('span', {}, rec.reason)],
           )
         : '',
     ]);
@@ -282,53 +286,105 @@ export function renderDnsBenchmarkModal() {
     onClick: () => applyRecommended(),
   });
 
+  let isPolling = false;
+  let isDisposed = false;
+  let hasMounted = false;
+
   const closeBtn = renderButton({
     text: _('Close'),
     classNames: ['cbi-button-neutral'],
     onClick: () => {
-      if (pollInterval) clearInterval(pollInterval);
+      isDisposed = true;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
       if (isRunning) TachyonShellMethods.stopDnsBenchmark();
       if (ui.hideModal) ui.hideModal();
     },
   });
 
   const pollStatus = async () => {
-    const res = await TachyonShellMethods.getDnsBenchmarkStatus();
-    if (!res.success || !res.data) return;
-
-    const data = res.data;
-    isRunning = data.running;
-
-    if (data.running) {
-      progressContainer.style.display = 'block';
-      progressBar.style.width = `${data.progress}%`;
-      statusLabel.textContent = `⏳ ${data.current_server || _('Testing')} (${data.progress}%)`;
-      if (startBtn) (startBtn as HTMLButtonElement).disabled = true;
-      if (applyBtn) (applyBtn as HTMLButtonElement).disabled = true;
-    } else {
-      progressContainer.style.display = 'none';
-      if (data.finished_at) {
-        statusLabel.textContent = `✓ ${_('Benchmark completed successfully')}`;
-        if (startBtn) (startBtn as HTMLButtonElement).disabled = false;
-        if (applyBtn)
-          (applyBtn as HTMLButtonElement).disabled = !data.recommendation;
-      }
+    if (statusLabel.isConnected) {
+      hasMounted = true;
+    }
+    if (isDisposed || (hasMounted && !statusLabel.isConnected)) {
       if (pollInterval) {
         clearInterval(pollInterval);
         pollInterval = null;
       }
+      return;
     }
+    if (isPolling) return;
+    isPolling = true;
+    try {
+      const res = await TachyonShellMethods.getDnsBenchmarkStatus();
+      if (isDisposed || (hasMounted && !statusLabel.isConnected)) {
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
+        return;
+      }
+      if (!res.success || !res.data) return;
 
-    if (data.results && data.results.length > 0) {
-      updateTable(data.results);
-    }
-    if (data.recommendation) {
-      updateRecommendation(data.recommendation);
+      const data = res.data;
+      isRunning = data.running;
+
+      if (data.running) {
+        progressContainer.style.display = 'block';
+        progressBar.style.width = `${data.progress}%`;
+        statusLabel.replaceChildren(
+          renderHourglassIcon(14),
+          document.createTextNode(
+            ` ${data.current_server || _('Testing')} (${data.progress}%)`,
+          ),
+        );
+        if (startBtn) (startBtn as HTMLButtonElement).disabled = true;
+        if (applyBtn) (applyBtn as HTMLButtonElement).disabled = true;
+      } else {
+        progressContainer.style.display = 'none';
+        if (data.error) {
+          statusLabel.replaceChildren(
+            renderXIcon(14),
+            document.createTextNode(` ${data.error}`),
+          );
+          if (startBtn) (startBtn as HTMLButtonElement).disabled = false;
+          if (applyBtn)
+            (applyBtn as HTMLButtonElement).disabled = !data.recommendation;
+        } else if (data.finished_at) {
+          statusLabel.replaceChildren(
+            renderCheckIcon(14),
+            document.createTextNode(
+              ` ${_('Benchmark completed successfully')}`,
+            ),
+          );
+          if (startBtn) (startBtn as HTMLButtonElement).disabled = false;
+          if (applyBtn)
+            (applyBtn as HTMLButtonElement).disabled = !data.recommendation;
+        }
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
+      }
+
+      if (data.results && data.results.length > 0) {
+        updateTable(data.results);
+      }
+      if (data.recommendation) {
+        updateRecommendation(data.recommendation);
+      }
+    } finally {
+      isPolling = false;
     }
   };
 
   const startBenchmark = async () => {
-    statusLabel.textContent = `🚀 ${_('Starting DNS benchmark...')}`;
+    statusLabel.replaceChildren(
+      renderZapIcon(14),
+      document.createTextNode(` ${_('Starting DNS benchmark...')}`),
+    );
     progressContainer.style.display = 'block';
     progressBar.style.width = '0%';
     if (startBtn) (startBtn as HTMLButtonElement).disabled = true;
@@ -336,7 +392,12 @@ export function renderDnsBenchmarkModal() {
 
     const res = await TachyonShellMethods.startDnsBenchmark();
     if (!res.success) {
-      statusLabel.textContent = `✗ ${res.error || _('Failed to start benchmark')}`;
+      statusLabel.replaceChildren(
+        renderXIcon(14),
+        document.createTextNode(
+          ` ${res.error || _('Failed to start benchmark')}`,
+        ),
+      );
       if (startBtn) (startBtn as HTMLButtonElement).disabled = false;
       progressContainer.style.display = 'none';
       return;
@@ -419,7 +480,7 @@ export function renderDnsBenchmarkModal() {
     ),
   ]);
 
-  ui.showModal(`⚡ ${_('Tachyon DNS Benchmark & Auto-Tuning')}`, modalContent);
+  ui.showModal(_('Tachyon DNS Benchmark & Auto-Tuning'), modalContent);
 
   // Automatically start probe when modal opens
   startBenchmark();

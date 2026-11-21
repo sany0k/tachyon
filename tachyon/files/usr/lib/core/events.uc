@@ -53,8 +53,8 @@ const DEFAULT_JOURNAL_MAX_BYTES   = int(getenv("TACHYON_JOURNAL_MAX_BYTES") || "
 // Secret Redaction Engine
 // ---------------------------------------------------------------------------
 
-const SENSITIVE_KEY_REGEX = /^(token|secret|password|passwd|key|auth|credential|credentials|api_key|bot_token|private_key|private|cert|cookie|access_token|refresh_token)$/i;
-const SENSITIVE_KEY_SUBSTR_REGEX = /(token|secret|password|passwd|bot_token|api_key|private_key)/i;
+const SENSITIVE_KEY_REGEX = /^(token|secret|password|passwd|key|auth|credential|credentials|api_key|bot_token|private_key|private|cert|cookie|access_token|refresh_token|uuid|preshared_key|pre_shared_key|psk|hwid|hwid_token|fptn_token|crypto_key|outbound_json|outbound_jsons|amnezia_config|amnezia_configs|proxy_links|proxy_links_text|subscription_url|subscription_urls)$/i;
+const SENSITIVE_KEY_SUBSTR_REGEX = /(token|secret|password|passwd|bot_token|api_key|private_key|preshared_key|pre_shared_key|outbound_json|amnezia_conf|proxy_links)/i;
 
 function is_sensitive_key(key) {
     if (key == null || key == "")
@@ -71,19 +71,25 @@ function redact_string(str) {
     // 1. Telegram bot tokens: e.g. 123456789:ABCdef-GHIjkl_MNOpqrsTUVwxyz1234567
     s = replace(s, /[0-9]{8,12}:[-_a-zA-Z0-9]{35}/g, "[REDACTED_TELEGRAM_TOKEN]");
 
-    // 2. Bearer tokens: e.g. Bearer eyJhbGci...
+    // 2. Bearer tokens & cloud LLM API keys
     s = replace(s, /Bearer[ \t]+[-_a-zA-Z0-9.+=]{16,}/gi, "Bearer [REDACTED_TOKEN]");
+    s = replace(s, /(sk-(or-v1-|ant-|proj-)?[-_a-zA-Z0-9]{16,}|AIza[-_a-zA-Z0-9]{20,}|gsk_[-_a-zA-Z0-9]{16,}|xai-[-_a-zA-Z0-9]{16,})/g, "[REDACTED_API_KEY]");
 
-    // 3. Proxy & HTTP URLs with credentials:
+    // 3. VLESS / Trojan / Hysteria / Base64 proxy links
+    s = replace(s, /vless:\/\/([^@ \t\r\n]+)@/g, "vless://[REDACTED_UUID]@");
+    s = replace(s, /trojan:\/\/([^@ \t\r\n]+)@/g, "trojan://[REDACTED_PASS]@");
+    s = replace(s, /hysteria2?:\/\/([^@ \t\r\n]+)@/g, "hysteria2://[REDACTED_AUTH]@");
+    s = replace(s, /(vmess|ssr|fptn|fptns|warp):\/\/[^ \t\r\n'"]+/gi, "$1://[REDACTED]");
+
+    // 4. Proxy & HTTP URLs with credentials:
     //    e.g. https://user:pass@host:port -> https://[REDACTED]@host:port
     s = replace(s, /:\/\/([^:@ \t\r\n]+)(:[^@ \t\r\n]+)?@/g, "://[REDACTED]@");
 
-    // 4. VLESS / Trojan UUIDs in links: e.g. vless://12345678-1234-1234-1234-1234567890ab@
-    s = replace(s, /vless:\/\/([-a-fA-F0-9]{36})@/g, "vless://[REDACTED_UUID]@");
-    s = replace(s, /trojan:\/\/([^@ \t\r\n]+)@/g, "trojan://[REDACTED_PASS]@");
-
-    // 5. Standalone UUID / Hex secret patterns in query parameters: e.g. ?secret=... or &key=...
-    s = replace(s, /([?&](password|secret|key|token|auth)=)[^& \t\r\n]+/gi, "$1[REDACTED]");
+    // 5. Standalone UUIDs and secret/password params in query strings or key=value pairs
+    s = replace(s, /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, "[REDACTED_UUID]");
+    s = replace(s, /([?&](password|pass|secret|key|api_key|apikey|token|access_token|auth|auth_token|uuid|id|sub|hash|sig|signature|hwid)=)[^& \t\r\n'"]+/gi, "$1[REDACTED]");
+    s = replace(s, /(https?:\/\/[^\/ \t\r\n'"]+\/(sub|subscribe|subscription|api\/v1\/client\/subscribe)\/)[-_a-zA-Z0-9]{8,}/gi, "$1[REDACTED_SUB_TOKEN]");
+    s = replace(s, /(password|passwd|secret|api_key|apikey|bot_token|agent_api_token|access_token|auth_token|private_key|preshared_key|pre_shared_key|hwid_token|fptn_token)=([^ \t\r\n'";,&]+)/gi, "$1=[REDACTED]");
 
     return s;
 }
@@ -163,17 +169,22 @@ function journal(opts) {
             start_idx = total_lines - target_keep;
         }
 
-        let kept = [];
-        for (let i = start_idx; i < total_lines; i++) {
-            push(kept, lines[i]);
+        // Accumulate from tail in O(N) instead of O(N^2) shift() + join()
+        let selected_rev = [];
+        let total_bytes = 0;
+        for (let i = total_lines - 1; i >= start_idx; i--) {
+            let entry_len = length(lines[i]) + 1;
+            if (length(selected_rev) > 0 && total_bytes + entry_len > max_bytes)
+                break;
+            push(selected_rev, lines[i]);
+            total_bytes += entry_len;
         }
 
-        // Also ensure byte size fits max_bytes
-        let compact_text = join("\n", kept) + "\n";
-        while (length(compact_text) > max_bytes && length(kept) > 1) {
-            shift(kept);
-            compact_text = join("\n", kept) + "\n";
+        let kept = [];
+        for (let i = length(selected_rev) - 1; i >= 0; i--) {
+            push(kept, selected_rev[i]);
         }
+        let compact_text = length(kept) > 0 ? (join("\n", kept) + "\n") : "";
 
         let tmp_file = sprintf("%s.tmp.%d", file_path, now_ms());
         let res = fs.writefile(tmp_file, compact_text);
@@ -480,6 +491,14 @@ function bus(opts) {
                 return -1;
             }
         }
+        if (length(keys(last_emit)) > 256) {
+            for (let k in keys(last_emit)) {
+                if (stamp - int(last_emit[k] || 0) > 3600000)
+                    delete last_emit[k];
+            }
+            if (length(keys(last_emit)) > 512)
+                last_emit = {};
+        }
         last_emit[dedup_key] = stamp;
 
         return self.emit(event_type, payload);
@@ -530,10 +549,19 @@ function bus(opts) {
 // Module Exports
 // ---------------------------------------------------------------------------
 
+function publish(event_type, data, meta) {
+    try {
+        return journal().record(event_type, data, meta);
+    } catch (e) {
+        return null;
+    }
+}
+
 function module_exports() {
     return {
         bus,
         journal,
+        publish,
         redact,
         redact_string,
         is_sensitive_key,

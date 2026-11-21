@@ -27,8 +27,23 @@ function command_success(args) {
     return system(command_from_args(args) + " >/dev/null 2>&1") == 0;
 }
 
+let _cmd_exists_cache = {};
+let _opkg_list_cache = null;
+
 function command_exists(name) {
-    return system(command_from_args([ "command", "-v", name ]) + " >/dev/null 2>&1") == 0;
+    name = as_string(name);
+    if (_cmd_exists_cache[name] != null)
+        return _cmd_exists_cache[name];
+    let exists = system(command_from_args([ "command", "-v", name ]) + " >/dev/null 2>&1") == 0;
+    _cmd_exists_cache[name] = exists;
+    return exists;
+}
+
+function opkg_list_installed_output() {
+    if (_opkg_list_cache != null)
+        return _opkg_list_cache;
+    _opkg_list_cache = as_string(command_output_args([ "opkg", "list-installed" ]) || "");
+    return _opkg_list_cache;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,15 +87,7 @@ function detect_arch() {
 // ---------------------------------------------------------------------------
 
 function binary_installed(package_name) {
-    if (package_name == "zapret2")
-        return fs.stat("/opt/zapret2/nfq2/nfqws2") != null || fs.stat("/opt/zapret2/nfqws2") != null || fs.stat("/usr/bin/nfqws2") != null;
-    if (package_name == "zapret")
-        return fs.stat("/opt/zapret/nfq/nfqws") != null || fs.stat("/opt/zapret/nfqws") != null;
-    if (package_name == "byedpi")
-        return fs.stat("/usr/bin/ciadpi") != null;
-    if (package_name == "fptn" || package_name == "fptn-client")
-        return fs.stat("/usr/bin/fptn-client-cli") != null || fs.stat("/usr/bin/fptn-client") != null;
-    if (package_name == "sing-box" || package_name == "sing-box-extended" || package_name == "sing-box-lx")
+    if (package_name == "tachyon-core")
         return fs.stat("/usr/bin/tachyon-core") != null;
     return false;
 }
@@ -94,9 +101,11 @@ function apk_installed(package_name) {
 
 function opkg_installed(package_name) {
     package_name = as_string(package_name);
+    if (fs.stat("/usr/lib/opkg/info/" + package_name + ".control") != null)
+        return true;
     if (command_exists("opkg")) {
         let prefix = package_name + " - ";
-        for (let line in split(command_output_args([ "opkg", "list-installed" ]), "\n")) {
+        for (let line in split(opkg_list_installed_output(), "\n")) {
             line = trim(as_string(line));
             if (substr(line, 0, length(prefix)) == prefix)
                 return true;
@@ -168,42 +177,15 @@ function apk_query_version(package_name, output) {
 }
 
 function binary_version(package_name) {
-    if (package_name == "zapret2") {
-        for (let p in [ "/opt/zapret2/nfq2/nfqws2", "/opt/zapret2/nfqws2", "/usr/bin/nfqws2" ]) {
-            if (fs.stat(p) != null) {
-                let out = command_output_args([ p, "--version" ]);
-                let m = match(out, /version[ \t]*([0-9a-zA-Z._-]+)/i);
-                if (m) return m[1];
-            }
+    if (package_name == "tachyon-core") {
+        let p = "/usr/bin/tachyon-core";
+        if (fs.stat(p) != null) {
+            let out = command_output_args([ p, "version" ]);
+            let m = match(out, /version[ \t]*([0-9a-zA-Z._-]+)/i);
+            if (m) return m[1];
+            m = match(out, /tachyon-core[ \t]+(v?[0-9a-zA-Z._-]+)/i);
+            if (m) return m[1];
         }
-    }
-    if (package_name == "zapret") {
-        for (let p in [ "/opt/zapret/nfq/nfqws", "/opt/zapret/nfqws" ]) {
-            if (fs.stat(p) != null) {
-                let out = command_output_args([ p, "--version" ]);
-                let m = match(out, /version[ \t]*([0-9a-zA-Z._-]+)/i);
-                if (m) return m[1];
-            }
-        }
-    }
-    if (package_name == "byedpi" && fs.stat("/usr/bin/ciadpi") != null) {
-        let out = command_output_args([ "/usr/bin/ciadpi", "--version" ]);
-        let m = match(out, /([0-9a-zA-Z._-]+)/);
-        if (m) return m[1];
-    }
-    if ((package_name == "fptn" || package_name == "fptn-client")) {
-        for (let p in [ "/usr/bin/fptn-client-cli", "/usr/bin/fptn-client" ]) {
-            if (fs.stat(p) != null) {
-                let out = command_output_args([ p, "--version" ]);
-                let m = match(out, /version[ \t]*([0-9a-zA-Z._-]+)/i) || match(out, /([0-9]+\.[0-9a-zA-Z._-]+)/);
-                if (m) return m[1];
-            }
-        }
-    }
-    if ((package_name == "sing-box" || package_name == "sing-box-extended" || package_name == "sing-box-lx") && fs.stat("/usr/bin/tachyon-core") != null) {
-        let out = command_output_args([ "/usr/bin/tachyon-core", "version" ]);
-        let m = match(out, /version[ \t]*([0-9a-zA-Z._-]+)/i);
-        if (m) return m[1];
     }
     return "";
 }
@@ -212,6 +194,8 @@ function apk_version(package_name) {
     package_name = as_string(package_name);
     if (!apk_installed(package_name))
         return "";
+    if (!command_exists("apk"))
+        return binary_version(package_name);
     let ver = apk_list_version(package_name, command_output_args([ "apk", "list", "--installed", package_name ]));
     if (ver != "") return ver;
     ver = apk_info_version(package_name, command_output_args([ "apk", "info", "-v", package_name ]));
@@ -235,9 +219,17 @@ function apk_available_version(package_name) {
 
 function opkg_version(package_name) {
     package_name = as_string(package_name);
+    let control = fs.readfile("/usr/lib/opkg/info/" + package_name + ".control");
+    if (control != null) {
+        for (let line in split(as_string(control), "\n")) {
+            let m = match(trim(as_string(line)), /^Version:[ \t]*(.+)$/);
+            if (m && m[1])
+                return trim(m[1]);
+        }
+    }
     if (command_exists("opkg")) {
         let prefix = package_name + " - ";
-        for (let line in split(command_output_args([ "opkg", "list-installed" ]), "\n")) {
+        for (let line in split(opkg_list_installed_output(), "\n")) {
             line = trim(as_string(line));
             if (substr(line, 0, length(prefix)) == prefix)
                 return substr(line, length(prefix));

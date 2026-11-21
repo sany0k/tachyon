@@ -51,7 +51,7 @@ fi
 grep -Fq '"tachyon-stably-running"' "$UI_UC" ||
   fail "UI Tachyon status must use stable runtime state to avoid crash-loop flicker"
 grep -Fq '"tachyon-core-service-stable"' "$UI_UC" ||
-  fail "UI sing-box status must use stable runtime state to avoid crash-loop flicker"
+  fail "UI tachyon-core status must use stable runtime state to avoid crash-loop flicker"
 if sed -n '/^function ensure_dir(/,/^}/p' "$UI_UC" | grep -Fq 'mkdir", "-p'; then
   fail "UI state refresh must not spawn mkdir for existing directories"
 fi
@@ -66,8 +66,8 @@ grep -Fq 'let args = [ SERVICE_INIT, action ];' "$UI_UC" ||
   fail "UI service action worker must use init.d so procd triggers stay registered"
 grep -Fq 'start_service_action("reload", "initd", "pending")' "$UI_UC" ||
   fail "pending reload must enter the normal reload service action immediately"
-if grep -n -E 'pgrep.*sing-box|service-list-instance-running' "$UI_UC" >/dev/null 2>&1; then
-  fail "service/ui.uc must not use transient sing-box process probes for visible status"
+if grep -n -E 'pgrep.*tachyon-core|service-list-instance-running' "$UI_UC" >/dev/null 2>&1; then
+  fail "service/ui.uc must not use transient tachyon-core process probes for visible status"
 fi
 
 for mode in \
@@ -278,15 +278,100 @@ component_job="$TACHYON_UI_COMPONENT_ACTION_DIR/component-1.json"
 mkdir -p "$TACHYON_UI_COMPONENT_ACTION_DIR"
 bash -c 'while true; do sleep 1; done' component-action-worker &
 worker_pid=$!
-printf '%s\n' '{"running":true,"component":"sing_box","pid":"'"$worker_pid"'","started_at":100}' >"$component_job"
-ui_ucode component-action-running-for sing_box >/dev/null ||
-  fail "component-action-running-for should detect running sing-box component action"
-if ui_ucode component-action-running-for zapret >/dev/null 2>&1; then
+printf '%s\n' '{"running":true,"component":"tachyon-core","pid":null,"started_at":100}' >"$component_job"
+printf '%s\n' "$worker_pid" >"$component_job.pid"
+ui_ucode component-action-running-for tachyon-core >/dev/null ||
+  fail "component-action-running-for should detect running tachyon-core component action using sidecar .json.pid after grace period"
+if grep -Fq "Component action worker exited unexpectedly" "$component_job"; then
+  fail "refresh_action_dirs must not mark a live worker with sidecar .json.pid as exited unexpectedly"
+fi
+if ui_ucode component-action-running-for tachyon >/dev/null 2>&1; then
   fail "component-action-running-for should ignore other components"
 fi
 kill "$worker_pid" 2>/dev/null || true
+rm -f "$component_job.pid"
 
 ui_ucode action-ack service "$job_id" >/dev/null ||
   fail "action-ack should acknowledge finished service action"
+
+# Queued UI reload when another service action (e.g. procd on_config_change) is active
+active_job_id="$(ui_ucode service-action-begin-if-idle reload initd)"
+[ -n "$active_job_id" ] || fail "active initd reload job should be created"
+queued_pending_file="$WORK_DIR/ui-reload.pending"
+rm -f "$queued_pending_file"
+queued_resp="$(
+  TACHYON_PENDING_RELOAD_FILE="$queued_pending_file" \
+  TACHYON_LIB="$TACHYON_FILES/usr/lib" \
+  TACHYON_STATE_UC="$TACHYON_FILES/usr/lib/service/state.uc" \
+    ui_ucode service-action-async reload
+)" || fail "UI reload while another service action is running should succeed by queueing pending force reload"
+grep -Fq "\"job_id\": \"$active_job_id\"" <<<"$queued_resp" ||
+  fail "queued UI reload should return the active service action job_id ($queued_resp)"
+[ -f "$queued_pending_file" ] ||
+  fail "queued UI reload should write pending reload marker"
+grep -Fq 'reason=force' "$queued_pending_file" ||
+  fail "queued UI reload should record reason=force in pending reload marker"
+ui_ucode service-action-finish "$active_job_id" true done 0 >/dev/null || true
+ui_ucode action-ack service "$active_job_id" >/dev/null || true
+
+# Test tachyon-core subscription CLI integration (parse & fetch) + subscription_engine setting
+mock_core_bin="$WORK_DIR/mock-tachyon-core"
+cat >"$mock_core_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "subscription" ] && [ "$2" = "hwid" ]; then
+  printf '{"x-hwid":"0123456789abcdef"}\n'
+  exit 0
+fi
+if [ "$1" = "subscription" ] && [ "$2" = "parse" ]; then
+  out=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  cat >"$out" <<'JSON'
+[
+  {
+    "type": "vless",
+    "tag": "CoreParsedNode",
+    "server": "198.51.100.10",
+    "server_port": 443,
+    "uuid": "11111111-1111-1111-1111-111111111111",
+    "tls": {
+      "enabled": true,
+      "server_name": "example.com",
+      "utls": { "enabled": true, "fingerprint": "hellochrome_120" }
+    }
+  }
+]
+JSON
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$mock_core_bin"
+
+core_in="$WORK_DIR/core-sub-in.txt"
+core_out="$WORK_DIR/core-sub-out.json"
+printf 'vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&sni=example.com#FallbackNode\n' >"$core_in"
+
+TACHYON_CORE_BIN="$mock_core_bin" \
+  ucode -L "$TACHYON_FILES/usr/lib" "$TACHYON_FILES/usr/lib/subscription/parser.uc" \
+  normalize-content-validated "$core_in" "$core_out" "" "core" ||
+  fail "normalize-content-validated with engine=core should succeed via mock tachyon-core"
+
+grep -Fq '"CoreParsedNode"' "$core_out" ||
+  fail "engine=core should use outbounds returned by tachyon-core subscription parse"
+
+TACHYON_CORE_BIN="$mock_core_bin" \
+  ucode -L "$TACHYON_FILES/usr/lib" "$TACHYON_FILES/usr/lib/subscription/parser.uc" \
+  normalize-content-validated "$core_in" "$core_out" "" "ucode" ||
+  fail "normalize-content-validated with engine=ucode should succeed via built-in ucode parser"
+
+grep -Fq '"FallbackNode"' "$core_out" ||
+  fail "engine=ucode should bypass tachyon-core binary and parse via built-in ucode parser"
 
 printf 'UI runtime job checks passed\n'

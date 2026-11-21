@@ -28,23 +28,14 @@ function createUiState(
         status,
         dns_configured: running,
       },
-      sing_box: {
+      tachyon_core: {
         running,
         enabled: 0,
         status: running ? 'running but disabled' : 'stopped & disabled',
       },
     },
     capabilities: {
-      sing_box_extended: 1,
-      sing_box_tiny: 0,
-      sing_box_compressed: 0,
-      sing_box_lx: 0,
-      sing_box_tailscale: 1,
-      zapret_installed: 1,
-      zapret2_installed: 1,
-      byedpi_installed: 0,
-      wdtt_installed: 0,
-      olcrtc_installed: 0,
+      tachyon_core_tailscale: 1,
       server_inbounds_enabled_count: 0,
     },
     actions: {
@@ -78,7 +69,7 @@ describe('refreshRuntimeUiState', () => {
     expect(mocks.executeShellCommand).toHaveBeenCalledWith({
       command: '/usr/bin/tachyon',
       args: ['get_ui_state'],
-      timeout: 3000,
+      timeout: 15000,
     });
     expect(store.get().servicesInfoWidget.data).toMatchObject({
       tachyonRunning: 0,

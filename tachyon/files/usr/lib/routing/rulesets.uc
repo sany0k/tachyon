@@ -37,15 +37,7 @@ function array_from_value(value) {
 }
 
 function trim_string(value) {
-    let text = as_string(value);
-    let start_match = match(text, /^[ \t\r\n]*/);
-    let start = start_match ? length(start_match[0]) : 0;
-    let end = length(text);
-
-    while (end > start && match(substr(text, end - 1, 1), /[ \t\r\n]/))
-        end--;
-
-    return substr(text, start, end - start);
+    return trim(as_string(value));
 }
 
 function sort_values(values) {
@@ -145,9 +137,14 @@ function import_plain_list(plain_path, ruleset_path, key, kind, chunk_size_text,
     let invalid = [];
 
     for (let line in split(as_string(data), "\n")) {
+        line = as_string(line);
+        if (index(line, "//") >= 0)
+            line = replace(line, /[ \t]*\/\/.*$/, "");
+        if (index(line, "#") >= 0)
+            line = replace(line, /[ \t]*#.*$/, "");
         line = trim_string(line);
 
-        if (line == "" || substr(line, 0, 1) == "#")
+        if (line == "" || substr(line, 0, 1) == "#" || substr(line, 0, 1) == ";")
             continue;
 
         let normalized = normalize_plain_ruleset_value(line, kind);
@@ -647,31 +644,81 @@ function has_rules(path) {
 }
 
 function compile_plain_list(plain_path, ruleset_srs_path, ruleset_json_path) {
-    create_source(ruleset_json_path);
-    import_plain_list(plain_path, ruleset_json_path, "domain_suffix", "domains", "5000");
-    import_plain_list(plain_path, ruleset_json_path, "ip_cidr", "subnets", "5000");
+    let data = fs.readfile(plain_path);
+    let domains = [];
+    let subnets = [];
 
-    let has_doms = has_domain_matchers(ruleset_json_path);
-    let rules_exist = has_rules(ruleset_json_path);
+    if (data != null) {
+        for (let line in split(as_string(data), "\n")) {
+            line = as_string(line);
+            if (index(line, "//") >= 0)
+                line = replace(line, /[ \t]*\/\/.*$/, "");
+            if (index(line, "#") >= 0)
+                line = replace(line, /[ \t]*#.*$/, "");
+            line = trim_string(line);
+
+            if (line == "" || substr(line, 0, 1) == "#" || substr(line, 0, 1) == ";")
+                continue;
+
+            if (ip.valid_ip_or_cidr(line)) {
+                push(subnets, line);
+            } else {
+                let dom = domain_config.suffix_to_ascii(line);
+                if (dom != null)
+                    push(domains, dom);
+            }
+        }
+    }
+
+    domains = unique_values(domains);
+    subnets = unique_values(subnets);
+    let has_doms = length(domains) > 0;
+    let has_ips = length(subnets) > 0;
+    let kind = (has_doms && has_ips) ? "mixed" : (has_ips ? "subnets" : (has_doms ? "domains" : "unknown"));
+    let rules = [];
+    if (has_doms)
+        push(rules, { domain_suffix: domains });
+    if (has_ips)
+        push(rules, { ip_cidr: subnets });
+    let rules_exist = length(rules) > 0;
+
+    if (!write_json_file(ruleset_json_path, { version: 3, rules }))
+        exit(1);
 
     if (rules_exist) {
         let compile_ok = common.command_success_from_args([
-            "sing-box", "rule-set", "compile", ruleset_json_path, "-o", ruleset_srs_path
+            "tachyon-core", "rule-set", "compile", ruleset_json_path, "-o", ruleset_srs_path
         ]);
+        if (!compile_ok && fs.stat("/usr/bin/tachyon-core") != null) {
+            compile_ok = common.command_success_from_args([
+                "/usr/bin/tachyon-core", "rule-set", "compile", ruleset_json_path, "-o", ruleset_srs_path
+            ]);
+        }
         let srs_st = fs.stat(ruleset_srs_path);
         if (compile_ok && srs_st != null && srs_st.size >= 16) {
-            fs.unlink(ruleset_json_path);
-            return { format: "binary", path: ruleset_srs_path, has_domains: has_doms };
+            return { format: "binary", path: ruleset_srs_path, has_domains: has_doms, has_ips, kind };
         }
-        return { format: "source", path: ruleset_json_path, has_domains: has_doms };
+        return { format: "source", path: ruleset_json_path, has_domains: has_doms, has_ips, kind };
     }
 
     let rulesets_mod = null;
     try { rulesets_mod = require("tachyon_core.rulesets"); } catch (e) {}
-    if (rulesets_mod && rulesets_mod.ensure_empty_srs_stub)
-        rulesets_mod.ensure_empty_srs_stub(ruleset_srs_path);
+    // ensure_empty_srs_stub() intentionally keeps an existing valid SRS. Build
+    // the empty replacement separately so clearing a list removes its old rules.
+    let stage = trim(common.command_output_from_args([ "mktemp", ruleset_srs_path + ".empty.XXXXXX" ]));
+    let ok = stage != "" && rulesets_mod &&
+        rulesets_mod.ensure_empty_srs_stub(stage) &&
+        rulesets_mod.is_referenceable_srs_file(stage);
+    if (ok && rulesets_mod.is_referenceable_srs_file(ruleset_srs_path))
+        ok = common.command_success_from_args([ "cp", "-p", ruleset_srs_path, ruleset_srs_path + ".bak" ]);
+    if (ok)
+        ok = common.command_success_from_args([ "mv", "-f", stage, ruleset_srs_path ]);
+    if (!ok) {
+        if (stage != "") fs.unlink(stage);
+        return { format: "source", path: ruleset_json_path, has_domains: false, has_ips: false, kind: "unknown" };
+    }
     fs.unlink(ruleset_json_path);
-    return { format: "binary", path: ruleset_srs_path, has_domains: false };
+    return { format: "binary", path: ruleset_srs_path, has_domains: false, has_ips: false, kind: "unknown" };
 }
 
 function module_exports() {

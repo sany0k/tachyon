@@ -38,12 +38,12 @@ done
 
 # ── the root cause is claimed and released ────────────────────────────────────
 # The general active_root_causes registry was replaced by two named deadline
-# vars — WAN and sing-box are the only two causes ever claimed; proxy and DNS
+# vars — WAN and core are the only two causes ever claimed; proxy and DNS
 # healers only need to know if either is active.
 grep -q 'let wan_repair_until' "$WATCHDOG_UC" \
   || fail "wan_repair_until is gone; nothing marks a WAN repair as a root cause"
-grep -q 'let singbox_repair_until' "$WATCHDOG_UC" \
-  || fail "singbox_repair_until is gone; nothing marks a sing-box restart as a root cause"
+grep -q 'let core_repair_until' "$WATCHDOG_UC" \
+  || fail "core_repair_until is gone; nothing marks a core restart as a root cause"
 grep -q 'function suppressed_by_root_cause(healer)' "$WATCHDOG_UC" \
   || fail "suppressed_by_root_cause() is gone; consequences no longer stand down"
 
@@ -56,16 +56,16 @@ ifdown_line="$(grep -n -m1 '/sbin/ifdown wan' "$WATCHDOG_UC" | cut -d: -f1)"
 [ "$claim_line" -lt "$ifdown_line" ] \
   || fail "the WAN deadline is set after ifdown; the resulting proxy/DNS failures would not be suppressed"
 
-grep -q 'singbox_repair_until = time()' "$WATCHDOG_UC" \
-  || fail "heal_core_stopped does not set singbox_repair_until"
+grep -q 'core_repair_until = ' "$WATCHDOG_UC" \
+  || fail "heal_core_stopped does not set core_repair_until"
 
 # ── every claim has a release path ────────────────────────────────────────────
 # A deadline released only at expiry suppresses real faults for the full window.
 # Both causes have a recovery fact that zeroes the deadline immediately.
 grep -q 'wan_repair_until = 0;' "$WATCHDOG_UC" \
   || fail "the WAN deadline is never cleared on recovery"
-grep -q 'singbox_repair_until = 0;' "$WATCHDOG_UC" \
-  || fail "the sing-box deadline is never cleared on recovery"
+grep -q 'core_repair_until = 0;' "$WATCHDOG_UC" \
+  || fail "the core deadline is never cleared on recovery"
 
 # WAN_UP is new: probe_wan only ever published failure, so a recovered uplink
 # was invisible.
@@ -85,41 +85,41 @@ grep -qE 'subscribe\(EV\.WAN_UP, note_wan_recovered,' "$WATCHDOG_UC" \
 grep -q 'const WAN_FAIL_THRESHOLD' "$CONTROLLER_UC" \
   || fail "probe_wan has no debounce threshold"
 wan_probe_body="$(sed -n '/function probe_wan()/,/^    }$/p' "$CONTROLLER_UC")"
-echo "$wan_probe_body" | grep -q 'state.wan_fail_streak = 0;' \
+grep -q 'state.wan_fail_streak = 0;' <<< "$wan_probe_body" \
   || fail "probe_wan no longer resets its miss streak on a healthy pass"
-echo "$wan_probe_body" | grep -q 'state.wan_fail_streak++;' \
+grep -q 'state.wan_fail_streak++;' <<< "$wan_probe_body" \
   || fail "probe_wan no longer counts consecutive misses"
-echo "$wan_probe_body" | grep -q 'if (state.wan_fail_streak < WAN_FAIL_THRESHOLD) return;' \
+grep -q 'if (state.wan_fail_streak < WAN_FAIL_THRESHOLD) return;' <<< "$wan_probe_body" \
   || fail "probe_wan publishes WAN_DOWN before the debounce threshold"
-echo "$wan_probe_body" | grep -q 'if (setting("recovery_bypass", "0") == "1") return;' \
+grep -q 'if (setting("recovery_bypass", "0") == "1") return;' <<< "$wan_probe_body" \
   || fail "probe_wan ignores recovery_bypass"
 wan_heal_body="$(sed -n '/function heal_wan_and_gateway/,/^}/p' "$WATCHDOG_UC")"
-echo "$wan_heal_body" | grep -q 'if (settings().recovery_bypass == "1") return;' \
+grep -q 'if (settings().recovery_bypass == "1") return;' <<< "$wan_heal_body" \
   || fail "heal_wan_and_gateway ignores recovery_bypass; it was the only healer that could not be disabled"
-echo "$wan_heal_body" | grep -q '/sbin/ubus call network.interface.wan renew' \
+grep -q '/sbin/ubus call network.interface.wan renew' <<< "$wan_heal_body" \
   || fail "heal_wan_and_gateway no longer tries a graceful renew before ifdown/ifup"
 
 # ── no http/mixed inbound → the proxy probe must not declare it broken ───────
 # proxy_port() used to fall back to the hardcoded 4534, so a config without
 # any http/mixed inbound (economy mode, all mixed proxies off) measured a dead
-# listener and the watchdog restarted sing-box every ~minute (issue #31).
+# listener and the watchdog restarted tachyon-core every ~minute (issue #31).
 proxy_port_body="$(sed -n '/^function proxy_port()/,/^}$/p' "$CONTROLLER_UC")"
-echo "$proxy_port_body" | grep -q 'let port = "";' \
+grep -q 'let port = "";' <<< "$proxy_port_body" \
   || fail "proxy_port() still defaults to a fake port instead of signalling 'no proxy inbound'"
 proxy_probe_body="$(sed -n '/function probe_proxy()/,/^    }$/p' "$CONTROLLER_UC")"
-echo "$proxy_probe_body" | grep -q 'if (port == "") return;' \
+grep -q 'if (port == "") return;' <<< "$proxy_probe_body" \
   || fail "probe_proxy() probes a dead default port when the config has no http/mixed inbound"
 # The guard is asserted on the smart-detect body rather than as a literal
 # one-liner: it now logs why it bails, so the "if (...) return;" spelling moved
 # into a block. Both halves of the guard are still required.
 smart_detect_body="$(sed -n '/^function smart_detect_process_pending/,/^}$/p' "$WATCHDOG_UC")"
-echo "$smart_detect_body" | grep -q 'proxy_addr == "127.0.0.1:"' \
+grep -q 'proxy_addr == "127.0.0.1:"' <<< "$smart_detect_body" \
   || fail "smart-detect lost the empty-proxy-address guard"
-echo "$smart_detect_body" | awk '
+awk '
   /proxy_addr == "127\.0\.0\.1:"/ { guard = NR }
   guard && /return;/ { found = 1; exit }
   END { exit found ? 0 : 1 }
-' || fail "smart-detect probes the empty proxy address when the config has no http/mixed inbound"
+' <<< "$smart_detect_body" || fail "smart-detect probes the empty proxy address when the config has no http/mixed inbound"
 
 # ── the consequences actually check ───────────────────────────────────────────
 for healer in heal_dns_stall heal_proxy_connectivity heal_proxy_health heal_dns_continuous; do
@@ -130,7 +130,7 @@ done
 # ── a skip is logged, never silent ────────────────────────────────────────────
 # "the watchdog did nothing" and "the watchdog deliberately stood down" look
 # identical in a log that omits this.
-grep -qE 'standing down, WAN repair|standing down, sing-box restart' "$WATCHDOG_UC" \
+grep -qE 'standing down, WAN repair|standing down, .* restart is in progress' "$WATCHDOG_UC" \
   || fail "a suppressed repair is now silent; the log cannot distinguish it from inaction"
 
 # ── the suppression state machine behaves ─────────────────────────────────────
@@ -164,18 +164,18 @@ wan_repair_until = time() + SUPPRESSION_DEADLINE;
 push(out, "wan_proxy=" + (suppressed_by_root_cause("proxy") ? "skip" : "run"));
 push(out, "wan_dns=" + (suppressed_by_root_cause("dns") ? "skip" : "run"));
 // WAN does not suppress itself (it IS the root cause).
-// Both vars are in scope; singbox_repair_until is still 0, so only WAN fires.
+// Both vars are in scope; core_repair_until is still 0, so only WAN fires.
 push(out, "logged=" + (length(logged) > 0 ? "yes" : "no"));
 
 // The uplink comes back: suppression lifts immediately, not at the deadline.
 wan_repair_until = 0;
 push(out, "released_proxy=" + (suppressed_by_root_cause("proxy") ? "skip" : "run"));
 
-// A sing-box restart suppresses proxy/DNS, but not a WAN fault which must still
+// A core restart suppresses proxy/DNS, but not a WAN fault which must still
 // be repaired.
-singbox_repair_until = time() + SUPPRESSION_DEADLINE;
-push(out, "singbox_blocks_proxy=" + (suppressed_by_root_cause("proxy") ? "skip" : "run"));
-singbox_repair_until = 0;
+core_repair_until = time() + SUPPRESSION_DEADLINE;
+push(out, "core_blocks_proxy=" + (suppressed_by_root_cause("proxy") ? "skip" : "run"));
+core_repair_until = 0;
 
 // An expired deadline no longer suppresses.
 wan_repair_until = time() - 1;
@@ -185,7 +185,7 @@ print(join(" ", out) + "\n");
 DRIVER
 
 actual="$(ucode "$SUPPRESS_UC")"
-expected="idle_proxy=run wan_proxy=skip wan_dns=skip logged=yes released_proxy=run singbox_blocks_proxy=skip expired_proxy=run"
+expected="idle_proxy=run wan_proxy=skip wan_dns=skip logged=yes released_proxy=run core_blocks_proxy=skip expired_proxy=run"
 [ "$actual" = "$expected" ] \
   || fail "root-cause suppression misbehaves
   expected: $expected

@@ -28,7 +28,7 @@ describe('runInboundsCheck', () => {
       success: true,
       data: {
         enabled_count: 1,
-        config_path: '/etc/sing-box/config.json',
+        config_path: '/etc/tachyon-core/config.json',
         wan_ip: '192.168.1.60',
         wan_public: 0,
         requires_public_wan: 0,
@@ -82,7 +82,7 @@ describe('runInboundsCheck', () => {
       success: true,
       data: {
         enabled_count: 1,
-        config_path: '/etc/sing-box/config.json',
+        config_path: '/etc/tachyon-core/config.json',
         wan_ip: '192.168.1.60',
         wan_public: 0,
         requires_public_wan: 1,
@@ -133,7 +133,7 @@ describe('runInboundsCheck', () => {
       success: true,
       data: {
         enabled_count: 0,
-        config_path: '/etc/sing-box/config.json',
+        config_path: '/etc/tachyon-core/config.json',
         wan_ip: '192.168.1.60',
         wan_public: 0,
         requires_public_wan: 0,
@@ -147,5 +147,77 @@ describe('runInboundsCheck', () => {
     const lastCall = calls[calls.length - 1]?.[0];
     expect(lastCall).toBeDefined();
     expect(lastCall.state).toBe('skipped');
+  });
+
+  it('brackets IPv6 listen addresses and includes WAN IPv6 when present', async () => {
+    mocks.checkInbounds.mockResolvedValue({
+      success: true,
+      data: {
+        enabled_count: 1,
+        config_path: '/etc/tachyon-core/config.json',
+        wan_ip: '203.0.113.10',
+        wan_ipv6: '2001:db8::10',
+        wan_public: 1,
+        wan_ipv6_public: 1,
+        items: [
+          {
+            id: 'srv_v6',
+            label: 'VLESS IPv6',
+            protocol: 'vless',
+            listen: '::',
+            listen_port: 8443,
+            required_proto: 'tcp',
+            runtime_exists: 1,
+            runtime_type: 'vless',
+            runtime_listen: '::',
+            runtime_port: 8443,
+            runtime_ok: 1,
+            listening: 1,
+            firewall_required: 1,
+            firewall_open: 1,
+            port_conflict: 0,
+            port_conflict_owners: '',
+            routes_configured: 1,
+            routing_mode: 'direct',
+            public_host: 'v6.example.com',
+            public_host_resolved: 1,
+            public_host_public: 1,
+            public_host_matches_wan: 1,
+          },
+        ],
+      },
+    });
+
+    await runInboundsCheck();
+
+    const calls = mocks.updateCheckStore.mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0];
+    expect(lastCall).toBeDefined();
+    expect(lastCall.state).toBe('success');
+    expect(lastCall.items[0].value).toContain('2001:db8::10');
+    const listenItem = lastCall.items.find((i: { value?: string }) =>
+      String(i.value || '').includes('[::]:8443'),
+    );
+    expect(listenItem).toBeDefined();
+  });
+
+  it('does not duplicate wan_ipv6 when wan_ip already contains it', async () => {
+    mocks.checkInbounds.mockResolvedValue({
+      success: true,
+      data: {
+        enabled_count: 1,
+        config_path: '/etc/tachyon-core/config.json',
+        wan_ip: '203.0.113.10, 2001:db8::10',
+        wan_ipv6: '2001:db8::10',
+        wan_public: 1,
+        items: [],
+      },
+    });
+
+    await runInboundsCheck();
+
+    const calls = mocks.updateCheckStore.mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0];
+    expect(lastCall.items[0].value).toBe('203.0.113.10, 2001:db8::10');
   });
 });

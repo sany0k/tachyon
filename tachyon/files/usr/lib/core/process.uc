@@ -33,7 +33,7 @@ const PROC_COMM_FORMAT = "/proc/%s/comm";
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 
 // Patterns that identify Tachyon-managed processes in /proc/PID/cmdline
-const TACHYON_CMDLINE_PATTERN = /ucode|tachyon|sh|sing-box/;
+const TACHYON_CMDLINE_PATTERN = /ucode|tachyon|sh|tachyon-core/;
 
 // ---------------------------------------------------------------------------
 // Boot ID
@@ -155,16 +155,13 @@ function pid_alive_raw(pid) {
     pid = as_string(pid);
     if (match(pid, /^[0-9]+$/) == null)
         return false;
-    if (int(system("kill -0 " + shell_quote(pid) + " 2>/dev/null")) == 0)
+    // Fast path: /proc needs no permission to stat the directory entry and
+    // avoids forking a shell for `kill -0` on every liveness probe.
+    if (fs.access(sprintf(PROC_DIR_FORMAT, pid), "f") == true)
         return true;
-    // kill -0 fails both when the process is gone (ESRCH) and when it exists but
-    // belongs to another user (EPERM), and both arrive as the same exit code 1,
-    // so the status alone cannot tell them apart. Reading every failure as "gone"
-    // is the exact inverse of the PID-recycling hazard this module exists to
-    // stop: it declares a LIVE worker dead, and the job reaper then rolls back
-    // work that is still running. /proc needs no permission to stat the directory
-    // entry, so it settles the question.
-    return fs.access(sprintf(PROC_DIR_FORMAT, pid), "f") == true;
+    if (fs.access("/proc/self", "f") == true)
+        return false;
+    return int(system("kill -0 " + shell_quote(pid) + " 2>/dev/null")) == 0;
 }
 
 // Check if a PID is alive AND belongs to a Tachyon-managed process.
@@ -179,26 +176,228 @@ function is_tachyon_process(pid) {
     return true;
 }
 
-// The core answers to `tachyon-core`. A router upgraded from the previous
-// release can still have the old process or its `/usr/bin/sing-box` symlink
-// running, so both names count as the engine here.
-const CORE_PROCESS_NAMES = [ "tachyon-core", "sing-box" ];
+// The core answers to `tachyon-core`.
+const CORE_PROCESS_NAMES = [ "tachyon-core" ];
 
-// Check if a PID is a proxy-core process (by /proc/PID/exe or /proc/PID/comm).
-function is_sing_box(pid) {
+// Service identity for the proxy core. Doctor, status, watchdog, lifecycle
+// and every init-script generator read this instead of hardcoding the procd
+// name, binary paths, pid files or UCI package. The init script's comm is
+// the procd name (`tachyon-core`, 15 characters), so BusyBox `killall` of
+// that name signals the script that is starting or stopping the daemon.
+function core_contract() {
+    return {
+        procd_name: "tachyon-core",
+        init_script: "/etc/init.d/tachyon-core",
+        uci_package: "tachyon-core",
+        pid_files: [
+            "/var/run/tachyon-core.pid",
+            "/var/run/tachyon-core/tachyon-core.pid"
+        ],
+        binaries: [ "/usr/bin/tachyon-core" ],
+        comm_names: CORE_PROCESS_NAMES,
+        workdir: "/usr/share/tachyon-core",
+        config_file: "/etc/tachyon-core/config.json",
+        log_file: "/tmp/tachyon-core/tachyon-core.log"
+    };
+}
+
+function own_pid() {
+    let stat = trim(as_string(fs.readfile("/proc/self/stat") || ""));
+    let sp = index(stat, " ");
+    if (sp <= 0)
+        return "";
+    return substr(stat, 0, sp);
+}
+
+function exe_basename(pid) {
+    let exe = fs.readlink(sprintf(PROC_EXE_FORMAT, as_string(pid)));
+    if (exe == null || exe == "")
+        return "";
+    exe = as_string(exe);
+    let space = index(exe, " ");
+    if (space >= 0)
+        exe = substr(exe, 0, space);
+    let slash = rindex(exe, "/");
+    return slash >= 0 ? substr(exe, slash + 1) : exe;
+}
+
+// /etc/init.d/tachyon-core is a shell script whose comm is tachyon-core.
+// Matching on comm alone treats that script as the daemon.
+function is_core_initscript(pid) {
     pid = as_string(pid);
     if (match(pid, /^[0-9]+$/) == null)
         return false;
+    let cmd = as_string(fs.readfile(sprintf(PROC_CMDLINE_FORMAT, pid)) || "");
+    return index(cmd, core_contract().init_script) >= 0;
+}
 
-    let exe = fs.readlink(sprintf(PROC_EXE_FORMAT, pid));
-    if (exe != null && exe != "") {
-        let slash = rindex(exe, "/");
-        let basename = slash >= 0 ? substr(exe, slash + 1) : exe;
-        // the /usr/bin/sing-box symlink resolves to the core, so an upgraded
-        // router reports the old name here even though it runs the new binary
-        if (index(CORE_PROCESS_NAMES, basename) >= 0)
+function core_daemon_pids() {
+    let found = [];
+    let directory = fs.opendir("/proc");
+    if (!directory)
+        return found;
+    let entry;
+    let self = own_pid();
+    while ((entry = directory.read()) != null) {
+        if (ltrim(entry, "0123456789") != "")
+            continue;
+        if (entry == self || is_core_initscript(entry))
+            continue;
+        if (index(CORE_PROCESS_NAMES, exe_basename(entry)) >= 0)
+            push(found, entry);
+    }
+    directory.close();
+    return found;
+}
+
+// Signal daemon binaries only. Never killall: that matches the init script.
+function kill_core_daemons() {
+    let killed = 0;
+    for (let pid in core_daemon_pids()) {
+        if (common.command_success_from_args([ "kill", "-9", pid ]))
+            killed++;
+    }
+    return killed;
+}
+
+// Adjust scheduling priority of running core daemons for Tachyon Lite mode.
+function apply_lite_mode_priority(enabled) {
+    let is_lite = (enabled === true || as_string(enabled) == "1" || as_string(enabled) == "true");
+    let nice_val = is_lite ? "15" : "0";
+    let updated = 0;
+    for (let pid in core_daemon_pids()) {
+        if (common.command_success_from_args([ "renice", "-n", nice_val, "-p", pid ]) ||
+            common.command_success_from_args([ "renice", nice_val, "-p", pid ])) {
+            updated++;
+        }
+    }
+    return updated;
+}
+
+function init_script_kills_itself(text) {
+    let name = core_contract().procd_name;
+    for (let line in split(as_string(text), "\n")) {
+        if (index(line, "killall") < 0)
+            continue;
+        if (match(line, regexp("(^|[^A-Za-z0-9_-])" + name + "([^A-Za-z0-9_-]|$)")) != null)
             return true;
     }
+    return false;
+}
+
+// Single generator for /etc/init.d/tachyon-core. reset_log truncates the core
+// log before procd starts.
+function managed_core_init_script(marker, reset_log) {
+    let contract = core_contract();
+    marker = as_string(marker);
+    if (marker == "")
+        marker = "Tachyon managed tachyon-core service";
+
+    let primary = contract.binaries[0];
+    let comms = contract.comm_names[0];
+    let exe_case = "*/" + contract.comm_names[0];
+    let log_prep = "";
+    if (reset_log)
+        log_prep = "    mkdir -p /tmp/tachyon-core 2>/dev/null\n" +
+            "    : > " + contract.log_file + " 2>/dev/null\n";
+
+    return "#!/bin/sh /etc/rc.common\n" +
+        "# " + marker + "\n\n" +
+        "USE_PROCD=1\n" +
+        "START=99\n" +
+        "PROG=\"" + primary + "\"\n\n" +
+        "_kill_daemon_instances() {\n" +
+        "    for p in $(pidof " + comms + " 2>/dev/null); do\n" +
+        "        [ \"$p\" != \"$$\" ] || continue\n" +
+        "        case \"$(readlink -f /proc/$p/exe 2>/dev/null)\" in\n" +
+        "            " + exe_case + ") kill -9 \"$p\" 2>/dev/null || true ;;\n" +
+        "        esac\n" +
+        "    done\n" +
+        "}\n\n" +
+        "_has_running_daemon() {\n" +
+        "    for p in $(pidof " + comms + " 2>/dev/null); do\n" +
+        "        [ \"$p\" != \"$$\" ] || continue\n" +
+        "        case \"$(readlink -f /proc/$p/exe 2>/dev/null)\" in\n" +
+        "            " + exe_case + ") return 0 ;;\n" +
+        "        esac\n" +
+        "    done\n" +
+        "    return 1\n" +
+        "}\n\n" +
+        "start_service() {\n" +
+        "    [ -d /dev/net ] || mkdir -p /dev/net\n" +
+        "    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true\n" +
+        "    modprobe tun 2>/dev/null || true\n" +
+        "    modprobe inet_diag 2>/dev/null || true\n\n" +
+        "    config_load \"" + contract.uci_package + "\"\n" +
+        "    local enabled config_file working_directory\n" +
+        "    local log_stderr\n\n" +
+        "    config_get_bool enabled \"main\" \"enabled\" \"0\"\n" +
+        "    [ \"$enabled\" -eq \"1\" ] || return 0\n\n" +
+        "    [ -x \"$PROG\" ] || PROG=\"$(command -v " + contract.comm_names[0] + " 2>/dev/null || echo " + primary + ")\"\n" +
+        "    config_get config_file \"main\" \"conffile\" \"" + contract.config_file + "\"\n" +
+        "    config_get working_directory \"main\" \"workdir\" \"" + contract.workdir + "\"\n" +
+        "    [ -d \"$working_directory\" ] || mkdir -p \"$working_directory\"\n" +
+        "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n\n" +
+        log_prep +
+        "    _kill_daemon_instances\n\n" +
+        "    procd_open_instance\n" +
+        "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
+        "    procd_set_param stderr \"$log_stderr\"\n" +
+        "    procd_set_param limits core=\"0\"\n" +
+        "    procd_set_param limits nofile=\"65535 65535\"\n" +
+        "    local lite_mode=\"$(uci get tachyon.settings.lite_mode 2>/dev/null || echo 0)\"\n" +
+        "    if [ \"$lite_mode\" = \"1\" ] || [ \"$lite_mode\" = \"true\" ]; then\n" +
+        "        procd_set_param nice 15\n" +
+        "    fi\n" +
+        "    procd_set_param env TACHYON_RULESET_SOFT_START=\"1\"\n" +
+        "    procd_set_param term_timeout 15\n" +
+        "    procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-0}\n" +
+        "    procd_close_instance\n" +
+        "}\n\n" +
+        "stop_service() {\n" +
+        "    for p in $(pidof " + comms + " 2>/dev/null); do\n" +
+        "        [ \"$p\" != \"$$\" ] || continue\n" +
+        "        case \"$(readlink -f /proc/$p/exe 2>/dev/null)\" in\n" +
+        "            " + exe_case + ") kill -TERM \"$p\" 2>/dev/null || true ;;\n" +
+        "        esac\n" +
+        "    done\n" +
+        "    local i=0\n" +
+        "    while [ \"$i\" -lt 20 ]; do\n" +
+        "        _has_running_daemon || return 0\n" +
+        "        sleep 0.1 2>/dev/null || sleep 1\n" +
+        "        i=$(( i + 1 ))\n" +
+        "    done\n" +
+        "    _kill_daemon_instances\n" +
+        "}\n\n" +
+        "reload_service() {\n" +
+        "    for p in $(pidof " + comms + " 2>/dev/null); do\n" +
+        "        [ \"$p\" != \"$$\" ] || continue\n" +
+        "        case \"$(readlink -f /proc/$p/exe 2>/dev/null)\" in\n" +
+        "            " + exe_case + ")\n" +
+        "                if ucode -L /usr/lib/tachyon /usr/lib/tachyon/service/state.uc sighup-core-runtime \"$p\" >/dev/null 2>&1; then\n" +
+        "                    return 0\n" +
+        "                fi\n" +
+        "                break\n" +
+        "                ;;\n" +
+        "        esac\n" +
+        "    done\n" +
+        "    restart\n" +
+        "}\n\n" +
+        "service_triggers() {\n" +
+        "    procd_add_reload_trigger \"" + contract.procd_name + "\"\n" +
+        "}\n";
+}
+
+// Check if a PID is a proxy-core process (by /proc/PID/exe or /proc/PID/comm).
+function is_tachyon_core(pid) {
+    pid = as_string(pid);
+    if (match(pid, /^[0-9]+$/) == null)
+        return false;
+    if (is_core_initscript(pid))
+        return false;
+
+    if (index(CORE_PROCESS_NAMES, exe_basename(pid)) >= 0)
+        return true;
 
     let comm = trim(as_string(fs.readfile(sprintf(PROC_COMM_FORMAT, pid)) || ""));
     if (index(CORE_PROCESS_NAMES, comm) >= 0)
@@ -284,7 +483,16 @@ function module_exports() {
         // Liveness
         pid_alive_raw,
         is_tachyon_process,
-        is_sing_box,
+        is_tachyon_core,
+        core_contract,
+        own_pid,
+        exe_basename,
+        is_core_initscript,
+        core_daemon_pids,
+        kill_core_daemons,
+        apply_lite_mode_priority,
+        init_script_kills_itself,
+        managed_core_init_script,
 
         // Identity
         make_identity,
@@ -382,6 +590,20 @@ if (mode == "selftest") {
     let bid2 = boot_id();
     _test_assert(bid1 == bid2, "boot_id should be stable");
 
+    // Test 13: generated init never killall's its own comm
+    let contract = core_contract();
+    _test_assert(contract.procd_name == "tachyon-core", "procd name");
+    _test_assert(contract.init_script == "/etc/init.d/tachyon-core", "init script path");
+    let generated = managed_core_init_script("marker", false);
+    let generated_log = managed_core_init_script("marker", true);
+    _test_assert(index(generated, "killall") < 0, "generated init must not call killall");
+    _test_assert(!init_script_kills_itself(generated), "generated init must not kill itself");
+    _test_assert(init_script_kills_itself("killall -q -9 tachyon-core\n"), "detector flags killall of the init comm");
+    _test_assert(index(generated, "_kill_daemon_instances") >= 0, "safe killer is present");
+    _test_assert(index(generated_log, contract.log_file) >= 0, "reset-log mode truncates the core log");
+    _test_assert(index(generated, contract.log_file) < 0, "plain mode leaves the core log alone");
+    _test_assert(index(generated, "procd_set_param nice 15") >= 0, "generated init supports lite_mode nice 15");
+
     print("process.uc selftest: " + _test_pass + " passed, " + _test_fail + " failed\n");
     exit(_test_fail > 0 ? 1 : 0);
 }
@@ -417,7 +639,17 @@ else if (mode == "alive") {
     }
     exit(pid_alive_raw(ARGV[1]) ? 0 : 1);
 }
+else if (mode == "init-script") {
+    print(managed_core_init_script(ARGV[1] || "", ARGV[2] == "reset-log"));
+}
+else if (mode == "kills-itself") {
+    if (ARGV[1] == null) {
+        warn("Usage: core/process.uc kills-itself <file>\n");
+        exit(1);
+    }
+    exit(init_script_kills_itself(fs.readfile(ARGV[1]) || "") ? 0 : 1);
+}
 else {
-    print("Usage: core/process.uc <selftest|boot-id|starttime|age|alive> ...\n");
+    print("Usage: core/process.uc <selftest|boot-id|starttime|age|alive|init-script|kills-itself> ...\n");
     exit(1);
 }

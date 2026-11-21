@@ -87,14 +87,14 @@ function count_prefix(values, prefix) { let count = 0; for (let value in values 
 
 let single = cfg(ARGV[0]);
 assert(length(single.dns.servers) == 3, "singleton keeps the legacy three-server shape");
-assert(length(single.inbounds) == 3, "singleton adds no health inbounds");
+assert(length(single.inbounds) == 2, "singleton without IPv6 adds no health inbounds");
 assert(count_prefix(single.dns.servers, "dns-health-") == 0, "singleton adds no health servers");
 assert(find_tag(single.dns.servers, "dns-server").server == "77.88.8.8", "singleton main DNS preserved");
 assert(single.route.default_domain_resolver == "dns-server", "singleton keeps main default resolver");
 
 let multi = cfg(ARGV[1]);
 assert(length(multi.dns.servers) == 7, "two main and two bootstrap candidates are generated");
-assert(length(multi.inbounds) == 8, "candidate and active health inbounds are generated");
+assert(length(multi.inbounds) == 7, "candidate and active health inbounds are generated");
 assert(count_prefix(multi.dns.servers, "dns-health-main-") == 2, "main health servers generated");
 assert(count_prefix(multi.dns.servers, "dns-health-bootstrap-") == 2, "bootstrap health servers generated");
 let main = find_tag(multi.dns.servers, "dns-server");
@@ -136,6 +136,17 @@ printf '%s' "$selected" | grep -Eq '"reason"[[:space:]]*:[[:space:]]*"active_dea
 selected="$(ucode -L "$TACHYON_LIB" "$FAILOVER" select-fixture "$WORK_DIR/select-state.json" "$WORK_DIR/alive-recovery.json" bootstrap 1)"
 printf '%s' "$selected" | grep -Eq '"index"[[:space:]]*:[[:space:]]*0' || fail "recovery must return to the highest live priority"
 printf '%s' "$selected" | grep -Eq '"reason"[[:space:]]*:[[:space:]]*"recovery"' || fail "recovery reason"
+
+# Issue #364: transient WAN blip where index 0 and 1 fail while WAN is down,
+# then WAN comes back up by the time index 2 is probed. Re-probing index 0
+# must keep priority 0 instead of switching to fallback index 2.
+cat >"$WORK_DIR/alive-blip.json" <<'JSON'
+{ "0": [false, true], "1": false, "2": true }
+JSON
+selected="$(ucode -L "$TACHYON_LIB" "$FAILOVER" select-fixture "$WORK_DIR/select-state.json" "$WORK_DIR/alive-blip.json" main 0)"
+printf '%s' "$selected" | grep -Eq '"index"[[:space:]]*:[[:space:]]*0' || fail "transient WAN blip must re-verify and keep active DNS index 0"
+printf '%s' "$selected" | grep -Eq '"reason"[[:space:]]*:[[:space:]]*"alive"' || fail "transient WAN blip reason must be alive"
+
 
 cat >"$WORK_DIR/verify-previous.json" <<'JSON'
 { "main_index": 0, "bootstrap_index": 0, "bootstrap_servers": [ "a", "b" ] }

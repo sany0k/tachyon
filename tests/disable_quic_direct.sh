@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# disable_quic has to reach traffic that never reaches sing-box, and since the
+# disable_quic has to reach traffic that never reaches tachyon-core, and since the
 # option became three modes (off/tunneled/all) every layer has to agree on them.
 #
-# singbox/route.uc rejects UDP/443 inside the engine, which only helps for
+# tachyon_core/route.uc rejects UDP/443 inside the engine, which only helps for
 # connections the tproxy rules handed over. A client whose destination is not
 # marked keeps using HTTP/3 straight out of br-lan, where the local DPI mangles
 # it - the measured symptom was the VK app loading nothing while Telegram, which
@@ -38,8 +38,8 @@ export NFT_LOG
 # reject with icmpx, not drop: a client whose QUIC is dropped waits out its own
 # timeout before falling back to TCP, an ICMP port-unreachable makes it
 # immediate.
-QUIC_TUNNELED_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\t&\t0x00100000\t!=\t0x00100000\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
-QUIC_ALL_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
+QUIC_TUNNELED_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\t&\t0x00100000\t==\t0x00100000\tmeta\tmark\tset\tmeta\tmark\t&\t0xffefffff\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
+QUIC_ALL_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\tset\tmeta\tmark\t&\t0xffefffff\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
 
 base_args=(nft-create-runtime-base TachyonTable localv4 tachyon_subnets
   tachyon_ports tachyon_ip_ports tachyon_interfaces "br-lan" 0x00100000
@@ -54,22 +54,21 @@ run_base() {
 # 1. Legacy flag value "1" keeps its meaning: the tunneled rule.
 run_base 1
 grep -Fq "$QUIC_TUNNELED_RULE" "$NFT_LOG" ||
-  fail "disable_quic=1 must reject UDP/443 that was not marked for tproxy"
+  fail "disable_quic=1 must reject UDP/443 marked for tproxy"
 
-# The reject has to sit after the fakeip marking rules. Traffic that sing-box is
-# going to handle must be left alone so the engine keeps deciding for it.
+# The reject has to sit after the fakeip marking rules.
 quic_line="$(awk -v pat='th\tdport\t443\tmeta\tmark' 'index($0, pat) { print NR; exit }' "$NFT_LOG")"
 fakeip_line="$(awk -v pat='ip\tdaddr\t198.18.0.0/15\tmeta\tl4proto\tudp\tmeta\tmark\tset' 'index($0, pat) { print NR; exit }' "$NFT_LOG")"
 
 [ -n "$quic_line" ] || fail "QUIC reject rule was not emitted"
 [ -n "$fakeip_line" ] || fail "fakeip marking rule was not emitted, cannot verify ordering"
 [ "$fakeip_line" -lt "$quic_line" ] ||
-  fail "QUIC reject must come after fakeip marking, else proxied QUIC is rejected before sing-box sees it"
+  fail "QUIC reject must come after fakeip marking, else proxied QUIC mark is not set yet"
 
 # 2. The explicit mode name behaves exactly like the legacy flag.
 run_base tunneled
 grep -Fq "$QUIC_TUNNELED_RULE" "$NFT_LOG" ||
-  fail "disable_quic=tunneled must reject UDP/443 that was not marked for tproxy"
+  fail "disable_quic=tunneled must reject UDP/443 marked for tproxy"
 
 # 3. "all" drops the mark condition: every UDP/443 is rejected, marked or not.
 run_base all
@@ -103,7 +102,7 @@ EOF_UCI
 
 run_from_uci 1
 grep -Fq "$QUIC_TUNNELED_RULE" "$NFT_LOG" ||
-  fail "settings.disable_quic=1 must reject the unmarked UDP/443"
+  fail "settings.disable_quic=1 must reject marked UDP/443"
 
 run_from_uci all
 grep -Fq "$QUIC_ALL_RULE" "$NFT_LOG" ||
@@ -152,6 +151,20 @@ for on_mode in 1 tunneled all; do
   route_fixture "$on_mode" "$WORK_DIR/out_quic_$on_mode"
   grep -Fq '"protocol": "quic"' "$WORK_DIR/out_quic_$on_mode" ||
     fail "disable_quic=$on_mode must push the route-level QUIC reject"
+  ucode -e '
+    import * as fs from "fs";
+    let cfg = json(fs.readfile(ARGV[0]));
+    let quic_rule = null;
+    for (let r in cfg.route.rules) {
+      if (r.protocol == "quic") {
+        quic_rule = r;
+        break;
+      }
+    }
+    if (!quic_rule || type(quic_rule.port) != "array" || length(quic_rule.port) != 1 || quic_rule.port[0] != 443)
+      exit(1);
+  ' -- "$WORK_DIR/out_quic_$on_mode" ||
+    fail "disable_quic=$on_mode protocol=quic rule must be scoped to port 443 so P2P QUIC on other ports is not killed"
 done
 
 route_fixture off "$WORK_DIR/out_quic_off"

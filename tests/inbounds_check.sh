@@ -81,28 +81,49 @@ if ! echo "$render_vless_out" | grep -Fq "[WARN] WAN IP is not public"; then
   fail "VLESS with private WAN IP should produce [WARN] in render_global_inbounds_check: $render_vless_out"
 fi
 
-# 5. Native Tailscale has no sing-box endpoint/route rule: the item must still
-# report runtime_ok=1 (TCH-1037), while the same empty runtime without the
-# native flag must keep reporting a failure.
+# 5. Native tachyon-core Tailscale endpoint: present endpoint reports runtime_ok=1,
+# while missing endpoint reports runtime_ok=0.
 # NB: no negative argument values here — ucode's CLI parses "-1" as an option.
-native_out="$(ucode -L "$TACHYON_LIB" "$STATUS_UC" inbound-item-json '{}' 'ts' 'Head' 'tailscale' 'native' \
+present_out="$(ucode -L "$TACHYON_LIB" "$STATUS_UC" inbound-item-json '{"exists":1,"type":"tailscale"}' 'ts' 'Head' 'tailscale' 'rules' \
   'server-Head-in' '0.0.0.0' '' '' '' 'tailscale' 'tcp' '0' '0' '0' '0' '' '1' '0' '0' '0' '1')"
-printf '%s' "$native_out" | ucode -e '
+printf '%s' "$present_out" | ucode -e '
 let fs = require("fs");
 let d = json(fs.readfile("/dev/stdin"));
 if (int(d.runtime_ok) != 1)
-    die("native tailscale item must report runtime_ok=1: " + sprintf("%J", d) + "\n");
-if (d.routing_mode != "native")
-    die("native tailscale item must keep routing_mode=native: " + sprintf("%J", d) + "\n");
-' || fail "native Tailscale inbound item check failed"
+    die("present tailscale endpoint must report runtime_ok=1: " + sprintf("%J", d) + "\n");
+' || fail "present Tailscale inbound item check failed"
 
-non_native_out="$(ucode -L "$TACHYON_LIB" "$STATUS_UC" inbound-item-json '{}' 'ts' 'Head' 'tailscale' 'rules' \
+missing_out="$(ucode -L "$TACHYON_LIB" "$STATUS_UC" inbound-item-json '{}' 'ts' 'Head' 'tailscale' 'rules' \
   'server-Head-in' '0.0.0.0' '' '' '' 'tailscale' 'tcp' '0' '0' '0' '0' '' '0' '0' '0' '0' '0')"
-printf '%s' "$non_native_out" | ucode -e '
+printf '%s' "$missing_out" | ucode -e '
 let fs = require("fs");
 let d = json(fs.readfile("/dev/stdin"));
 if (int(d.runtime_ok) != 0)
-    die("missing non-native tailscale endpoint must still report runtime_ok=0: " + sprintf("%J", d) + "\n");
-' || fail "non-native Tailscale inbound item regression"
+    die("missing tailscale endpoint must report runtime_ok=0: " + sprintf("%J", d) + "\n");
+' || fail "missing Tailscale inbound item regression"
+
+# 6. Live nftables dstnat redirect & DNAT rules satisfy firewall_required_protocols_open_cached
+env -u TACHYON_UCI_STATE_FILE -u UCI_STATE ucode -L "$TACHYON_LIB" -e '
+let r = require("diagnostics.routing");
+let dstnat_redirect = "meta nfproto ipv4 tcp dport 443 counter packets 0 bytes 0 redirect to :8443 comment \"!fw4: VLESS\"";
+if (!r.firewall_required_protocols_open_cached("8443", "tcp", "", "", dstnat_redirect, "192.168.1.1"))
+    die("nft redirect to :8443 must satisfy 8443/tcp\n");
+if (r.firewall_required_protocols_open_cached("8443", "udp", "", "", dstnat_redirect, "192.168.1.1"))
+    die("nft tcp redirect must not satisfy 8443/udp\n");
+if (r.firewall_required_protocols_open_cached("443", "tcp", "", "", dstnat_redirect, "192.168.1.1"))
+    die("nft redirect from 443 to :8443 must not satisfy 443/tcp\n");
+
+let dstnat_dnat = "meta nfproto ipv4 tcp dport 8443 counter dnat ip to 192.168.1.1:8443";
+if (!r.firewall_required_protocols_open_cached("8443", "tcp", "", "", dstnat_dnat, "192.168.1.1"))
+    die("nft dnat to local router IP 192.168.1.1:8443 must satisfy 8443/tcp\n");
+
+let dstnat_other_host = "meta nfproto ipv4 tcp dport 8443 counter dnat ip to 192.168.1.50:8443";
+if (r.firewall_required_protocols_open_cached("8443", "tcp", "", "", dstnat_other_host, "192.168.1.1"))
+    die("nft dnat to non-router LAN host must not satisfy 8443/tcp\n");
+
+let dstnat_both = "meta nfproto ipv4 meta l4proto { tcp, udp } th dport 443 redirect to :8443";
+if (!r.firewall_required_protocols_open_cached("8443", "tcp udp", "", "", dstnat_both, "192.168.1.1"))
+    die("nft multi-proto redirect must satisfy 8443 tcp udp\n");
+' || fail "nft dstnat redirect diagnostic regression"
 
 printf 'inbounds check diagnostics tests passed\n'

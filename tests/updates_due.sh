@@ -80,10 +80,10 @@ assert_eq "0 0 * * *" \
 assert_eq "*/30 * * * * /usr/bin/tachyon list_update_if_due # list" \
   "$(updates_ucode list-update-cron-job 30m /usr/bin/tachyon '# list')" \
   "list update cron job"
-assert_eq $'https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/telegram.lst\nhttps://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv6/telegram.lst' \
+assert_eq 'https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release/subnets/telegram.lst' \
   "$(updates_ucode builtin-subnet-urls telegram)" \
   "Telegram built-in subnet families"
-assert_eq 'https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/roblox.lst' \
+assert_eq 'https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release/subnets/roblox.lst' \
   "$(updates_ucode builtin-subnet-urls roblox)" \
   "Roblox available subnet family"
 assert_eq "0 */2 * * * /usr/bin/tachyon subscription_update_if_due # subscription" \
@@ -201,7 +201,7 @@ cat >"$WORK_DIR/cron-plan-auto-update.json" <<'JSON'
 }
 JSON
 
-assert_eq $'component\t0 0 * * * /usr/bin/tachyon component_updates_if_due # component\ncomponent-auto-update\t30 3 * * * /usr/bin/tachyon component_auto_update_apply # component' \
+assert_eq $'component\t0 0 * * * /usr/bin/tachyon component_updates_if_due # component\ncomponent-auto-update\t*/10 * * * * /usr/bin/tachyon component_auto_update_apply # component' \
   "$(updates_ucode cron-refresh-plan-fixture "$WORK_DIR/cron-plan-auto-update.json" /usr/bin/tachyon '# list' '# subscription' '# component')" \
   "component auto-update cron plan"
 

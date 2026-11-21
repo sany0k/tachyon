@@ -76,6 +76,55 @@ if command -v ucode >/dev/null 2>&1; then
   if (!found)
     die("server-VLESSXHTTP-in not found in inbounds");
   '
+
+  # 3. Quarantined server sections must be skipped by enabled_servers() so a
+  # broken server inbound does not crash the whole service (issues #233/#234).
+  cat >"$WORK_DIR/fixture-quarantine.json" <<'JSON'
+{
+  "settings": {
+    ".name": "settings",
+    ".type": "settings",
+    "enabled": "1",
+    "dns_type": "udp",
+    "dns_server": "1.1.1.1",
+    "service_listen_address": "127.0.0.1"
+  },
+  "section": [
+    {
+      ".name": "main",
+      ".type": "section",
+      "enabled": "1",
+      "action": "bypass",
+      "domain_list": [ "example.com" ]
+    }
+  ],
+  "server": [
+    {
+      ".name": "bad_srv",
+      ".type": "server",
+      "enabled": "1",
+      "protocol": "vless",
+      "security": "reality",
+      "server_uuid": "a86dca7b-fba1-4b19-9cf4-fa47d894b910",
+      "reality_private_key": "dGhpc2lzYXNhbXBsZXJlYWxpdHlrZXkxMjM0NTY3ODk",
+      "reality_handshake_server": "www.microsoft.com",
+      "reality_handshake_server_port": "443"
+    }
+  ]
+}
+JSON
+  config_q="$WORK_DIR/config-quarantine.json"
+  ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+    "$WORK_DIR/fixture-quarantine.json" "$config_q" "127.0.0.1" "0" "1" "" "bad_srv" >/dev/null
+
+  ucode -L "$TACHYON_LIB" -e '
+  let fs = require("fs");
+  let parsed = json(fs.readfile("'"$config_q"'"));
+  for (let inbound in parsed.inbounds) {
+    if (inbound.tag == "server-bad_srv-in")
+      die("quarantined server bad_srv must be omitted from inbounds");
+  }
+  '
 fi
 
 printf 'reality inbound certificate compatibility checks passed\n'

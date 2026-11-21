@@ -4,6 +4,7 @@ let fs = require("fs");
 let constants = require("core.constants");
 let uci_core = require("core.uci");
 let common = require("core.common");
+let kill_switch = require("service.kill_switch");
 
 let as_string = common.as_string;
 
@@ -37,10 +38,13 @@ const RULE_CONDITION_CACHE_DIR = getenv("TACHYON_RULE_CONDITION_CACHE_DIR") || R
 const RUNTIME_CACHE_FORMAT_FILE = getenv("TACHYON_RUNTIME_CACHE_FORMAT_FILE") || RUNTIME_STATE_DIR + "/cache-format";
 const PERSISTENT_SUBSCRIPTION_CACHE_DIR = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR") || "/etc/tachyon/subscription-cache";
 const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT_FILE") || PERSISTENT_SUBSCRIPTION_CACHE_DIR + "/cache-format";
-const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "7";
+const PERSISTENT_SUBSCRIPTION_CACHE_FORMAT = getenv("TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_FORMAT") || "8";
 const SUBSCRIPTION_BOOTSTRAP_RETRY_PID_FILE = getenv("TACHYON_SUBSCRIPTION_BOOTSTRAP_RETRY_PID_FILE") || RUNTIME_STATE_DIR + "/subscription-bootstrap-retry.pid";
 const DNS_FAILOVER_STATE_FILE = getenv("TACHYON_DNS_FAILOVER_STATE_FILE") || RUNTIME_STATE_DIR + "/dns-failover.json";
 const DNS_FAILOVER_PID_FILE = getenv("TACHYON_DNS_FAILOVER_PID_FILE") || RUNTIME_STATE_DIR + "/dns-failover.pid";
+const SECTION_FAIL_STATE_FILE = getenv("TACHYON_SECTION_FAIL_STATE_FILE") || RUNTIME_STATE_DIR + "/section-fail-state.json";
+const SECTION_ERRORS_FILE = getenv("TACHYON_SECTION_ERRORS_FILE") || RUNTIME_STATE_DIR + "/section-errors.json";
+const VALIDATOR_QUARANTINED_FILE = getenv("TACHYON_VALIDATOR_QUARANTINED_FILE") || RUNTIME_STATE_DIR + "/validator-quarantined.json";
 const SUBSCRIPTION_UPDATE_LOCK_DIR = getenv("TACHYON_SUBSCRIPTION_UPDATE_LOCK_DIR") || RUNTIME_STATE_DIR + "/subscription-update.lock";
 const RELOAD_LOCK_DIR = getenv("TACHYON_RELOAD_LOCK_DIR") || "/var/run/tachyon.reload.lock";
 const INTERNAL_CONFIG_TRIGGER_GUARD = getenv("TACHYON_INTERNAL_CONFIG_TRIGGER_GUARD") || "/var/run/tachyon.internal-config-change";
@@ -49,24 +53,24 @@ const LIST_UPDATE_CRON_MARKER = getenv("TACHYON_LIST_UPDATE_CRON_MARKER") || "# 
 const SUBSCRIPTION_UPDATE_CRON_MARKER = getenv("TACHYON_SUBSCRIPTION_UPDATE_CRON_MARKER") || "# tachyon-subscription-update";
 const COMPONENT_UPDATE_CHECK_CRON_MARKER = getenv("TACHYON_COMPONENT_UPDATE_CHECK_CRON_MARKER") || "# tachyon-component-update-check";
 const RELOAD_STATE_FORMAT = int(getenv("TACHYON_RELOAD_STATE_FORMAT") || "1");
-const RUNTIME_CACHE_FORMAT = int(getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "8");
+const RUNTIME_CACHE_FORMAT = int(getenv("TACHYON_RUNTIME_CACHE_FORMAT") || "9");
 const RUNTIME_STABLE_MIN_AGE = int(getenv("TACHYON_RUNTIME_STABLE_MIN_AGE") || "2");
 // The stable-age window is what a successful start actually waits out: the poll
-// loop cannot succeed until sing-box has survived this long. It exists to catch a
+// loop cannot succeed until tachyon-core has survived this long. It exists to catch a
 // process that comes up and then dies on a bad config, which happens within the
 // first second or two, so 5s keeps the crash window while cutting 3s off every
 // start, restart and reload. Later failures are the watchdog's job, not this gate.
-const SING_BOX_START_STABLE_MIN_AGE = int(getenv("TACHYON_SING_BOX_START_STABLE_MIN_AGE") || "5");
-// A healthy sing-box reaches the stable age within a couple of seconds; a run that
+const TACHYON_CORE_START_STABLE_MIN_AGE = int(getenv("TACHYON_CORE_START_STABLE_MIN_AGE") || "5");
+// A healthy tachyon-core reaches the stable age within a couple of seconds; a run that
 // is still unstable at 15s is failing for a reason more time will not fix. Cold
 // boot is the exception: the WAN may still be coming up, so the init script raises
-// this via TACHYON_SING_BOX_START_VERIFY_TIMEOUT for boot and WAN-retry starts.
-const SING_BOX_START_VERIFY_TIMEOUT = int(getenv("TACHYON_SING_BOX_START_VERIFY_TIMEOUT") || "60");
+// this via TACHYON_CORE_START_VERIFY_TIMEOUT for boot and WAN-retry starts.
+const TACHYON_CORE_START_VERIFY_TIMEOUT = int(getenv("TACHYON_CORE_START_VERIFY_TIMEOUT") || "60");
 const NFT_POPULATE_ENABLED_DEFAULT = int(getenv("TACHYON_NFT_POPULATE_ENABLED") || "1");
 
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constant_value("TMP_SING_BOX_FOLDER", "/tmp/tachyon-core");
-const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || constant_value("TMP_RULESET_FOLDER", TMP_SING_BOX_FOLDER + "/rulesets");
-const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || constant_value("TMP_SUBSCRIPTION_FOLDER", TMP_SING_BOX_FOLDER + "/subscriptions");
+const TMP_TACHYON_CORE_FOLDER = getenv("TMP_TACHYON_CORE_FOLDER") || constant_value("TMP_TACHYON_CORE_FOLDER", "/tmp/tachyon-core");
+const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || constant_value("TMP_RULESET_FOLDER", TMP_TACHYON_CORE_FOLDER + "/rulesets");
+const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || constant_value("TMP_SUBSCRIPTION_FOLDER", TMP_TACHYON_CORE_FOLDER + "/subscriptions");
 
 const RT_TABLE_NAME = constant_value("RT_TABLE_NAME", "tachyon");
 const NFT_TABLE_NAME = constant_value("NFT_TABLE_NAME", "TachyonTable");
@@ -81,32 +85,19 @@ const NFT_INTERFACE_SET_NAME = constant_value("NFT_INTERFACE_SET_NAME", "tachyon
 const NFT_FAKEIP_MARK = constant_value("NFT_FAKEIP_MARK", "0x04000000");
 const NFT_OUTBOUND_MARK = constant_value("NFT_OUTBOUND_MARK", "0x08000000");
 
-const SB_FAKEIP_INET4_RANGE = constant_value("SB_FAKEIP_INET4_RANGE", "198.18.0.0/15");
-const SB_FAKEIP_INET6_RANGE = constant_value("SB_FAKEIP_INET6_RANGE", "fc00::/18");
-const SB_TPROXY_INBOUND6_ADDRESS = constant_value("SB_TPROXY_INBOUND6_ADDRESS", "::1");
-const SB_TPROXY_INBOUND_PORT = constant_value("SB_TPROXY_INBOUND_PORT", "1602");
-const SB_SERVICE_MIXED_INBOUND_ADDRESS = constant_value("SB_SERVICE_MIXED_INBOUND_ADDRESS", "127.0.0.1");
-const SB_SERVICE_MIXED_INBOUND_PORT = constant_value("SB_SERVICE_MIXED_INBOUND_PORT", "4534");
-const SB_VARIANT_STATE_FILE = constant_value("SB_VARIANT_STATE_FILE", "/etc/tachyon/tachyon-core-variant");
-const SB_VERSION_STATE_FILE = constant_value("SB_VERSION_STATE_FILE", "/etc/tachyon/tachyon-core-version");
-
-const ZAPRET_PROVIDER_NFQWS_BIN = constant_value("ZAPRET_PROVIDER_NFQWS_BIN", "/opt/zapret/nfq/nfqws");
-const ZAPRET_ROUTE_MARK_BASE = constant_value("ZAPRET_ROUTE_MARK_BASE", "0x01000000");
-const ZAPRET_QUEUE_BASE = constant_value("ZAPRET_QUEUE_BASE", "4000");
-const ZAPRET_DESYNC_MARK = constant_value("ZAPRET_DESYNC_MARK", "0x40000000");
-const ZAPRET_DESYNC_MARK_POSTNAT = constant_value("ZAPRET_DESYNC_MARK_POSTNAT", "0x20000000");
-const ZAPRET2_PROVIDER_NFQWS2_BIN = constant_value("ZAPRET2_PROVIDER_NFQWS2_BIN", "/opt/zapret2/nfq2/nfqws2");
-const ZAPRET2_ROUTE_MARK_BASE = constant_value("ZAPRET2_ROUTE_MARK_BASE", "0x02000000");
-const ZAPRET2_QUEUE_BASE = constant_value("ZAPRET2_QUEUE_BASE", "4300");
-const ZAPRET2_DESYNC_MARK = constant_value("ZAPRET2_DESYNC_MARK", "0x40000000");
-const ZAPRET2_DESYNC_MARK_POSTNAT = constant_value("ZAPRET2_DESYNC_MARK_POSTNAT", "0x20000000");
-const BYEDPI_BIN = constant_value("BYEDPI_BIN", "/usr/bin/ciadpi");
+const CORE_FAKEIP_INET4_RANGE = constant_value("CORE_FAKEIP_INET4_RANGE", "198.18.0.0/15");
+const CORE_FAKEIP_INET6_RANGE = constant_value("CORE_FAKEIP_INET6_RANGE", "fc00::/18");
+const CORE_TPROXY_INBOUND6_ADDRESS = constant_value("CORE_TPROXY_INBOUND6_ADDRESS", "::1");
+const CORE_TPROXY_INBOUND_PORT = constant_value("CORE_TPROXY_INBOUND_PORT", "1602");
+const CORE_SERVICE_MIXED_INBOUND_ADDRESS = constant_value("CORE_SERVICE_MIXED_INBOUND_ADDRESS", "127.0.0.1");
+const CORE_SERVICE_MIXED_INBOUND_PORT = constant_value("CORE_SERVICE_MIXED_INBOUND_PORT", "4534");
+const TACHYON_CORE_VERSION_FILE = constant_value("TACHYON_CORE_VERSION_FILE", "/etc/tachyon/tachyon-core-version");
 
 const DNS_APPLY_UC = LIB_DIR + "/dns/apply.uc";
 const VALIDATOR_UC = LIB_DIR + "/config/validator.uc";
 const SERVER_UC = LIB_DIR + "/server/service.uc";
 const NFT_UC = LIB_DIR + "/nft/apply.uc";
-const SINGBOX_UC = LIB_DIR + "/tachyon_core/runtime.uc";
+const TACHYON_CORE_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const PRIORITY_UC = LIB_DIR + "/tachyon_core/priority.uc";
 const DNS_FAILOVER_UC = LIB_DIR + "/tachyon_core/dns_failover.uc";
 const SUBSCRIPTION_CACHE_UC = LIB_DIR + "/subscription/cache.uc";
@@ -116,18 +107,10 @@ const STATE_UC = LIB_DIR + "/service/state.uc";
 const RELOAD_UC = LIB_DIR + "/service/reload.uc";
 const UI_UC = LIB_DIR + "/service/ui.uc";
 const DIAGNOSTICS_UC = LIB_DIR + "/diagnostics/runtime.uc";
-const ZAPRET_UC = LIB_DIR + "/providers/zapret/runtime.uc";
-const ZAPRET2_UC = LIB_DIR + "/providers/zapret2/runtime.uc";
-const BYEDPI_UC = LIB_DIR + "/providers/byedpi/runtime.uc";
-const TAILSCALE_UC = LIB_DIR + "/providers/tailscale/runtime.uc";
-const WDTT_UC = LIB_DIR + "/providers/wdtt/runtime.uc";
-const OLCRTC_UC = LIB_DIR + "/providers/olcrtc/runtime.uc";
-const FPTN_UC = LIB_DIR + "/providers/fptn/runtime.uc";
 const PARENTAL_QUOTA_UC = LIB_DIR + "/service/parental_quota.uc";
 const PACKAGES_UC = LIB_DIR + "/core/packages.uc";
 const WATCHDOG_UC = LIB_DIR + "/service/watchdog.uc";
 const TELEGRAM_UC = LIB_DIR + "/service/telegram.uc";
-const STEER_DNS_UC = LIB_DIR + "/steer/dns.uc";
 
 let start_subscription_update_lock_held = false;
 let subscription_caches_prepared = getenv("TACHYON_SUBSCRIPTION_CACHES_PREPARED") || "0";
@@ -136,20 +119,13 @@ let subscription_deferred_sections = "";
 let nft_populate_enabled = NFT_POPULATE_ENABLED_DEFAULT;
 let rule_condition_cache_enabled = 0;
 let startup_config_fingerprint = "";
+let startup_ipv6_effective = "";
 
 let shell_quote = common.shell_quote;
 
 let command_from_args = common.command_from_args;
 
-function normalize_status(status) {
-    status = int(status);
-    if (status == -1)
-        return 255;
-    let signal = status & 127;
-    if (signal != 0)
-        return 128 + signal;
-    return (status >> 8) & 255;
-}
+let normalize_status = common.normalize_status;
 
 let command_status = common.command_status;
 
@@ -255,19 +231,18 @@ function lifecycle_env() {
         TACHYON_SUBSCRIPTION_BOOTSTRAP_RETRY_PID_FILE: SUBSCRIPTION_BOOTSTRAP_RETRY_PID_FILE,
         TACHYON_DNS_FAILOVER_STATE_FILE: DNS_FAILOVER_STATE_FILE,
         TACHYON_DNS_FAILOVER_PID_FILE: DNS_FAILOVER_PID_FILE,
+        TACHYON_SECTION_FAIL_STATE_FILE: SECTION_FAIL_STATE_FILE,
+        TACHYON_SECTION_ERRORS_FILE: SECTION_ERRORS_FILE,
+        TACHYON_VALIDATOR_QUARANTINED_FILE: VALIDATOR_QUARANTINED_FILE,
         TACHYON_SUBSCRIPTION_UPDATE_LOCK_DIR: SUBSCRIPTION_UPDATE_LOCK_DIR,
         TACHYON_PENDING_RELOAD_FILE: PENDING_RELOAD_FILE,
         TACHYON_RELOAD_LOCK_DIR: RELOAD_LOCK_DIR,
-        TMP_SING_BOX_FOLDER: TMP_SING_BOX_FOLDER,
+        TMP_TACHYON_CORE_FOLDER: TMP_TACHYON_CORE_FOLDER,
         TMP_RULESET_FOLDER: TMP_RULESET_FOLDER,
         TMP_SUBSCRIPTION_FOLDER: TMP_SUBSCRIPTION_FOLDER,
-        SB_SERVICE_MIXED_INBOUND_ADDRESS: SB_SERVICE_MIXED_INBOUND_ADDRESS,
-        SB_SERVICE_MIXED_INBOUND_PORT: SB_SERVICE_MIXED_INBOUND_PORT,
-        SB_VARIANT_STATE_FILE: SB_VARIANT_STATE_FILE,
-        SB_VERSION_STATE_FILE: SB_VERSION_STATE_FILE,
-        ZAPRET_PROVIDER_NFQWS_BIN: ZAPRET_PROVIDER_NFQWS_BIN,
-        ZAPRET2_PROVIDER_NFQWS2_BIN: ZAPRET2_PROVIDER_NFQWS2_BIN,
-        BYEDPI_BIN: BYEDPI_BIN,
+        TACHYON_CORE_SERVICE_MIXED_INBOUND_ADDRESS: CORE_SERVICE_MIXED_INBOUND_ADDRESS,
+        TACHYON_CORE_SERVICE_MIXED_INBOUND_PORT: CORE_SERVICE_MIXED_INBOUND_PORT,
+        TACHYON_CORE_VERSION_FILE: TACHYON_CORE_VERSION_FILE,
         TACHYON_RULE_CONDITION_CACHE_ENABLED: as_string(rule_condition_cache_enabled)
     };
 }
@@ -379,6 +354,8 @@ function selector_state_from_proxies_payload(payload) {
     let proxies = object_or_empty(object_or_empty(payload).proxies);
 
     for (let tag, proxy in proxies) {
+        if (index(as_string(tag), "-priority-") >= 0)
+            continue;
         proxy = object_or_empty(proxy);
         let proxy_type = lc(as_string(proxy.type || ""));
         let selected = as_string(proxy.now || "");
@@ -399,7 +376,7 @@ function selector_restore_pairs(snapshot, payload) {
         group = as_string(group);
         selected = as_string(selected);
 
-        if (group == "" || selected == "")
+        if (group == "" || selected == "" || index(group, "-priority-") >= 0)
             continue;
 
         let proxy = object_or_empty(proxies[group]);
@@ -435,37 +412,6 @@ function clash_api_json(action, arg1, arg2, arg3) {
     }
 }
 
-function capture_selector_state() {
-    let state = selector_state_from_proxies_payload(clash_api_json("get_proxies"));
-    if (type(state) == "object" && length(keys(state)) > 0) {
-        let persistent_path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
-        let disk_state = common.read_json_file(persistent_path);
-        if (type(disk_state) != "object")
-            disk_state = {};
-        for (let k, v in state)
-            disk_state[k] = v;
-        common.write_json_file(persistent_path, disk_state, 2);
-    }
-    return state;
-}
-
-function restore_selector_state(snapshot) {
-    if (snapshot == null || (type(snapshot) == "object" && length(keys(snapshot)) == 0)) {
-        let persistent_path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
-        let disk_state = common.read_json_file(persistent_path);
-        if (type(disk_state) == "object" && length(keys(disk_state)) > 0)
-            snapshot = disk_state;
-    }
-    let pairs = selector_restore_pairs(snapshot, clash_api_json("get_proxies"));
-
-    for (let pair in pairs)
-        module_success(DIAGNOSTICS_UC, [ "clash-api", "set_group_proxy", pair.group, pair.proxy, "" ]);
-}
-
-function module_background(module_path, args) {
-    return command_status(common.background_command(module_command(module_path, args))) == 0;
-}
-
 function config_get(path, fallback) {
     path = as_string(path);
     if (!uci_core.exists(path))
@@ -475,6 +421,99 @@ function config_get(path, fallback) {
 
 function config_set(path, value) {
     return uci_core.set(path, value);
+}
+
+function capture_selector_state() {
+    return selector_state_from_proxies_payload(clash_api_json("get_proxies"));
+}
+
+function selector_tag_has_balancer(proxy_entry) {
+    proxy_entry = object_or_empty(proxy_entry);
+    let all_list = proxy_entry.all;
+    if (type(all_list) != "array")
+        return false;
+    for (let item in all_list) {
+        let t = as_string(item);
+        if (index(t, "-urltest-") >= 0 || index(t, "-priority-") >= 0)
+            return true;
+    }
+    return false;
+}
+
+function sync_selector_defaults_after_reload(proxies_payload) {
+    let persistent_path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
+    let disk_state = object_or_empty(common.read_json_file(persistent_path));
+    let core_config_path = config_get(CONFIG_NAME + ".settings.config_path", "/etc/tachyon-core/config.json");
+    if (core_config_path == "")
+        core_config_path = "/etc/tachyon-core/config.json";
+    let cfg = object_or_empty(common.read_json_file(core_config_path));
+    let outbounds = type(cfg.outbounds) == "array" ? cfg.outbounds : [];
+    if (length(outbounds) == 0)
+        return;
+
+    let payload = proxies_payload != null ? proxies_payload : clash_api_json("get_proxies");
+    let proxies = object_or_empty(object_or_empty(payload).proxies);
+
+    for (let ob in outbounds) {
+        ob = object_or_empty(ob);
+        if (lc(as_string(ob.type || "")) != "selector")
+            continue;
+        let tag = as_string(ob.tag || "");
+        let def_target = as_string(ob.default || "");
+        if (tag == "" || def_target == "" || index(tag, "-priority-") >= 0)
+            continue;
+        let ob_outbounds = type(ob.outbounds) == "array" ? ob.outbounds : [];
+        let desired = as_string(disk_state[tag] || "");
+        if (desired == "" || (length(ob_outbounds) > 0 && !string_array_contains(ob_outbounds, desired)))
+            desired = def_target;
+        let proxy = object_or_empty(proxies[tag]);
+        if (lc(as_string(proxy.type || "")) != "selector")
+            continue;
+        let candidates = length(ob_outbounds) > 0 ? ob_outbounds : proxy.all;
+        if (!string_array_contains(candidates, desired))
+            continue;
+        if (as_string(proxy.now || "") != desired)
+            module_success(DIAGNOSTICS_UC, [ "clash-api", "set_group_proxy", tag, desired, "ephemeral" ]);
+    }
+}
+
+function restore_selector_state(snapshot) {
+    let persistent_path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
+    let disk_state = object_or_empty(common.read_json_file(persistent_path));
+    let payload = clash_api_json("get_proxies");
+    let proxies = object_or_empty(object_or_empty(payload).proxies);
+
+    let effective_snapshot = {};
+    if (type(snapshot) == "object") {
+        for (let k, v in snapshot) {
+            let group = as_string(k);
+            let target = as_string(v);
+            if (group == "" || target == "")
+                continue;
+            if (as_string(disk_state[group] || "") != "") {
+                effective_snapshot[group] = as_string(disk_state[group]);
+            }
+            else if (!selector_tag_has_balancer(proxies[group])) {
+                effective_snapshot[group] = target;
+            }
+        }
+    }
+    for (let k, v in disk_state) {
+        let group = as_string(k);
+        let target = as_string(v);
+        if (group != "" && target != "" && effective_snapshot[group] == null)
+            effective_snapshot[group] = target;
+    }
+
+    let pairs = selector_restore_pairs(effective_snapshot, payload);
+    for (let pair in pairs)
+        module_success(DIAGNOSTICS_UC, [ "clash-api", "set_group_proxy", pair.group, pair.proxy, "ephemeral" ]);
+
+    sync_selector_defaults_after_reload(payload);
+}
+
+function module_background(module_path, args) {
+    return command_status(common.background_command(module_command(module_path, args))) == 0;
 }
 
 
@@ -548,10 +587,6 @@ function dnsmasq_configure(force) {
     return dns_apply_status(args);
 }
 
-function dnsmasq_configure_steer() {
-    return dns_apply_status([ "configure-steer" ]);
-}
-
 function dnsmasq_restore(force) {
     let args = [ "restore" ];
     if (force)
@@ -568,10 +603,10 @@ function dnsmasq_has_tachyon_managed_state() {
 }
 
 function discover_awg_mtu() {
-    let sections = uci_core.get_all(CONFIG_NAME, "outbound") || {};
+    let sections = uci_core.section_objects(CONFIG_NAME, "section");
     let changed = false;
     for (let section in sections) {
-        if (section.action == "awg" && (section.awg_mtu == "" || section.awg_mtu == "0" || section.awg_mtu == null)) {
+        if (section.enabled != "0" && section.action == "awg" && (section.awg_mtu == "" || section.awg_mtu == "0" || section.awg_mtu == null)) {
             let endpoint = section.awg_server_address;
             if (endpoint) {
                 log_message("Auto-discovering optimal MTU for AWG section '" + section[".name"] + "'...", "info");
@@ -601,10 +636,29 @@ function discover_awg_mtu() {
     return 0;
 }
 
+function desired_core_component_name() {
+    return "tachyon-core";
+}
+
+function ensure_core_binary_installed() {
+    if (getenv("TACHYON_PACKAGE_TEST_MODE") != null || getenv("TACHYON_UCI_STATE_FILE") != null)
+        return true;
+    if (command_success("command -v tachyon-core"))
+        return true;
+    if (fs.stat(RUNTIME_STATE_DIR + "/component-action.lock") != null)
+        return false;
+    let action_uc = LIB_DIR + "/components/action.uc";
+    if (fs.stat(action_uc) == null)
+        return false;
+    log_message("Core binary is missing (e.g. after sysupgrade); auto-installing tachyon-core...", "info");
+    return module_status(action_uc, [ "component-action", "tachyon-core", "install" ]) == 0;
+}
+
 function validate_start_config() {
+    ensure_core_binary_installed();
     // The two validator checks share the expensive context_from_runtime() assembly
-    // (sing-box version, installed packages, compression markers). Running both in
-    // one ucode process cuts two forks (context_from_runtime twice + one extra
+    // (tachyon-core version, installed packages). Running both in one ucode
+    // process cuts two forks (context_from_runtime twice + one extra
     // module_status round-trip). check_runtime_requirements exits non-zero on
     // failure, so validate_runtime_config is only reached when requirements pass.
     let status = module_status(VALIDATOR_UC, [ "check-requirements-and-validate-runtime" ]);
@@ -636,40 +690,7 @@ function release_start_subscription_update_lock() {
     start_subscription_update_lock_held = false;
 }
 
-function resolve_zapret_bin() {
-    let candidate_bins = [
-        getenv("ZAPRET_NFQWS_BIN"),
-        getenv("ZAPRET_PROVIDER_NFQWS_BIN"),
-        ZAPRET_PROVIDER_NFQWS_BIN,
-        "/opt/zapret/nfq/nfqws",
-        "/opt/zapret/nfqws",
-        "/usr/bin/nfqws"
-    ];
-    for (let b in candidate_bins) {
-        if (b && fs.stat(b) != null) return b;
-    }
-    return ZAPRET_PROVIDER_NFQWS_BIN;
-}
-
-function resolve_zapret2_bin() {
-    let candidate_bins = [
-        getenv("ZAPRET2_NFQWS2_BIN"),
-        getenv("ZAPRET2_PROVIDER_NFQWS2_BIN"),
-        ZAPRET2_PROVIDER_NFQWS2_BIN,
-        "/opt/zapret2/nfq2/nfqws2",
-        "/opt/zapret2/nfq/nfqws2",
-        "/opt/zapret2/nfqws2",
-        "/usr/bin/nfqws2"
-    ];
-    for (let b in candidate_bins) {
-        if (b && fs.stat(b) != null) return b;
-    }
-    return ZAPRET2_PROVIDER_NFQWS2_BIN;
-}
-
 function nft_rebuild_runtime() {
-    let zapret_bin = resolve_zapret_bin();
-    let zapret2_bin = resolve_zapret2_bin();
     return module_status(NFT_UC, [
         "nft-rebuild-runtime-from-uci",
         RT_TABLE_NAME,
@@ -681,23 +702,13 @@ function nft_rebuild_runtime() {
         NFT_INTERFACE_SET_NAME,
         NFT_FAKEIP_MARK,
         NFT_OUTBOUND_MARK,
-        SB_FAKEIP_INET4_RANGE,
-        SB_TPROXY_INBOUND_PORT,
-        zapret_bin,
-        ZAPRET_ROUTE_MARK_BASE,
-        ZAPRET_QUEUE_BASE,
-        ZAPRET_DESYNC_MARK,
-        ZAPRET_DESYNC_MARK_POSTNAT,
-        zapret2_bin,
-        ZAPRET2_ROUTE_MARK_BASE,
-        ZAPRET2_QUEUE_BASE,
-        ZAPRET2_DESYNC_MARK,
-        ZAPRET2_DESYNC_MARK_POSTNAT,
+        CORE_FAKEIP_INET4_RANGE,
+        CORE_TPROXY_INBOUND_PORT,
         NFT_LOCALV6_SET_NAME,
         NFT_COMMON6_SET_NAME,
         NFT_IP_PORT6_SET_NAME,
-        SB_FAKEIP_INET6_RANGE,
-        SB_TPROXY_INBOUND6_ADDRESS
+        CORE_FAKEIP_INET6_RANGE,
+        CORE_TPROXY_INBOUND6_ADDRESS
     ]);
 }
 
@@ -724,11 +735,16 @@ function reload_firewall() {
     if (status != 0)
         return status;
 
-    return nft_populate_runtime_sets();
+    status = nft_populate_runtime_sets();
+    if (status != 0)
+        return status;
+
+    module_status(NFT_UC, [ "nft-sync-router-output-intercept", NFT_TABLE_NAME, NFT_LOCALV4_SET_NAME, NFT_OUTBOUND_MARK ]);
+    return 0;
 }
 
-function singbox_init_config() {
-    let result = module_capture(SINGBOX_UC, [
+function core_init_config() {
+    let result = module_capture(TACHYON_CORE_UC, [
         "init-config",
         as_string(nft_populate_enabled),
         subscription_caches_prepared,
@@ -741,6 +757,17 @@ function singbox_init_config() {
         subscription_caches_prepared = "1";
     }
     return result.status;
+}
+
+function section_errors_snapshot() {
+    let data = object_or_empty(read_json_file(SECTION_ERRORS_FILE));
+    let active = [];
+    for (let k in keys(data)) {
+        if (as_string(data[k] || "") != "")
+            push(active, k);
+    }
+    sort(active);
+    return sprintf("%J", active);
 }
 
 function refresh_cron() {
@@ -770,7 +797,22 @@ function prepare_subscription_caches(mode) {
         subscription_runtime_no_refresh
     ]);
     if (result.status == 0) {
-        subscription_deferred_sections = trim(result.output);
+        let known_sections = {};
+        for (let sec in common.array_or_empty(uci_core.sections(CONFIG_NAME, "section"))) {
+            let name = common.section_name(sec);
+            if (name != "")
+                known_sections[name] = true;
+        }
+        let cleaned = [];
+        let seen = {};
+        for (let token in split(trim(as_string(result.output)), /[ \t\r\n]+/)) {
+            if (token != "" && !seen[token] && match(token, /^[A-Za-z0-9_-]+$/) != null &&
+                (length(keys(known_sections)) == 0 || known_sections[token] == true)) {
+                seen[token] = true;
+                push(cleaned, token);
+            }
+        }
+        subscription_deferred_sections = join(" ", cleaned);
         subscription_caches_prepared = "1";
     }
     return result.status;
@@ -779,6 +821,8 @@ function prepare_subscription_caches(mode) {
 
 function restore_rulesets_from_cache() {
     let runtime_rulesets_mod = require("tachyon_core.rulesets");
+    let use_trs = type(runtime_rulesets_mod.supports_trs) == "function" &&
+        runtime_rulesets_mod.supports_trs();
     let etc_dir = "/etc/tachyon/rulesets";
     let tmp_dir = TMP_RULESET_FOLDER;
 
@@ -788,25 +832,40 @@ function restore_rulesets_from_cache() {
 
     let entry;
     while ((entry = dir.read()) != null) {
-        if (!match(entry, /\.(srs|lst|json)$/)) continue;
+        if (!match(entry, /\.(trs|srs|lst|json)$/)) continue;
+        if (use_trs && match(entry, /^community-.*\.srs$/)) {
+            remove_file(tmp_dir + "/" + entry);
+            remove_file(etc_dir + "/" + entry);
+            continue;
+        }
         let tmp_path = tmp_dir + "/" + entry;
         let etc_path = etc_dir + "/" + entry;
         let tmp_st = fs.stat(tmp_path);
         let etc_st = fs.stat(etc_path);
         if (!etc_st || etc_st.size <= 0) continue;
-        // An .srs copied out of /etc into the ruleset sing-box actually reads has to
+        if (etc_st.size > 524288) {
+            if (!match(entry, /\.json$/) && (!tmp_st || tmp_st.size == 0)) {
+                common.copy_file_stream(etc_path, tmp_path);
+                if (match(entry, /\.srs$/) && runtime_rulesets_mod.is_populated_srs_file(tmp_path))
+                    runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
+            }
+            remove_file(etc_path);
+            continue;
+        }
+        if (tmp_st && tmp_st.size > 0)
+            continue;
+        if (match(entry, /\.trs$/) && type(runtime_rulesets_mod.is_referenceable_trs_file) == "function" &&
+            !runtime_rulesets_mod.is_referenceable_trs_file(etc_path))
+            continue;
+        // An .srs copied out of /etc into the ruleset tachyon-core actually reads has to
         // be one it can parse. Restoring a broken one here is what left the router
         // unable to apply anything, because the copy that was broken was the copy
         // the generator went on to reference.
         if (match(entry, /\.srs$/) && !runtime_rulesets_mod.is_referenceable_srs_file(etc_path))
             continue;
-        if (!tmp_st || tmp_st.size == 0) {
-            let content = fs.readfile(etc_path);
-            if (content) {
-                write_file(tmp_path, content);
-                if (match(entry, /\.srs$/) && runtime_rulesets_mod.is_populated_srs_file(tmp_path))
-                    runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
-            }
+        if (common.copy_file_stream(etc_path, tmp_path)) {
+            if (match(entry, /\.srs$/) && runtime_rulesets_mod.is_populated_srs_file(tmp_path))
+                runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
         }
     }
     dir.close();
@@ -817,7 +876,7 @@ function prepare_community_rulesets() {
     let core_url_mod = require("core.url");
     let connections = require("config.connections");
     let tmp_dir = TMP_RULESET_FOLDER;
-    let etc_dir = "/etc/tachyon/rulesets";
+    let etc_dir = getenv("TACHYON_PERSISTENT_RULESETS_DIR") || "/etc/tachyon/rulesets";
 
     command_success_from_args(["mkdir", "-p", tmp_dir]);
 
@@ -826,34 +885,34 @@ function prepare_community_rulesets() {
     let exclusion_lists = exclusions.selected_lists(uci_core.get_all(CONFIG_NAME, "settings"));
     for (let name in exclusion_lists)
         if (exclusions.supported(name)) needed[name] = true;
-    let sections = uci_core.get_all(CONFIG_NAME, "section") || {};
-    for (let name, section in sections) {
-        if (!section || !section.enabled || section.enabled == "0")
+    if (type(connections.set_item_sections_from_cursor) == "function" && type(uci_core.cursor) == "function")
+        connections.set_item_sections_from_cursor(uci_core.cursor(), CONFIG_NAME);
+    let add_needed_list_items = function(raw_items) {
+        let arr = raw_items;
+        if (type(arr) == "string")
+            arr = split(trim(arr), /[ \t\r\n,]+/);
+        if (type(arr) == "array") {
+            for (let item in arr) {
+                item = trim(as_string(item));
+                if (item != "" && runtime_rulesets_mod.is_community(item))
+                    needed[item] = true;
+            }
+        }
+    };
+    let sections = uci_core.section_objects(CONFIG_NAME, "section");
+    for (let section in sections) {
+        if (section.enabled == "0")
             continue;
-        let comms = section.community_lists;
-        if (type(comms) == "string")
-            comms = split(trim(comms), /[ \t\r\n]+/);
-        if (type(comms) == "array") {
-            for (let c in comms) {
-                c = trim(c);
-                if (c != "" && runtime_rulesets_mod.is_community(c))
-                    needed[c] = true;
-            }
-        }
-        let rulesets = section.rule_sets;
-        if (type(rulesets) == "string")
-            rulesets = split(trim(rulesets), /[ \t\r\n]+/);
-        if (type(rulesets) == "array") {
-            for (let r in rulesets) {
-                r = trim(r);
-                if (r != "" && runtime_rulesets_mod.is_community(r))
-                    needed[r] = true;
-            }
-        }
+        add_needed_list_items(section.community_lists);
+        add_needed_list_items(connections.community_lists(section));
+        add_needed_list_items(section.rule_sets);
+        add_needed_list_items(section.rule_set);
+        add_needed_list_items(connections.rule_sets(section));
+        add_needed_list_items(connections.rule_sets_with_subnets(section));
         // geoip_country pulls in geoip_<cc> plus geosite_ru, and the generator
         // references them exactly like community_lists entries. Scanning only
         // community_lists/rule_sets left them uncached, so any section with
-        // GeoIP produced remote rule-sets that sing-box had to download during
+        // GeoIP produced remote rule-sets that tachyon-core had to download during
         // startup — a GitHub hiccup then killed the core with
         // "initialize rule-set: context deadline exceeded".
         for (let cc in connections.geoip_country_list(section)) {
@@ -864,58 +923,143 @@ function prepare_community_rulesets() {
                 needed["geosite_ru"] = true;
         }
     }
+    let conditions_all = uci_core.section_objects(CONFIG_NAME, "condition");
+    for (let cond in conditions_all) {
+        if (cond.enabled == "0")
+            continue;
+        add_needed_list_items(cond.community_lists);
+        add_needed_list_items(cond.rule_set);
+        add_needed_list_items(cond.rule_set_with_subnets);
+        for (let cc in connections.geoip_country_list(cond)) {
+            let ip_list = "geoip_" + cc;
+            if (runtime_rulesets_mod.is_community(ip_list))
+                needed[ip_list] = true;
+            if (cc == "ru" && runtime_rulesets_mod.is_community("geosite_ru"))
+                needed["geosite_ru"] = true;
+        }
+    }
 
     let has_curl = command_status("command -v curl >/dev/null 2>&1") == 0;
+    let use_trs = type(runtime_rulesets_mod.supports_trs) == "function" &&
+        runtime_rulesets_mod.supports_trs();
 
     for (let service in keys(needed)) {
+        let tmp_trs_path = tmp_dir + "/community-" + service + ".trs";
+        let etc_trs_path = etc_dir + "/community-" + service + ".trs";
         let tmp_path = tmp_dir + "/community-" + service + ".srs";
         let etc_path = etc_dir + "/community-" + service + ".srs";
 
-        // The /tmp copy used to be trusted outright, which is what left the reported
-        // router stuck: the file an older Tachyon downloaded passed the cheap test,
-        // sing-box died on it, and the copy that was broken was the copy believed -
-        // so neither an apply nor a list update could recover. A placeholder is
-        // still accepted: it is readable, and re-downloading over it on every boot
-        // would be pointless.
-        if (runtime_rulesets_mod.is_referenceable_srs_file(tmp_path))
+        let trs_urls = (use_trs && type(runtime_rulesets_mod.community_trs_urls) == "function")
+            ? runtime_rulesets_mod.community_trs_urls(service) : [];
+        let has_trs_upstream = type(trs_urls) == "array" && length(trs_urls) > 0;
+        let can_ref_trs = use_trs && type(runtime_rulesets_mod.is_referenceable_trs_file) == "function";
+        let tmp_trs_ref = can_ref_trs ? runtime_rulesets_mod.is_referenceable_trs_file(tmp_trs_path) : false;
+        let etc_trs_ref = false;
+        if (!tmp_trs_ref && can_ref_trs)
+            etc_trs_ref = runtime_rulesets_mod.is_referenceable_trs_file(etc_trs_path);
+        let has_local_trs = tmp_trs_ref || etc_trs_ref;
+
+        if (can_ref_trs && (has_trs_upstream || has_local_trs)) {
+            if (tmp_trs_ref) {
+                remove_file(tmp_path);
+                continue;
+            }
+            if (etc_trs_ref) {
+                if (common.copy_file_stream(etc_trs_path, tmp_trs_path)) {
+                    remove_file(tmp_path);
+                    remove_file(etc_path);
+                    continue;
+                }
+            }
+            let trs_ok = false;
+            if (has_curl && has_trs_upstream) {
+                let trs_candidates = [];
+                for (let tu in trs_urls) {
+                    let expanded = type(core_url_mod.download_candidates) == "function" ?
+                        core_url_mod.download_candidates(tu) : [ tu ];
+                    for (let ex in expanded)
+                        if (!(ex in trs_candidates))
+                            push(trs_candidates, ex);
+                }
+                let trs_attempts = 0;
+                for (let trs_candidate in trs_candidates) {
+                    if (trs_attempts >= 2)
+                        break;
+                    trs_attempts++;
+                    let dl_tmp = tmp_dir + "/.fetch-" + service + ".trs.tmp";
+                    let args = [ "curl", "-fsSL", "--connect-timeout", "2", "-m", "3", trs_candidate, "-o", dl_tmp ];
+                    if (command_success_from_args(args) && runtime_rulesets_mod.is_usable_trs_file(dl_tmp)) {
+                        let st_trs = fs.stat(dl_tmp);
+                        let sz_trs = st_trs != null ? int(st_trs.size || 0) : 0;
+                        command_success_from_args([ "mv", "-f", dl_tmp, tmp_trs_path ]);
+                        if (sz_trs > 0 && sz_trs <= 524288) {
+                            command_success_from_args([ "mkdir", "-p", etc_dir ]);
+                            common.copy_file(tmp_trs_path, etc_trs_path);
+                        } else if (sz_trs > 524288) {
+                            remove_file(etc_trs_path);
+                        }
+                        remove_file(tmp_path);
+                        remove_file(etc_path);
+                        log_message("Pre-downloaded community ruleset " + service + " (.trs) from " + trs_candidate, "info");
+                        trs_ok = true;
+                        break;
+                    }
+                    remove_file(dl_tmp);
+                }
+            }
+            if (trs_ok)
+                continue;
+            // In native .trs mode do not fall through to legacy .srs download or local
+            // empty .srs stubs; leave absent so generator emits remote .trs entries.
+            remove_file(tmp_path);
+            remove_file(etc_path);
+            log_message("Community ruleset '" + service + "' has no local .trs cache; keeping remote .trs entry", "info");
+            continue;
+        }
+
+        // A fallback stub may be referenced by the generator, but it is not a
+        // downloaded list. Retry it when preparation runs after network recovery.
+        if (runtime_rulesets_mod.is_adoptable_srs_file(tmp_path))
             continue;
 
         // The /etc copy is adopted across reboots, so a file that went bad there
-        // would be re-adopted on every apply and sing-box would refuse the config
-        // with "unexpected EOF" forever. Asking sing-box whether it parses is the
+        // would be re-adopted on every apply and tachyon-core would refuse the config
+        // with "unexpected EOF" forever. Asking tachyon-core whether it parses is the
         // way out: a truncated copy is skipped, the download below replaces it, and
         // if that fails too the empty stub keeps the router applyable.
-        //
-        // is_referenceable, not is_usable: the placeholder is worth adopting, since
-        // promoting it beats a pointless download attempt on a boot with no network.
-        if (runtime_rulesets_mod.is_referenceable_srs_file(etc_path)) {
-            let content = fs.readfile(etc_path);
-            if (content && write_file(tmp_path, content)) {
+        if (runtime_rulesets_mod.is_adoptable_srs_file(etc_path)) {
+            if (common.copy_file_stream(etc_path, tmp_path)) {
                 if (runtime_rulesets_mod.is_populated_srs_file(tmp_path))
                     runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
                 continue;
             }
         }
 
+        let fetched = false;
         let url = runtime_rulesets_mod.community_url(service);
         let candidates = type(core_url_mod.download_candidates) == "function" ?
             core_url_mod.download_candidates(url) : [ url ];
-        let fetched = false;
 
-        if (has_curl) {
+        if (has_curl && !fetched) {
+            let srs_attempts = 0;
             for (let candidate in candidates) {
+                if (srs_attempts >= 2)
+                    break;
+                srs_attempts++;
                 let dl_tmp = tmp_dir + "/.fetch-" + service + ".tmp";
-                let args = [ "curl", "-fsSL", "--connect-timeout", "3", "-m", "5", candidate, "-o", dl_tmp ];
+                let args = [ "curl", "-fsSL", "--connect-timeout", "2", "-m", "3", candidate, "-o", dl_tmp ];
                 if (command_success_from_args(args) && runtime_rulesets_mod.is_usable_srs_file(dl_tmp)) {
                     let st = fs.stat(dl_tmp);
-                    if (st && st.size >= 100) {
+                    if (st && st.size > runtime_rulesets_mod.EMPTY_SRS_SIZE) {
+                        let sz = int(st.size || 0);
                         command_success_from_args([ "mv", "-f", dl_tmp, tmp_path ]);
                         runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
-                        command_success_from_args([ "mkdir", "-p", etc_dir ]);
-                        let cdata = fs.readfile(tmp_path);
-                        if (cdata) {
-                            write_file(etc_path, cdata);
-                            runtime_rulesets_mod.remember_srs_file_verified(etc_path);
+                        if (sz > 0 && sz <= 524288) {
+                            command_success_from_args([ "mkdir", "-p", etc_dir ]);
+                            if (common.copy_file(tmp_path, etc_path))
+                                runtime_rulesets_mod.remember_srs_file_verified(etc_path);
+                        } else if (sz > 524288) {
+                            remove_file(etc_path);
                         }
                         log_message("Pre-downloaded community ruleset " + service + " from " + candidate, "info");
                         fetched = true;
@@ -927,8 +1071,10 @@ function prepare_community_rulesets() {
         }
 
         if (!fetched) {
+            if (!runtime_rulesets_mod.is_referenceable_srs_file(tmp_path))
+                remove_file(tmp_path);
             runtime_rulesets_mod.ensure_empty_srs_stub(tmp_path);
-            log_message("Community ruleset '" + service + "' initialized with local fallback stub to allow sing-box clean start", "info");
+            log_message("Community ruleset '" + service + "' initialized with local fallback stub to allow tachyon-core clean start", "info");
         }
     }
     for (let name in exclusion_lists)
@@ -936,123 +1082,10 @@ function prepare_community_rulesets() {
             log_message("Smart Detect: exclusion preset " + name + " is unavailable; keeping the previous cache", "warn");
 }
 
-// Whether the active routing engine is steer or steer-extended. Used to skip
-// the sing-box-only start work (config validation, dnsmasq pointing at the
-// sing-box DNS inbound) that must never run on a steer device.
-function active_engine_is_steer() {
-    let active_engine = "tachyon-core";
-    try {
-        active_engine = require("core.engine").get_active();
-    }
-    catch (e) {
-        active_engine = "tachyon-core";
-    }
-    return active_engine != "tachyon-core";
-}
-
-// Start the steer engine. Tachyon's job here is to make sure sing-box is not
-// running and holding the same dataplane, generate the spec from the current
-// configuration, and let the steer init script bring the engine up.
-function start_steer_main(active_engine) {
-    log_message("Starting Tachyon with the " + active_engine + " engine", "info");
-
-    // Make sure the sing-box service is not left running: two engines must not
-    // fight over nftables and policy routing.
-    if (fs.stat("/etc/init.d/tachyon-core") != null)
-        command_status_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
-
-    // Watchdog first, so auto-healing is active through a failed boot.
-    let wd_status = module_status(WATCHDOG_UC, [ "start-runtime" ]);
-    if (wd_status != 0)
-        log_message("Watchdog start-runtime failed (status " + as_string(wd_status) + ")", "warn");
-
-    let engine_runtime = require("service.engine_runtime");
-
-    // The subscription cache lives in /var/run (tmpfs) and is empty after a
-    // reboot. The steer spec embeds the vless sub files built from that cache,
-    // so without this step vless outputs lose their nodes after every reboot
-    // and fall back to direct. Not fatal on steer: the engine starts either
-    // way, and the subscription update cycle will retry later.
-    module_status(SUBSCRIPTION_CACHE_UC, [ "ensure-runtime-dirs" ]);
-    if (module_status(SUBSCRIPTION_CACHE_UC, [ "prepare-caches", "startup", "0", "0" ]) != 0)
-        log_message("Subscription caches are not ready; vless outputs may fall back to direct until the next subscription update", "warn");
-    prepare_community_rulesets();
-
-    let generated = engine_runtime.generate_steer_spec({});
-    if (!generated.ok) {
-        let detail = generated.output ? (": " + trim(as_string(generated.output))) : "";
-        log_message("Failed to generate the steer spec: " + as_string(generated.reason) + detail, "fatal");
-        return 1;
-    }
-
-    if (!engine_runtime.init_script_present(active_engine)) {
-        log_message("steer is not installed; cannot start the " + active_engine + " engine", "fatal");
-        return 1;
-    }
-
-    // Start the DNS upstream resolver (smartdns) BEFORE steer dnsd so that
-    // steer init.d can read the upstream port from the port file and pass it
-    // as --upstream-port. If smartdns is not installed this is a safe no-op.
-    let dns_status = module_status(STEER_DNS_UC, [ "start-runtime" ]);
-    if (dns_status != 0)
-        log_message("steer DNS upstream start failed (non-fatal, steer dnsd will use port 53)", "warn");
-
-    let started = engine_runtime.run_init(active_engine, "start");
-    if (!started.ok) {
-        log_message("Failed to start the " + active_engine + " engine", "fatal");
-        return 1;
-    }
-
-    // Spawn the nfqws handlers for the engine's zapret outputs. Older steer
-    // init scripts (1.5.x) do not manage them — the engine builds the queue
-    // rules but nobody listens, so bypassed traffic goes out unprocessed. The
-    // service steps aside when the steer init handles zapret on its own.
-    if (fs.stat("/etc/init.d/tachyon-steer-zapret") != null) {
-        if (command_status_from_args([ "/etc/init.d/tachyon-steer-zapret", "start" ]) != 0)
-            log_message("steer zapret handler service failed to start (non-fatal)", "warn");
-    }
-
-    // The steer package ships its own /usr/sbin/steer-nfqws, which replaces our
-    // nfqws2-aware wrapper at every steer (re)install/upgrade. Without the
-    // wrapper's nfqws2 detection all zapret2 strategies die with "no
-    // /opt/zapret/nfq/nfqws" or run through the wrong binary. Restore our
-    // master copy when the packaged stub is back.
-    let nfqws_wrapper = fs.stat("/usr/share/tachyon/steer-nfqws") != null ? "/usr/share/tachyon/steer-nfqws" : (LIB_DIR + "/../../usr/sbin/steer-nfqws");
-    if (fs.stat(nfqws_wrapper) != null && fs.stat("/usr/sbin/steer-nfqws") != null) {
-        let current = fs.readfile("/usr/sbin/steer-nfqws", 256) || "";
-        if (index(current, "Tachyon") < 0 && index(current, "tachyon") < 0) {
-            fs.writefile("/usr/sbin/steer-nfqws", fs.readfile(nfqws_wrapper));
-            fs.chmod("/usr/sbin/steer-nfqws", 0755);
-        }
-    }
-
-    // On steer, zapret/zapret2 sections are handled directly by steer as
-    // kind: zapret outputs running steer-nfqws. Standalone runtimes on
-    // queues 4200/4300 would collide and hijack packets.
-    // Other optional runtimes (byedpi, wdtt, etc.) remain independent:
-    module_success(BYEDPI_UC, [ "start-runtime" ]);
-    module_success(WDTT_UC, [ "start-runtime" ]);
-    module_success(OLCRTC_UC, [ "start-runtime" ]);
-    module_success(FPTN_UC, [ "start-runtime" ]);
-    module_success(TAILSCALE_UC, [ "start-runtime" ]);
-
-    module_background(TELEGRAM_UC, [ "start-runtime" ]);
-
-    return 0;
-}
-
 function start_main() {
     let status;
 
     log_message("Starting Tachyon", "info");
-
-    // steer owns the dataplane through its own nftables table and policy
-    // routing. Tachyon's sing-box nft rules and sing-box itself must stay out
-    // of the way, so the steer branch never touches NFT_UC or sing-box. The
-    // engine check comes first: the sing-box config validator would abort the
-    // start on a steer-only device before the steer branch is ever reached.
-    if (active_engine_is_steer())
-        return start_steer_main(require("core.engine").get_active());
 
     status = validate_start_config();
     if (status != 0)
@@ -1089,35 +1122,35 @@ function start_main() {
     if (module_success(STATE_UC, [ "has-hosts-list-update-sources" ]))
         module_background(HOSTS_UC, [ "list-update" ]);
 
-    status = module_status(SINGBOX_UC, [ "configure-service" ]);
+    status = module_status(TACHYON_CORE_UC, [ "configure-service" ]);
     if (status != 0)
         return status;
 
-    status = singbox_init_config();
+    let errors_before = section_errors_snapshot();
+    startup_ipv6_effective = as_string(common.resolve_effective_ipv6_state(uci_core.get_all(CONFIG_NAME, "settings"), null).effective || "");
+    status = core_init_config();
     if (status != 0)
         return status;
+
+    if (section_errors_snapshot() != errors_before) {
+        log_message("Quarantined sections changed during startup; resyncing nftables rules", "info");
+        status = nft_rebuild_runtime();
+        if (status != 0)
+            return status;
+        if (nft_populate_enabled == 1) {
+            status = nft_populate_runtime_sets();
+            if (status != 0)
+                return status;
+        }
+    }
 
     status = refresh_cron();
     if (status != 0)
         return status;
 
-    module_success(BYEDPI_UC, [ "start-runtime" ]);
-    // Native Tailscale must be up before sing-box so tailnet routes win over
-    // policy routing from the very first packet - the order the reload path
-    // keeps. This branch never started the runtime, and a reload after boot
-    // skips an unchanged configuration, so after a reboot the daemon stayed
-    // down until someone ran tailscale_restart (#110).
-    module_success(TAILSCALE_UC, [ "start-runtime" ]);
-
-    for (let comp_svc in [ "forkop", "podkop", "netshift", "steer" ]) {
-        if (fs.stat("/etc/init.d/" + comp_svc) != null) {
-            command_status_from_args([ "/etc/init.d/" + comp_svc, "stop" ]);
-        }
-    }
-
-    let sb_start = command_success_from_args([ "/etc/init.d/tachyon-core", "start" ]);
-    if (!sb_start) {
-        log_message("Failed to start sing-box. Aborted.", "fatal");
+    let core_start = command_success_from_args([ "/etc/init.d/tachyon-core", "start" ]);
+    if (!core_start) {
+        log_message("Failed to start tachyon-core. Aborted.", "fatal");
         return 1;
     }
 
@@ -1135,8 +1168,8 @@ function start_main() {
         RT_TABLE_NAME,
         NFT_TABLE_NAME,
         NFT_FAKEIP_MARK,
-        as_string(SING_BOX_START_STABLE_MIN_AGE),
-        as_string(SING_BOX_START_VERIFY_TIMEOUT)
+        as_string(TACHYON_CORE_START_STABLE_MIN_AGE),
+        as_string(TACHYON_CORE_START_VERIFY_TIMEOUT)
     ]);
     if (status != 0) {
         log_message("Startup verification failed after Tachyon was started; rolling back DNS changes", "warn");
@@ -1160,27 +1193,53 @@ function start_main() {
         return status;
 
     release_start_subscription_update_lock();
-    module_success(ZAPRET_UC, [ "start-runtime" ]);
-    module_success(ZAPRET2_UC, [ "start-runtime" ]);
-    module_success(WDTT_UC, [ "start-runtime" ]);
-    module_success(OLCRTC_UC, [ "start-runtime" ]);
-    module_success(FPTN_UC, [ "start-runtime" ]);
     module_success(PARENTAL_QUOTA_UC, [ "install-cron" ]);
     module_success(PARENTAL_QUOTA_UC, [ "tick" ]);
 
     restore_selector_state(null);
-
-    module_background(UI_UC, [ "latency-boot-sweep" ]);
-    module_background(UPDATES_UC, [ "list-update" ]);
-    module_background(LIB_DIR + "/service/lifecycle.uc", [ "discover-awg-mtu" ]);
     return 0;
 }
 
+function purge_legacy_steer_runtime() {
+    for (let svc in [ "/etc/init.d/tachyon-steer-zapret", "/etc/init.d/steer" ]) {
+        if (fs.stat(svc) != null) {
+            command_success_from_args([ svc, "stop" ]);
+            command_success_from_args([ svc, "disable" ]);
+            remove_file(svc);
+        }
+    }
+    for (let rc in (fs.glob("/etc/rc.d/*steer*") || []))
+        remove_file(rc);
+    for (let bin in [ "/usr/sbin/steer", "/usr/bin/steer" ])
+        remove_file(bin);
+    if (fs.stat("/etc/steer") != null || fs.stat("/usr/lib/tachyon/steer") != null)
+        command_success_from_args([ "rm", "-rf", "/etc/steer", "/usr/lib/tachyon/steer" ]);
+    if (command_success_from_args([ "nft", "list", "table", "inet", "steer" ]))
+        command_success_from_args([ "nft", "delete", "table", "inet", "steer" ]);
+}
+
+let planned_restart_active = false;
+
 function start_impl() {
+    let is_planned_restart = planned_restart_active;
+    planned_restart_active = false;
     fs.writefile("/var/run/tachyon/starting", as_string(time()));
+    remove_file(SECTION_FAIL_STATE_FILE);
+    remove_file(SECTION_ERRORS_FILE);
+    remove_file(VALIDATOR_QUARANTINED_FILE);
+    purge_legacy_steer_runtime();
     // (e.g. config generator killed during restart). 30-min threshold is safe since
     // all tachyon temp files are created and deleted within seconds under normal operation.
     command_status("find /tmp -maxdepth 1 -name 'tachyon-*' -mmin +30 -delete 2>/dev/null; true");
+
+    // Interception is absent until nft is rebuilt below; keep a fail-closed
+    // setup blocked meanwhile (the gate also shuts LAN DNS, so the rollback
+    // below only gives the router itself a resolver).
+    kill_switch.hold();
+    if (!is_planned_restart && config_get(CONFIG_NAME + ".settings.shutdown_correctly") == "0") {
+        log_message("Previous shutdown was unclean; restoring dnsmasq to failsafe before start", "warn");
+        dnsmasq_restore_fail_safe();
+    }
 
     // Watchdog must start early so auto-healing is active even through a failed boot.
     // Telegram (119 KB) is heavy but non-critical: move to background after the proxy
@@ -1198,16 +1257,8 @@ function start_impl() {
     if (status != 0)
         return status;
 
-    // On steer the sing-box DNS inbound does not run, so dnsmasq must not be
-    // pointed at it: configure dnsmasq for steer (noresolv=0, smartdns/bootstrap
-    // upstreams, no 127.0.0.42).
-    if (active_engine_is_steer()) {
-        status = dnsmasq_configure_steer();
-        if (status != 0)
-            return status;
-    }
-    else if (!setting_bool("dont_touch_dhcp", false)) {
-        status = dnsmasq_configure(false);
+    if (!setting_bool("dont_touch_dhcp", false)) {
+        status = dnsmasq_configure(true);
         if (status != 0)
             return status;
     }
@@ -1216,6 +1267,9 @@ function start_impl() {
         if (status != 0)
             return status;
     }
+    // nft was rebuilt before DNS moved back to the proxy, so the gate is still
+    // closed in a fail-closed setup; it opens only now.
+    kill_switch.release_if_ready();
 
     if (!config_set(CONFIG_NAME + ".settings.shutdown_correctly", "0"))
         return 1;
@@ -1239,9 +1293,21 @@ function start_impl() {
         return status;
     }
 
+    try { fs.unlink("/var/run/tachyon/boot-sweep-done"); } catch (e) {}
+    module_background(UI_UC, [ "latency-boot-sweep" ]);
+    module_background(UPDATES_UC, [ "list-update" ]);
+    module_background(LIB_DIR + "/service/lifecycle.uc", [ "discover-awg-mtu" ]);
+    module_background(UI_UC, [ "get-ui-capabilities" ]);
     module_background(DIAGNOSTICS_UC, [ "get-system-info" ]);
     module_background(TELEGRAM_UC, [ "start-runtime" ]);
     fs.unlink("/var/run/tachyon/starting");
+    let current_ipv6_effective = as_string(common.resolve_effective_ipv6_state(uci_core.get_all(CONFIG_NAME, "settings"), null).effective || "");
+    if (startup_ipv6_effective != "" && current_ipv6_effective != "" && current_ipv6_effective != startup_ipv6_effective) {
+        log_message("IPv6 effective state changed during startup (" + startup_ipv6_effective + " -> " + current_ipv6_effective + "); resynchronizing runtime", "info");
+        let sync_status = module_status(LIB_DIR + "/service/lifecycle.uc", [ "reload", "ipv6_state_change" ]);
+        if (sync_status != 0)
+            log_message("Post-start IPv6 synchronization failed (status " + as_string(sync_status) + ")", "warn");
+    }
     return 0;
 }
 
@@ -1249,22 +1315,6 @@ function stop_main() {
     let status = 0;
 
     log_message("Stopping Tachyon", "info");
-
-    // Stop the steer engine if present; its init script removes its own
-    // nftables table and policy routing. Stopping it unconditionally ensures
-    // that switching steer -> sing-box cleanly shuts down steer before sing-box
-    // takes over the dataplane. The zapret handler service must go first: its
-    // processes hold the engine's nfqueue sockets.
-    if (fs.stat("/etc/init.d/tachyon-steer-zapret") != null)
-        command_status_from_args([ "/etc/init.d/tachyon-steer-zapret", "stop" ]);
-    if (fs.stat("/etc/init.d/steer") != null) {
-        command_status_from_args([ "/etc/init.d/steer", "stop" ]);
-    }
-
-    // Stop the steer DNS upstream (smartdns). Must happen after steer dnsd is
-    // gone (init stop above) so the port file removal is safe and no new queries
-    // arrive at the shutting-down smartdns instance.
-    module_success(STEER_DNS_UC, [ "stop-runtime" ]);
 
     if (!module_success(DNS_FAILOVER_UC, [ "stop-runtime" ]))
         log_message("DNS failover stop failed (non-fatal)", "warn");
@@ -1275,20 +1325,6 @@ function stop_main() {
     remove_cron_jobs();
     // command_success_from_args([ "find", TMP_RULESET_FOLDER, "-mindepth", "1", "-maxdepth", "1", "-type", "f", "-delete" ]);
 
-    if (!module_success(ZAPRET_UC, [ "stop-runtime" ]))
-        log_message("Zapret stop failed (non-fatal)", "warn");
-    if (!module_success(ZAPRET2_UC, [ "stop-runtime" ]))
-        log_message("Zapret2 stop failed (non-fatal)", "warn");
-    if (!module_success(BYEDPI_UC, [ "stop-runtime" ]))
-        log_message("ByeDPI stop failed (non-fatal)", "warn");
-    if (!module_success(WDTT_UC, [ "stop-runtime" ]))
-        log_message("WDTT stop failed (non-fatal)", "warn");
-    if (!module_success(OLCRTC_UC, [ "stop-runtime" ]))
-        log_message("OlcRTC stop failed (non-fatal)", "warn");
-    if (!module_success(FPTN_UC, [ "stop-runtime" ]))
-        log_message("FPTN stop failed (non-fatal)", "warn");
-    if (!module_success(TAILSCALE_UC, [ "stop-runtime" ]))
-        log_message("Tailscale stop failed (non-fatal)", "warn");
     module_success(PARENTAL_QUOTA_UC, [ "remove-cron" ]);
     module_success(TELEGRAM_UC, [ "stop-runtime" ]);
     if (!module_success(WATCHDOG_UC, [ "stop-runtime" ]))
@@ -1312,16 +1348,18 @@ function stop_main() {
         command_success_from_args([ "ip", "-6", "route", "flush", "table", RT_TABLE_NAME ]);
 
     if (module_success(STATE_UC, [ "core-is-foreign" ]))
-        log_message("Sing-box PID provenance mismatch: the running sing-box was not started by Tachyon; stopping it anyway", "warn");
+        log_message("tachyon-core PID provenance mismatch: the running tachyon-core was not started by Tachyon; stopping it anyway", "warn");
 
-    if (fs.stat("/etc/init.d/tachyon-core") != null) {
-        let sing_box_status = command_status_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
-        command_success_from_args([ "killall", "-q", "-9", "tachyon-core" ]);
-        if (!active_engine_is_steer() && sing_box_status != 0)
-            status = sing_box_status;
+    let core_proc = require("core.process");
+    let core_init = core_proc.core_contract().init_script;
+    if (fs.stat(core_init) != null) {
+        command_success_from_args([ core_init, "stop" ]);
+        core_proc.kill_core_daemons();
     }
 
     module_success(STATE_UC, [ "cleanup-provenance" ]);
+    remove_file(SECTION_ERRORS_FILE);
+    remove_file(VALIDATOR_QUARANTINED_FILE);
 
     return status;
 }
@@ -1337,6 +1375,12 @@ function cleanup_failed_runtime() {
     if (stop_status != 0)
         status = stop_status;
 
+    // A fail-closed setup stays blocked until a later start succeeds: the gate
+    // shuts LAN forwarding and LAN DNS, so the DNS rollback below only gives
+    // the router itself a resolver (updates, subscriptions, NTP).
+    let fail_closed = kill_switch.hold();
+    if (fail_closed != "")
+        log_message("Start failed; LAN stays blocked until Tachyon recovers (" + fail_closed + ")", "warn");
     let dns_status = dnsmasq_restore_fail_safe();
     if (dns_status != 0 && status == 0)
         status = dns_status;
@@ -1344,6 +1388,9 @@ function cleanup_failed_runtime() {
     let mark_status = mark_runtime_stopped_clean();
     if (mark_status != 0 && status == 0)
         status = mark_status;
+
+    if (fs.stat("/etc/rc.d/S99tachyon") != null)
+        module_status(WATCHDOG_UC, [ "start-runtime" ]);
 
     if (status != 0)
         log_message("Failed to fully clean up Tachyon runtime after start/reload failure", "warn");
@@ -1376,25 +1423,10 @@ function start() {
 
     mark_pending_reload_if_config_changed(startup_config_fingerprint, "config_changed_during_start");
 
-    // The stable-start verification below is sing-box specific. When steer
-    // drives routing, its own init script already reported success, so asking
-    // for a stable sing-box would always fail and roll the start back.
-    let active_engine = "tachyon-core";
-    try {
-        active_engine = require("core.engine").get_active();
-    }
-    catch (e) {
-        active_engine = "tachyon-core";
-    }
-    if (active_engine != "tachyon-core") {
-        module_status(STATE_UC, [ "run-pending-reload-if-requested", PENDING_RELOAD_FILE, SERVICE_INIT ]);
-        return 0;
-    }
-
     status = module_status(STATE_UC, [
         "wait-tachyon-core-service-stable",
-        as_string(SING_BOX_START_STABLE_MIN_AGE),
-        as_string(SING_BOX_START_VERIFY_TIMEOUT)
+        as_string(TACHYON_CORE_START_STABLE_MIN_AGE),
+        as_string(TACHYON_CORE_START_VERIFY_TIMEOUT)
     ]);
     if (status != 0) {
         log_message("Startup verification failed after Tachyon was started; rolling back DNS changes", "warn");
@@ -1411,6 +1443,15 @@ function stop_impl() {
     let status = 0;
     invalidate_reload_hash();
 
+    // Every stop goes through here: the LuCI button, but also package upgrades,
+    // tachyon-core updates and the installer. A fail-closed setup must not get
+    // a direct path out of any of them, so the gate closes and DNS stays on the
+    // proxy; only a disabled or removed service goes direct.
+    // The gate closes first and also shuts LAN DNS, so the rollback below only
+    // gives the router itself a resolver; LAN clients get nothing until start.
+    let fail_closed = kill_switch.stop_hold();
+    if (fail_closed != "")
+        log_message("Stopping with Fail-Closed: LAN stays blocked until Tachyon starts (" + fail_closed + ")", "warn");
     if (!setting_bool("dont_touch_dhcp", false)) {
         let dns_status = dnsmasq_restore(false);
         if (dns_status != 0)
@@ -1436,6 +1477,7 @@ function stop_impl() {
 
     module_success(STATE_UC, [ "clear-reload-state", RELOAD_STATE_FILE, RELOAD_STATE_SNAPSHOT_FILE ]);
 
+    // Keep stop_hold()'s guard decision even if cleanup or the UCI commit fails.
     if (status != 0)
         dnsmasq_restore_fail_safe();
 
@@ -1453,26 +1495,22 @@ function restart_runtime_for_reload() {
     log_message("Reload requires a full Tachyon runtime restart", "info");
     invalidate_reload_hash();
 
+    kill_switch.hold(); // stop_main drops interception until start rebuilds it
     status = stop_main();
     if (status != 0)
         return status;
 
+    planned_restart_active = true;
     status = start_impl();
     if (status != 0) {
         cleanup_failed_runtime();
         return status;
     }
 
-    if (active_engine_is_steer()) {
-        restore_selector_state(selector_state);
-        remove_file(RELOAD_STATE_SNAPSHOT_FILE);
-        return 0;
-    }
-
     status = module_status(STATE_UC, [
         "wait-tachyon-core-service-stable",
-        as_string(SING_BOX_START_STABLE_MIN_AGE),
-        as_string(SING_BOX_START_VERIFY_TIMEOUT)
+        as_string(TACHYON_CORE_START_STABLE_MIN_AGE),
+        as_string(TACHYON_CORE_START_VERIFY_TIMEOUT)
     ]);
     if (status != 0) {
         log_message("Reload runtime restart verification failed after Tachyon was started; rolling back DNS changes", "fatal");
@@ -1494,24 +1532,13 @@ function parse_reload_plan(output) {
     let result = {
         changed_service_triggers: 0,
         changed_dnsmasq: 0,
-        changed_sing_box: 0,
+        changed_tachyon_core: 0,
         changed_nft: 0,
-        changed_zapret_queue: 0,
-        changed_zapret_runtime: 0,
-        changed_zapret2_queue: 0,
-        changed_zapret2_runtime: 0,
-        changed_byedpi_runtime: 0,
         changed_cron: 0,
         changed_list: 0,
         changed_hosts_list: 0,
-        needs_sing_box_reload: 0,
+        needs_tachyon_core_reload: 0,
         needs_nft_rebuild: 0,
-        needs_zapret_restart: 0,
-        needs_zapret2_restart: 0,
-        needs_byedpi_restart: 0,
-        needs_wdtt_restart: 0,
-        needs_olcrtc_restart: 0,
-        needs_fptn_restart: 0,
         needs_dnsmasq_configure: 0,
         needs_dnsmasq_restore: 0,
         needs_cron_refresh: 0,
@@ -1543,14 +1570,8 @@ function append_reload_action(actions, enabled, label) {
 
 function reload_actions_summary(plan) {
     let actions = "";
-    actions = append_reload_action(actions, plan.needs_sing_box_reload, "sing-box");
+    actions = append_reload_action(actions, plan.needs_tachyon_core_reload, "tachyon-core");
     actions = append_reload_action(actions, plan.needs_nft_rebuild, "nftables");
-    actions = append_reload_action(actions, plan.needs_zapret_restart, "Zapret");
-    actions = append_reload_action(actions, plan.needs_zapret2_restart, "Zapret2");
-    actions = append_reload_action(actions, plan.needs_byedpi_restart, "ByeDPI");
-    actions = append_reload_action(actions, plan.needs_wdtt_restart, "WDTT");
-    actions = append_reload_action(actions, plan.needs_olcrtc_restart, "OlcRTC");
-    actions = append_reload_action(actions, plan.needs_fptn_restart, "FPTN");
     actions = append_reload_action(actions, plan.needs_dnsmasq_configure || plan.needs_dnsmasq_restore, "dnsmasq");
     actions = append_reload_action(actions, plan.needs_cron_refresh, "scheduled jobs");
     actions = append_reload_action(actions, plan.needs_list_update, "remote lists");
@@ -1562,7 +1583,7 @@ function release_reload_lock() {
     module_success(STATE_UC, [ "release-runtime-dir-lock", RELOAD_LOCK_DIR ]);
 }
 
-function sing_box_runtime_pid() {
+function tachyon_core_runtime_pid() {
     let result = module_capture(STATE_UC, [ "tachyon-core-service-runtime-pid" ]);
     return result.status == 0 ? trim(result.output) : "";
 }
@@ -1587,7 +1608,7 @@ function dns_failover_apply(candidate_state_path) {
     if (!module_success(STATE_UC, [ "acquire-runtime-dir-lock-wait", RELOAD_LOCK_DIR, owner_pid(), "2" ]))
         return 2;
 
-    let patch_result = module_capture(SINGBOX_UC, [ "patch-dns-config", candidate_state_path ]);
+    let patch_result = module_capture(TACHYON_CORE_UC, [ "patch-dns-config", candidate_state_path ]);
     if (patch_result.status != 0) {
         release_reload_lock();
         return patch_result.status;
@@ -1599,14 +1620,14 @@ function dns_failover_apply(candidate_state_path) {
     let status = 0;
 
     if (changed) {
-        let sing_box_pid_before = sing_box_runtime_pid();
+        let core_pid_before = tachyon_core_runtime_pid();
         status = module_status(STATE_UC, [ "hup-core-runtime" ]);
         if (status == 0)
             status = wait_dns_failover_state(candidate_state_path, 10);
 
         if (status != 0) {
             log_message("tachyon-core SIGHUP DNS reload did not become ready; trying service reload", "warn");
-            status = module_status(STATE_UC, [ "reload-core-runtime", sing_box_pid_before, "dns-before", "dns-after", "restart" ]);
+            status = module_status(STATE_UC, [ "reload-core-runtime", core_pid_before, "dns-before", "dns-after", "restart" ]);
             if (status == 0)
                 status = wait_dns_failover_state(candidate_state_path, 15);
         }
@@ -1617,9 +1638,9 @@ function dns_failover_apply(candidate_state_path) {
 
     if (status != 0 && backup_path != "") {
         log_message("DNS failover apply failed; restoring the previous tachyon-core configuration", "error");
-        if (module_success(SINGBOX_UC, [ "restore-dns-config", backup_path ])) {
-            let sing_box_pid_before_restore = sing_box_runtime_pid();
-            module_success(STATE_UC, [ "reload-core-runtime", sing_box_pid_before_restore, "dns-failed", "dns-restored" ]);
+        if (module_success(TACHYON_CORE_UC, [ "restore-dns-config", backup_path ])) {
+            let core_pid_before_restore = tachyon_core_runtime_pid();
+            module_success(STATE_UC, [ "reload-core-runtime", core_pid_before_restore, "dns-failed", "dns-restored" ]);
         }
     }
 
@@ -1629,78 +1650,27 @@ function dns_failover_apply(candidate_state_path) {
     return status;
 }
 
-// Reload the steer engine: regenerate the spec from the current configuration
-// and let steer reload itself. No sing-box config, DNS or nft work happens here.
-function reload_steer(active_engine, reason, initial_fingerprint) {
-    if (as_string(reason || "") != "force" && current_config_hash() == last_completed_reload_hash()) {
-        log_message("Reload skipped: configuration is unchanged", "info");
-        return 0;
-    }
-
-    // A config change can add or replace a subscription section; its cache does
-    // not exist yet, and the spec generator needs it to write the vless sub
-    // file. "runtime" phase refreshes only due/missing caches. Non-fatal: the
-    // previous spec keeps running if the refresh fails.
-    module_status(SUBSCRIPTION_CACHE_UC, [ "ensure-runtime-dirs" ]);
-    if (module_status(SUBSCRIPTION_CACHE_UC, [ "prepare-caches", "runtime", "0", "0" ]) != 0)
-        log_message("Subscription cache refresh failed on reload; keeping the previous node lists", "warn");
-
-    let engine_runtime = require("service.engine_runtime");
-    let generated = engine_runtime.generate_steer_spec({});
-    if (!generated.ok) {
-        let detail = generated.output ? (": " + trim(as_string(generated.output))) : "";
-        log_message("Failed to generate the steer spec: " + as_string(generated.reason) + detail, "error");
-        return finish_reload_status(1, initial_fingerprint);
-    }
-
-    let reloaded = engine_runtime.run_init(active_engine, "reload");
-    if (!reloaded.ok)
-        reloaded = engine_runtime.run_init(active_engine, "restart");
-    if (!reloaded.ok) {
-        log_message("Failed to reload the " + active_engine + " engine", "error");
-        return finish_reload_status(1, initial_fingerprint);
-    }
-
-    // The steer-nfqws wrapper re-reads the opts file only when its process
-    // starts, and the engine's init reload never touches those handlers: a
-    // strategy changed in the config would keep running with the old keys, and
-    // a zapret output added or removed would have no handler at all. Restarting
-    // the handler service re-enumerates the outputs from the current spec and
-    // re-reads every strategy in one step (tunnels and dnsd stay up).
-    if (fs.stat("/etc/init.d/tachyon-steer-zapret") != null) {
-        if (command_status_from_args([ "/etc/init.d/tachyon-steer-zapret", "restart" ]) != 0)
-            log_message("steer zapret handler service restart failed (non-fatal)", "warn");
-    }
-
-    return finish_reload_status(0, initial_fingerprint);
-}
-
 function reload(reason) {
     let status;
     let force_runtime_reload = as_string(reason || "") == "on_config_change" ? 0 : 1;
+    if (as_string(reason || "") != "section_fail_policy")
+        remove_file(SECTION_FAIL_STATE_FILE);
     let reload_config_fingerprint = external_config_fingerprint();
     rule_condition_cache_enabled = force_runtime_reload;
 
     log_message("Reloading Tachyon", "info");
 
-    // steer reloads by regenerating its spec and reloading its own service;
-    // the sing-box reload pipeline below never runs while steer is active.
-    let active_engine = "tachyon-core";
-    try {
-        active_engine = require("core.engine").get_active();
-    }
-    catch (e) {
-        active_engine = "tachyon-core";
-    }
-    if (active_engine != "tachyon-core")
-        return reload_steer(active_engine, reason, reload_config_fingerprint);
-
     // Skip all work when config fingerprint is unchanged since the last reload.
-    // Applies to user-triggered reloads as well as on_config_change; saves ~4
-    // ucode forks (3 validate + 1 plan) when nothing actually changed.
-    if (reason != "force" && current_config_hash() == last_completed_reload_hash()) {
-        log_message("Reload skipped: configuration is unchanged", "info");
-        return 0;
+    // Applies only to background on_config_change triggers; explicit user reloads
+    // (tachyon reload, /etc/init.d/tachyon reload, force, ipv6_state_change) always execute.
+    if (as_string(reason || "") == "on_config_change" &&
+        as_string(getenv("TACHYON_RUNTIME_CACHE_INVALIDATED") || "0") != "1" &&
+        current_config_hash() == last_completed_reload_hash() &&
+        !module_success(SUBSCRIPTION_CACHE_UC, [ "runtime-cache-needs-rebuild", SECTION_CACHE_DIR ])) {
+        if (module_success(STATE_UC, [ "tachyon-running", RT_TABLE_NAME, NFT_TABLE_NAME, NFT_FAKEIP_MARK ])) {
+            log_message("Reload skipped: configuration is unchanged", "info");
+            return 0;
+        }
     }
 
     status = validate_start_config();
@@ -1793,19 +1763,6 @@ function reload(reason) {
     if (actions != "")
         log_message("Applying reload changes: " + actions, "info");
 
-    if (plan.needs_zapret_restart == 1)
-        module_success(ZAPRET_UC, [ "stop-runtime" ]);
-    if (plan.needs_zapret2_restart == 1)
-        module_success(ZAPRET2_UC, [ "stop-runtime" ]);
-    if (plan.needs_byedpi_restart == 1)
-        module_success(BYEDPI_UC, [ "stop-runtime" ]);
-    if (plan.needs_wdtt_restart == 1)
-        module_success(WDTT_UC, [ "stop-runtime" ]);
-    if (plan.needs_olcrtc_restart == 1)
-        module_success(OLCRTC_UC, [ "stop-runtime" ]);
-    if (plan.needs_fptn_restart == 1)
-        module_success(FPTN_UC, [ "stop-runtime" ]);
-
     if (plan.needs_hosts_update == 1 && module_success(STATE_UC, [ "has-hosts-list-update-sources" ]))
         module_success(HOSTS_UC, [ "list-update" ]);
 
@@ -1816,58 +1773,83 @@ function reload(reason) {
             return abort_reload(status, true);
     }
 
-    if (plan.needs_sing_box_reload == 1) {
+    if (plan.needs_tachyon_core_reload == 1) {
+        if (plan.needs_nft_rebuild != 1)
+            module_success(NFT_UC, [ "sync-server-firewall-uci-rules" ]);
         module_success(DNS_FAILOVER_UC, [ "stop-runtime" ]);
         module_success(PRIORITY_UC, [ "stop-runtime" ]);
-        status = module_status(SINGBOX_UC, [ "configure-service" ]);
+        status = module_status(TACHYON_CORE_UC, [ "configure-service" ]);
         if (status != 0)
             return abort_reload(status, true);
-        let sing_box_config_path = config_get(CONFIG_NAME + ".settings.config_path", "");
-        let sing_box_config_hash_before = file_md5(sing_box_config_path);
-        let sing_box_pid_result = module_capture(STATE_UC, [ "tachyon-core-service-runtime-pid" ]);
-        let sing_box_pid_before = sing_box_pid_result.status == 0 ? trim(sing_box_pid_result.output) : "";
+        let core_config_path = config_get(CONFIG_NAME + ".settings.config_path", "");
+        let core_config_hash_before = file_md5(core_config_path);
+        let core_pid_result = module_capture(STATE_UC, [ "tachyon-core-service-runtime-pid" ]);
+        let core_pid_before = core_pid_result.status == 0 ? trim(core_pid_result.output) : "";
+        restore_rulesets_from_cache();
+        prepare_community_rulesets();
         nft_populate_enabled = plan.needs_nft_rebuild == 1 ? 1 : 0;
-        status = singbox_init_config();
-        if (status != 0)
+        let errors_before = section_errors_snapshot();
+        status = core_init_config();
+        if (status != 0) {
+            nft_populate_enabled = NFT_POPULATE_ENABLED_DEFAULT;
             return abort_reload(status, true);
+        }
         nft_populate_enabled = NFT_POPULATE_ENABLED_DEFAULT;
+        if (section_errors_snapshot() != errors_before) {
+            log_message("Quarantined sections changed during reload; resyncing nftables rules", "info");
+            status = nft_rebuild_runtime();
+            if (status != 0)
+                return abort_reload(status, true);
+            if (nft_populate_enabled == 1 || plan.needs_nft_rebuild == 1) {
+                let prev_populate = nft_populate_enabled;
+                nft_populate_enabled = 1;
+                status = nft_populate_runtime_sets();
+                nft_populate_enabled = prev_populate;
+                if (status != 0)
+                    return abort_reload(status, true);
+            }
+        }
         status = module_status(STATE_UC, [
             "reload-core-runtime",
-            sing_box_pid_before,
-            sing_box_config_hash_before,
-            file_md5(sing_box_config_path),
+            core_pid_before,
+            core_config_hash_before,
+            file_md5(core_config_path),
             as_string(force_runtime_reload)
         ]);
         if (status != 0)
             return abort_reload(status, true);
         status = module_status(STATE_UC, [
             "wait-tachyon-core-service-stable",
-            as_string(SING_BOX_START_STABLE_MIN_AGE),
-            as_string(SING_BOX_START_VERIFY_TIMEOUT)
+            as_string(TACHYON_CORE_START_STABLE_MIN_AGE),
+            as_string(TACHYON_CORE_START_VERIFY_TIMEOUT)
         ]);
         if (status != 0) {
-            log_message("Reload verification failed after sing-box was reloaded; stopping Tachyon runtime", "fatal");
+            log_message("Reload verification failed after tachyon-core was reloaded; stopping Tachyon runtime", "fatal");
             cleanup_failed_runtime();
             return status;
         }
 
-        let reload_sb_pid = trim(module_output(STATE_UC, [ "tachyon-core-service-runtime-pid" ]));
-        if (match(reload_sb_pid, /^[0-9]+$/) != null)
-            module_success(STATE_UC, [ "write-provenance", reload_sb_pid ]);
-        common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
+        let reload_core_pid = trim(module_output(STATE_UC, [ "tachyon-core-service-runtime-pid" ]));
+        if (match(reload_core_pid, /^[0-9]+$/) != null)
+            module_success(STATE_UC, [ "write-provenance", reload_core_pid ]);
+        common.write_file(RUNTIME_STATE_DIR + "/tachyon-core-reload.timestamp", as_string(time()) + "\n");
+
+        sync_selector_defaults_after_reload(null);
 
         status = module_status(PRIORITY_UC, [ "start-runtime" ]);
         if (status != 0) {
-            log_message("Failed to start Priority runtime after sing-box reload", "fatal");
+            log_message("Failed to start Priority runtime after tachyon-core reload", "fatal");
             cleanup_failed_runtime();
             return status;
         }
         status = module_status(DNS_FAILOVER_UC, [ "start-runtime" ]);
         if (status != 0) {
-            log_message("Failed to restart DNS failover runtime after sing-box reload", "fatal");
+            log_message("Failed to restart DNS failover runtime after tachyon-core reload", "fatal");
             cleanup_failed_runtime();
             return status;
         }
+        if (subscription_deferred_sections != "")
+            module_background(SUBSCRIPTION_CACHE_UC, [ "run-deferred-bootstrap", subscription_deferred_sections ]);
     }
     else if (plan.needs_nft_rebuild == 1 && nft_populate_enabled == 1) {
         status = nft_populate_runtime_sets();
@@ -1875,21 +1857,6 @@ function reload(reason) {
             return abort_reload(status, true);
     }
 
-    if (plan.needs_zapret_restart == 1)
-        module_success(ZAPRET_UC, [ "start-runtime" ]);
-    if (plan.needs_zapret2_restart == 1)
-        module_success(ZAPRET2_UC, [ "start-runtime" ]);
-    if (plan.needs_wdtt_restart == 1)
-        module_success(WDTT_UC, [ "start-runtime" ]);
-    if (plan.needs_olcrtc_restart == 1)
-        module_success(OLCRTC_UC, [ "start-runtime" ]);
-    if (plan.needs_fptn_restart == 1)
-        module_success(FPTN_UC, [ "start-runtime" ]);
-    if (plan.needs_byedpi_restart == 1)
-    module_success(BYEDPI_UC, [ "start-runtime" ]);
-    // Native Tailscale must be up before sing-box so tailnet routes win over
-    // policy routing from the very first packet.
-    module_success(TAILSCALE_UC, [ "start-runtime" ]);
     // Minute-tick cron for parental daily time quotas (idempotent install).
     module_success(PARENTAL_QUOTA_UC, [ "install-cron" ]);
     module_success(PARENTAL_QUOTA_UC, [ "tick" ]);
@@ -1897,7 +1864,7 @@ function reload(reason) {
     module_status(NFT_UC, [ "nft-sync-router-output-intercept", NFT_TABLE_NAME, NFT_LOCALV4_SET_NAME, NFT_OUTBOUND_MARK ]);
 
     if (plan.needs_dnsmasq_configure == 1) {
-        status = active_engine_is_steer() ? dnsmasq_configure_steer() : dnsmasq_configure(true);
+        status = dnsmasq_configure(true);
         if (status != 0)
             return abort_reload(status, true);
         module_success(STATE_UC, [ "capture-reload-state", RELOAD_STATE_SNAPSHOT_FILE, as_string(RELOAD_STATE_FORMAT) ]);
@@ -1952,25 +1919,22 @@ function restart() {
     let selector_state = capture_selector_state();
     invalidate_reload_hash();
 
+    kill_switch.hold(); // stop_main drops interception until start rebuilds it
     let status = stop_main();
     if (status != 0)
         return status;
 
+    planned_restart_active = true;
     status = start_impl();
     if (status != 0) {
         cleanup_failed_runtime();
         return status;
     }
 
-    if (active_engine_is_steer()) {
-        restore_selector_state(selector_state);
-        return 0;
-    }
-
     status = module_status(STATE_UC, [
         "wait-tachyon-core-service-stable",
-        as_string(SING_BOX_START_STABLE_MIN_AGE),
-        as_string(SING_BOX_START_VERIFY_TIMEOUT)
+        as_string(TACHYON_CORE_START_STABLE_MIN_AGE),
+        as_string(TACHYON_CORE_START_VERIFY_TIMEOUT)
     ]);
     if (status != 0) {
         log_message("Restart verification failed after Tachyon was started; rolling back DNS changes", "fatal");
@@ -1998,7 +1962,7 @@ function package_manager_remove_if_installed(package_name) {
     package_name = as_string(package_name);
     if (command_success_from_args([ "sh", "-c", "command -v apk" ])) {
         if (command_success_from_args([ "apk", "info", "-e", package_name ]))
-            command_success_from_args([ "apk", "del", package_name ]);
+            command_success_from_args([ "apk", "del", "--no-network", "--repositories-file", "/dev/null", package_name ]);
         return;
     }
 
@@ -2014,6 +1978,8 @@ function uninstall() {
         command_success_from_args([ SERVICE_INIT, "disable" ]);
     }
 
+    // Removing Tachyon is the one stop that must leave the router usable.
+    kill_switch.remove();
     dnsmasq_restore_fail_safe();
 
     if (fs.stat("/etc/init.d/tachyon") != null) {
@@ -2024,8 +1990,8 @@ function uninstall() {
     package_manager_remove_if_installed("luci-i18n-tachyon-ru");
     package_manager_remove_if_installed("luci-app-tachyon");
 
-    if (module_success(SINGBOX_UC, [ "managed-service-installed" ])) {
-        module_success(SINGBOX_UC, [ "remove-managed-service-script" ]);
+    if (module_success(TACHYON_CORE_UC, [ "managed-service-installed" ])) {
+        module_success(TACHYON_CORE_UC, [ "remove-managed-service-script" ]);
         remove_file("/usr/bin/tachyon-core");
         remove_file("/usr/lib/libcronet.so");
     }
@@ -2049,18 +2015,13 @@ function uninstall() {
 }
 
 function enable_service() {
-    let res = command_status_from_args([ SERVICE_INIT, "enable" ]);
-    uci_core.set(CONFIG_NAME, "settings", "enabled", "1");
-    uci_core.commit(CONFIG_NAME);
-    return res;
+    return command_status_from_args([ SERVICE_INIT, "enable" ]);
 }
 
 function disable_service() {
-    let res = command_status_from_args([ SERVICE_INIT, "disable" ]);
-    uci_core.set(CONFIG_NAME, "settings", "enabled", "0");
-    uci_core.commit(CONFIG_NAME);
-    stop();
-    return res;
+    // Autostart controls boot links only. Keep the live runtime and its desired
+    // configuration intact; stopping the service is a separate explicit action.
+    return command_status_from_args([ SERVICE_INIT, "disable" ]);
 }
 
 let mode = ARGV[0] || "";
@@ -2072,8 +2033,10 @@ else if (mode == "start")
     status = start();
 else if (mode == "stop")
     status = stop();
-else if (mode == "reload-firewall")
+else if (mode == "reload-firewall" || mode == "reload_firewall")
     status = reload_firewall();
+else if (mode == "nft-populate-runtime-sets" || mode == "nft_populate_runtime_sets")
+    status = nft_populate_runtime_sets();
 else if (mode == "reload")
     status = reload_tracked(ARGV[1] || "");
 else if (mode == "dns-failover-apply")
@@ -2090,6 +2053,10 @@ else if (mode == "selector-state-from-proxies-fixture") {
 }
 else if (mode == "selector-restore-pairs-fixture") {
     write_json(selector_restore_pairs(read_json_file(ARGV[1]), read_json_file(ARGV[2])));
+    status = 0;
+}
+else if (mode == "prepare-community-rulesets-fixture") {
+    prepare_community_rulesets();
     status = 0;
 }
 else if (mode == "dnsmasq-restore" || mode == "restore-dnsmasq")

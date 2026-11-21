@@ -1,4 +1,8 @@
-import { renderCheckIcon24, renderXIcon24 } from '../../../../icons';
+import {
+  renderCheckIcon24,
+  renderXIcon24,
+  renderClockIcon,
+} from '../../../../icons';
 import { renderButton } from '../../../../partials';
 import { copyToClipboard } from '../../../../helpers/copyToClipboard';
 import { TachyonShellMethods } from '../../../methods';
@@ -126,10 +130,11 @@ export function showUpdateProgressModal(
   let timerInterval: ReturnType<typeof setInterval> | null = null;
   let currentModalVersions = { ...options };
 
+  const timerTextEl = E('span', {}, '00:00');
   const timerBadgeEl = E(
     'div',
     { class: 'tachyon-update-modal__timer-badge' },
-    '⏱️ 00:00',
+    [renderClockIcon(12), timerTextEl],
   );
 
   const phaseBadgeEl = E(
@@ -204,7 +209,7 @@ export function showUpdateProgressModal(
       .toString()
       .padStart(2, '0');
     const secs = (elapsedSeconds % 60).toString().padStart(2, '0');
-    timerBadgeEl.textContent = `⏱️ ${mins}:${secs}`;
+    timerTextEl.textContent = `${mins}:${secs}`;
   };
 
   timerInterval = setInterval(() => {
@@ -397,7 +402,7 @@ export function showUpdateProgressModal(
             if (activeModalJobId) {
               saveHandledJobToSession(activeModalJobId);
             }
-            safeReloadPage();
+            void safeReloadPage();
           },
         });
 
@@ -449,7 +454,7 @@ export function showUpdateProgressModal(
                   saveHandledJobToSession(activeModalJobId);
                 }
                 await new Promise((resolve) => setTimeout(resolve, 800));
-                safeReloadPage();
+                await safeReloadPage();
                 return;
               }
             } catch (_err) {

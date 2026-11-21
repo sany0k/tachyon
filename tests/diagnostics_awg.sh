@@ -99,4 +99,130 @@ if (v.runtime_ok != 0) {
 }
 NODE
 
+# ---- 4. Conntrack session parsing and fwmark decoding
+cat >"$WORK_DIR/nf_conntrack" <<'CT'
+ipv4     2 tcp      6 431995 ESTABLISHED src=192.168.1.50 dst=142.250.74.110 sport=54321 dport=443 packets=20 bytes=3200 src=142.250.74.110 dst=95.24.100.12 sport=443 dport=54321 packets=25 bytes=24800 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 udp      17 170 src=192.168.1.50 dst=1.1.1.1 sport=60123 dport=443 packets=15 bytes=4100 src=1.1.1.1 dst=95.24.100.12 sport=443 dport=60123 packets=18 bytes=19200 [ASSURED] mark=33554433 zone=0 use=2
+ipv4     2 tcp      6 15 TIME_WAIT src=192.168.1.50 dst=8.8.8.8 sport=50000 dport=443 packets=4 bytes=240 src=8.8.8.8 dst=95.24.100.12 sport=443 dport=50000 packets=4 bytes=240 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 tcp      6 300 ESTABLISHED src=192.168.1.50 dst=192.168.1.1 sport=55555 dport=80 packets=10 bytes=1200 src=192.168.1.1 dst=192.168.1.50 sport=80 dport=55555 packets=10 bytes=4500 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 tcp      6 300 ESTABLISHED src=95.24.100.12 dst=185.199.108.153 sport=41234 dport=443 packets=10 bytes=1500 src=185.199.108.153 dst=95.24.100.12 sport=443 dport=41234 packets=10 bytes=8500 [ASSURED] mark=134217728 zone=0 use=2
+ipv4     2 tcp      6 300 ESTABLISHED src=37.143.105.83 dst=95.85.224.159 sport=45120 dport=443 packets=12 bytes=20400 src=95.85.224.159 dst=37.143.105.83 sport=443 dport=45120 packets=10 bytes=60 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 tcp      6 300 ESTABLISHED src=192.168.1.50 dst=172.217.117.4 sport=51111 dport=443 packets=10 bytes=1200 src=172.217.117.4 dst=192.168.1.50 sport=443 dport=51111 packets=10 bytes=4500 [ASSURED] mark=0 zone=0 use=2
+CT
+
+ct_json="$(TACHYON_CONNTRACK_FILE="$WORK_DIR/nf_conntrack" ucode -L "$TACHYON_LIB" -e '
+  let routing = require("diagnostics.routing");
+  let mark_info = {
+    marks: { "33554433": "youtube_ds-out" }
+  };
+  let existing = {};
+  existing[routing.connection_tuple_key("tcp", "192.168.1.50", "54321", "142.250.74.110", "443")] = true;
+  let conns = routing.read_conntrack_connections(mark_info, existing, { "1.1.1.1": "one.one.one.one" });
+  printf("%J\n", conns);
+')"
+
+JSON_VALUE="$ct_json" node - <<'NODE'
+const conns = JSON.parse(process.env.JSON_VALUE);
+if (!Array.isArray(conns) || conns.length !== 1) {
+  console.error(`expected 1 non-duplicate active public conntrack connection, got ${JSON.stringify(conns)}`);
+  process.exit(1);
+}
+const c = conns[0];
+if (
+  c.id !== "ct:udp:192.168.1.50:60123:1.1.1.1:443" ||
+  c.dataSource !== "conntrack" ||
+  c.upload !== 4100 ||
+  c.download !== 19200 ||
+  !Array.isArray(c.chains) ||
+  c.chains[0] !== "youtube_ds-out" ||
+  !c.metadata ||
+  c.metadata.host !== "one.one.one.one"
+) {
+  console.error(`unexpected conntrack entry fields: ${JSON.stringify(c)}`);
+  process.exit(1);
+}
+NODE
+
+# ---- 5. clash_api get_connections strips reverseDns, compacts rule_set=[...] and caps stdout <= 56 KB while writing full state file
+mkdir -p "$WORK_DIR/mock_bin" "$WORK_DIR/runtime"
+cat >"$WORK_DIR/mock_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+node - <<'GEN'
+const rev = {};
+for (let i = 1; i <= 200; i++) rev[`198.51.100.${i}`] = `host-${i}.example.net`;
+const conns = [];
+const bigRuleSet = Array.from({ length: 40 }, (_, i) => `cat-${i}-geosite`).join(" ");
+for (let i = 1; i <= 180; i++) {
+  conns.push({
+    id: `conn-${i}`,
+    upload: 1024 * i,
+    download: 4096 * i,
+    start: "2026-11-10T08:00:00Z",
+    chains: ["proxy-out", "main-out"],
+    rule: `protocol=tls rule_set=[${bigRuleSet}] => main-out`,
+    rulePayload: "rule_set=cat-0-geosite",
+    metadata: {
+      network: "tcp",
+      type: "tproxy",
+      sourceIP: "192.168.1.50",
+      sourcePort: String(40000 + i),
+      destinationIP: `198.51.100.${(i % 200) + 1}`,
+      destinationPort: "443",
+      host: ""
+    }
+  });
+}
+process.stdout.write(JSON.stringify({
+  downloadTotal: 1000000,
+  uploadTotal: 200000,
+  memory: 16777216,
+  reverseDns: rev,
+  connections: conns
+}));
+GEN
+CURL
+chmod +x "$WORK_DIR/mock_bin/curl"
+
+conn_stdout="$(
+  PATH="$WORK_DIR/mock_bin:$PATH" \
+  TACHYON_RUNTIME_STATE_DIR="$WORK_DIR/runtime" \
+  TACHYON_CONNTRACK_FILE="$WORK_DIR/nf_conntrack" \
+  ucode -L "$TACHYON_LIB" -e '
+    let routing = require("diagnostics.routing");
+    routing.clash_api("get_connections");
+  '
+)"
+
+STDOUT_JSON="$conn_stdout" STATE_FILE="$WORK_DIR/runtime/ui-state/clash-connections.json" node - <<'NODE'
+const fs = require("fs");
+const rawStdout = process.env.STDOUT_JSON || "";
+if (Buffer.byteLength(rawStdout, "utf8") > 56000) {
+  console.error(`stdout must be capped <= 56000 bytes for rpcd, got ${Buffer.byteLength(rawStdout, "utf8")}`);
+  process.exit(1);
+}
+const stdoutObj = JSON.parse(rawStdout);
+if ("reverseDns" in stdoutObj) {
+  console.error("reverseDns must be stripped from clash_api get_connections payload");
+  process.exit(1);
+}
+if (!stdoutObj.truncated) {
+  console.error("truncated flag must be set when connections are capped for stdout");
+  process.exit(1);
+}
+const first = stdoutObj.connections[0];
+if (!first || first.rule !== "protocol=tls rule_set=cat-0-geosite => main-out") {
+  console.error(`expected compacted rule_set rule, got ${first && first.rule}`);
+  process.exit(1);
+}
+if (!first.metadata || first.metadata.host !== "host-2.example.net") {
+  console.error(`expected reverseDns host enrichment before stripping, got ${JSON.stringify(first && first.metadata)}`);
+  process.exit(1);
+}
+const fullObj = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
+if (!Array.isArray(fullObj.connections) || fullObj.connections.length < 180) {
+  console.error(`expected full connections array in state file, got ${fullObj.connections && fullObj.connections.length}`);
+  process.exit(1);
+}
+NODE
+
 printf 'Diagnostics AWG checks passed\n'

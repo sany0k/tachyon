@@ -38,6 +38,26 @@ function strip_version_prefix(value) {
     return value;
 }
 
+function package_base_and_rev(value) {
+    value = as_string(value);
+    let m = match(value, /^(.*)-(r|r\.)?([0-9]+)$/);
+    if (m)
+        return [ m[1], int(m[3]) ];
+    return [ value, null ];
+}
+
+function to_apk_version(value) {
+    value = as_string(value);
+    let m = match(value, /^(.*)-([0-9]+)$/);
+    return m ? (m[1] + "-r" + m[2]) : value;
+}
+
+function to_opkg_version(value) {
+    value = as_string(value);
+    let m = match(value, /^(.*)-(r|r\.)([0-9]+)$/);
+    return m ? (m[1] + "-" + m[3]) : value;
+}
+
 function compare_versions(lhs, rhs) {
     lhs = strip_version_prefix(lhs);
     rhs = strip_version_prefix(rhs);
@@ -60,8 +80,20 @@ function compare_versions(lhs, rhs) {
         rhs = rhs_base;
     }
 
+    let lp = package_base_and_rev(lhs);
+    let rp = package_base_and_rev(rhs);
+    if (lp[0] == rp[0]) {
+        let lr = lp[1] == null ? 1 : lp[1];
+        let rr = rp[1] == null ? 1 : rp[1];
+        if (lr == rr)
+            return 0;
+        return lr < rr ? -1 : 1;
+    }
+
     if (helpers.is_apk()) {
-        let apk_result = trim(command_output_from_args([ "apk", "version", "-t", lhs, rhs ]));
+        let apk_lhs = to_apk_version(lhs);
+        let apk_rhs = to_apk_version(rhs);
+        let apk_result = trim(command_output_from_args([ "apk", "version", "-t", apk_lhs, apk_rhs ]));
         if (apk_result == ">")
             return 1;
         if (apk_result == "<")
@@ -70,16 +102,18 @@ function compare_versions(lhs, rhs) {
             return 0;
     }
 
+    let opkg_lhs = to_opkg_version(lhs);
+    let opkg_rhs = to_opkg_version(rhs);
     if (helpers.command_exists("opkg")) {
-        if (command_success_from_args([ "opkg", "compare-versions", lhs, ">", rhs ]))
+        if (command_success_from_args([ "opkg", "compare-versions", opkg_lhs, ">", opkg_rhs ]))
             return 1;
-        if (command_success_from_args([ "opkg", "compare-versions", lhs, "<", rhs ]))
+        if (command_success_from_args([ "opkg", "compare-versions", opkg_lhs, "<", opkg_rhs ]))
             return -1;
-        if (command_success_from_args([ "opkg", "compare-versions", lhs, "=", rhs ]))
+        if (command_success_from_args([ "opkg", "compare-versions", opkg_lhs, "=", opkg_rhs ]))
             return 0;
     }
 
-    return helpers.module_success([ helpers.LIB_DIR + "/core/helpers.uc", "version-at-least", lhs, rhs ]) ? 1 : -1;
+    return helpers.module_success([ helpers.LIB_DIR + "/core/helpers.uc", "version-at-least", opkg_lhs, opkg_rhs ]) ? 1 : -1;
 }
 
 function status_from_compare(compare_result) {
@@ -117,36 +151,20 @@ function available_package_version(package_name) {
     return opkg_package_version_from_list(package_name, command_output_from_args([ "opkg", "list", package_name ]));
 }
 
-function extract_arch_package_version(package_name, package_arch) {
-    return trim(helpers.helper_output("updates-arch-package-version", [ package_name, package_arch ]));
-}
-
-function extract_zapret_bundle_version(bundle_name) {
-    return trim(helpers.helper_output("updates-zapret-bundle-version", [ bundle_name ]));
-}
-
-function extract_zapret2_bundle_version(bundle_name) {
-    return trim(helpers.helper_output("updates-zapret2-bundle-version", [ bundle_name ]));
-}
-
-function normalize_zapret_version(value) {
-    return trim(helpers.helper_output("updates-normalize-zapret-version", [ value ]));
-}
-
-function normalize_sing_box_version(value) {
-    return trim(helpers.helper_output("updates-normalize-sing-box-version", [ value ]));
+function normalize_core_version(value) {
+    return trim(helpers.helper_output("updates-normalize-core-version", [ value ]));
 }
 
 // ============================================================================
-// sing-box binary version parsing
+// tachyon-core binary version parsing
 // ============================================================================
 
-function extract_sing_box_version_from_output(output) {
+function extract_core_version_from_output(output) {
     output = as_string(output);
     for (let line in split(output, "\n")) {
         line = trim(line);
         let fields = split(line, /[ \t\r\n]+/);
-        if (length(fields) >= 3 && (lc(fields[0]) == "sing-box" || lc(fields[0]) == "tachyon-core") && lc(fields[1]) == "version" && match(fields[2], /^[vV]?[0-9]+/))
+        if (length(fields) >= 3 && lc(fields[0]) == "tachyon-core" && lc(fields[1]) == "version" && match(fields[2], /^[vV]?[0-9]+/))
             return fields[2];
         if (length(fields) >= 2 && (lc(fields[0]) == "version" || lc(fields[0]) == "tachyon-core") && match(fields[1], /^[vV]?[0-9]+/))
             return fields[1];
@@ -154,10 +172,10 @@ function extract_sing_box_version_from_output(output) {
     return "";
 }
 
-function read_sing_box_binary_version(binary, library_dir) {
+function read_core_binary_version(binary, library_dir) {
     binary = as_string(binary);
     if (binary == "" || !helpers.file_exists(binary)) {
-        helpers.updates_log("sing-box binary not found at " + binary, "warn");
+        helpers.updates_log("tachyon-core binary not found at " + binary, "warn");
         return "";
     }
 
@@ -174,7 +192,7 @@ function read_sing_box_binary_version(binary, library_dir) {
     }
 
     let raw_output = command_output_lenient("(" + command + ") 2>&1");
-    let version = extract_sing_box_version_from_output(raw_output);
+    let version = extract_core_version_from_output(raw_output);
     if (version == "") {
         let candidate = trim(helpers.helper_output_input(raw_output, "stdin-first-line-last-field", []));
         if (match(candidate, /^[vV]?[0-9]+/))
@@ -182,7 +200,7 @@ function read_sing_box_binary_version(binary, library_dir) {
     }
     if (version == "") {
         let trimmed_raw = trim(raw_output);
-        helpers.updates_log("Failed to parse sing-box version from binary " + binary + (trimmed_raw != "" ? "; output: " + trimmed_raw : "; binary produced no output"), "warn");
+        helpers.updates_log("Failed to parse tachyon-core version from binary " + binary + (trimmed_raw != "" ? "; output: " + trimmed_raw : "; binary produced no output"), "warn");
     }
     return version;
 }
@@ -196,13 +214,9 @@ function module_exports() {
         installed_package_version,
         opkg_package_version_from_list,
         available_package_version,
-        extract_arch_package_version,
-        extract_zapret_bundle_version,
-        extract_zapret2_bundle_version,
-        normalize_zapret_version,
-        normalize_sing_box_version,
-        extract_sing_box_version_from_output,
-        read_sing_box_binary_version
+        normalize_core_version,
+        extract_core_version_from_output,
+        read_core_binary_version
     };
 }
 

@@ -6,6 +6,8 @@ let helpers = require("core.helpers");
 let core_ip = require("core.ip");
 let core_url = require("core.url");
 let runtime_constants = require("tachyon_core.constants");
+let variant_state = require("tachyon_core.variant_state");
+let runtime_country = require("tachyon_core.country");
 let runtime_dns = require("tachyon_core.dns");
 let runtime_route = require("tachyon_core.route");
 let runtime_rulesets = require("tachyon_core.rulesets");
@@ -32,6 +34,82 @@ const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 let runtime_ruleset_folder = getenv("TACHYON_RULESET_FOLDER") || "/usr/share/tachyon/rulesets";
 
 let ctx = {};
+let section_leaf_tags = {};
+let section_group_map = {};
+let section_state_map = {};
+let active_group_tags = {};
+// The section whose route rules are being emitted (push_section_route_rule needs
+// its fail policy and has no section argument).
+let active_route_section = null;
+
+// Declared before every caller: ucode resolves names at the call site, and
+// section_fail_policy_mode() is defined far below the selector builders.
+function section_is_fail_closed(section) {
+    return lc(trim(as_string(object_or_empty(section).fail_policy || ""))) == "block";
+}
+let active_remote_custom_rulesets = {};
+let remote_custom_rulesets_state = null;
+
+function remote_custom_rulesets_state_path() {
+    let custom = getenv("TACHYON_REMOTE_RULESETS_STATE_FILE");
+    if (custom != null && trim(custom) != "")
+        return trim(custom);
+    let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
+    return folder + "/.remote-custom-rulesets-state.json";
+}
+
+function load_remote_custom_rulesets_state() {
+    if (remote_custom_rulesets_state != null)
+        return remote_custom_rulesets_state;
+    let raw = read_json_file(remote_custom_rulesets_state_path());
+    if (type(raw) != "object" || type(raw.entries) != "object")
+        remote_custom_rulesets_state = { entries: {} };
+    else
+        remote_custom_rulesets_state = raw;
+    return remote_custom_rulesets_state;
+}
+
+function remote_custom_ruleset_tag(reference) {
+    let base_hash = runtime_rulesets.hash12(reference);
+    let state_obj = load_remote_custom_rulesets_state();
+    let entry = object_or_empty(state_obj.entries[reference]);
+    let gen = int(entry.gen || 1);
+    if (gen < 1)
+        gen = 1;
+    if (entry.active === false) {
+        gen = gen + 1;
+        state_obj.entries[reference] = { active: true, gen: gen };
+    }
+    active_remote_custom_rulesets[reference] = gen;
+    if (gen <= 1)
+        return "inline-custom-" + base_hash + "-ruleset";
+    return "inline-custom-" + base_hash + "-r" + as_string(gen) + "-ruleset";
+}
+
+function finalize_remote_custom_rulesets_state() {
+    let state_obj = load_remote_custom_rulesets_state();
+    let next_entries = {};
+    for (let url in keys(state_obj.entries)) {
+        let prev = object_or_empty(state_obj.entries[url]);
+        let gen = int(prev.gen || 1);
+        if (gen < 1)
+            gen = 1;
+        if (active_remote_custom_rulesets[url] != null)
+            next_entries[url] = { active: true, gen: int(active_remote_custom_rulesets[url]) };
+        else
+            next_entries[url] = { active: false, gen: gen };
+    }
+    for (let url in keys(active_remote_custom_rulesets)) {
+        if (next_entries[url] == null)
+            next_entries[url] = { active: true, gen: int(active_remote_custom_rulesets[url]) };
+    }
+    remote_custom_rulesets_state = { entries: next_entries };
+    if (length(keys(next_entries)) > 0 || fs.stat(remote_custom_rulesets_state_path()) != null) {
+        let path = remote_custom_rulesets_state_path();
+        common.ensure_dir(common.parent_dir(path));
+        common.write_json_file(path, remote_custom_rulesets_state);
+    }
+}
 
 function settings_update_interval() {
     let settings = ctx.runtime_settings();
@@ -49,6 +127,12 @@ function remote_ruleset_update_interval() {
 
 function init(c) {
     ctx = c;
+    section_leaf_tags = {};
+    section_group_map = {};
+    section_state_map = {};
+    active_group_tags = {};
+    active_remote_custom_rulesets = {};
+    remote_custom_rulesets_state = null;
 }
 
 function valid_section_name(name) {
@@ -105,9 +189,76 @@ function duration_to_seconds(value) {
     return total <= 0 ? null : int(total + 0.5);
 }
 
+let cached_boot_seed = null;
+function current_boot_seed() {
+    if (cached_boot_seed != null)
+        return cached_boot_seed;
+    cached_boot_seed = trim(as_string(fs.readfile("/proc/sys/kernel/random/boot_id") || ""));
+    return cached_boot_seed;
+}
+
+function deterministic_jitter_offset(seed_text, max_delta) {
+    max_delta = int(max_delta || 0);
+    if (max_delta <= 0)
+        return 0;
+    let s = as_string(seed_text || "");
+    let h = 2166136261;
+    for (let i = 0; i < length(s); i++) {
+        h = ((h ^ ord(s, i)) * 16777619) & 0x7fffffff;
+    }
+    let span = max_delta * 2 + 1;
+    let offset = (h % span) - max_delta;
+    if (offset == 0)
+        offset = (h & 1) ? 1 : -1;
+    return offset;
+}
+
+function parse_jitter_max_delta(base_seconds, jitter_spec) {
+    base_seconds = int(base_seconds || 0);
+    jitter_spec = trim(as_string(jitter_spec || ""));
+    if (base_seconds <= 1 || jitter_spec == "" || jitter_spec == "0" || lc(jitter_spec) == "disabled")
+        return 0;
+    let pct_match = match(jitter_spec, /^([0-9]+)%$/);
+    if (pct_match != null) {
+        let pct = int(pct_match[1], 10);
+        if (pct <= 0)
+            return 0;
+        if (pct > 80)
+            pct = 80;
+        let delta = int((base_seconds * pct) / 100.0 + 0.5);
+        return delta > 0 ? delta : 1;
+    }
+    let dur = duration_to_seconds(jitter_spec);
+    if (dur != null && dur > 0) {
+        let max_allowed = int(base_seconds * 0.8);
+        if (max_allowed < 1)
+            max_allowed = 1;
+        return dur > max_allowed ? max_allowed : dur;
+    }
+    let fallback = int(base_seconds * 0.15 + 0.5);
+    return fallback > 0 ? fallback : 1;
+}
+
 function urltest_check_interval(section, urltest_id) {
     let interval = connections.urltest_check_interval(section, urltest_id);
-    return interval != "" ? interval : "3m";
+    let base_interval = interval != "" ? interval : "3m";
+    let jitter = type(connections.urltest_check_interval_jitter) == "function"
+        ? connections.urltest_check_interval_jitter(section, urltest_id)
+        : "";
+    if (jitter == "")
+        return base_interval;
+    let base_sec = duration_to_seconds(base_interval);
+    if (base_sec == null || base_sec <= 1)
+        return base_interval;
+    let max_delta = parse_jitter_max_delta(base_sec, jitter);
+    if (max_delta <= 0)
+        return base_interval;
+    let sec_name = type(section) == "object" ? as_string(section[".name"] || "") : as_string(section || "");
+    let seed = current_boot_seed() + ":" + sec_name + ":" + as_string(urltest_id || "urltest");
+    let eff_sec = base_sec + deterministic_jitter_offset(seed, max_delta);
+    if (eff_sec < 5)
+        eff_sec = 5;
+    return as_string(eff_sec) + "s";
 }
 
 function urltest_idle_timeout(section, urltest_id) {
@@ -118,7 +269,7 @@ function urltest_idle_timeout(section, urltest_id) {
         ? configured
         : runtime_constants.URLTEST_DEFAULT_IDLE_TIMEOUT);
 
-    // sing-box refuses to start a URLTest group whose interval exceeds its
+    // tachyon-core refuses to start a URLTest group whose interval exceeds its
     // idle_timeout, and substitutes URLTEST_DEFAULT_IDLE_TIMEOUT when the
     // option is omitted. Raise the timeout to the interval instead of emitting
     // a config that fails with "interval must be less or equal than idle_timeout".
@@ -167,26 +318,39 @@ function section_needs_country_is(section) {
     }
 
     for (let group_id in connections.priority_groups(section)) {
-        for (let level_id in connections.priority_levels(group_id)) {
-            if (connections.priority_level_direct(group_id, level_id))
+        for (let level_id in connections.priority_levels(group_id, section)) {
+            if (connections.priority_level_direct(group_id, level_id, section))
                 continue;
-            let mode = connections.priority_level_filter_mode(group_id, level_id);
-            if (connections.priority_level_detect_server_country(group_id, level_id) == "country_is" &&
+            let mode = connections.priority_level_filter_mode(group_id, level_id, section);
+            if (connections.priority_level_detect_server_country(group_id, level_id, section) == "country_is" &&
                 configured_country_filter(
                     mode,
-                    connections.priority_level_include_countries(group_id, level_id),
-                    connections.priority_level_exclude_countries(group_id, level_id)
+                    connections.priority_level_include_countries(group_id, level_id, section),
+                    connections.priority_level_exclude_countries(group_id, level_id, section)
                 ))
                 return true;
         }
     }
+
+    for (let grp_id in connections.section_outbound_group_refs(section)) {
+        let gspec = connections.outbound_group_filter_spec(grp_id, section);
+        if (gspec != null && gspec.country_mode == "country_is" &&
+            configured_country_filter(gspec.mode, gspec.include_countries, gspec.exclude_countries))
+            return true;
+    }
+
+    let sec_pool = connections.section_pool_filter_spec(section);
+    if (sec_pool != null && sec_pool.country_mode == "country_is" &&
+        configured_country_filter(sec_pool.mode, sec_pool.include_countries, sec_pool.exclude_countries))
+        return true;
+
     return false;
 }
 
 function section_has_direct_priority_level(section) {
     for (let group_id in connections.priority_groups(section))
-        for (let level_id in connections.priority_levels(group_id))
-            if (connections.priority_level_direct(group_id, level_id))
+        for (let level_id in connections.priority_levels(group_id, section))
+            if (connections.priority_level_direct(group_id, level_id, section))
                 return true;
     return false;
 }
@@ -252,9 +416,28 @@ function format_outbound_type_label(protocol, transport) {
     else if (p == "shadowsocks" || p == "ss") norm_proto = "Shadowsocks";
     else if (p == "trojan") norm_proto = "Trojan";
     else if (p == "wireguard" || p == "wg") norm_proto = "WireGuard";
+    else if (p == "amneziawg" || p == "awg") norm_proto = "AmneziaWG";
     else if (p == "hysteria2" || p == "hy2") norm_proto = "Hysteria2";
     else if (p == "hysteria") norm_proto = "Hysteria";
     else if (p == "tuic") norm_proto = "TUIC";
+    else if (p == "anytls") norm_proto = "AnyTLS";
+    else if (p == "naive") norm_proto = "NaiveProxy";
+    else if (p == "mieru") norm_proto = "Mieru";
+    else if (p == "snell") norm_proto = "Snell";
+    else if (p == "sudoku") norm_proto = "Sudoku";
+    else if (p == "masque") norm_proto = "MASQUE";
+    else if (p == "openvpn") norm_proto = "OpenVPN";
+    else if (p == "openconnect") norm_proto = "OpenConnect";
+    else if (p == "tewfai") norm_proto = "Tewfai";
+    else if (p == "wdtt" || p == "csqtt") norm_proto = "CSQTT";
+    else if (p == "trusttunnel") norm_proto = "TrustTunnel";
+    else if (p == "mtproto" || p == "mtproxy") norm_proto = "MTProto";
+    else if (p == "shadowtls") norm_proto = "ShadowTLS";
+    else if (p == "fptn") norm_proto = "FPTN";
+    else if (p == "desync") norm_proto = "Desync";
+    else if (p == "chain") norm_proto = "Chain";
+    else if (p == "tailscale") norm_proto = "Tailscale";
+    else if (p == "interface") norm_proto = "Interface";
     else if (p == "socks" || p == "socks5") norm_proto = "SOCKS5";
     else if (p == "http") norm_proto = "HTTP";
     else if (p == "direct") norm_proto = "Direct";
@@ -293,16 +476,96 @@ function tag_display_name_with_type(tag, names, metadata) {
     return label != "" ? (name + " [" + label + "]") : name;
 }
 
-function tag_name_filter_matches(tag, names, name_filter, regex_set, metadata, name_with_type_indexed) {
+function tag_source_badge(tag, name, metadata) {
+    metadata = object_or_empty(metadata);
+    let stored_prefix = trim(as_string(object_or_empty(metadata.prefixes)[tag] || ""));
+    if (stored_prefix != "" &&
+        index(name, stored_prefix + ": ") != 0 &&
+        index(name, "[" + stored_prefix + "]") != 0)
+        return stored_prefix;
+    let stored_source = trim(as_string(object_or_empty(metadata.sources)[tag] || ""));
+    if (stored_prefix == "" && match(stored_source, /^sub:[0-9]+$/i) != null)
+        return stored_source;
+    return "";
+}
+
+function tag_prefixed_name_with_type(tag, names, metadata) {
     let name = tag_display_name(tag, names);
-    if (array_contains(name_filter, name) || array_contains(name_filter, tag) || regex_set[tag])
+    let badge = tag_source_badge(tag, name, metadata);
+    let base = badge != "" ? ("[" + badge + "] " + name) : name;
+    let proto = object_or_empty(object_or_empty(metadata).protocols)[tag];
+    let trans = object_or_empty(object_or_empty(metadata).transports)[tag];
+    let label = format_outbound_type_label(proto, trans);
+    return label != "" ? (base + " [" + label + "]") : base;
+}
+
+function tag_name_filter_matches(tag, names, matches_name, regex_set, metadata, name_with_type_indexed, prefixed_with_type_indexed, is_first_for_type, is_first_for_prefixed_type) {
+    if (regex_set && regex_set[tag])
         return true;
-    if (name_with_type_indexed != null && array_contains(name_filter, name_with_type_indexed))
+    if (matches_name == null)
+        return false;
+    let name = tag_display_name(tag, names);
+    if (matches_name(name) || matches_name(tag, true))
         return true;
-    if (name_with_type_indexed == null && type(metadata) == "object") {
-        let name_with_type = tag_display_name_with_type(tag, names, metadata);
-        if (name_with_type != name && array_contains(name_filter, name_with_type))
+    let name_with_type = tag_display_name_with_type(tag, names, metadata);
+    if (name_with_type != name && (is_first_for_type != false) && matches_name(name_with_type))
+        return true;
+    let badge = tag_source_badge(tag, name, metadata);
+    if (badge != "") {
+        let b_name = "[" + badge + "] " + name;
+        let b_with_type = tag_prefixed_name_with_type(tag, names, metadata);
+        if (matches_name(b_name) ||
+            ((is_first_for_prefixed_type != false) && matches_name(b_with_type)) ||
+            matches_name(badge + ": " + name) ||
+            matches_name(badge + " " + name))
             return true;
+    }
+    let stored_prefix = trim(as_string(object_or_empty(object_or_empty(metadata).prefixes)[tag] || ""));
+    if (stored_prefix != "") {
+        if (matches_name(stored_prefix + ": " + name) ||
+            matches_name(stored_prefix + " " + name) ||
+            matches_name("[" + stored_prefix + "] " + name))
+            return true;
+        let unprefixed = "";
+        if (index(name, stored_prefix + ": ") == 0)
+            unprefixed = trim(substr(name, length(stored_prefix) + 2));
+        else if (index(name, stored_prefix + " ") == 0)
+            unprefixed = trim(substr(name, length(stored_prefix) + 1));
+        if (unprefixed != "") {
+            let bracketed = "[" + stored_prefix + "] " + unprefixed;
+            if (matches_name(unprefixed) ||
+                matches_name(bracketed) ||
+                matches_name(stored_prefix + ": " + unprefixed) ||
+                matches_name(stored_prefix + " " + unprefixed))
+                return true;
+            let proto = object_or_empty(object_or_empty(metadata).protocols)[tag];
+            let trans = object_or_empty(object_or_empty(metadata).transports)[tag];
+            let label = format_outbound_type_label(proto, trans);
+            if (label != "" &&
+                (matches_name(unprefixed + " [" + label + "]") ||
+                 matches_name(bracketed + " [" + label + "]")))
+                return true;
+        }
+    }
+    if (name_with_type_indexed != null && matches_name(name_with_type_indexed))
+        return true;
+    if (prefixed_with_type_indexed != null && matches_name(prefixed_with_type_indexed))
+        return true;
+    let source_name = trim(as_string(object_or_empty(object_or_empty(metadata).source_names)[tag] || ""));
+    if (source_name != "" && source_name != name) {
+        if (matches_name(source_name))
+            return true;
+        let proto = object_or_empty(object_or_empty(metadata).protocols)[tag];
+        let trans = object_or_empty(object_or_empty(metadata).transports)[tag];
+        let label = format_outbound_type_label(proto, trans);
+        if (label != "" && matches_name(source_name + " [" + label + "]"))
+            return true;
+        if (stored_prefix != "") {
+            let b_src = "[" + stored_prefix + "] " + source_name;
+            if (matches_name(b_src) ||
+                (label != "" && matches_name(b_src + " [" + label + "]")))
+                return true;
+        }
     }
     return false;
 }
@@ -320,9 +583,13 @@ function tag_attribute_filter_matches(tag, metadata, selected_values) {
     let value = lc(as_string(object_or_empty(metadata)[tag] || ""));
     if (value == "")
         return false;
-    for (let selected in selected_values)
-        if (lc(as_string(selected)) == value)
+    for (let selected in selected_values) {
+        let sel = lc(as_string(selected));
+        if (sel == value)
             return true;
+        if ((sel == "amneziawg" || sel == "wireguard") && (value == "amneziawg" || value == "wireguard"))
+            return true;
+    }
     return false;
 }
 
@@ -398,13 +665,30 @@ function urltest_matching_candidate_outbounds(urltest_candidate_tags, names, cou
     let result = [];
 
     let seen_type_counts = {};
+    let seen_prefixed_type_counts = {};
+    let matches_name = runtime_urltest.prepare_name_filter(name_filter);
     for (let tag in array_or_empty(urltest_candidate_tags)) {
-        let name_with_type = tag_display_name_with_type(tag, names, metadata);
-        seen_type_counts[name_with_type] = (seen_type_counts[name_with_type] || 0) + 1;
-        let count = seen_type_counts[name_with_type];
-        let name_with_type_indexed = count > 1 ? (name_with_type + " (#" + count + ")") : name_with_type;
+        let name_with_type_indexed = null;
+        let prefixed_with_type_indexed = null;
+        let is_first_type = false;
+        let is_first_pref_type = false;
+        if (matches_name != null) {
+            let name_with_type = tag_display_name_with_type(tag, names, metadata);
+            let name_with_type_key = runtime_urltest.strip_dynamic_server_telemetry(name_with_type);
+            seen_type_counts[name_with_type_key] = (seen_type_counts[name_with_type_key] || 0) + 1;
+            let count = seen_type_counts[name_with_type_key];
+            name_with_type_indexed = count > 1 ? (name_with_type + " (#" + count + ")") : name_with_type;
+            is_first_type = (count == 1);
 
-        let base_matches = tag_name_filter_matches(tag, names, name_filter, regex_set, metadata, name_with_type_indexed) ||
+            let prefixed_with_type = tag_prefixed_name_with_type(tag, names, metadata);
+            let prefixed_with_type_key = runtime_urltest.strip_dynamic_server_telemetry(prefixed_with_type);
+            seen_prefixed_type_counts[prefixed_with_type_key] = (seen_prefixed_type_counts[prefixed_with_type_key] || 0) + 1;
+            let p_count = seen_prefixed_type_counts[prefixed_with_type_key];
+            prefixed_with_type_indexed = p_count > 1 ? (prefixed_with_type + " (#" + p_count + ")") : prefixed_with_type;
+            is_first_pref_type = (p_count == 1);
+        }
+
+        let base_matches = tag_name_filter_matches(tag, names, matches_name, regex_set, metadata, name_with_type_indexed, prefixed_with_type_indexed, is_first_type, is_first_pref_type) ||
             tag_country_filter_matches(tag, countries, country_filter);
         let matches = additional_set[tag] || base_matches;
         if (proxy_parameters_enabled && proxy_parameters_operator == "or") {
@@ -462,22 +746,25 @@ function filter_candidate_outbounds(filter_mode, urltest_candidate_tags, names, 
     if (!supported_urltest_filter_mode(filter_mode))
         return visible_outbounds;
 
-    let include_outbounds = urltest_matching_candidate_outbounds(
-        urltest_candidate_tags,
-        names,
-        countries,
-        include_names,
-        include_regex,
-        include_countries,
-        metadata,
-        include_proxy_parameters,
-        "and",
-        include_protocols,
-        include_transports,
-        include_securities,
-        include_ports,
-        include_additional_matches
-    );
+    if (filter_mode == "include") {
+        return urltest_matching_candidate_outbounds(
+            urltest_candidate_tags,
+            names,
+            countries,
+            include_names,
+            include_regex,
+            include_countries,
+            metadata,
+            include_proxy_parameters,
+            "and",
+            include_protocols,
+            include_transports,
+            include_securities,
+            include_ports,
+            include_additional_matches
+        );
+    }
+
     let exclude_outbounds = urltest_matching_candidate_outbounds(
         urltest_candidate_tags,
         names,
@@ -495,48 +782,379 @@ function filter_candidate_outbounds(filter_mode, urltest_candidate_tags, names, 
         exclude_additional_matches
     );
 
-    if (filter_mode == "include")
-        return include_outbounds;
     if (filter_mode == "exclude")
         return urltest_exclude_outbounds(visible_outbounds, exclude_outbounds);
-    if (filter_mode == "mixed")
-        return urltest_exclude_outbounds(include_outbounds, exclude_outbounds);
+
+    let has_include_criteria =
+        length(array_or_empty(include_names)) > 0 ||
+        length(array_or_empty(include_regex)) > 0 ||
+        length(array_or_empty(include_countries)) > 0 ||
+        length(array_or_empty(include_additional_matches)) > 0 ||
+        (include_proxy_parameters == true && (
+            length(array_or_empty(include_protocols)) > 0 ||
+            length(array_or_empty(include_transports)) > 0 ||
+            length(array_or_empty(include_securities)) > 0 ||
+            length(array_or_empty(include_ports)) > 0
+        ));
+
+    if (filter_mode == "mixed") {
+        let base_list = has_include_criteria ? urltest_matching_candidate_outbounds(
+            urltest_candidate_tags,
+            names,
+            countries,
+            include_names,
+            include_regex,
+            include_countries,
+            metadata,
+            include_proxy_parameters,
+            "and",
+            include_protocols,
+            include_transports,
+            include_securities,
+            include_ports,
+            include_additional_matches
+        ) : visible_outbounds;
+        return urltest_exclude_outbounds(base_list, exclude_outbounds);
+    }
     return visible_outbounds;
 }
 
+function tag_prefix_filter_matches(tag, names, metadata, prefixes) {
+    prefixes = array_or_empty(prefixes);
+    if (length(prefixes) == 0)
+        return false;
+    let stored_prefix = lc(trim(as_string(object_or_empty(object_or_empty(metadata).prefixes)[tag] || "")));
+    let stored_source = lc(trim(as_string(object_or_empty(object_or_empty(metadata).sources)[tag] || "")));
+    let stored_source_id = lc(trim(as_string(object_or_empty(object_or_empty(metadata).source_ids)[tag] || "")));
+    let stored_source_name = lc(trim(as_string(object_or_empty(object_or_empty(metadata).source_names)[tag] || "")));
+    let display = lc(trim(tag_display_name(tag, names)));
+    let raw_tag = lc(trim(as_string(tag)));
+    for (let p in prefixes) {
+        let pl = lc(trim(as_string(p)));
+        if (pl == "")
+            continue;
+        let bare = replace(pl, /^\[|\]$/g, "");
+        if (bare == "")
+            continue;
+        if (stored_prefix != "" && (stored_prefix == bare || stored_prefix == pl))
+            return true;
+        if (stored_source != "" && (stored_source == bare || stored_source == pl))
+            return true;
+        if (stored_source_id != "" && (stored_source_id == bare || stored_source_id == pl))
+            return true;
+        if (stored_source_name != "" && (stored_source_name == bare || stored_source_name == pl))
+            return true;
+        if (substr(bare, 0, 4) == "sub:" || substr(bare, 0, 4) == "src_")
+            continue;
+        if (index(display, "[" + bare + "]") == 0 ||
+            index(display, bare + " ") == 0 ||
+            index(display, bare + "-") == 0 ||
+            index(display, bare + "_") == 0 ||
+            display == bare ||
+            index(raw_tag, bare) == 0)
+            return true;
+    }
+    return false;
+}
+
+function country_metadata_for_method(detect_method, state) {
+    let names = object_or_empty(object_or_empty(state.outboundMetadata).names);
+    let from_flags = runtime_urltest.countries_from_flag_names(names);
+    if (detect_method == "flag_emoji")
+        return from_flags;
+    let metadata = object_or_empty(object_or_empty(state.outboundMetadata).countries);
+    let result = {};
+    for (let t, c in from_flags)
+        result[t] = c;
+    for (let t, c in metadata)
+        if (c != "")
+            result[t] = c;
+    return result;
+}
+
+// Multi-criteria group filter where server selectors (country, name, regex) combine via OR,
+// prefix and proxy_parameters intersect via AND, and exclude categories subtract via OR.
+function filter_tags_by_group_spec(candidate_tags, spec, state) {
+    if (spec == null || type(spec) != "object")
+        return unique_string_array(candidate_tags);
+    let mode = as_string(spec.mode || "disabled");
+    let all_tags = unique_string_array(candidate_tags);
+    let hidden_tags = object_or_empty(state ? state.hiddenOutboundTags : null);
+    let inc_prefixes = array_or_empty(spec.include_prefixes);
+    let has_inc_prefix = length(inc_prefixes) > 0;
+    if ((mode == "" || mode == "disabled") && !has_inc_prefix) {
+        if (length(keys(hidden_tags)) > 0) {
+            let vis = [];
+            for (let t in all_tags)
+                if (!hidden_tags[t])
+                    push(vis, t);
+            if (length(vis) > 0)
+                return vis;
+        }
+        return all_tags;
+    }
+
+    let metadata = object_or_empty(state ? state.outboundMetadata : null);
+    let names = object_or_empty(metadata.names);
+    let countries = country_metadata_for_method(as_string(spec.country_mode || "flag_emoji"), state || {});
+
+    let inc_countries = runtime_urltest.normalized_country_list(spec.include_countries);
+    let inc_names = runtime_urltest.prepare_name_filter(spec.include_outbounds);
+    let inc_regex = array_or_empty(spec.include_regex);
+    let inc_regex_set = regex_match_set(all_tags, names, inc_regex);
+    let inc_params = spec.include_proxy_parameters == true && (
+        length(array_or_empty(spec.include_protocols)) > 0 ||
+        length(array_or_empty(spec.include_transports)) > 0 ||
+        length(array_or_empty(spec.include_securities)) > 0 ||
+        length(array_or_empty(spec.include_ports)) > 0
+    );
+
+    let has_inc_country = length(inc_countries) > 0;
+    let has_inc_name_regex = inc_names != null || length(inc_regex) > 0;
+    let has_inc_base = has_inc_country || has_inc_name_regex;
+    let any_inc_category = has_inc_base || inc_params;
+
+    if (!has_inc_name_regex && length(keys(hidden_tags)) > 0) {
+        let vis = [];
+        for (let t in all_tags)
+            if (!hidden_tags[t])
+                push(vis, t);
+        if (length(vis) > 0)
+            all_tags = vis;
+    }
+
+    let exc_prefixes = array_or_empty(spec.exclude_prefixes);
+    let exc_countries = runtime_urltest.normalized_country_list(spec.exclude_countries);
+    let exc_names = runtime_urltest.prepare_name_filter(spec.exclude_outbounds);
+    let exc_regex = array_or_empty(spec.exclude_regex);
+    let exc_regex_set = regex_match_set(all_tags, names, exc_regex);
+    let exc_params = spec.exclude_proxy_parameters == true && (
+        length(array_or_empty(spec.exclude_protocols)) > 0 ||
+        length(array_or_empty(spec.exclude_transports)) > 0 ||
+        length(array_or_empty(spec.exclude_securities)) > 0 ||
+        length(array_or_empty(spec.exclude_ports)) > 0
+    );
+
+    let result = [];
+    let seen_type_counts = {};
+    let seen_prefixed_type_counts = {};
+    let intersect_country_and_name = false;
+    let has_inc_names_only = inc_names != null;
+    let need_indexed_type_names = has_inc_names_only || exc_names != null;
+    if (has_inc_country && has_inc_name_regex) {
+        let pre_type_counts = {};
+        let pre_prefixed_counts = {};
+        for (let t in all_tags) {
+            let nwt_idx = null;
+            let pwt_idx = null;
+            let c_first = false;
+            let pc_first = false;
+            if (has_inc_names_only) {
+                let nwt = tag_display_name_with_type(t, names, metadata);
+                let nwt_key = runtime_urltest.strip_dynamic_server_telemetry(nwt);
+                pre_type_counts[nwt_key] = (pre_type_counts[nwt_key] || 0) + 1;
+                let c_idx = pre_type_counts[nwt_key];
+                nwt_idx = c_idx > 1 ? (nwt + " (#" + c_idx + ")") : nwt;
+                c_first = (c_idx == 1);
+                let pwt = tag_prefixed_name_with_type(t, names, metadata);
+                let pwt_key = runtime_urltest.strip_dynamic_server_telemetry(pwt);
+                pre_prefixed_counts[pwt_key] = (pre_prefixed_counts[pwt_key] || 0) + 1;
+                let pc_idx = pre_prefixed_counts[pwt_key];
+                pwt_idx = pc_idx > 1 ? (pwt + " (#" + pc_idx + ")") : pwt;
+                pc_first = (pc_idx == 1);
+            }
+            if (tag_country_filter_matches(t, countries, inc_countries) &&
+                tag_name_filter_matches(t, names, inc_names, inc_regex_set, metadata, nwt_idx, pwt_idx, c_first, pc_first)) {
+                intersect_country_and_name = true;
+                break;
+            }
+        }
+    }
+    for (let t in all_tags) {
+        let name_with_type_indexed = null;
+        let prefixed_with_type_indexed = null;
+        let is_first_type = false;
+        let is_first_pref_type = false;
+        if (need_indexed_type_names) {
+            let name_with_type = tag_display_name_with_type(t, names, metadata);
+            let name_with_type_key = runtime_urltest.strip_dynamic_server_telemetry(name_with_type);
+            seen_type_counts[name_with_type_key] = (seen_type_counts[name_with_type_key] || 0) + 1;
+            let count = seen_type_counts[name_with_type_key];
+            name_with_type_indexed = count > 1 ? (name_with_type + " (#" + count + ")") : name_with_type;
+            is_first_type = (count == 1);
+
+            let prefixed_with_type = tag_prefixed_name_with_type(t, names, metadata);
+            let prefixed_with_type_key = runtime_urltest.strip_dynamic_server_telemetry(prefixed_with_type);
+            seen_prefixed_type_counts[prefixed_with_type_key] = (seen_prefixed_type_counts[prefixed_with_type_key] || 0) + 1;
+            let p_count = seen_prefixed_type_counts[prefixed_with_type_key];
+            prefixed_with_type_indexed = p_count > 1 ? (prefixed_with_type + " (#" + p_count + ")") : prefixed_with_type;
+            is_first_pref_type = (p_count == 1);
+        }
+
+        if (has_inc_prefix && !tag_prefix_filter_matches(t, names, metadata, inc_prefixes))
+            continue;
+
+        if ((mode == "include" || mode == "mixed") && any_inc_category) {
+            if (has_inc_base) {
+                let c_match = has_inc_country && tag_country_filter_matches(t, countries, inc_countries);
+                let n_match = has_inc_name_regex && tag_name_filter_matches(t, names, inc_names, inc_regex_set, metadata, name_with_type_indexed, prefixed_with_type_indexed, is_first_type, is_first_pref_type);
+                let base_matches = intersect_country_and_name ? (c_match && n_match) : (c_match || n_match);
+                if (!base_matches)
+                    continue;
+            }
+            if (inc_params && !proxy_parameter_filter_matches_all(
+                t, metadata, spec.include_protocols, spec.include_transports, spec.include_securities, spec.include_ports
+            ))
+                continue;
+        }
+
+        if (mode == "exclude" || mode == "mixed") {
+            let is_excluded = false;
+            if (length(exc_prefixes) > 0 && tag_prefix_filter_matches(t, names, metadata, exc_prefixes))
+                is_excluded = true;
+            if (!is_excluded && length(exc_countries) > 0 && tag_country_filter_matches(t, countries, exc_countries))
+                is_excluded = true;
+            if (!is_excluded && (exc_names != null || length(exc_regex) > 0) &&
+                tag_name_filter_matches(t, names, exc_names, exc_regex_set, metadata, name_with_type_indexed, prefixed_with_type_indexed, is_first_type, is_first_pref_type))
+                is_excluded = true;
+            if (!is_excluded && exc_params && proxy_parameter_filter_matches_any(
+                t, metadata, spec.exclude_protocols, spec.exclude_transports, spec.exclude_securities, spec.exclude_ports
+            ))
+                is_excluded = true;
+            if (is_excluded)
+                continue;
+        }
+
+        push(result, t);
+    }
+    return result;
+}
+
 function urltest_filtered_outbounds(section, urltest_id, urltest_candidate_tags, state) {
+    let grefs = type(connections.urltest_group_refs) == "function"
+        ? connections.urltest_group_refs(section, urltest_id)
+        : [];
+    let matched_grefs = false;
+    if (length(grefs) > 0) {
+        let union_cand = [];
+        for (let grp_id in grefs) {
+            let gspec = connections.outbound_group_filter_spec(grp_id, section);
+            if (gspec == null)
+                continue;
+            for (let t in filter_tags_by_group_spec(urltest_candidate_tags, gspec, state))
+                push(union_cand, t);
+        }
+        union_cand = unique_string_array(union_cand);
+        if (length(union_cand) > 0) {
+            urltest_candidate_tags = union_cand;
+            matched_grefs = true;
+        }
+    }
+    let inc_prefixes = connections.urltest_include_prefixes(section, urltest_id);
+    let exc_prefixes = connections.urltest_exclude_prefixes(section, urltest_id);
+    let inc_countries = connections.urltest_include_countries(section, urltest_id);
+    let inc_outbounds = connections.urltest_include_outbounds(section, urltest_id);
+    let inc_regex = connections.urltest_include_regex(section, urltest_id);
+    let inc_proxy_parameters = connections.urltest_include_proxy_parameters(section, urltest_id);
+    let inc_protocols = connections.urltest_include_protocols(section, urltest_id);
+    let inc_transports = connections.urltest_include_transports(section, urltest_id);
+    let inc_securities = connections.urltest_include_securities(section, urltest_id);
+    let inc_ports = connections.urltest_include_ports(section, urltest_id);
+
+    let has_own_includes = length(inc_prefixes) > 0 ||
+        length(inc_countries) > 0 ||
+        length(inc_outbounds) > 0 ||
+        length(inc_regex) > 0 ||
+        inc_proxy_parameters ||
+        length(inc_protocols) > 0 ||
+        length(inc_transports) > 0 ||
+        length(inc_securities) > 0 ||
+        length(inc_ports) > 0;
+
+    let exc_countries = connections.urltest_exclude_countries(section, urltest_id);
+    let exc_outbounds = connections.urltest_exclude_outbounds(section, urltest_id);
+    let exc_regex = connections.urltest_exclude_regex(section, urltest_id);
+    let exc_proxy_parameters = connections.urltest_exclude_proxy_parameters(section, urltest_id);
+    let exc_protocols = connections.urltest_exclude_protocols(section, urltest_id);
+    let exc_transports = connections.urltest_exclude_transports(section, urltest_id);
+    let exc_securities = connections.urltest_exclude_securities(section, urltest_id);
+    let exc_ports = connections.urltest_exclude_ports(section, urltest_id);
+
+    let has_own_excludes = length(exc_prefixes) > 0 ||
+        length(exc_countries) > 0 ||
+        length(exc_outbounds) > 0 ||
+        length(exc_regex) > 0 ||
+        exc_proxy_parameters ||
+        length(exc_protocols) > 0 ||
+        length(exc_transports) > 0 ||
+        length(exc_securities) > 0 ||
+        length(exc_ports) > 0;
+
+    let eff_mode = connections.urltest_filter_mode(section, urltest_id);
+    if (matched_grefs && !has_own_includes) {
+        if (has_own_excludes)
+            eff_mode = "exclude";
+        else
+            eff_mode = "disabled";
+    }
+
+    if (length(inc_prefixes) > 0 || length(exc_prefixes) > 0) {
+        return filter_tags_by_group_spec(urltest_candidate_tags, {
+            mode: eff_mode,
+            country_mode: connections.urltest_detect_server_country(section, urltest_id),
+            include_prefixes: inc_prefixes,
+            include_countries: inc_countries,
+            include_outbounds: inc_outbounds,
+            include_regex: inc_regex,
+            include_proxy_parameters: inc_proxy_parameters,
+            include_protocols: inc_protocols,
+            include_transports: inc_transports,
+            include_securities: inc_securities,
+            include_ports: inc_ports,
+            exclude_prefixes: exc_prefixes,
+            exclude_countries: exc_countries,
+            exclude_outbounds: exc_outbounds,
+            exclude_regex: exc_regex,
+            exclude_proxy_parameters: exc_proxy_parameters,
+            exclude_protocols: exc_protocols,
+            exclude_transports: exc_transports,
+            exclude_securities: exc_securities,
+            exclude_ports: exc_ports
+        }, state);
+    }
+
     return filter_candidate_outbounds(
-        connections.urltest_filter_mode(section, urltest_id),
+        eff_mode,
         urltest_candidate_tags,
         object_or_empty(object_or_empty(state.outboundMetadata).names),
         urltest_country_metadata(section, urltest_id, state),
         object_or_empty(state.outboundMetadata),
-        connections.urltest_include_outbounds(section, urltest_id),
-        connections.urltest_include_regex(section, urltest_id),
-        connections.urltest_include_countries(section, urltest_id),
-        connections.urltest_include_proxy_parameters(section, urltest_id),
-        connections.urltest_include_protocols(section, urltest_id),
-        connections.urltest_include_transports(section, urltest_id),
-        connections.urltest_include_securities(section, urltest_id),
-        connections.urltest_include_ports(section, urltest_id),
-        connections.urltest_exclude_outbounds(section, urltest_id),
-        connections.urltest_exclude_regex(section, urltest_id),
-        connections.urltest_exclude_countries(section, urltest_id),
-        connections.urltest_exclude_proxy_parameters(section, urltest_id),
-        connections.urltest_exclude_protocols(section, urltest_id),
-        connections.urltest_exclude_transports(section, urltest_id),
-        connections.urltest_exclude_securities(section, urltest_id),
-        connections.urltest_exclude_ports(section, urltest_id),
+        inc_outbounds,
+        inc_regex,
+        inc_countries,
+        inc_proxy_parameters,
+        inc_protocols,
+        inc_transports,
+        inc_securities,
+        inc_ports,
+        exc_outbounds,
+        exc_regex,
+        exc_countries,
+        exc_proxy_parameters,
+        exc_protocols,
+        exc_transports,
+        exc_securities,
+        exc_ports,
         null,
         null,
         state ? state.hiddenOutboundTags : null
     );
 }
 
-function priority_level_country_metadata(group_id, level_id, state) {
+function priority_level_country_metadata(group_id, level_id, state, section, force_from_section_pool) {
     let names = object_or_empty(object_or_empty(state.outboundMetadata).names);
     let from_flags = runtime_urltest.countries_from_flag_names(names);
-    let detect_method = connections.priority_level_detect_server_country(group_id, level_id);
+    let detect_method = connections.priority_level_detect_server_country(group_id, level_id, section, force_from_section_pool);
     if (detect_method == "flag_emoji")
         return from_flags;
     let metadata = object_or_empty(object_or_empty(state.outboundMetadata).countries);
@@ -549,32 +1167,67 @@ function priority_level_country_metadata(group_id, level_id, state) {
     return result;
 }
 
-function priority_level_filtered_outbounds(group_id, level_id, urltest_candidate_tags, state) {
-    if (connections.priority_level_direct(group_id, level_id))
+function priority_level_filtered_outbounds(group_id, level_id, urltest_candidate_tags, state, section, force_from_section_pool) {
+    if (connections.priority_level_direct(group_id, level_id, section, force_from_section_pool))
         return [ runtime_constants.DIRECT_OUTBOUND_TAG ];
 
+    let inc_prefixes = connections.priority_level_include_prefixes(group_id, level_id, section, force_from_section_pool);
+    let exc_prefixes = connections.priority_level_exclude_prefixes(group_id, level_id, section, force_from_section_pool);
+    let child_obj = connections.priority_level_items(group_id, section, force_from_section_pool);
+    let from_outbound_group = false;
+    for (let it in child_obj) {
+        if (as_string(it[".name"] || "") == as_string(level_id) && it.outbound_group_ref != null) {
+            from_outbound_group = true;
+            break;
+        }
+    }
+    if (from_outbound_group || length(inc_prefixes) > 0 || length(exc_prefixes) > 0) {
+        return filter_tags_by_group_spec(urltest_candidate_tags, {
+            mode: connections.priority_level_filter_mode(group_id, level_id, section, force_from_section_pool),
+            country_mode: connections.priority_level_detect_server_country(group_id, level_id, section, force_from_section_pool),
+            include_prefixes: inc_prefixes,
+            include_countries: connections.priority_level_include_countries(group_id, level_id, section, force_from_section_pool),
+            include_outbounds: connections.priority_level_include_outbounds(group_id, level_id, section, force_from_section_pool),
+            include_regex: connections.priority_level_include_regex(group_id, level_id, section, force_from_section_pool),
+            include_proxy_parameters: connections.priority_level_include_proxy_parameters(group_id, level_id, section, force_from_section_pool),
+            include_protocols: connections.priority_level_include_protocols(group_id, level_id, section, force_from_section_pool),
+            include_transports: connections.priority_level_include_transports(group_id, level_id, section, force_from_section_pool),
+            include_securities: connections.priority_level_include_securities(group_id, level_id, section, force_from_section_pool),
+            include_ports: connections.priority_level_include_ports(group_id, level_id, section, force_from_section_pool),
+            exclude_prefixes: exc_prefixes,
+            exclude_countries: connections.priority_level_exclude_countries(group_id, level_id, section, force_from_section_pool),
+            exclude_outbounds: connections.priority_level_exclude_outbounds(group_id, level_id, section, force_from_section_pool),
+            exclude_regex: connections.priority_level_exclude_regex(group_id, level_id, section, force_from_section_pool),
+            exclude_proxy_parameters: connections.priority_level_exclude_proxy_parameters(group_id, level_id, section, force_from_section_pool),
+            exclude_protocols: connections.priority_level_exclude_protocols(group_id, level_id, section, force_from_section_pool),
+            exclude_transports: connections.priority_level_exclude_transports(group_id, level_id, section, force_from_section_pool),
+            exclude_securities: connections.priority_level_exclude_securities(group_id, level_id, section, force_from_section_pool),
+            exclude_ports: connections.priority_level_exclude_ports(group_id, level_id, section, force_from_section_pool)
+        }, state);
+    }
+
     return filter_candidate_outbounds(
-        connections.priority_level_filter_mode(group_id, level_id),
+        connections.priority_level_filter_mode(group_id, level_id, section, force_from_section_pool),
         urltest_candidate_tags,
         object_or_empty(object_or_empty(state.outboundMetadata).names),
-        priority_level_country_metadata(group_id, level_id, state),
+        priority_level_country_metadata(group_id, level_id, state, section, force_from_section_pool),
         object_or_empty(state.outboundMetadata),
-        connections.priority_level_include_outbounds(group_id, level_id),
-        connections.priority_level_include_regex(group_id, level_id),
-        connections.priority_level_include_countries(group_id, level_id),
-        connections.priority_level_include_proxy_parameters(group_id, level_id),
-        connections.priority_level_include_protocols(group_id, level_id),
-        connections.priority_level_include_transports(group_id, level_id),
-        connections.priority_level_include_securities(group_id, level_id),
-        connections.priority_level_include_ports(group_id, level_id),
-        connections.priority_level_exclude_outbounds(group_id, level_id),
-        connections.priority_level_exclude_regex(group_id, level_id),
-        connections.priority_level_exclude_countries(group_id, level_id),
-        connections.priority_level_exclude_proxy_parameters(group_id, level_id),
-        connections.priority_level_exclude_protocols(group_id, level_id),
-        connections.priority_level_exclude_transports(group_id, level_id),
-        connections.priority_level_exclude_securities(group_id, level_id),
-        connections.priority_level_exclude_ports(group_id, level_id),
+        connections.priority_level_include_outbounds(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_regex(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_countries(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_proxy_parameters(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_protocols(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_transports(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_securities(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_include_ports(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_outbounds(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_regex(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_countries(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_proxy_parameters(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_protocols(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_transports(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_securities(group_id, level_id, section, force_from_section_pool),
+        connections.priority_level_exclude_ports(group_id, level_id, section, force_from_section_pool),
         null,
         null,
         state ? state.hiddenOutboundTags : null
@@ -644,28 +1297,115 @@ function dashboard_filtered_outbounds(section, selector_tags, state, group_outbo
     );
 }
 
-function priority_levels_with_outbounds(group_id, urltest_candidate_tags, state) {
+function build_priority_levels_for_mode(group_id, urltest_candidate_tags, state, section, force_from_section_pool) {
     let result = [];
     let assigned = {};
-
-    for (let level_id in connections.priority_levels(group_id)) {
+    for (let level_id in connections.priority_levels(group_id, section, force_from_section_pool)) {
+        // Fail-Closed promises the section never leaves directly, so a Direct
+        // failover level cannot be part of its chain.
+        if (section_is_fail_closed(section) &&
+            connections.priority_level_direct(group_id, level_id, section, force_from_section_pool))
+            continue;
         let outbounds = [];
-        for (let tag_name in priority_level_filtered_outbounds(group_id, level_id, urltest_candidate_tags, state)) {
+        for (let tag_name in priority_level_filtered_outbounds(group_id, level_id, urltest_candidate_tags, state, section, force_from_section_pool)) {
             if (!assigned[tag_name]) {
                 assigned[tag_name] = true;
                 push(outbounds, tag_name);
             }
         }
-
         push(result, {
             id: level_id,
-            displayName: connections.priority_level_display_name(group_id, level_id),
-            order: int(connections.priority_level_order(group_id, level_id), 10),
-            direct: connections.priority_level_direct(group_id, level_id),
-            filter_mode: connections.priority_level_filter_mode(group_id, level_id),
-            detect_server_country: connections.priority_level_detect_server_country(group_id, level_id),
+            displayName: connections.priority_level_display_name(group_id, level_id, section, force_from_section_pool),
+            order: int(connections.priority_level_order(group_id, level_id, section, force_from_section_pool), 10),
+            direct: connections.priority_level_direct(group_id, level_id, section, force_from_section_pool),
+            filter_mode: connections.priority_level_filter_mode(group_id, level_id, section, force_from_section_pool),
+            detect_server_country: connections.priority_level_detect_server_country(group_id, level_id, section, force_from_section_pool),
             outbounds
         });
+    }
+    return { levels: result, assigned };
+}
+
+function priority_levels_have_non_direct_outbounds(levels) {
+    for (let lvl in array_or_empty(levels)) {
+        if (!lvl.direct && length(array_or_empty(lvl.outbounds)) > 0)
+            return true;
+    }
+    return false;
+}
+
+function priority_levels_with_outbounds(group_id, urltest_candidate_tags, state, section) {
+    let built = build_priority_levels_for_mode(group_id, urltest_candidate_tags, state, section, false);
+    let result = built.levels;
+    let assigned = built.assigned;
+
+    if (!priority_levels_have_non_direct_outbounds(result) &&
+        connections.balancer_section(group_id) != null &&
+        length(array_or_empty(urltest_candidate_tags)) > 0) {
+        let pool_built = build_priority_levels_for_mode(group_id, urltest_candidate_tags, state, section, true);
+        if (priority_levels_have_non_direct_outbounds(pool_built.levels)) {
+            let had_direct = false;
+            for (let lvl in result) {
+                if (lvl.direct) {
+                    had_direct = true;
+                    break;
+                }
+            }
+            result = pool_built.levels;
+            assigned = pool_built.assigned;
+            if (had_direct) {
+                let pool_has_direct = false;
+                for (let lvl in result) {
+                    if (lvl.direct) {
+                        pool_has_direct = true;
+                        break;
+                    }
+                }
+                if (!pool_has_direct) {
+                    push(result, {
+                        id: as_string(group_id) + "_lvl_" + (length(result) + 1),
+                        displayName: "Direct",
+                        order: length(result) + 1,
+                        direct: true,
+                        filter_mode: "include",
+                        detect_server_country: "flag_emoji",
+                        outbounds: [ runtime_constants.DIRECT_OUTBOUND_TAG ]
+                    });
+                }
+            }
+        }
+    }
+
+    if (!priority_levels_have_non_direct_outbounds(result) &&
+        connections.balancer_section(group_id) != null &&
+        length(array_or_empty(urltest_candidate_tags)) > 0) {
+        let pool_outbounds = [];
+        for (let tag_name in array_or_empty(urltest_candidate_tags)) {
+            tag_name = as_string(tag_name);
+            if (tag_name != "" && !assigned[tag_name]) {
+                assigned[tag_name] = true;
+                push(pool_outbounds, tag_name);
+            }
+        }
+        if (length(pool_outbounds) > 0) {
+            let fallback_lvl = {
+                id: as_string(group_id) + "_lvl_pool",
+                displayName: "Section Pool",
+                order: 1,
+                direct: false,
+                filter_mode: "disabled",
+                detect_server_country: "flag_emoji",
+                outbounds: pool_outbounds
+            };
+            let new_res = [ fallback_lvl ];
+            for (let lvl in result) {
+                if (lvl.direct) {
+                    lvl.order = length(new_res) + 1;
+                    push(new_res, lvl);
+                }
+            }
+            result = new_res;
+        }
     }
 
     return result;
@@ -686,15 +1426,41 @@ function priority_group_outbounds(levels) {
     return result;
 }
 
+function clean_balancer_tag_id(section_name, id) {
+    id = as_string(id);
+    section_name = as_string(section_name);
+    if (id == "" || id == "urltest" || section_name == "")
+        return id;
+    let s = id;
+    if (substr(s, 0, 9) == "bal_prio_")
+        s = substr(s, 9);
+    else if (substr(s, 0, 4) == "bal_")
+        s = substr(s, 4);
+    else
+        return id;
+    let prefix = section_name + "_";
+    let suffix = "_" + section_name;
+    let matched_sec = false;
+    if (lc(substr(s, 0, length(prefix))) == lc(prefix)) {
+        s = substr(s, length(prefix));
+        matched_sec = true;
+    } else if (length(s) > length(suffix) && lc(substr(s, length(s) - length(suffix))) == lc(suffix)) {
+        s = substr(s, 0, length(s) - length(suffix));
+        matched_sec = true;
+    }
+    return (matched_sec && s != "") ? s : id;
+}
+
 function urltest_outbound_tag(section_name, urltest_id) {
-    urltest_id = as_string(urltest_id);
+    urltest_id = clean_balancer_tag_id(section_name, urltest_id);
     return urltest_id == "urltest"
         ? outbound_tag(section_name + "-urltest")
         : outbound_tag(section_name + "-urltest-" + urltest_id);
 }
 
 function priority_outbound_tag(section_name, group_id) {
-    return outbound_tag(section_name + "-priority-" + as_string(group_id));
+    group_id = clean_balancer_tag_id(section_name, group_id);
+    return outbound_tag(section_name + "-priority-" + group_id);
 }
 
 // Section group (action 'group'): members keep their own selectors, but their
@@ -702,27 +1468,32 @@ function priority_outbound_tag(section_name, group_id) {
 // leaves. add_proxy_selector records each section's leaf candidates; the
 // post-pass add_group_urltest_outbounds builds the urltest and fills
 // section_group_map, which route generation reads.
-let section_leaf_tags = {};
-let section_group_map = {};
-
 function remember_section_leaf_tags(name, tags) {
     section_leaf_tags[name] = tags;
 }
 
 function find_outbound_by_tag(config, want) {
-    for (let outbound in config.outbounds)
+    for (let outbound in array_or_empty(config.outbounds))
         if (as_string(outbound.tag) == want)
             return outbound;
+    for (let endpoint in array_or_empty(config.endpoints))
+        if (as_string(endpoint.tag) == want)
+            return endpoint;
     return null;
 }
 
-// urltest tag of the group this section belongs to, or "" when the section is
+// urltest tag of the group this section belongs to (or the group's own urltest
+// tag when the section itself has action 'group'), or "" when the section is
 // not a group member (or its group produced no urltest).
 function group_outbound_tag_for_section(section) {
+    if (type(section) != "object")
+        return "";
+    if (option(section, "action", "") == "group")
+        return as_string(active_group_tags[section[".name"]] || "");
     let group_name = as_string(section_group_map[section[".name"]]);
     if (group_name == "")
         return "";
-    return urltest_outbound_tag(group_name, "urltest");
+    return as_string(active_group_tags[group_name] || urltest_outbound_tag(group_name, "urltest"));
 }
 
 function group_member_action_supported(action) {
@@ -731,8 +1502,8 @@ function group_member_action_supported(action) {
         return false;
     return connections.is_connections_action(action) ||
         action == "awg" || action == "warp" ||
-        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" ||
-        action == "sudoku" || action == "masque" || action == "openvpn" || action == "fptn";
+        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
+        action == "masque" || action == "openvpn" || action == "fptn";
 }
 
 // Union of the member sections' leaf outbound tags. Sections that went through
@@ -745,7 +1516,7 @@ function group_member_leaf_tags(members, config) {
         if (ctx.deferred_sections && ctx.deferred_sections[name])
             continue;
         let recorded = section_leaf_tags[name];
-        if (type(recorded) == "array" && length(recorded) > 0) {
+        if (type(recorded) == "array") {
             for (let candidate in recorded)
                 push(tags, candidate);
             continue;
@@ -758,21 +1529,49 @@ function group_member_leaf_tags(members, config) {
     return unique_string_array(tags);
 }
 
-function is_extended_variant_detected() {
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
-    if (sb_variant_val == "extended" || sb_variant_val == "extended-compressed")
-        return true;
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
-    let sb_version_val = trim(fs.readfile(sb_version_file) || "");
-    return index(sb_version_val, "extended") >= 0;
-}
-
 function add_urltest_outbound(config, section, urltest_id, urltest_candidate_tags, state) {
     let section_name = section[".name"];
     let urltest_outbounds = urltest_filtered_outbounds(section, urltest_id, urltest_candidate_tags, state);
     let urltest_tag = urltest_outbound_tag(section_name, urltest_id);
     let display_name = connections.urltest_display_name(section, urltest_id);
+
+    let sel_mode = lc(trim(option(section, "section_selection_mode", "auto")));
+    let has_sec_priority = sel_mode == "priority_failover";
+    let ut_tiers = [];
+    if (has_sec_priority && length(urltest_outbounds) > 1) {
+        let built_levels = priority_levels_with_outbounds(urltest_id, urltest_outbounds, state, section);
+        let ordered_ut = [];
+        let seen_ut = {};
+        for (let lvl in array_or_empty(built_levels)) {
+            if (lvl.direct)
+                continue;
+            let tier_tags = [];
+            for (let t in array_or_empty(lvl.outbounds)) {
+                t = as_string(t);
+                if (t != "" && !seen_ut[t]) {
+                    seen_ut[t] = true;
+                    push(tier_tags, t);
+                    push(ordered_ut, t);
+                }
+            }
+            if (length(tier_tags) > 0)
+                push(ut_tiers, tier_tags);
+        }
+        let leftover_tier = [];
+        for (let t in urltest_outbounds) {
+            t = as_string(t);
+            if (t != "" && !seen_ut[t]) {
+                seen_ut[t] = true;
+                push(leftover_tier, t);
+                push(ordered_ut, t);
+            }
+        }
+        if (length(leftover_tier) > 0 && length(ut_tiers) > 0)
+            push(ut_tiers, leftover_tier);
+        if (length(ordered_ut) == length(urltest_outbounds))
+            urltest_outbounds = ordered_ut;
+    }
+
     let urltest_outbound = {
         type: "urltest",
         tag: urltest_tag,
@@ -786,16 +1585,54 @@ function add_urltest_outbound(config, section, urltest_id, urltest_candidate_tag
     if (idle_timeout != "")
         urltest_outbound.idle_timeout = idle_timeout;
 
+    if (variant_state.supports_native_balancer(ctx.detect_core_version ? ctx.detect_core_version() : null)) {
+        let ut_mode = connections.urltest_mode(section, urltest_id);
+        if (ut_mode != "" && ut_mode != "least_test")
+            urltest_outbound.mode = ut_mode;
+
+        let bal_obj = {};
+        if (ut_mode == "round_robin" || ut_mode == "sticky" || ut_mode == "stability" ||
+            ut_mode == "least_load" || ut_mode == "weighted" || ut_mode == "passive" ||
+            ut_mode == "priority" || ut_mode == "hedged" || ut_mode == "throughput" ||
+            ut_mode == "quota") {
+            let bal_pool = connections.urltest_balancer_pool(section, urltest_id);
+            let bal_tol = connections.urltest_balancer_pool_tolerance(section, urltest_id);
+            let bal_sticky = connections.urltest_sticky_hash(section, urltest_id);
+            let bal_quota = connections.urltest_balancer_quota_mib(section, urltest_id);
+            if (bal_pool > 0)
+                bal_obj.pool = bal_pool;
+            if (bal_tol > 0)
+                bal_obj.pool_tolerance = bal_tol;
+            if (length(bal_sticky) > 0)
+                bal_obj.sticky_hash = bal_sticky;
+            if (bal_quota > 0)
+                bal_obj.quota_mib = bal_quota;
+        }
+        if (length(ut_tiers) >= 2)
+            bal_obj.tiers = ut_tiers;
+        if (length(keys(bal_obj)) > 0)
+            urltest_outbound.balancer = bal_obj;
+    }
+
+    let active_check_interval = connections.urltest_active_check_interval(section, urltest_id);
+    let testing_urls = connections.urltest_testing_urls(section, urltest_id);
+    let multi_url_strategy = connections.urltest_multi_url_strategy(section, urltest_id);
     runtime_subscription.remember_outbound_metadata(state, urltest_tag, display_name, urltest_outbound);
-    runtime_subscription.remember_urltest_group_config(state, urltest_tag, {
+    let ut_cfg = {
         displayName: display_name,
         outbounds: urltest_outbounds,
         url: urltest_outbound.url,
+        testing_urls,
+        multi_url_strategy,
+        active_check_interval: active_check_interval != "" ? active_check_interval : null,
         interval: urltest_outbound.interval,
         tolerance: urltest_outbound.tolerance,
         idle_timeout: urltest_outbound.idle_timeout,
         interrupt_exist_connections: urltest_outbound.interrupt_exist_connections
-    });
+    };
+    if (length(ut_tiers) >= 2)
+        ut_cfg.tiers = ut_tiers;
+    runtime_subscription.remember_urltest_group_config(state, urltest_tag, ut_cfg);
 
     if (length(urltest_outbounds) == 0)
         return {
@@ -810,51 +1647,81 @@ function add_urltest_outbound(config, section, urltest_id, urltest_candidate_tag
     };
 }
 
-// Post-pass: after every section has generated its outbounds, build one flat
-// urltest per group section over the union of member leaves and record the
-// member -> group mapping used to repoint route rules. Deferred (quarantined)
-// members contribute no leaves; a group with no live members is not emitted.
-function add_group_urltest_outbounds(config, sections) {
-    for (let section in sections) {
-        if (option(section, "action", "") != "group")
-            continue;
-        let group_name = section[".name"];
-        if (ctx.deferred_sections && ctx.deferred_sections[group_name])
-            continue;
+function routed_dns_server_tag(section_name) {
+    return runtime_constants.tag(section_name, "routed-dns-server");
+}
 
-        let wanted = {};
-        for (let member_name in list_option(section, "group_members"))
-            wanted[trim(as_string(member_name))] = true;
+function add_routed_dns_server_for_section(config, section) {
+    if (!connections.routed_dns_enabled(section))
+        return;
+    let section_name = section[".name"];
+    let action = option(section, "action", "");
+    let servers = connections.routed_dns_servers(section);
+    let dns_type = connections.routed_dns_type(section);
+    let tag_name = routed_dns_server_tag(section_name);
+    let detour = action == "bypass" ? null : (group_outbound_tag_for_section(section) || outbound_tag(section_name));
 
-        let members = [];
-        for (let candidate in sections)
-            if (wanted[candidate[".name"]])
-                push(members, candidate);
+    for (let i = 0; i < length(servers); i++) {
+        let s_val = servers[i];
+        // The rule references the un-indexed tag, so the first server has to
+        // carry it however many are configured — with a single server this is
+        // the same tag as before, with several the rest get -2, -3, …
+        let server_tag = i == 0
+            ? tag_name
+            : runtime_constants.tag(section_name, "routed-dns-server-" + (i + 1));
+        let server = runtime_dns.server_from_options(
+            server_tag,
+            dns_type,
+            s_val,
+            detour
+        );
+        if (server.unsupported)
+            ctx.runtime_generate_unsupported(server.unsupported);
+        push(config.dns.servers, server);
+    }
+}
 
-        let tags = group_member_leaf_tags(members, config);
-        if (length(tags) == 0) {
-            warn("Section group " + group_name + " has no member servers available, the group is not generated\n");
-            continue;
+function merge_member_state_into_group(group_state, member, config) {
+    let name = member[".name"];
+    let member_state = section_state_map[name];
+    if (type(member_state) == "object") {
+        let recorded = section_leaf_tags[name];
+        let allowed = (type(recorded) == "array") ? object_keys_set(recorded) : null;
+        for (let k, v in object_or_empty(member_state.links)) {
+            if (!allowed || allowed[k])
+                group_state.links[k] = v;
         }
-
-        let state = runtime_subscription.new_section_state(group_name);
-        let result = add_urltest_outbound(config, section, "urltest", tags, state);
-        if (result.tag == "")
-            continue;
-        for (let member in members) {
-            let name = member[".name"];
-            if (section_group_map[name] != null)
-                warn("Rule " + name + " belongs to several section groups; " +
-                    as_string(section_group_map[name]) + " wins, " + group_name + " is ignored\n");
-            else
-                section_group_map[name] = group_name;
+        for (let k, v in object_or_empty(member_state.servers)) {
+            if (!allowed || allowed[k])
+                group_state.servers[k] = v;
         }
+        for (let item in array_or_empty(member_state.subscriptionMetadata))
+            push(group_state.subscriptionMetadata, item);
+        let member_meta = object_or_empty(member_state.outboundMetadata);
+        for (let field in [ "names", "countries", "protocols", "transports", "securities", "prefixes", "ports", "details", "sources", "source_ids" ]) {
+            if (!group_state.outboundMetadata[field])
+                group_state.outboundMetadata[field] = {};
+            for (let k, v in object_or_empty(member_meta[field])) {
+                if (!allowed || allowed[k])
+                    group_state.outboundMetadata[field][k] = v;
+            }
+        }
+        return;
+    }
+
+    let own_tag = outbound_tag(name);
+    let outbound = find_outbound_by_tag(config, own_tag);
+    if (outbound != null && ctx.outbounds.urltest_leaf_candidate_outbound(outbound)) {
+        let display_name = trim(option(member, "label", option(member, "name", "")));
+        if (display_name == "")
+            display_name = name;
+        runtime_subscription.remember_outbound_metadata(group_state, own_tag, display_name, outbound);
     }
 }
 
 function add_priority_group_outbound(config, section, group_id, urltest_candidate_tags, state) {
     let section_name = section[".name"];
-    let levels = priority_levels_with_outbounds(group_id, urltest_candidate_tags, state);
+    let levels = priority_levels_with_outbounds(group_id, urltest_candidate_tags, state, section);
     let outbounds = priority_group_outbounds(levels);
     let priority_tag = priority_outbound_tag(section_name, group_id);
     let display_name = connections.priority_group_display_name(section, group_id);
@@ -873,6 +1740,8 @@ function add_priority_group_outbound(config, section, group_id, urltest_candidat
         section: section_name,
         displayName: display_name,
         health_url: connections.priority_group_health_url(section, group_id),
+        health_urls: connections.priority_group_health_urls(section, group_id),
+        multi_url_strategy: connections.priority_group_multi_url_strategy(section, group_id),
         active_check_interval: connections.priority_group_active_check_interval(section, group_id),
         check_timeout: connections.priority_group_check_timeout(section, group_id),
         recovery_check_interval: connections.priority_group_recovery_check_interval(section, group_id),
@@ -898,19 +1767,188 @@ function add_priority_group_outbound(config, section, group_id, urltest_candidat
     };
 }
 
-function is_mieru_detour(config, tag, depth) {
+// Post-pass: after every section has generated its outbounds, build one flat
+// urltest per group section over the union of member leaves and record the
+// member -> group mapping used to repoint route rules. Deferred (quarantined)
+// members contribute no leaves; a group with no live members is not emitted.
+function add_group_urltest_outbounds(config, sections) {
+    for (let section in sections) {
+        if (option(section, "action", "") != "group")
+            continue;
+        let group_name = section[".name"];
+        if (ctx.deferred_sections && ctx.deferred_sections[group_name])
+            continue;
+        ctx.current_section = group_name;
+
+        let wanted = {};
+        for (let member_name in list_option(section, "group_members"))
+            wanted[trim(as_string(member_name))] = true;
+
+        let members = [];
+        for (let candidate in sections)
+            if (wanted[candidate[".name"]])
+                push(members, candidate);
+
+        let tags = group_member_leaf_tags(members, config);
+        if (length(tags) == 0) {
+            warn("Section group " + group_name + " has no member servers available, the group is not generated\n");
+            continue;
+        }
+
+        let state = runtime_subscription.new_section_state(group_name);
+        for (let member in members)
+            merge_member_state_into_group(state, member, config);
+
+        if (section_needs_country_is(section)) {
+            let previous_state = read_json_file(runtime_subscription.section_cache_path(group_name));
+            state.outboundMetadata.countries = runtime_country.detect(
+                state.servers,
+                previous_state,
+                option(ctx.runtime_settings(), "bootstrap_dns_server", "77.88.8.8")
+            );
+        }
+        if (section_has_direct_priority_level(section))
+            state.outboundMetadata.names[runtime_constants.DIRECT_OUTBOUND_TAG] = "Direct";
+
+        let group_refs = connections.section_outbound_group_refs(section);
+        if (length(group_refs) > 0) {
+            let union_cand = [];
+            for (let grp_id in group_refs) {
+                let gspec = connections.outbound_group_filter_spec(grp_id, section);
+                if (gspec == null)
+                    continue;
+                for (let t in filter_tags_by_group_spec(tags, gspec, state))
+                    push(union_cand, t);
+            }
+            tags = unique_string_array(union_cand);
+        }
+
+        let sec_pool_spec = connections.section_pool_filter_spec(section);
+        if (sec_pool_spec != null)
+            tags = filter_tags_by_group_spec(tags, sec_pool_spec, state);
+
+        if (length(tags) == 0) {
+            warn("Section group " + group_name + " has no member servers matching its pool filter, the group is not generated\n");
+            continue;
+        }
+
+        let configured_urltests = connections.urltests(section);
+        let urltest_ids = length(configured_urltests) > 0 ? configured_urltests : [ "urltest" ];
+        let urltest_tags = [];
+        let priority_tags = [];
+        let leaf_outbounds = [];
+
+        for (let urltest_id in urltest_ids) {
+            let result = add_urltest_outbound(config, section, urltest_id, tags, state);
+            if (result.tag == "")
+                continue;
+            push(urltest_tags, result.tag);
+            for (let t in result.outbounds)
+                push(leaf_outbounds, t);
+        }
+
+        for (let group_id in connections.priority_groups(section)) {
+            let priority = add_priority_group_outbound(config, section, group_id, tags, state);
+            if (priority.tag == "")
+                continue;
+            push(priority_tags, priority.tag);
+            for (let t in priority.outbounds)
+                push(leaf_outbounds, t);
+        }
+
+        if (length(urltest_tags) == 0 && length(priority_tags) == 0)
+            continue;
+
+        let selector_tag = outbound_tag(group_name);
+        let merged_leaves = unique_string_array(length(leaf_outbounds) > 0 ? leaf_outbounds : tags);
+        let selector_outbounds = [];
+        for (let t in merged_leaves)
+            push(selector_outbounds, t);
+        for (let t in urltest_tags)
+            push(selector_outbounds, t);
+        for (let t in priority_tags)
+            push(selector_outbounds, t);
+        let sel_mode = lc(trim(option(section, "section_selection_mode", "auto")));
+        let is_priority_failover_mode = (sel_mode == "priority_failover" || sel_mode == "priority" || sel_mode == "failover");
+        let selector_default = (length(priority_tags) > 0 && is_priority_failover_mode)
+            ? priority_tags[0]
+            : (length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0]);
+        let persistent_selector_file = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
+        let saved_selector_state = read_json_file(persistent_selector_file);
+        if (type(saved_selector_state) == "object" && as_string(saved_selector_state[selector_tag]) != "") {
+            let saved_target = as_string(saved_selector_state[selector_tag]);
+            if (index(selector_outbounds, saved_target) >= 0)
+                selector_default = saved_target;
+        }
+        push(config.outbounds, {
+            type: "selector",
+            tag: selector_tag,
+            outbounds: selector_outbounds,
+            default: selector_default,
+            interrupt_exist_connections: connections.urltest_interrupt_exist_connections(section, "urltest")
+        });
+
+        state.urltestCandidateTags = unique_string_array(tags);
+        if (!getenv("TACHYON_CORE_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(group_name), state))
+            ctx.runtime_generate_unsupported("failed to write section cache for " + group_name);
+
+        active_group_tags[group_name] = selector_tag;
+        for (let member in members) {
+            let name = member[".name"];
+            if (section_group_map[name] != null)
+                warn("Rule " + name + " belongs to several section groups; " +
+                    as_string(section_group_map[name]) + " wins, " + group_name + " is ignored\n");
+            else
+                section_group_map[name] = group_name;
+        }
+        add_routed_dns_server_for_section(config, section);
+    }
+    ctx.current_section = null;
+}
+
+let cached_outbounds_map_config = null;
+let cached_outbounds_map_len = -1;
+let cached_outbounds_by_tag = {};
+let cached_valid_detour_by_tag = {};
+let cached_udp_support_by_tag = {};
+
+function get_outbounds_by_tag_index(config) {
+    if (type(config) != "object")
+        return {};
+    let outs = array_or_empty(config.outbounds);
+    let len = length(outs);
+    if (cached_outbounds_map_config != config || cached_outbounds_map_len != len) {
+        cached_outbounds_map_config = config;
+        cached_outbounds_map_len = len;
+        cached_outbounds_by_tag = {};
+        cached_valid_detour_by_tag = {};
+        cached_udp_support_by_tag = {};
+        for (let out in outs) {
+            if (type(out) == "object" && out.tag != null && out.tag != "")
+                cached_outbounds_by_tag[as_string(out.tag)] = out;
+        }
+    }
+    return cached_outbounds_by_tag;
+}
+
+function is_mieru_detour(config, tag, depth, visited) {
     depth = int(depth || 0);
     if (depth > 5 || tag == null || tag == "")
         return false;
-    for (let out in array_or_empty(config.outbounds)) {
-        if (type(out) == "object" && out.tag == tag) {
-            if (out.type == "mieru")
-                return true;
-            if ((out.type == "selector" || out.type == "urltest") && type(out.outbounds) == "array") {
-                for (let sub in out.outbounds) {
-                    if (is_mieru_detour(config, sub, depth + 1))
-                        return true;
-                }
+    visited = visited || {};
+    let tag_str = as_string(tag);
+    if (visited[tag_str])
+        return false;
+    visited[tag_str] = true;
+    let by_tag = get_outbounds_by_tag_index(config);
+    let out = by_tag[tag_str];
+    if (type(out) == "object") {
+        if (out.type == "mieru")
+            return true;
+        if ((out.type == "selector" || out.type == "urltest") && type(out.outbounds) == "array") {
+            for (let sub in out.outbounds) {
+                if (is_mieru_detour(config, sub, depth + 1, visited))
+                    return true;
             }
         }
     }
@@ -920,32 +1958,37 @@ function is_mieru_detour(config, tag, depth) {
 function is_valid_detour(config, tag) {
     if (tag == null || tag == "")
         return false;
-    if (tag == runtime_constants.DIRECT_OUTBOUND_TAG || tag == runtime_constants.BYPASS_OUTBOUND_TAG)
+    let tag_str = as_string(tag);
+    if (tag_str == runtime_constants.DIRECT_OUTBOUND_TAG || tag_str == runtime_constants.BYPASS_OUTBOUND_TAG)
         return true;
-    for (let out in array_or_empty(config.outbounds)) {
-        if (type(out) == "object" && out.tag == tag) {
-            if (out.tag == "DPI-out" || (out.type == "socks" && (out.server == "127.0.0.1" || out.server == "::1")))
-                return false;
-            if (out.routing_mark != null)
-                return false;
-            if (out.type == "mieru" || is_mieru_detour(config, tag, 0))
-                return false;
-            return true;
+    let by_tag = get_outbounds_by_tag_index(config);
+    if (cached_valid_detour_by_tag[tag_str] != null)
+        return cached_valid_detour_by_tag[tag_str];
+    let out = by_tag[tag_str];
+    if (type(out) == "object") {
+        let valid = true;
+        if (out.tag == "DPI-out" || (out.type == "socks" && (out.server == "127.0.0.1" || out.server == "::1")))
+            valid = false;
+        else if (out.routing_mark != null)
+            valid = false;
+        else if (out.type == "mieru" || is_mieru_detour(config, tag_str, 0, {}))
+            valid = false;
+        cached_valid_detour_by_tag[tag_str] = valid;
+        return valid;
+    }
+    for (let ep in array_or_empty(config.endpoints)) {
+        if (type(ep) == "object" && as_string(ep.tag) == tag_str) {
+            let valid = ep.routing_mark == null;
+            cached_valid_detour_by_tag[tag_str] = valid;
+            return valid;
         }
     }
+    cached_valid_detour_by_tag[tag_str] = false;
     return false;
 }
 
-// sing-box 1.14.0 deprecated the remote rule-set `download_detour` field in
-// favour of `http_client`, and removed it in 1.16.0. The replacement names a
-// declared HTTP client, so a detour that the old field carried inline now needs
-// a client of its own. `ruleset-http` already exists in base_config and covers
-// the no-detour case; cores below 1.14 keep `download_detour`, since
-// `http_clients` is an unknown top-level field there and sing-box aborts the
-// whole config on it.
+// tachyon-core uses `http_client` for remote rule-set downloads (`ruleset-http`).
 function download_http_client_tag(config, detour) {
-    if (!ctx.is_sb_1_14_plus || !ctx.is_sb_1_14_plus())
-        return "";
     if (!is_valid_detour(config, detour))
         return "ruleset-http";
 
@@ -990,6 +2033,7 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
     let exclude_protocols = connections.dashboard_exclude_protocols(section);
     let exclude_transports = connections.dashboard_exclude_transports(section);
     let exclude_securities = connections.dashboard_exclude_securities(section);
+    let exclude_ports = connections.dashboard_exclude_ports(section);
 
     let has_exclude_criteria = length(exclude_names) > 0 ||
         length(exclude_regex) > 0 ||
@@ -997,7 +2041,8 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
         (exclude_proxy_parameters && (
             length(exclude_protocols) > 0 ||
             length(exclude_transports) > 0 ||
-            length(exclude_securities) > 0
+            length(exclude_securities) > 0 ||
+            length(exclude_ports) > 0
         ));
 
     if (!has_exclude_criteria)
@@ -1016,13 +2061,155 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
         exclude_protocols,
         exclude_transports,
         exclude_securities,
-        []
+        exclude_ports
     );
 }
 
 function add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag) {
     let section_name = section[".name"];
-    remember_section_leaf_tags(section_name, urltest_candidate_tags);
+    if (type(state) == "object")
+        section_state_map[section_name] = state;
+
+    let group_refs = connections.section_outbound_group_refs(section);
+    let initial_candidate_tags = unique_string_array(urltest_candidate_tags);
+    let has_section_filter = false;
+    let priority_extra_cand = [];
+    if (length(group_refs) > 0) {
+        has_section_filter = true;
+        let union_selector = [];
+        let union_cand = [];
+        let covered_all = false;
+        let covered_src_set = {};
+        for (let grp_id in group_refs) {
+            let grp = connections.outbound_group_section(grp_id);
+            if (grp == null || !bool_option(grp, "enabled", true))
+                continue;
+            let g_srcs = list_option(grp, "source_refs");
+            if (length(g_srcs) == 0 || g_srcs[0] == "*") {
+                covered_all = true;
+            } else {
+                for (let gs in g_srcs)
+                    covered_src_set[as_string(gs)] = true;
+            }
+        }
+        let priority_level_src_set = {};
+        for (let pg_id in connections.priority_groups(section)) {
+            let pg_items = connections.priority_level_items(pg_id, section);
+            let pg_has_group = false;
+            for (let lvl_obj in pg_items) {
+                let ref_id = type(lvl_obj) == "object" ? as_string(lvl_obj.outbound_group_ref || "") : "";
+                if (ref_id != "" && connections.outbound_group_section(ref_id) != null) {
+                    pg_has_group = true;
+                    break;
+                }
+            }
+            if (!pg_has_group)
+                continue;
+            for (let lvl_obj in pg_items) {
+                let ref_id = type(lvl_obj) == "object" ? as_string(lvl_obj.outbound_group_ref || "") : "";
+                if (ref_id != "" && connections.outbound_source_section(ref_id) != null)
+                    priority_level_src_set[ref_id] = true;
+            }
+        }
+        let explicit_src_refs = connections.section_outbound_source_refs(section);
+        if (length(explicit_src_refs) > 0 && state && state.outboundMetadata) {
+            let meta_sources = object_or_empty(state.outboundMetadata.sources);
+            let meta_source_ids = object_or_empty(state.outboundMetadata.source_ids);
+            let sub_urls = connections.subscription_urls(section);
+            let explicit_src_set = {};
+            let explicit_sub_markers = {};
+            let prio_only_src_set = {};
+            let prio_only_sub_markers = {};
+            for (let src_id in explicit_src_refs) {
+                src_id = as_string(src_id);
+                let is_covered = covered_all || covered_src_set[src_id] == true;
+                if (is_covered && !priority_level_src_set[src_id])
+                    continue;
+                let src = connections.outbound_source_section(src_id);
+                let stype = src != null ? option(src, "source_type", "") : "";
+                if (connections.is_dpi_or_desync_source_type && connections.is_dpi_or_desync_source_type(stype))
+                    continue;
+                if (is_covered)
+                    prio_only_src_set[src_id] = true;
+                else
+                    explicit_src_set[src_id] = true;
+                let src_url = src != null ? trim(option(src, "url", "")) : "";
+                if (src_url != "") {
+                    for (let u_idx = 0; u_idx < length(sub_urls); u_idx++) {
+                        if (trim(as_string(sub_urls[u_idx])) == src_url) {
+                            if (is_covered)
+                                prio_only_sub_markers["sub:" + (u_idx + 1)] = true;
+                            else
+                                explicit_sub_markers["sub:" + (u_idx + 1)] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            let matches_explicit_src = function(t) {
+                let m_src = as_string(meta_sources[t] || "");
+                let m_src_id = as_string(meta_source_ids[t] || "");
+                return (m_src != "" && (explicit_src_set[m_src] || explicit_sub_markers[m_src])) ||
+                    (m_src_id != "" && explicit_src_set[m_src_id]);
+            };
+            let matches_prio_only_src = function(t) {
+                let m_src = as_string(meta_sources[t] || "");
+                let m_src_id = as_string(meta_source_ids[t] || "");
+                return (m_src != "" && (prio_only_src_set[m_src] || prio_only_sub_markers[m_src])) ||
+                    (m_src_id != "" && prio_only_src_set[m_src_id]);
+            };
+            for (let t in selector_tags) {
+                if (matches_explicit_src(t) || matches_prio_only_src(t))
+                    push(union_selector, t);
+            }
+            for (let t in urltest_candidate_tags) {
+                if (matches_explicit_src(t))
+                    push(union_cand, t);
+                else if (matches_prio_only_src(t))
+                    push(priority_extra_cand, t);
+            }
+        }
+        for (let grp_id in group_refs) {
+            let gspec = connections.outbound_group_filter_spec(grp_id, section);
+            if (gspec == null)
+                continue;
+            for (let t in filter_tags_by_group_spec(selector_tags, gspec, state))
+                push(union_selector, t);
+            for (let t in filter_tags_by_group_spec(urltest_candidate_tags, gspec, state))
+                push(union_cand, t);
+        }
+        if (length(union_cand) > 0) {
+            urltest_candidate_tags = unique_string_array(union_cand);
+            for (let t in urltest_candidate_tags) {
+                if (state && state.hiddenOutboundTags)
+                    delete state.hiddenOutboundTags[t];
+                push(union_selector, t);
+            }
+        }
+        if (length(union_selector) > 0)
+            selector_tags = unique_string_array(union_selector);
+    }
+
+    let sec_pool_spec = connections.section_pool_filter_spec(section);
+    if (sec_pool_spec != null) {
+        has_section_filter = true;
+        let narrowed_sel = filter_tags_by_group_spec(selector_tags, sec_pool_spec, state);
+        let narrowed_cand = filter_tags_by_group_spec(urltest_candidate_tags, sec_pool_spec, state);
+        if (length(narrowed_cand) > 0 || sec_pool_spec.mode == "exclude") {
+            urltest_candidate_tags = narrowed_cand;
+            if (sec_pool_spec.mode == "include" || sec_pool_spec.mode == "mixed") {
+                for (let t in narrowed_cand) {
+                    if (state && state.hiddenOutboundTags)
+                        delete state.hiddenOutboundTags[t];
+                    push(narrowed_sel, t);
+                }
+                narrowed_sel = unique_string_array(narrowed_sel);
+            }
+        }
+        if (length(narrowed_sel) > 0 || sec_pool_spec.mode == "exclude")
+            selector_tags = narrowed_sel;
+    }
+
     let selector_tag = outbound_tag(section_name);
     let selector_outbounds = selector_tags;
     let selector_default = selector_tags[0];
@@ -1030,10 +2217,18 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
     let priority_tags = [];
     let group_outbounds = {};
 
+    let mode = connections.dashboard_filter_mode(section);
     let section_excluded = section_excluded_candidate_tags(section, urltest_candidate_tags, state);
     let group_candidate_tags = length(section_excluded) > 0
         ? urltest_exclude_outbounds(urltest_candidate_tags, section_excluded)
         : urltest_candidate_tags;
+    if ((mode == "include" || mode == "mixed") &&
+        length(connections.dashboard_include_groups(section)) == 0 &&
+        length(connections.dashboard_exclude_groups(section)) == 0) {
+        let narrowed_group_candidates = dashboard_filtered_outbounds(section, group_candidate_tags, state, {});
+        if (length(narrowed_group_candidates) > 0)
+            group_candidate_tags = narrowed_group_candidates;
+    }
 
     for (let urltest_id in connections.urltests(section)) {
         let urltest = add_urltest_outbound(config, section, urltest_id, group_candidate_tags, state);
@@ -1049,10 +2244,13 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
     }
 
     if (as_string(text_urltest_tag) != "" && index(urltest_tags, as_string(text_urltest_tag)) < 0)
-        push(urltest_tags, text_urltest_tag);
+        push(urltest_tags, as_string(text_urltest_tag));
 
+    let priority_candidate_tags = length(priority_extra_cand) > 0
+        ? unique_string_array([ ...group_candidate_tags, ...priority_extra_cand ])
+        : group_candidate_tags;
     for (let group_id in connections.priority_groups(section)) {
-        let priority = add_priority_group_outbound(config, section, group_id, group_candidate_tags, state);
+        let priority = add_priority_group_outbound(config, section, group_id, priority_candidate_tags, state);
         remember_dashboard_group_outbounds(
             group_outbounds,
             connections.priority_group_display_name(section, group_id),
@@ -1065,7 +2263,6 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
     }
 
     let dashboard_candidates = selector_tags;
-    let mode = connections.dashboard_filter_mode(section);
     if (mode == "include" || mode == "mixed") {
         let combined = [];
         for (let t in selector_tags) push(combined, t);
@@ -1084,14 +2281,232 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
             "falling back to all available subscription servers\n");
         filtered_outbounds = selector_tags;
     }
+
+    let effective_leaf_tags = group_candidate_tags;
+    if ((mode == "include" || mode == "exclude" || mode == "mixed") && length(filtered_outbounds) > 0) {
+        let allowed_set = object_keys_set(filtered_outbounds);
+        let narrowed = [];
+        for (let t in group_candidate_tags) {
+            if (allowed_set[t])
+                push(narrowed, t);
+        }
+        if (length(narrowed) > 0 || mode == "exclude")
+            effective_leaf_tags = narrowed;
+    }
+    remember_section_leaf_tags(section_name, effective_leaf_tags);
+
+    let sec_source_refs = connections.section_outbound_source_refs(section);
+    let sel_mode = lc(trim(option(section, "section_selection_mode", "auto")));
+    let meta_sources = object_or_empty(object_or_empty(state.outboundMetadata).sources);
+    let meta_source_ids = object_or_empty(object_or_empty(state.outboundMetadata).source_ids);
+    let sub_urls = connections.subscription_urls(section);
+    let source_level_entries = [];
+    let has_dpi_source = false;
+    let first_is_dpi = false;
+
+    if (length(sec_source_refs) > 0 && length(filtered_outbounds) > 0) {
+        let ordered_filtered = [];
+        let seen_ordered = {};
+        for (let s_idx = 0; s_idx < length(sec_source_refs); s_idx++) {
+            let src_id = sec_source_refs[s_idx];
+            let src = connections.outbound_source_section(src_id);
+            let stype = src != null ? option(src, "source_type", "") : "";
+            let is_dpi = connections.is_dpi_or_desync_source_type && connections.is_dpi_or_desync_source_type(stype);
+            if (is_dpi) {
+                has_dpi_source = true;
+                if (s_idx == 0)
+                    first_is_dpi = true;
+            }
+            let src_url = src != null ? trim(option(src, "url", "")) : "";
+            let sub_marker = "";
+            if (src_url != "") {
+                for (let u_idx = 0; u_idx < length(sub_urls); u_idx++) {
+                    if (trim(as_string(sub_urls[u_idx])) == src_url) {
+                        sub_marker = "sub:" + (u_idx + 1);
+                        break;
+                    }
+                }
+            }
+            let this_src_tags = [];
+            for (let t in filtered_outbounds) {
+                let m_src = as_string(meta_sources[t] || "");
+                let m_src_id = as_string(meta_source_ids[t] || "");
+                if (m_src == src_id || m_src_id == src_id || (sub_marker != "" && m_src == sub_marker)) {
+                    push(this_src_tags, t);
+                    if (!seen_ordered[t]) {
+                        seen_ordered[t] = true;
+                        push(ordered_filtered, t);
+                    }
+                }
+            }
+            if (length(this_src_tags) > 0) {
+                push(source_level_entries, {
+                    id: src_id,
+                    displayName: src != null ? (option(src, "name", src_id) || src_id) : src_id,
+                    is_dpi: is_dpi,
+                    outbounds: this_src_tags
+                });
+            }
+        }
+        for (let t in filtered_outbounds) {
+            if (!seen_ordered[t]) {
+                seen_ordered[t] = true;
+                push(ordered_filtered, t);
+            }
+        }
+        filtered_outbounds = ordered_filtered;
+    }
+
+    let has_explicit_tier_levels = sel_mode == "priority_failover" &&
+        connections.extract_entity_priority_level_refs &&
+        length(connections.extract_entity_priority_level_refs(section)) > 0;
+    let is_priority_failover_mode = sel_mode == "priority_failover";
+    if (has_explicit_tier_levels && length(filtered_outbounds) > 0) {
+        let built_sec_levels = priority_levels_with_outbounds(section_name, filtered_outbounds, state, section);
+        if (length(built_sec_levels) > 0) {
+            let custom_entries = [];
+            let ordered_by_tiers = [];
+            let seen_by_tiers = {};
+            let dpi_by_src = {};
+            for (let entry in source_level_entries) {
+                if (entry.is_dpi) {
+                    for (let t in array_or_empty(entry.outbounds))
+                        dpi_by_src[as_string(t)] = true;
+                }
+            }
+            for (let lvl in built_sec_levels) {
+                if (lvl.direct) {
+                    push(custom_entries, {
+                        id: lvl.id,
+                        displayName: lvl.displayName || "Direct",
+                        is_dpi: false,
+                        direct: true,
+                        outbounds: [ runtime_constants.DIRECT_OUTBOUND_TAG ]
+                    });
+                    continue;
+                }
+                let tier_tags = [];
+                let tier_has_dpi = false;
+                for (let t in array_or_empty(lvl.outbounds)) {
+                    t = as_string(t);
+                    if (t != "" && !seen_by_tiers[t]) {
+                        seen_by_tiers[t] = true;
+                        push(tier_tags, t);
+                        push(ordered_by_tiers, t);
+                        if (dpi_by_src[t])
+                            tier_has_dpi = true;
+                    }
+                }
+                if (length(tier_tags) > 0) {
+                    push(custom_entries, {
+                        id: lvl.id,
+                        displayName: lvl.displayName || lvl.id,
+                        is_dpi: tier_has_dpi,
+                        direct: false,
+                        outbounds: tier_tags
+                    });
+                }
+            }
+            for (let t in filtered_outbounds) {
+                t = as_string(t);
+                if (t != "" && !seen_by_tiers[t]) {
+                    seen_by_tiers[t] = true;
+                    push(ordered_by_tiers, t);
+                }
+            }
+            if (length(custom_entries) > 0) {
+                source_level_entries = custom_entries;
+                first_is_dpi = custom_entries[0].is_dpi == true;
+            }
+            if (length(ordered_by_tiers) == length(filtered_outbounds))
+                filtered_outbounds = ordered_by_tiers;
+        }
+    }
+
     selector_outbounds = filtered_outbounds;
     selector_default = selector_outbounds[0];
-    if (length(urltest_tags) > 0 || length(priority_tags) > 0) {
+    let has_explicit_balancers = length(urltest_tags) > 0 || length(priority_tags) > 0;
+    let supports_native_bal = variant_state.supports_native_balancer(ctx.detect_core_version ? ctx.detect_core_version() : null);
+    let use_section_failover = sel_mode != "default" && (
+        has_dpi_source ||
+        (is_priority_failover_mode && (!has_explicit_balancers || (!supports_native_bal && length(priority_tags) == 0)))
+    );
+    if (has_explicit_balancers) {
         for (let tag in urltest_tags)
             push(selector_outbounds, tag);
         for (let tag in priority_tags)
             push(selector_outbounds, tag);
-        selector_default = length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0];
+        if (!first_is_dpi && (!is_priority_failover_mode || supports_native_bal || length(priority_tags) > 0))
+            selector_default = length(priority_tags) > 0 && is_priority_failover_mode
+                ? priority_tags[0]
+                : (length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0]);
+    }
+
+    if (use_section_failover) {
+        let auto_levels = [];
+        let lvl_order = 1;
+        let prefer_balancer_for_non_dpi = has_explicit_balancers && (!is_priority_failover_mode || supports_native_bal);
+        let added_balancers = false;
+        let append_balancer_levels = () => {
+            if (added_balancers)
+                return;
+            added_balancers = true;
+            for (let ut_tag in urltest_tags) {
+                push(auto_levels, {
+                    id: ut_tag,
+                    displayName: ut_tag,
+                    order: lvl_order++,
+                    direct: false,
+                    outbounds: [ ut_tag ]
+                });
+            }
+            for (let pr_tag in priority_tags) {
+                push(auto_levels, {
+                    id: pr_tag,
+                    displayName: pr_tag,
+                    order: lvl_order++,
+                    direct: false,
+                    outbounds: [ pr_tag ]
+                });
+            }
+        };
+        for (let entry in source_level_entries) {
+            if (prefer_balancer_for_non_dpi && !entry.is_dpi && !entry.direct) {
+                append_balancer_levels();
+                continue;
+            }
+            push(auto_levels, {
+                id: entry.id,
+                displayName: entry.displayName,
+                order: lvl_order++,
+                direct: entry.direct == true,
+                outbounds: entry.outbounds
+            });
+        }
+        if (prefer_balancer_for_non_dpi || length(source_level_entries) == 0)
+            append_balancer_levels();
+        if (length(auto_levels) >= 2) {
+            let h_url = trim(option(section, "section_health_url", "https://www.gstatic.com/generate_204"));
+            if (h_url == "")
+                h_url = "https://www.gstatic.com/generate_204";
+            runtime_subscription.remember_priority_group(state, selector_tag, {
+                id: section_name + "_failover",
+                tag: selector_tag,
+                section: section_name,
+                displayName: option(section, "label", section_name) || section_name,
+                health_url: h_url,
+                active_check_interval: "15s",
+                check_timeout: "2s",
+                recovery_check_interval: "30s",
+                pick_fastest: true,
+                switch_to_faster_same_priority: false,
+                fastest_check_interval: "10m",
+                interrupt_exist_connections: connections.section_interrupt_exist_connections(section),
+                pin_dashboard: false,
+                outbounds: selector_outbounds,
+                levels: auto_levels
+            });
+        }
     }
 
     if (length(selector_outbounds) == 0) {
@@ -1103,11 +2518,29 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
         else {
             selector_outbounds = [ runtime_constants.DIRECT_OUTBOUND_TAG ];
             selector_default = runtime_constants.DIRECT_OUTBOUND_TAG;
-            warn("Section " + section_name + ": subscription has no loaded servers yet, using direct fallback until cache is populated\n");
+            if (section_is_fail_closed(section)) {
+                // The direct placeholder only keeps the selector valid: routing
+                // this section to it would be a leak, so it is quarantined and
+                // its rules reject until the cache is populated.
+                ctx.quarantined_sections = ctx.quarantined_sections || {};
+                ctx.quarantined_sections[section_name] = true;
+                warn("Section " + section_name + ": subscription has no loaded servers yet; Fail-Closed rejects its traffic until the cache is populated\n");
+            }
+            else
+                warn("Section " + section_name + ": subscription has no loaded servers yet, using direct fallback until cache is populated\n");
         }
     }
 
     if (state && state.hiddenOutboundTags) {
+        if (has_section_filter || mode == "include" || mode == "exclude" || mode == "mixed") {
+            let visible_set = object_keys_set(selector_outbounds);
+            for (let t in effective_leaf_tags)
+                visible_set[t] = true;
+            for (let tag in initial_candidate_tags) {
+                if (!visible_set[tag])
+                    state.hiddenOutboundTags[tag] = true;
+            }
+        }
         for (let tag in selector_outbounds)
             delete state.hiddenOutboundTags[tag];
     }
@@ -1116,20 +2549,86 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
     let saved_selector_state = read_json_file(persistent_selector_file);
     if (type(saved_selector_state) == "object" && as_string(saved_selector_state[selector_tag]) != "") {
         let saved_target = as_string(saved_selector_state[selector_tag]);
-        if (index(selector_outbounds, saved_target) >= 0)
+        if (index(selector_outbounds, saved_target) >= 0) {
             selector_default = saved_target;
+        }
     }
 
-    push(config.outbounds, {
+    let selector_outbound = {
         type: "selector",
         tag: selector_tag,
         outbounds: selector_outbounds,
         default: selector_default,
-        interrupt_exist_connections: true
-    });
+        interrupt_exist_connections: connections.section_interrupt_exist_connections(section)
+    };
+    if (connections.section_selector_auto_failover(section, ctx.runtime_settings ? ctx.runtime_settings() : null))
+        selector_outbound.auto_failover = true;
+    push(config.outbounds, selector_outbound);
 }
 
-function ensure_custom_ruleset(config, reference) {
+function plain_ruleset_kind(json_path, etc_json, srs_path, fallback_kind) {
+    if (fs.stat(json_path) == null && fs.stat(etc_json) != null)
+        common.copy_file(etc_json, json_path);
+    if (fs.stat(json_path) == null && srs_path != null && srs_path != "" && runtime_rulesets.is_referenceable_srs_file(srs_path)) {
+        let dec_ok = false;
+        if (fs.stat("/usr/bin/tachyon-core") != null)
+            dec_ok = common.command_success_from_args([ "/usr/bin/tachyon-core", "rule-set", "decompile", srs_path, "-o", json_path ]);
+        if (!dec_ok)
+            dec_ok = common.command_success_from_args([ "tachyon-core", "rule-set", "decompile", srs_path, "-o", json_path ]);
+        if (dec_ok && fs.stat(json_path) != null && etc_json != null && etc_json != "") {
+            let st_j = fs.stat(json_path);
+            let sz_j = st_j != null ? int(st_j.size || 0) : 0;
+            if (sz_j > 0 && sz_j <= 524288) {
+                common.ensure_dir("/etc/tachyon/rulesets");
+                common.copy_file(json_path, etc_json);
+            } else if (sz_j > 524288) {
+                fs.unlink(etc_json);
+            }
+        }
+    }
+    let inspect_path = fs.stat(json_path) != null ? json_path : (fs.stat(etc_json) != null ? etc_json : "");
+    let detected = null;
+    if (inspect_path != "") {
+        let has_doms = source_rulesets.has_domain_matchers(inspect_path);
+        let has_ips = source_rulesets.has_ip_matchers(inspect_path);
+        if (has_doms && has_ips)
+            detected = "mixed";
+        else if (has_ips)
+            detected = "subnets";
+        else if (has_doms)
+            detected = "domains";
+    }
+    if (srs_path != null && srs_path != "" && fs.stat(srs_path) != null && fs.stat(json_path) != null) {
+        let st_tmp_j = fs.stat(json_path);
+        if (st_tmp_j != null && int(st_tmp_j.size || 0) > 524288)
+            fs.unlink(json_path);
+    }
+    if (detected != null)
+        return detected;
+    return (fallback_kind != null && fallback_kind != "" && fallback_kind != "unknown") ? fallback_kind : "domains";
+}
+
+function resolve_ruleset_download_detour(config, section_name) {
+    let detour = ctx.download_detour_tag(ctx.runtime_settings(), "lists");
+    let sec_name = as_string(section_name || ctx.current_section || "");
+    if (detour == "" && sec_name != "") {
+        let sec_out = outbound_tag(sec_name);
+        if (sec_out != "" && sec_out != runtime_constants.DIRECT_OUTBOUND_TAG && sec_out != runtime_constants.BYPASS_OUTBOUND_TAG && is_valid_detour(config, sec_out)) {
+            detour = sec_out;
+        }
+    }
+    if (detour == "") {
+        for (let outb in array_or_empty(config.outbounds)) {
+            if (type(outb) == "object" && (outb.type == "selector" || outb.type == "urltest") && is_valid_detour(config, outb.tag)) {
+                detour = as_string(outb.tag);
+                break;
+            }
+        }
+    }
+    return detour;
+}
+
+function ensure_custom_ruleset(config, reference, section_name) {
     let tag_name;
     let kind = runtime_rulesets.kind_from_reference_hint(reference);
 
@@ -1138,24 +2637,30 @@ function ensure_custom_ruleset(config, reference) {
         kind = runtime_rulesets.community_kind ? runtime_rulesets.community_kind(reference) : "domains";
         if (!ruleset_registered(config, tag_name)) {
             let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
+            let tmp_trs = folder + "/community-" + reference + ".trs";
+            let etc_trs = "/etc/tachyon/rulesets/community-" + reference + ".trs";
             let tmp_srs = folder + "/community-" + reference + ".srs";
             let etc_srs = "/etc/tachyon/rulesets/community-" + reference + ".srs";
             let local_path = null;
 
             // is_populated_srs_file, not is_valid_srs_file: the fetch-failure
             // stub is itself a valid 17-byte SRS, and treating it as downloaded
-            // emits a local rule_set with no url, so sing-box can never fetch the
+            // emits a local rule_set with no url, so tachyon-core can never fetch the
             // real list and the rule matches nothing (TCH-1043).
-// is_referenceable_srs_file: the question is whether sing-box can read the file,
+// is_referenceable_srs_file: the question is whether tachyon-core can read the file,
 // not whether it matches anything. The 17-byte placeholder is valid and parseable,
 // so it stays referenced locally and a cold boot without a network still applies -
 // emitting a remote rule-set there puts the fetch back into startup, and a GitHub
 // hiccup then kills the core. A truncated list is valid-looking and unreadable, and
 // that one must fall through to the remote url, because a config pointing at a file
-// sing-box cannot parse is refused outright ("unexpected EOF") and leaves the router
+// tachyon-core cannot parse is refused outright ("unexpected EOF") and leaves the router
 // unable to apply anything. is_populated_srs_file alone answers neither: it accepts
 // the truncation.
-if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
+if (type(runtime_rulesets.is_referenceable_trs_file) == "function" && runtime_rulesets.is_referenceable_trs_file(tmp_trs))
+            local_path = tmp_trs;
+        else if (type(runtime_rulesets.is_referenceable_trs_file) == "function" && runtime_rulesets.is_referenceable_trs_file(etc_trs))
+            local_path = etc_trs;
+        else if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             local_path = tmp_srs;
         else if (runtime_rulesets.is_referenceable_srs_file(etc_srs))
             local_path = etc_srs;
@@ -1172,13 +2677,19 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             });
         }
         else {
+            let use_trs = type(runtime_rulesets.supports_trs) == "function" &&
+                runtime_rulesets.supports_trs() &&
+                type(runtime_rulesets.community_trs_url) == "function";
+            let trs_url = use_trs ? as_string(runtime_rulesets.community_trs_url(reference)) : "";
             let rule_set = {
                 type: "remote",
                 tag: tag_name,
                 format: "binary",
-                url: runtime_rulesets.community_url(reference)
+                url: (trs_url != "")
+                    ? trs_url
+                    : runtime_rulesets.community_url(reference)
             };
-                let detour = ctx.download_detour_tag(ctx.runtime_settings());
+                let detour = resolve_ruleset_download_detour(config, section_name);
                 apply_download_transport(config, rule_set, detour);
                 rule_set.update_interval = remote_ruleset_update_interval();
                 push(config.route.rule_set, rule_set);
@@ -1187,12 +2698,28 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
         return { tag: tag_name, kind };
     }
 
-    tag_name = "inline-custom-" + runtime_rulesets.hash12(reference) + "-ruleset";
-    if (ruleset_registered(config, tag_name))
-        return { tag: tag_name, kind };
-
+    let is_remote_non_plain = (substr(reference, 0, 7) == "http://" || substr(reference, 0, 8) == "https://") &&
+        !runtime_rulesets.is_plain_list_reference(reference);
+    tag_name = is_remote_non_plain
+        ? remote_custom_ruleset_tag(reference)
+        : "inline-custom-" + runtime_rulesets.hash12(reference) + "-ruleset";
     let extension = runtime_rulesets.file_extension(reference);
     let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
+    if (ruleset_registered(config, tag_name)) {
+        if (runtime_rulesets.is_plain_list_reference(reference)) {
+            return {
+                tag: tag_name,
+                kind: plain_ruleset_kind(
+                    folder + "/" + tag_name + ".json",
+                    "/etc/tachyon/rulesets/" + tag_name + ".json",
+                    folder + "/" + tag_name + ".srs",
+                    kind
+                )
+            };
+        }
+        return { tag: tag_name, kind };
+    }
+
     common.ensure_dir(folder);
 
     if (runtime_rulesets.is_plain_list_reference(reference)) {
@@ -1202,19 +2729,19 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
         let etc_json = "/etc/tachyon/rulesets/" + tag_name + ".json";
 
         if (substr(reference, 0, 1) == "/") {
-            if (!helpers.file_is_usable(reference, 1))
+            if (fs.stat(reference)?.type != "file")
                 return null;
 
             let ref_st = fs.stat(reference);
             let srs_st = fs.stat(srs_path);
-            if (srs_st && runtime_rulesets.is_valid_srs_file(srs_path) && ref_st && srs_st.mtime >= ref_st.mtime) {
+            if (srs_st && runtime_rulesets.is_adoptable_srs_file(srs_path) && ref_st && srs_st.mtime >= ref_st.mtime && fs.stat(json_path) != null) {
                 push(config.route.rule_set, {
                     type: "local",
                     tag: tag_name,
                     format: "binary",
                     path: srs_path
                 });
-                return { tag: tag_name, kind: "domains" };
+                return { tag: tag_name, kind: plain_ruleset_kind(json_path, etc_json, srs_path, kind) };
             }
 
             let res = source_rulesets.compile_plain_list(reference, srs_path, json_path);
@@ -1224,27 +2751,28 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
                 format: res.format,
                 path: res.path
             });
-            return { tag: tag_name, kind: res.has_domains ? "domains" : "unknown" };
+            return { tag: tag_name, kind: res.kind || (res.has_domains ? "domains" : "unknown") };
         }
         else if (substr(reference, 0, 7) == "http://" || substr(reference, 0, 8) == "https://") {
-            if (runtime_rulesets.is_valid_srs_file(srs_path)) {
+            if (runtime_rulesets.is_adoptable_srs_file(srs_path)) {
                 push(config.route.rule_set, {
                     type: "local",
                     tag: tag_name,
                     format: "binary",
                     path: srs_path
                 });
-                return { tag: tag_name, kind: "domains" };
+                return { tag: tag_name, kind: plain_ruleset_kind(json_path, etc_json, srs_path, kind) };
             }
-            else if (runtime_rulesets.is_valid_srs_file(etc_srs)) {
-                common.copy_file(etc_srs, srs_path);
+            else if (runtime_rulesets.is_adoptable_srs_file(etc_srs) && common.copy_file(etc_srs, srs_path)) {
+                if (fs.stat(etc_json) != null)
+                    common.copy_file(etc_json, json_path);
                 push(config.route.rule_set, {
                     type: "local",
                     tag: tag_name,
                     format: "binary",
                     path: srs_path
                 });
-                return { tag: tag_name, kind: "domains" };
+                return { tag: tag_name, kind: plain_ruleset_kind(json_path, etc_json, srs_path, kind) };
             }
             else if (fs.stat(json_path) != null) {
                 push(config.route.rule_set, {
@@ -1253,7 +2781,7 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
                     format: "source",
                     path: json_path
                 });
-                return { tag: tag_name, kind: "domains" };
+                return { tag: tag_name, kind: plain_ruleset_kind(json_path, etc_json, "", kind) };
             }
             else if (fs.stat(etc_json) != null) {
                 common.copy_file(etc_json, json_path);
@@ -1263,7 +2791,7 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
                     format: "source",
                     path: json_path
                 });
-                return { tag: tag_name, kind: "domains" };
+                return { tag: tag_name, kind: plain_ruleset_kind(json_path, etc_json, "", kind) };
             }
             else {
                 let tmp_plain = folder + "/" + tag_name + ".tmp.plain";
@@ -1274,12 +2802,29 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
                     dl_ok = common.command_success_from_args([ "wget", "-q", "-T", "10", "-O", tmp_plain, reference ]);
 
                 if (dl_ok && helpers.file_is_usable(tmp_plain, 1)) {
-                    common.ensure_dir("/etc/tachyon/rulesets");
                     let res = source_rulesets.compile_plain_list(tmp_plain, srs_path, json_path);
-                    if (res.format == "binary")
-                        common.copy_file(srs_path, etc_srs);
-                    else
-                        common.copy_file(json_path, etc_json);
+                    if (res.format == "binary") {
+                        let st_s = fs.stat(srs_path);
+                        let sz_s = st_s != null ? int(st_s.size || 0) : 0;
+                        if (sz_s > 0 && sz_s <= 524288) {
+                            common.ensure_dir("/etc/tachyon/rulesets");
+                            common.copy_file(srs_path, etc_srs);
+                        } else if (sz_s > 524288) {
+                            fs.unlink(etc_srs);
+                        }
+                    }
+                    if (fs.stat(json_path) != null) {
+                        let st_j = fs.stat(json_path);
+                        let sz_j = st_j != null ? int(st_j.size || 0) : 0;
+                        if (sz_j > 0 && sz_j <= 524288) {
+                            common.ensure_dir("/etc/tachyon/rulesets");
+                            common.copy_file(json_path, etc_json);
+                        } else if (sz_j > 524288) {
+                            fs.unlink(etc_json);
+                            if (res.format == "binary")
+                                fs.unlink(json_path);
+                        }
+                    }
                     fs.unlink(tmp_plain);
                     push(config.route.rule_set, {
                         type: "local",
@@ -1287,10 +2832,11 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
                         format: res.format,
                         path: res.path
                     });
-                    return { tag: tag_name, kind: res.has_domains ? "domains" : "unknown" };
+                    return { tag: tag_name, kind: res.kind || (res.has_domains ? "domains" : "unknown") };
                 }
                 else {
                     fs.unlink(tmp_plain);
+                    fs.unlink(srs_path);
                     runtime_rulesets.ensure_empty_srs_stub(srs_path);
                     push(config.route.rule_set, {
                         type: "local",
@@ -1303,12 +2849,12 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             }
         }
         else {
-            ctx.runtime_generate_unsupported("plain list reference is not supported by sing-box config generation");
+            ctx.runtime_generate_unsupported("plain list reference is not supported by tachyon-core config generation");
         }
     }
     else if (substr(reference, 0, 1) == "/") {
-        if (extension != "srs" && extension != "json")
-            ctx.runtime_generate_unsupported("local rule_set extension is not supported by sing-box config generation");
+        if (extension != "srs" && extension != "trs" && extension != "json")
+            ctx.runtime_generate_unsupported("local rule_set extension is not supported by tachyon-core config generation");
         // Skip broken local ruleset files — nonexistent or suspiciously small
         if (!helpers.file_is_usable(reference, 100))
             return null;
@@ -1328,7 +2874,7 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             format: runtime_rulesets.remote_format(reference),
             url: reference
         };
-        let detour = ctx.download_detour_tag(ctx.runtime_settings());
+        let detour = resolve_ruleset_download_detour(config, section_name);
         apply_download_transport(config, rule_set, detour);
         rule_set.update_interval = remote_ruleset_update_interval();
         if (config.route.rule_set == null)
@@ -1336,7 +2882,7 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
         push(config.route.rule_set, rule_set);
     }
     else {
-        ctx.runtime_generate_unsupported("rule_set reference is not supported by sing-box config generation");
+        ctx.runtime_generate_unsupported("rule_set reference is not supported by tachyon-core config generation");
     }
 
     return { tag: tag_name, kind };
@@ -1351,6 +2897,8 @@ function ensure_community_ruleset(config, section_name, community) {
     let tag_name = ruleset_tag(section_name, community, "community");
     if (!ruleset_registered(config, tag_name)) {
         let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
+        let tmp_trs = folder + "/community-" + community + ".trs";
+        let etc_trs = "/etc/tachyon/rulesets/community-" + community + ".trs";
         let tmp_srs = folder + "/community-" + community + ".srs";
         let etc_srs = "/etc/tachyon/rulesets/community-" + community + ".srs";
         let local_path = null;
@@ -1360,7 +2908,11 @@ function ensure_community_ruleset(config, section_name, community) {
 // fetch back into startup, where a GitHub hiccup kills the core). A truncated list
 // passes is_populated_srs_file and is unreadable, and a config pointing at it is
 // refused outright, so it falls through to the remote url below.
-if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
+if (type(runtime_rulesets.is_referenceable_trs_file) == "function" && runtime_rulesets.is_referenceable_trs_file(tmp_trs))
+            local_path = tmp_trs;
+        else if (type(runtime_rulesets.is_referenceable_trs_file) == "function" && runtime_rulesets.is_referenceable_trs_file(etc_trs))
+            local_path = etc_trs;
+        else if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             local_path = tmp_srs;
         else if (runtime_rulesets.is_referenceable_srs_file(etc_srs))
             local_path = etc_srs;
@@ -1377,20 +2929,20 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
             });
         }
         else {
+            let use_trs = type(runtime_rulesets.supports_trs) == "function" &&
+                runtime_rulesets.supports_trs() &&
+                type(runtime_rulesets.community_trs_url) == "function";
+            let trs_url = use_trs ? as_string(runtime_rulesets.community_trs_url(community)) : "";
             let rule_set = {
                 type: "remote",
                 tag: tag_name,
                 format: "binary",
-                url: runtime_rulesets.community_url(community),
+                url: (trs_url != "")
+                    ? trs_url
+                    : runtime_rulesets.community_url(community),
                 update_interval: remote_ruleset_update_interval()
             };
-            let detour = ctx.download_detour_tag(ctx.runtime_settings(), "lists");
-            if (detour == "" && section_name != "") {
-                let sec_out = outbound_tag(section_name);
-                if (sec_out != "" && sec_out != runtime_constants.DIRECT_OUTBOUND_TAG && sec_out != runtime_constants.BYPASS_OUTBOUND_TAG) {
-                    detour = sec_out;
-                }
-            }
+            let detour = resolve_ruleset_download_detour(config, section_name);
             apply_download_transport(config, rule_set, detour);
             push(config.route.rule_set, rule_set);
         }
@@ -1399,6 +2951,67 @@ if (runtime_rulesets.is_referenceable_srs_file(tmp_srs))
         tag: tag_name,
         kind: runtime_rulesets.community_kind ? runtime_rulesets.community_kind(community) : "domains"
     };
+}
+
+function ensure_community_subnet_ruleset(config, service) {
+    service = as_string(service);
+    let canonical = (type(rule_config.canonical_community_subnet_service) == "function")
+        ? rule_config.canonical_community_subnet_service(service)
+        : service;
+    let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder || "/tmp/tachyon-core/rulesets";
+    let raw_candidates = [
+        folder + "/community-subnets-" + service + ".lst",
+        folder + "/community-subnets-" + canonical + ".lst",
+        "/tmp/tachyon-core/rulesets/community-subnets-" + service + ".lst",
+        "/tmp/tachyon-core/rulesets/community-subnets-" + canonical + ".lst",
+        "/etc/tachyon/rulesets/community-subnets-" + service + ".lst",
+        "/etc/tachyon/rulesets/community-subnets-" + canonical + ".lst"
+    ];
+    let seen_paths = {};
+    let content = null;
+    for (let path in raw_candidates) {
+        if (seen_paths[path])
+            continue;
+        seen_paths[path] = true;
+        let data = fs.readfile(path);
+        if (data != null && data != "") {
+            content = data;
+            break;
+        }
+    }
+    if (content == null)
+        return null;
+
+    let cidrs = [];
+    for (let line in split(as_string(content), "\n")) {
+        line = trim(replace(as_string(line), /\r/g, ""));
+        if (line != "" && substr(line, 0, 1) != "#" && match(line, /^[0-9a-fA-F:.]+(\/[0-9]+)?$/) && !match(line, /\.$/)) {
+            if (index(line, "/") < 0)
+                line = line + (index(line, ":") >= 0 ? "/128" : "/32");
+            push(cidrs, line);
+        }
+    }
+    if (length(cidrs) == 0)
+        return null;
+
+    let sub_tag = "builtin-" + canonical + "-subnets-ruleset";
+    let json_path = folder + "/community-subnets-" + canonical + "-ruleset.json";
+    if (!ruleset_registered(config, sub_tag)) {
+        common.ensure_dir(folder);
+        common.write_json_file(json_path, {
+            version: 3,
+            rules: [ { ip_cidr: cidrs } ]
+        });
+        if (config.route.rule_set == null)
+            config.route.rule_set = [];
+        push(config.route.rule_set, {
+            type: "local",
+            tag: sub_tag,
+            format: "source",
+            path: json_path
+        });
+    }
+    return sub_tag;
 }
 
 function domain_ip_list_ruleset_tag(section_name) {
@@ -1427,34 +3040,68 @@ function source_file_exists(path) {
 
 function rebuild_local_domain_ip_list_ruleset(section_name, references, domains_only) {
     let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
-    let ruleset_path = folder + "/" + domain_ip_list_ruleset_tag(section_name) + ".json";
+    let tag = domain_ip_list_ruleset_tag(section_name);
+    let ruleset_path = folder + "/" + tag + ".json";
+    let etc_path = "/etc/tachyon/rulesets/" + tag + ".json";
     let has_local = false;
+    let has_remote = false;
 
     for (let reference in references) {
-        if (reference_is_local(reference)) {
+        let ref_str = as_string(reference);
+        if (reference_is_local(ref_str))
             has_local = true;
-            break;
-        }
+        else if (substr(ref_str, 0, 7) == "http://" || substr(ref_str, 0, 8) == "https://")
+            has_remote = true;
     }
 
-    if (!has_local)
+    let need_remote_fetch = has_remote && !source_rulesets.has_rules(ruleset_path) && !source_rulesets.has_rules(etc_path);
+    if (!has_local && !need_remote_fetch)
         return;
 
-    fs.unlink(ruleset_path);
-    source_rulesets.create_source(ruleset_path);
+    common.ensure_dir(folder);
+    if (has_remote && !need_remote_fetch && source_rulesets.has_rules(etc_path) && !source_rulesets.has_rules(ruleset_path)) {
+        common.copy_file(etc_path, ruleset_path);
+    } else if (!has_remote || need_remote_fetch) {
+        fs.unlink(ruleset_path);
+        source_rulesets.create_source(ruleset_path);
+    }
 
     for (let reference in references) {
         reference = as_string(reference);
-        if (!reference_is_local(reference))
-            continue;
-        if (!source_file_exists(reference)) {
-            warn("local domain/IP list not found: ", reference, "\n");
-            continue;
-        }
+        if (reference_is_local(reference)) {
+            if (!source_file_exists(reference)) {
+                warn("local domain/IP list not found: ", reference, "\n");
+                continue;
+            }
+            source_rulesets.import_plain_list(reference, ruleset_path, "domain_suffix", "domains", "5000");
+            if (!domains_only)
+                source_rulesets.import_plain_list(reference, ruleset_path, "ip_cidr", "subnets", "5000");
+        } else if (need_remote_fetch && (substr(reference, 0, 7) == "http://" || substr(reference, 0, 8) == "https://")) {
+            let tmp_plain = folder + "/" + tag + "-" + runtime_rulesets.hash12(reference) + ".tmp.plain";
+            let dl_ok = false;
+            if (common.command_success("command -v curl"))
+                dl_ok = common.command_success_from_args([ "curl", "-fsSL", "--connect-timeout", "5", "-m", "10", reference, "-o", tmp_plain ]);
+            else if (common.command_success("command -v wget"))
+                dl_ok = common.command_success_from_args([ "wget", "-q", "-T", "10", "-O", tmp_plain, reference ]);
 
-        source_rulesets.import_plain_list(reference, ruleset_path, "domain_suffix", "domains", "5000");
-        if (!domains_only)
-            source_rulesets.import_plain_list(reference, ruleset_path, "ip_cidr", "subnets", "5000");
+            if (dl_ok && helpers.file_is_usable(tmp_plain, 1)) {
+                source_rulesets.import_plain_list(tmp_plain, ruleset_path, "domain_suffix", "domains", "5000");
+                if (!domains_only)
+                    source_rulesets.import_plain_list(tmp_plain, ruleset_path, "ip_cidr", "subnets", "5000");
+            }
+            fs.unlink(tmp_plain);
+        }
+    }
+
+    if (need_remote_fetch && source_rulesets.has_rules(ruleset_path)) {
+        let st_r = fs.stat(ruleset_path);
+        let sz_r = st_r != null ? int(st_r.size || 0) : 0;
+        if (sz_r > 0 && sz_r <= 524288) {
+            common.ensure_dir("/etc/tachyon/rulesets");
+            common.copy_file(ruleset_path, etc_path);
+        } else if (sz_r > 524288) {
+            fs.unlink(etc_path);
+        }
     }
 }
 
@@ -1476,7 +3123,7 @@ function add_domain_ip_list_ruleset(config, section_name, rule_set_tags, dns_que
         config.route.rule_set = [];
 
     // If ruleset has BOTH domains and IP subnets, split them so domains can go to DNS without
-    // causing sing-box 1.14+ to require match_response: true, which erroneously issues FakeIP for pure-IP matches.
+    // causing tachyon-core to require match_response: true, which erroneously issues FakeIP for pure-IP matches.
     if (has_domains && has_ips) {
         let folder = ctx.runtime_ruleset_folder || runtime_ruleset_folder;
         let dom_path = folder + "/" + tag_name + "-domains.json";
@@ -1551,7 +3198,9 @@ function legacy_condition_values(section, key) {
     let text_value = option(section, key + "_text", "");
     let text_values = rule_config.text_list_values(text_value, "comma-space");
 
-    if (bool_option(section, key + "_text_mode", false) || bool_option(section, "conditions_text_mode", false))
+    if (bool_option(section, key + "_text_mode", false))
+        return text_values;
+    if (bool_option(section, "conditions_text_mode", false) && length(text_values) > 0)
         return text_values;
     if (length(list_values) > 0)
         return list_values;
@@ -1614,6 +3263,88 @@ function domain_conditions(section) {
 function add_domain_array(rule, key, values) {
     if (length(values) > 0)
         rule[key] = values;
+}
+
+function build_excluded_domain_subrules(section) {
+    let exc = connections.excluded_domain_conditions(section);
+    let sub = { invert: true };
+    add_domain_array(sub, "domain", exc.domain);
+    add_domain_array(sub, "domain_suffix", exc.domain_suffix);
+    add_domain_array(sub, "domain_keyword", exc.domain_keyword);
+    add_domain_array(sub, "domain_regex", exc.domain_regex);
+    return length(keys(sub)) > 1 ? [ sub ] : [];
+}
+
+function community_subnets_enabled(section) {
+    let raw = lc(trim(option(section, "community_subnets", "1")));
+    return raw != "0" && raw != "false" && raw != "no" && raw != "off";
+}
+
+const ACTION_KEYS = {
+    action: true,
+    outbound: true,
+    server: true,
+    rewrite_ttl: true,
+    client_subnet: true,
+    disable_cache: true,
+    disable_optimistic_cache: true,
+    timeout: true,
+    method: true,
+    no_drop: true,
+    strategy: true,
+    rcode: true,
+    answer: true,
+    ns: true,
+    extra: true
+};
+
+function apply_inverted_subrules(rule, inv_subrules) {
+    if (!rule)
+        return rule;
+    delete rule.__inv_subrules;
+    if (!inv_subrules || length(inv_subrules) == 0)
+        return rule;
+
+    if (rule.type == "logical" && rule.mode == "and" && type(rule.rules) == "array") {
+        let cloned = {};
+        for (let k, v in rule) {
+            if (k == "rules") {
+                cloned.rules = [];
+                for (let r in v) {
+                    if (r && length(keys(r)) > 0)
+                        push(cloned.rules, r);
+                }
+                for (let sub in inv_subrules)
+                    push(cloned.rules, sub);
+            } else {
+                cloned[k] = v;
+            }
+        }
+        return cloned;
+    }
+
+    let match_part = {};
+    for (let k, v in rule) {
+        if (!ACTION_KEYS[k] && substr(k, 0, 2) != "__")
+            match_part[k] = v;
+    }
+
+    let rules_list = [];
+    if (length(keys(match_part)) > 0)
+        push(rules_list, match_part);
+    for (let sub in inv_subrules)
+        push(rules_list, sub);
+
+    let logical_rule = {
+        type: "logical",
+        mode: "and",
+        rules: rules_list
+    };
+    for (let k, v in rule) {
+        if (ACTION_KEYS[k] || substr(k, 0, 2) == "__")
+            logical_rule[k] = v;
+    }
+    return logical_rule;
 }
 
 function sanitize_rule(rule) {
@@ -1695,28 +3426,80 @@ function section_fail_policy_override_target(section) {
 }
 
 function section_dns_server(section) {
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    let fakeip_or_real = (!eff_state || eff_state.fakeip_enabled)
+        ? runtime_constants.FAKEIP_DNS_SERVER_TAG
+        : runtime_constants.DNS_SERVER_TAG;
     let override = section_fail_policy_override_target(section);
     if (override != null) {
         if (override.fail_policy == "direct")
             return runtime_constants.DNS_SERVER_TAG;
-        return runtime_constants.FAKEIP_DNS_SERVER_TAG;
+        return fakeip_or_real;
     }
     if (connections.routed_dns_enabled(section))
         return runtime_constants.tag(section[".name"], "routed-dns-server");
     if (option(section, "action", "") == "bypass")
         return runtime_constants.DNS_SERVER_TAG;
-    return runtime_constants.FAKEIP_DNS_SERVER_TAG;
+    return fakeip_or_real;
 }
 
-function section_is_ipv4_only_dpi(section) {
+function section_awg_has_ipv6(section) {
+    let amz = connections.amnezia_configs ? connections.amnezia_configs(section) : [];
+    if (length(amz) > 0) {
+        for (let item in amz) {
+            let body = type(item) == "object"
+                ? as_string(item.body || item.conf || item.content || item.text || "")
+                : as_string(item);
+            if (type(item) == "object" && type(item.address) == "array") {
+                for (let addr in item.address)
+                    if (index(as_string(addr), ":") >= 0)
+                        return true;
+            }
+            for (let line in split(body, /\r?\n/)) {
+                let m = match(trim(line), /^Address[ \t]*=[ \t]*(.+)$/i);
+                if (m && index(m[1], ":") >= 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+    let addrs = list_option(section, "awg_local_address");
+    if (length(addrs) == 0)
+        return true;
+    for (let addr in addrs) {
+        if (index(as_string(addr), ":") >= 0)
+            return true;
+    }
+    return false;
+}
+
+function section_ipv6_supported(section) {
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    if (eff_state && !eff_state.ipv6_active)
+        return false;
+    let raw_v6 = lc(trim(option(section, "ipv6_support", "1")));
+    if (raw_v6 == "0" || raw_v6 == "false" || raw_v6 == "off")
+        return false;
     let action = option(section, "action", "");
-    if (action != "zapret" && action != "zapret2")
+    if (eff_state && eff_state.effective == "tunnel_over_v4" &&
+        (action == "bypass" || action == "hosts" || action == "dns"))
         return false;
-    let opt_key = action == "zapret2" ? "nfqws2_opt" : "nfqws_opt";
-    let raw = trim(option(section, opt_key, ""));
-    if (raw == "" || index(raw, "--filter-l3=ipv4") < 0)
+    if (action == "awg" && !section_awg_has_ipv6(section))
         return false;
-    return match(raw, /--filter-l3=[^[:space:]]*ipv6/) == null;
+    return true;
+}
+
+function build_section_aaaa_noerror_rule(template_rule) {
+    let aaaa_rule = {
+        action: "predefined",
+        query_type: [ "AAAA" ],
+        rcode: "NOERROR"
+    };
+    for (let key in [ "inbound", "domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set", "source_ip_cidr", "invert" ]) {
+        if (template_rule[key] != null)
+            aaaa_rule[key] = template_rule[key];
+    }
+    return aaaa_rule;
 }
 
 // The fakeip server synthesises addresses and answers A and AAAA only. Without
@@ -1727,10 +3510,6 @@ function add_fakeip_query_type(rule, server_tag, ipv4_only) {
     if (server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG)
         rule.query_type = ipv4_only ? [ "A" ] : [ "A", "AAAA" ];
     return rule;
-}
-
-function routed_dns_server_tag(section_name) {
-    return runtime_constants.tag(section_name, "routed-dns-server");
 }
 
 function single_or_array(values) {
@@ -1747,16 +3526,66 @@ function dns_action_detour_tag(section) {
     if (!bool_option(section, "dns_detour_enabled", false))
         return "";
     let target_section = option(section, "dns_detour_section", "");
-    return target_section == "" ? "" : outbound_tag(target_section);
+    if (target_section == "")
+        return "";
+    if (as_string(active_group_tags[target_section] || "") != "")
+        return as_string(active_group_tags[target_section]);
+    let group_name = as_string(section_group_map[target_section] || "");
+    if (group_name != "")
+        return as_string(active_group_tags[group_name] || urltest_outbound_tag(group_name, "urltest"));
+    return outbound_tag(target_section);
 }
 
 function section_dns_servers(section) {
+    let result = [];
+    let seen = {};
+    if (bool_option(section, "dns_use_wan", false)) {
+        let settings = ctx.runtime_settings ? ctx.runtime_settings() : {};
+        let ipv6_ok = common.resolve_effective_ipv6_state(settings, null).ipv6_active;
+        let dns_strategy = option(settings, "dns_strategy", "prefer_ipv4");
+        let wan_v4 = [];
+        let wan_v6 = [];
+        for (let wan_ip in runtime_dns.get_wan_dns_servers()) {
+            wan_ip = trim(as_string(wan_ip));
+            if (wan_ip == "" || seen[wan_ip])
+                continue;
+            let is_v6 = index(wan_ip, ":") >= 0;
+            if (is_v6 && !ipv6_ok)
+                continue;
+            seen[wan_ip] = true;
+            if (is_v6)
+                push(wan_v6, wan_ip);
+            else
+                push(wan_v4, wan_ip);
+        }
+        let ordered_wan = (dns_strategy == "prefer_ipv6" || dns_strategy == "ipv6_only")
+            ? [ wan_v6, wan_v4 ]
+            : [ wan_v4, wan_v6 ];
+        for (let group in ordered_wan) {
+            for (let wan_ip in group)
+                push(result, wan_ip);
+        }
+    }
     let servers = list_option(section, "dns_server");
     if (length(servers) == 0) {
-        let single = option(section, "dns_server", "");
-        servers = [single];
+        let single = trim(option(section, "dns_server", ""));
+        if (single != "")
+            servers = [single];
     }
-    return servers;
+    for (let srv in servers) {
+        srv = trim(as_string(srv));
+        if (srv != "" && !seen[srv]) {
+            seen[srv] = true;
+            push(result, srv);
+        }
+    }
+    if (length(result) == 0) {
+        if (bool_option(section, "dns_use_wan", false))
+            push(result, "77.88.8.8");
+        else
+            push(result, option(section, "dns_server", ""));
+    }
+    return result;
 }
 
 function add_dns_server_for_section(config, section) {
@@ -1765,15 +3594,24 @@ function add_dns_server_for_section(config, section) {
     let dns_type = option(section, "dns_type", "udp");
     let detour = dns_action_detour_tag(section);
     let server_tags = [];
+    let wan_set = {};
+    let use_wan = bool_option(section, "dns_use_wan", false);
+    let explicit_servers = list_option(section, "dns_server");
+    let has_explicit = length(explicit_servers) > 0 || trim(option(section, "dns_server", "")) != "";
+    if (use_wan) {
+        for (let wip in runtime_dns.get_wan_dns_servers())
+            wan_set[trim(as_string(wip))] = true;
+    }
 
     for (let i = 0; i < length(servers); i++) {
         let s_val = servers[i];
         let tag_name = length(servers) <= 1
             ? dns_action_server_tag(section_name)
             : dns_action_server_tag(section_name, i + 1);
+        let eff_type = (wan_set[s_val] || (use_wan && !has_explicit)) ? "udp" : dns_type;
         let server = runtime_dns.server_from_options(
             tag_name,
-            dns_type,
+            eff_type,
             s_val,
             detour
         );
@@ -1785,36 +3623,6 @@ function add_dns_server_for_section(config, section) {
     return server_tags;
 }
 
-function add_routed_dns_server_for_section(config, section) {
-    if (!connections.routed_dns_enabled(section))
-        return;
-    let section_name = section[".name"];
-    let action = option(section, "action", "");
-    let servers = connections.routed_dns_servers(section);
-    let dns_type = connections.routed_dns_type(section);
-    let tag_name = routed_dns_server_tag(section_name);
-    let detour = action == "bypass" ? null : outbound_tag(section_name);
-
-    for (let i = 0; i < length(servers); i++) {
-        let s_val = servers[i];
-        // The rule references the un-indexed tag, so the first server has to
-        // carry it however many are configured — with a single server this is
-        // the same tag as before, with several the rest get -2, -3, …
-        let server_tag = i == 0
-            ? tag_name
-            : runtime_constants.tag(section_name, "routed-dns-server-" + (i + 1));
-        let server = runtime_dns.server_from_options(
-            server_tag,
-            dns_type,
-            s_val,
-            detour
-        );
-        if (server.unsupported)
-            ctx.runtime_generate_unsupported(server.unsupported);
-        push(config.dns.servers, server);
-    }
-}
-
 function source_dns_inbound_matcher() {
     return [ runtime_constants.SOURCE_DNS_INBOUND_TAG ];
 }
@@ -1824,10 +3632,10 @@ function add_source_dns_matchers(rule, source_ip_cidr) {
         return;
 
     rule.inbound = source_dns_inbound_matcher();
-    rule.source_ip_cidr = single_or_array(source_ip_cidr);
+    rule.source_ip_cidr = single_or_array(core_ip.expand_ipv4_mapped_cidrs(source_ip_cidr));
 }
 
-function add_dns_action_rules_for_section(config, section) {
+function add_dns_action_rules_for_clause(config, section, phase) {
     let domains = domain_conditions(section);
     let domain = domains.domain;
     let domain_suffix = domains.domain_suffix;
@@ -1838,42 +3646,50 @@ function add_dns_action_rules_for_section(config, section) {
     let section_name = section[".name"];
     let source_ip_cidr = core_ip.normalize_to_cidrs(legacy_condition_values(section, "source_ip_cidr"));
     let fully_routed_ips = core_ip.normalize_to_cidrs(list_option(section, "fully_routed_ips"));
+    let force_pre_fakeip = bool_option(section, "disable_fakeip", false);
+    let emit_this_phase = (phase == null || phase == "" ||
+        (phase == "pre_fakeip" && force_pre_fakeip) ||
+        (phase == "post_fakeip" && !force_pre_fakeip));
+    let emit_inline = emit_this_phase;
+    let emit_rulesets = emit_this_phase;
 
-    for (let community in connections.community_lists(section)) {
-        let ensured = ensure_community_ruleset(config, section_name, as_string(community));
-        if (ensured.kind == "domains")
-            push(query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "subnets" || ensured.kind == "mixed")
+    if (emit_rulesets || phase == "post_fakeip") {
+        for (let community in connections.community_lists(section)) {
+            let ensured = ensure_community_ruleset(config, section_name, as_string(community));
+            if (ensured.kind == "domains")
+                push(query_rule_set_tags, ensured.tag);
+            else if (ensured.kind == "subnets" || ensured.kind == "mixed")
+                push(response_rule_set_tags, ensured.tag);
+            else
+                push(response_rule_set_tags, ensured.tag);
+        }
+        for (let reference in connections.rule_sets(section)) {
+            let ensured = ensure_custom_ruleset(config, as_string(reference), section_name);
+            if (ensured == null)
+                continue;
+            if (ensured.kind == "domains")
+                push(query_rule_set_tags, ensured.tag);
+            else
+                push(response_rule_set_tags, ensured.tag);
+        }
+        for (let reference in connections.rule_sets_with_subnets(section)) {
+            let ensured = ensure_custom_ruleset(config, as_string(reference), section_name);
+            if (ensured == null)
+                continue;
             push(response_rule_set_tags, ensured.tag);
-        else
-            push(response_rule_set_tags, ensured.tag);
+        }
+        add_domain_ip_list_ruleset(
+            config,
+            section_name,
+            [],
+            query_rule_set_tags,
+            response_rule_set_tags,
+            list_option(section, "domain_ip_lists"),
+            true
+        );
     }
-    for (let reference in connections.rule_sets(section)) {
-        let ensured = ensure_custom_ruleset(config, as_string(reference));
-        if (ensured == null)
-            continue;
-        if (ensured.kind == "domains")
-            push(query_rule_set_tags, ensured.tag);
-        else
-            push(response_rule_set_tags, ensured.tag);
-    }
-    for (let reference in connections.rule_sets_with_subnets(section)) {
-        let ensured = ensure_custom_ruleset(config, as_string(reference));
-        if (ensured == null)
-            continue;
-        push(response_rule_set_tags, ensured.tag);
-    }
-    add_domain_ip_list_ruleset(
-        config,
-        section_name,
-        [],
-        query_rule_set_tags,
-        response_rule_set_tags,
-        list_option(section, "domain_ip_lists"),
-        true
-    );
 
-    let rewrite_ttl = int_option(ctx.runtime_settings(), "dns_rewrite_ttl", "60");
+    let rewrite_ttl = int_option(ctx.runtime_settings ? ctx.runtime_settings() : {}, "dns_rewrite_ttl", "15");
     let section_servers = section_dns_servers(section);
     let server_tags = [];
     if (length(section_servers) <= 1) {
@@ -1885,8 +3701,9 @@ function add_dns_action_rules_for_section(config, section) {
     let server_tag = length(server_tags) > 0 ? server_tags[0] : dns_action_server_tag(section_name);
     let has_inline_domains = length(domain) > 0 || length(domain_suffix) > 0 ||
         length(domain_keyword) > 0 || length(domain_regex) > 0;
+    let exc_dom_subrules = build_excluded_domain_subrules(section);
 
-    if (length(fully_routed_ips) > 0) {
+    if (emit_rulesets && length(fully_routed_ips) > 0) {
         let dns_rule = {
             action: "route",
             server: server_tag,
@@ -1895,22 +3712,30 @@ function add_dns_action_rules_for_section(config, section) {
         add_source_dns_matchers(dns_rule, fully_routed_ips);
         push_dns_matcher_rule(config, dns_rule);
     }
-    if (has_inline_domains) {
-        let dns_rule = {
-            action: "route",
-            server: server_tag,
-            rewrite_ttl
-        };
-        add_domain_array(dns_rule, "domain", domain);
-        add_domain_array(dns_rule, "domain_suffix", domain_suffix);
-        add_domain_array(dns_rule, "domain_keyword", domain_keyword);
-        add_domain_array(dns_rule, "domain_regex", domain_regex);
-        add_source_dns_matchers(dns_rule, source_ip_cidr);
-        push_dns_matcher_rule(config, dns_rule);
+    if (emit_inline && has_inline_domains) {
+        let domain_matchers = [
+            [ "domain", domain ],
+            [ "domain_suffix", domain_suffix ],
+            [ "domain_keyword", domain_keyword ],
+            [ "domain_regex", domain_regex ]
+        ];
+        for (let dm in domain_matchers) {
+            let key = dm[0];
+            let values = dm[1];
+            if (length(values) == 0)
+                continue;
+            let dns_rule = {
+                action: "route",
+                server: server_tag,
+                rewrite_ttl
+            };
+            add_domain_array(dns_rule, key, values);
+            add_source_dns_matchers(dns_rule, source_ip_cidr);
+            push_dns_matcher_rule(config, apply_inverted_subrules(dns_rule, exc_dom_subrules));
+        }
     }
 
-    let is_1_14 = ctx.is_sb_1_14_plus && ctx.is_sb_1_14_plus();
-    if (is_1_14) {
+    if (emit_rulesets) {
         if (length(query_rule_set_tags) > 0) {
             let dns_rule = {
                 action: "route",
@@ -1919,7 +3744,7 @@ function add_dns_action_rules_for_section(config, section) {
                 rule_set: single_or_array(query_rule_set_tags)
             };
             add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, dns_rule);
+            push_dns_matcher_rule(config, apply_inverted_subrules(dns_rule, exc_dom_subrules));
         }
         if (length(response_rule_set_tags) > 0) {
             let eval_rule = {
@@ -1937,30 +3762,18 @@ function add_dns_action_rules_for_section(config, section) {
                 match_response: true
             };
             add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, dns_rule);
-        }
-    }
-    else {
-        let all_rule_set_tags = [];
-        for (let tag in query_rule_set_tags)
-            push(all_rule_set_tags, tag);
-        for (let tag in response_rule_set_tags)
-            push(all_rule_set_tags, tag);
-
-        if (length(all_rule_set_tags) > 0) {
-            let dns_rule = {
-                action: "route",
-                server: server_tag,
-                rewrite_ttl,
-                rule_set: single_or_array(all_rule_set_tags)
-            };
-            add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, dns_rule);
+            push_dns_matcher_rule(config, apply_inverted_subrules(dns_rule, exc_dom_subrules));
         }
     }
 
-    if (!has_inline_domains && length(query_rule_set_tags) == 0 && length(response_rule_set_tags) == 0 && length(fully_routed_ips) == 0)
+    if ((phase == null || phase == "" || phase == "post_fakeip") &&
+        !has_inline_domains && length(query_rule_set_tags) == 0 && length(response_rule_set_tags) == 0 && length(fully_routed_ips) == 0)
         ctx.runtime_generate_unsupported("DNS action '" + section_name + "' has no domain matchers");
+}
+
+function add_dns_action_rules_for_section(config, section, phase) {
+    for (let clause in connections.section_effective_clauses(section))
+        add_dns_action_rules_for_clause(config, clause, phase);
 }
 
 function normalize_port_number_value(value) {
@@ -1969,8 +3782,7 @@ function normalize_port_number_value(value) {
 
 function add_dscp_matchers(rule, section) {
     // DSCP matching is handled exclusively at the firewall/nftables layer (nft/apply.uc).
-    // sing-box route rules do not support a "dscp" field; emitting it causes sing-box
-    // to abort config loading with: route.rules[...].dscp: json: unknown field "dscp".
+    // tachyon-core route rules do not support a "dscp" field.
 }
 
 function add_port_matchers(rule, section) {
@@ -2010,7 +3822,11 @@ function add_port_matchers(rule, section) {
 }
 
 function tproxy_inbound_matcher() {
-    if (!core_ip.ipv6_supported())
+    if (type(ctx.tproxy_inbound_matcher) == "function")
+        return ctx.tproxy_inbound_matcher();
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    let ipv6_ok = eff_state ? eff_state.ipv6_active : core_ip.ipv6_supported();
+    if (!ipv6_ok)
         return [ runtime_constants.TPROXY_INBOUND_TAG ];
     return [ runtime_constants.TPROXY_INBOUND_TAG, runtime_constants.TPROXY_INBOUND6_TAG ];
 }
@@ -2021,48 +3837,64 @@ function outbound_supports_udp(config, tag_name, visited) {
         return false;
     if (tag_name == runtime_constants.DIRECT_OUTBOUND_TAG || tag_name == runtime_constants.BYPASS_OUTBOUND_TAG)
         return true;
+    let top_level = (visited == null);
+    let by_tag = get_outbounds_by_tag_index(config);
+    if (top_level && cached_udp_support_by_tag[tag_name] != null)
+        return cached_udp_support_by_tag[tag_name];
     visited = visited || {};
     if (visited[tag_name])
         return true;
     visited[tag_name] = true;
-    for (let outb in (config.outbounds || [])) {
-        if (as_string(outb.tag) == tag_name) {
-            let t = as_string(outb.type);
-            if (t == "http" || (t == "socks" && as_string(outb.version) == "4") || t == "block")
-                return false;
-            if (t == "selector" || t == "urltest") {
-                if (type(outb.outbounds) == "array" && length(outb.outbounds) > 0) {
-                    for (let nested_tag in outb.outbounds) {
-                        if (!outbound_supports_udp(config, nested_tag, visited))
-                            return false;
-                    }
-                    return true;
-                }
-                return false;
+    let outb = by_tag[tag_name];
+    if (type(outb) == "object") {
+        let t = as_string(outb.type);
+        let res = true;
+        if (t == "http" || (t == "socks" && as_string(outb.version) == "4") || t == "block")
+            res = false;
+        else if (t == "desync") {
+            if (outb.udp_fake === true)
+                res = true;
+            else if (outb.udp_fake === false)
+                res = false;
+            else {
+                let p = lc(trim(as_string(outb.preset || "")));
+                let m = lc(trim(as_string(outb.mode || "")));
+                if (p == "split" || p == "disorder" || p == "tlsrec" || p == "tls_rec" || p == "oob" || p == "multi_split" || p == "multisplit")
+                    res = false;
+                else if (p == "" && (m == "split" || m == "disorder" || m == "tlsrec" || m == "tls_rec" || m == "oob" || m == "multi_split" || m == "multisplit"))
+                    res = false;
+                else
+                    res = true;
             }
+        }
+        else if (t == "selector" || t == "urltest") {
+            if (type(outb.outbounds) == "array" && length(outb.outbounds) > 0) {
+                res = true;
+                for (let nested_tag in outb.outbounds) {
+                    if (!outbound_supports_udp(config, nested_tag, visited)) {
+                        res = false;
+                        break;
+                    }
+                }
+            } else {
+                res = false;
+            }
+        }
+        if (top_level)
+            cached_udp_support_by_tag[tag_name] = res;
+        return res;
+    }
+    for (let ep in (config.endpoints || [])) {
+        if (as_string(ep.tag) == tag_name) {
+            if (top_level)
+                cached_udp_support_by_tag[tag_name] = true;
             return true;
         }
     }
-    for (let ep in (config.endpoints || [])) {
-        if (as_string(ep.tag) == tag_name)
-            return true;
-    }
+    if (top_level)
+        cached_udp_support_by_tag[tag_name] = false;
     return false;
 }
-
-const ACTION_KEYS = {
-    action: true,
-    outbound: true,
-    server: true,
-    rewrite_ttl: true,
-    client_subnet: true,
-    disable_cache: true,
-    disable_optimistic_cache: true,
-    timeout: true,
-    method: true,
-    no_drop: true,
-    strategy: true
-};
 
 // The two "everything except the selected countries" modes match the inverted
 // set; the other two match the selected countries themselves.
@@ -2190,10 +4022,91 @@ function apply_excluded_source_ips(rule, excluded_cidrs) {
     return logical_rule;
 }
 
+function section_is_dns_block_eligible(section) {
+    let override = section_fail_policy_override_target(section);
+    let is_block = override != null
+        ? override.fail_policy == "block"
+        : option(section, "action", "") == "block";
+    if (!is_block)
+        return false;
+    if (length(list_option(section, "ports")) > 0 ||
+        trim(option(section, "ports_text", "")) != "" ||
+        length(list_option(section, "protocol")) > 0 ||
+        length(list_option(section, "excluded_protocol")) > 0 ||
+        length(connections.dscp_list(section)) > 0 ||
+        length(connections.geoip_country_list(section)) > 0)
+        return false;
+    if (type(section.__inverted_conditions) == "array" && length(section.__inverted_conditions) > 0)
+        return false;
+    return true;
+}
+
+function push_section_dns_matcher_rule(config, section, rule, excluded_cidrs, domain_rule_set_tags) {
+    let dns_excluded_cidrs = core_ip.expand_ipv4_mapped_cidrs(excluded_cidrs);
+    let exc_dom_subrules = build_excluded_domain_subrules(section);
+    if (section_is_dns_block_eligible(section)) {
+        let ttl_num = int(rule.rewrite_ttl != null ? rule.rewrite_ttl : 60);
+        if (ttl_num == null || ttl_num < 0)
+            ttl_num = 60;
+        let ttl_str = as_string(ttl_num);
+        let is_tachyon_core = ctx.is_tachyon_core && ctx.is_tachyon_core();
+        let rule_a = {};
+        let rule_aaaa = {};
+        for (let key, value in rule) {
+            if (key == "action" || key == "server" || key == "rewrite_ttl" || key == "query_type")
+                continue;
+            rule_a[key] = value;
+            rule_aaaa[key] = value;
+        }
+        rule_a.action = "predefined";
+        rule_a.rcode = "NOERROR";
+        rule_a.query_type = [ "A" ];
+        rule_a.answer = [ is_tachyon_core ? { ttl: ttl_num, value: "0.0.0.0" } : "*. " + ttl_str + " IN A 0.0.0.0" ];
+        push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(rule_a, dns_excluded_cidrs), exc_dom_subrules));
+
+        rule_aaaa.action = "predefined";
+        rule_aaaa.rcode = "NOERROR";
+        rule_aaaa.query_type = [ "AAAA" ];
+        rule_aaaa.answer = [ is_tachyon_core ? { ttl: ttl_num, value: "::" } : "*. " + ttl_str + " IN AAAA ::" ];
+        push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(rule_aaaa, dns_excluded_cidrs), exc_dom_subrules));
+        return;
+    }
+    let routed_tag = runtime_constants.tag(section[".name"], "routed-dns-server");
+    let is_dpi_sec = connections.is_dpi_or_desync_only_section(section);
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    if ((!eff_state || eff_state.fakeip_enabled) && is_dpi_sec &&
+        connections.routed_dns_enabled(section) && rule.server == routed_tag &&
+        !connections.geoip_country_mode_is_closed(section) &&
+        !rule.match_response && (rule.rule_set == null || length(domain_rule_set_tags) > 0)) {
+        // Domain-only traffic enters TPROXY through FakeIP. Returning the
+        // routed resolver's real address here lets it bypass the DPI output.
+        // The route's resolve action still uses this resolver and its detour.
+        // Closed GeoIP modes skip that resolve and need real DNS addresses
+        // to decide the destination country before choosing an outbound.
+        let fakeip_rule = {};
+        for (let key, value in rule)
+            fakeip_rule[key] = value;
+        // In the legacy branch the fallback combines domain and mixed sets.
+        // Only domain-only sets may produce FakeIP: an IP-only match loses
+        // its real destination and cannot match the subsequent DPI route.
+        if (rule.rule_set != null)
+            fakeip_rule.rule_set = single_or_array(domain_rule_set_tags);
+        fakeip_rule.server = runtime_constants.FAKEIP_DNS_SERVER_TAG;
+        add_fakeip_query_type(fakeip_rule, fakeip_rule.server, !section_ipv6_supported(section));
+        push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(fakeip_rule, dns_excluded_cidrs), exc_dom_subrules));
+    }
+    // Retain routed DNS for other query types and non-domain rulesets.
+    push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(rule, dns_excluded_cidrs), exc_dom_subrules));
+}
+
 function push_section_route_rule(config, rule, target_outbound, excluded_cidrs, geo_tags, country_mode) {
+    let inv_subrules = rule ? rule.__inv_subrules : null;
+    if (rule)
+        delete rule.__inv_subrules;
     let apply_filters = function(r) {
         let filtered = apply_section_geoip_filter(r, geo_tags, country_mode);
-        return apply_excluded_source_ips(filtered, excluded_cidrs);
+        filtered = apply_excluded_source_ips(filtered, excluded_cidrs);
+        return apply_inverted_subrules(filtered, inv_subrules);
     };
 
     if (target_outbound && !outbound_supports_udp(config, target_outbound)) {
@@ -2211,7 +4124,13 @@ function push_section_route_rule(config, rule, target_outbound, excluded_cidrs, 
         for (let k, v in rule)
             udp_rule[k] = v;
         delete udp_rule.outbound;
-        udp_rule.action = "reject";
+        let fail_closed = active_route_section != null && section_is_fail_closed(active_route_section);
+        if (!fail_closed && rule.source_ip_cidr && !rule.domain && !rule.ip_cidr && !rule.rule_set) {
+            udp_rule.action = "route";
+            udp_rule.outbound = runtime_constants.DIRECT_OUTBOUND_TAG;
+        } else {
+            udp_rule.action = "reject";
+        }
         udp_rule.network = "udp";
         push_route_matcher_rule(config, apply_filters(udp_rule));
 
@@ -2240,8 +4159,20 @@ function push_section_geoip_remainder(config, base_rule, target, excluded_cidrs,
     push_section_route_rule(config, remainder, target.outbound, excluded_cidrs, null, country_mode);
 }
 
+function section_leaf_list_option(section, key) {
+    let result = [];
+    for (let item in list_option(section, key))
+        push(result, item);
+    for (let cond in connections.section_leaf_conditions(section)) {
+        for (let item in list_option(cond, key))
+            push(result, item);
+    }
+    return result;
+}
+
 function add_fully_routed_ips_rule(config, section) {
-    let source_ip_cidr = core_ip.normalize_to_cidrs(list_option(section, "fully_routed_ips"));
+    active_route_section = section;
+    let source_ip_cidr = core_ip.normalize_to_cidrs(section_leaf_list_option(section, "fully_routed_ips"));
     if (length(source_ip_cidr) == 0)
         return;
 
@@ -2258,10 +4189,278 @@ function add_fully_routed_ips_rule(config, section) {
         route_rule.outbound = target.outbound;
     route_rule.source_ip_cidr = single_or_array(source_ip_cidr);
     push_section_route_rule(config, route_rule, target.outbound);
+
+    let routed_dns = connections.routed_dns_enabled(section);
+    if (routed_dns) {
+        let server_tag = runtime_constants.tag(section[".name"], "routed-dns-server");
+        let rewrite_ttl = int_option(ctx.runtime_settings ? ctx.runtime_settings() : {}, "dns_rewrite_ttl", "15");
+        let dns_rule = {
+            action: "route",
+            server: server_tag,
+            rewrite_ttl
+        };
+        add_source_dns_matchers(dns_rule, source_ip_cidr);
+        push_dns_matcher_rule(config, dns_rule);
+    }
+}
+
+function resolve_section_server_outbound_tag(config, section, server_key) {
+    let key = trim(as_string(server_key));
+    if (key == "")
+        return "";
+    let key_lc = lc(key);
+    let section_name = as_string(section[".name"]);
+
+    for (let outb in array_or_empty(config.outbounds)) {
+        if (type(outb) == "object" && as_string(outb.tag) == key)
+            return key;
+    }
+    for (let ep in array_or_empty(config.endpoints)) {
+        if (type(ep) == "object" && as_string(ep.tag) == key)
+            return key;
+    }
+
+    let state = section_state_map[section_name];
+    let metadata = object_or_empty(object_or_empty(state).outboundMetadata);
+    let names = object_or_empty(metadata.names);
+    let leaves = array_or_empty(section_leaf_tags[section_name]);
+
+    for (let t in leaves) {
+        let t_str = as_string(t);
+        if (lc(t_str) == key_lc)
+            return t_str;
+    }
+    for (let t in keys(names)) {
+        let t_str = as_string(t);
+        if (lc(t_str) == key_lc)
+            return t_str;
+    }
+
+    for (let t in leaves) {
+        let t_str = as_string(t);
+        let disp = trim(as_string(names[t_str] || ""));
+        let badge = tag_source_badge(t_str, disp, metadata);
+        let b_disp = badge != "" ? ("[" + badge + "] " + disp) : "";
+        let p_disp = badge != "" ? (badge + ": " + disp) : "";
+        let s_disp = badge != "" ? (badge + " " + disp) : "";
+        if ((b_disp != "" && lc(b_disp) == key_lc) ||
+            (p_disp != "" && lc(p_disp) == key_lc) ||
+            (s_disp != "" && lc(s_disp) == key_lc))
+            return t_str;
+    }
+    for (let t in leaves) {
+        let t_str = as_string(t);
+        let disp = trim(as_string(names[t_str] || ""));
+        if (disp != "" && lc(disp) == key_lc)
+            return t_str;
+    }
+    for (let t, disp_raw in names) {
+        let t_str = as_string(t);
+        let disp = trim(as_string(disp_raw));
+        let badge = tag_source_badge(t_str, disp, metadata);
+        let b_disp = badge != "" ? ("[" + badge + "] " + disp) : "";
+        let p_disp = badge != "" ? (badge + ": " + disp) : "";
+        let s_disp = badge != "" ? (badge + " " + disp) : "";
+        if ((disp != "" && lc(disp) == key_lc) ||
+            (b_disp != "" && lc(b_disp) == key_lc) ||
+            (p_disp != "" && lc(p_disp) == key_lc) ||
+            (s_disp != "" && lc(s_disp) == key_lc))
+            return t_str;
+    }
+    for (let t in leaves) {
+        let t_str = as_string(t);
+        let disp = trim(as_string(names[t_str] || ""));
+        if (index(lc(t_str), key_lc) >= 0 || (disp != "" && index(lc(disp), key_lc) >= 0))
+            return t_str;
+    }
+    for (let t, disp_raw in names) {
+        let disp = trim(as_string(disp_raw));
+        if (index(lc(as_string(t)), key_lc) >= 0 || (disp != "" && index(lc(disp), key_lc) >= 0))
+            return as_string(t);
+    }
+    for (let outb in array_or_empty(config.outbounds)) {
+        if (type(outb) != "object")
+            continue;
+        let t_str = as_string(outb.tag);
+        if (t_str != "" && index(lc(t_str), key_lc) >= 0)
+            return t_str;
+    }
+    return "";
+}
+
+function add_server_domain_rules_for_section(config, section) {
+    active_route_section = section;
+    let raw_entries = connections.server_domain_rules ? connections.server_domain_rules(section) : [];
+    if (length(raw_entries) == 0)
+        return;
+
+    let section_name = as_string(section[".name"]);
+    let excluded_cidrs = core_ip.normalize_to_cidrs(section_leaf_list_option(section, "excluded_ips"));
+    let dns_excluded_cidrs = core_ip.expand_ipv4_mapped_cidrs(excluded_cidrs);
+    let dns_server_tag = section_dns_server(section);
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    let ipv4_only_sec = !section_ipv6_supported(section);
+    let ipv4_only_dpi = ipv4_only_sec && dns_server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG;
+    let emit_sec_aaaa_noerror = eff_state != null && eff_state.ipv6_active && ipv4_only_sec;
+    let rewrite_ttl = int_option(ctx.runtime_settings ? ctx.runtime_settings() : {}, "dns_rewrite_ttl", "15");
+
+    for (let entry in raw_entries) {
+        let text = trim(as_string(entry));
+        if (text == "" || substr(text, 0, 1) == "#")
+            continue;
+        let sep_idx = index(text, "=");
+        let sep_len = 1;
+        if (sep_idx < 0) {
+            sep_idx = index(text, "->");
+            sep_len = 2;
+        }
+        if (sep_idx < 0) {
+            sep_idx = index(text, "|");
+            sep_len = 1;
+        }
+        if (sep_idx <= 0)
+            continue;
+
+        let server_key = trim(substr(text, 0, sep_idx));
+        let domains_raw = trim(substr(text, sep_idx + sep_len));
+        if (server_key == "" || domains_raw == "")
+            continue;
+
+        let target_tag = resolve_section_server_outbound_tag(config, section, server_key);
+        if (target_tag == "") {
+            warn("Section " + section_name + ": server_domain_rules target '" + server_key + "' did not match any server outbound, skipping\n");
+            continue;
+        }
+
+        let dom_exact = [];
+        let dom_suffix = [];
+        let dom_keyword = [];
+        let dom_regex = [];
+        let pin_rule_sets = [];
+        let pin_dns_rule_sets = [];
+        let pin_ip_raw = [];
+
+        for (let token in rule_config.text_list_values(domains_raw, "comma-space")) {
+            let tok = trim(as_string(token));
+            if (tok == "" || substr(tok, 0, 1) == "#")
+                continue;
+            if (substr(tok, 0, 7) == "http://" || substr(tok, 0, 8) == "https://") {
+                let rest = substr(tok, index(tok, "://") + 3);
+                let slash = index(rest, "/");
+                if (slash >= 0)
+                    rest = substr(rest, 0, slash);
+                if (substr(rest, 0, 1) == "[") {
+                    let rbr = index(rest, "]");
+                    if (rbr > 0)
+                        rest = substr(rest, 1, rbr - 1);
+                } else {
+                    let colon = index(rest, ":");
+                    if (colon >= 0 && colon == rindex(rest, ":"))
+                        rest = substr(rest, 0, colon);
+                }
+                tok = trim(rest);
+            }
+            if (tok == "")
+                continue;
+
+            let comm_candidate = substr(tok, 0, 10) == "community:" ? substr(tok, 10) : tok;
+            if (runtime_rulesets.is_community(comm_candidate)) {
+                let ensured = ensure_community_ruleset(config, section_name, comm_candidate);
+                if (ensured && ensured.tag) {
+                    if (!array_contains(pin_rule_sets, ensured.tag))
+                        push(pin_rule_sets, ensured.tag);
+                    if ((ensured.kind == "domains" || comm_candidate == "discord") && !array_contains(pin_dns_rule_sets, ensured.tag))
+                        push(pin_dns_rule_sets, ensured.tag);
+                }
+                continue;
+            }
+
+            if (match(tok, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) != null ||
+                (index(tok, ":") >= 0 && match(tok, /^[0-9a-fA-F:]+(\/[0-9]+)?$/) != null)) {
+                push(pin_ip_raw, tok);
+                continue;
+            }
+
+            let parsed = domain_suffix_condition_value_kind(tok);
+            if (parsed != null) {
+                if (parsed.kind == "domain" && !array_contains(dom_exact, parsed.value))
+                    push(dom_exact, parsed.value);
+                else if (parsed.kind == "domain_suffix" && !array_contains(dom_suffix, parsed.value))
+                    push(dom_suffix, parsed.value);
+                else if (parsed.kind == "domain_keyword" && !array_contains(dom_keyword, parsed.value))
+                    push(dom_keyword, parsed.value);
+                else if (parsed.kind == "domain_regex" && !array_contains(dom_regex, parsed.value))
+                    push(dom_regex, parsed.value);
+            }
+        }
+
+        let pin_cidrs = core_ip.normalize_to_cidrs(pin_ip_raw);
+        let has_domains = length(dom_exact) > 0 || length(dom_suffix) > 0 || length(dom_keyword) > 0 || length(dom_regex) > 0;
+
+        if (has_domains) {
+            let route_rule = {
+                action: "route",
+                inbound: tproxy_inbound_matcher(),
+                outbound: target_tag
+            };
+            add_domain_array(route_rule, "domain", dom_exact);
+            add_domain_array(route_rule, "domain_suffix", dom_suffix);
+            add_domain_array(route_rule, "domain_keyword", dom_keyword);
+            add_domain_array(route_rule, "domain_regex", dom_regex);
+            push_section_route_rule(config, route_rule, target_tag, excluded_cidrs);
+
+            let dns_rule = {
+                action: "route",
+                server: dns_server_tag,
+                rewrite_ttl
+            };
+            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
+            add_domain_array(dns_rule, "domain", dom_exact);
+            add_domain_array(dns_rule, "domain_suffix", dom_suffix);
+            add_domain_array(dns_rule, "domain_keyword", dom_keyword);
+            add_domain_array(dns_rule, "domain_regex", dom_regex);
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs, []);
+            if (emit_sec_aaaa_noerror)
+                push_dns_matcher_rule(config, apply_excluded_source_ips(build_section_aaaa_noerror_rule(dns_rule), dns_excluded_cidrs));
+        }
+
+        if (length(pin_rule_sets) > 0) {
+            let rs_rule = {
+                action: "route",
+                inbound: tproxy_inbound_matcher(),
+                outbound: target_tag,
+                rule_set: single_or_array(pin_rule_sets)
+            };
+            push_section_route_rule(config, rs_rule, target_tag, excluded_cidrs);
+        }
+
+        if (length(pin_dns_rule_sets) > 0) {
+            let rs_dns_rule = {
+                action: "route",
+                server: dns_server_tag,
+                rewrite_ttl,
+                rule_set: single_or_array(pin_dns_rule_sets)
+            };
+            add_fakeip_query_type(rs_dns_rule, dns_server_tag, ipv4_only_dpi);
+            push_section_dns_matcher_rule(config, section, rs_dns_rule, excluded_cidrs, pin_dns_rule_sets);
+            if (emit_sec_aaaa_noerror)
+                push_dns_matcher_rule(config, apply_excluded_source_ips(build_section_aaaa_noerror_rule(rs_dns_rule), dns_excluded_cidrs));
+        }
+
+        if (length(pin_cidrs) > 0) {
+            let ip_rule = {
+                action: "route",
+                inbound: tproxy_inbound_matcher(),
+                outbound: target_tag,
+                ip_cidr: single_or_array(pin_cidrs)
+            };
+            push_section_route_rule(config, ip_rule, target_tag, excluded_cidrs);
+        }
+    }
 }
 
 function add_excluded_ips_rule(config, section) {
-    let excluded = list_option(section, "excluded_ips");
+    let excluded = section_leaf_list_option(section, "excluded_ips");
     if (length(excluded) == 0)
         return;
 
@@ -2278,24 +4477,116 @@ function add_excluded_ips_rule(config, section) {
     push(config.route.rules, route_rule);
 }
 
-function add_excluded_protocol_rule(config, section) {
-    let excluded = list_option(section, "excluded_protocol");
+function build_excluded_protocol_subrules(section) {
+    let excluded = section_leaf_list_option(section, "excluded_protocol");
     if (length(excluded) == 0)
-        return;
+        return [];
 
-    let route_rule = {
-        action: "route",
-        inbound: tproxy_inbound_matcher(),
-        outbound: runtime_constants.DIRECT_OUTBOUND_TAG,
-        protocol: single_or_array(excluded)
-    };
-    push(config.route.rules, route_rule);
+    let l4_nets = [];
+    let l7_protos = [];
+    for (let p in excluded) {
+        let lp = lc(trim(as_string(p)));
+        if (lp == "tcp" || lp == "udp" || lp == "icmp") {
+            if (index(l4_nets, lp) < 0)
+                push(l4_nets, lp);
+        } else if (lp != "" && index(l7_protos, lp) < 0) {
+            push(l7_protos, lp);
+        }
+    }
+    let subs = [];
+    if (length(l4_nets) > 0)
+        push(subs, { invert: true, network: single_or_array(l4_nets) });
+    if (length(l7_protos) > 0)
+        push(subs, { invert: true, protocol: single_or_array(l7_protos) });
+    return subs;
 }
 
 function add_protocol_matchers(rule, section) {
-    let protocols = list_option(section, "protocol");
-    if (length(protocols) > 0)
-        rule.protocol = single_or_array(protocols);
+    let protocols = section_leaf_list_option(section, "protocol");
+    if (length(protocols) == 0)
+        return;
+    let l4_nets = [];
+    let l7_protos = [];
+    for (let p in protocols) {
+        let lp = lc(trim(as_string(p)));
+        if (lp == "tcp" || lp == "udp" || lp == "icmp")
+            push(l4_nets, lp);
+        else if (lp != "")
+            push(l7_protos, lp);
+    }
+    if (length(l4_nets) > 0)
+        rule.network = single_or_array(l4_nets);
+    if (length(l7_protos) > 0)
+        rule.protocol = single_or_array(l7_protos);
+}
+
+function parse_interface_address_map(entries) {
+    let out = {};
+    let has_any = false;
+    for (let raw in array_or_empty(entries)) {
+        for (let token in split(as_string(raw || ""), /[\r\n,;]+/)) {
+            let item = trim(as_string(token || ""));
+            if (item == "" || substr(item, 0, 1) == "#")
+                continue;
+            let sep = index(item, "=");
+            if (sep <= 0)
+                sep = index(item, ":");
+            if (sep <= 0)
+                continue;
+            let key = trim(substr(item, 0, sep));
+            let val_raw = trim(substr(item, sep + 1));
+            if (key == "" || val_raw == "")
+                continue;
+            let cidrs = core_ip.normalize_to_cidrs([ val_raw ]);
+            if (length(cidrs) == 0)
+                continue;
+            if (out[key] == null)
+                out[key] = [];
+            for (let c in cidrs) {
+                if (!array_contains(out[key], c)) {
+                    push(out[key], c);
+                    has_any = true;
+                }
+            }
+        }
+    }
+    return has_any ? out : null;
+}
+
+function add_interface_address_matchers(rule, section) {
+    let added = false;
+    let def_raw = section_leaf_list_option(section, "default_interface_address");
+    if (length(def_raw) > 0) {
+        let def_cidrs = core_ip.normalize_to_cidrs(def_raw);
+        if (length(def_cidrs) > 0) {
+            rule.default_interface_address = single_or_array(def_cidrs);
+            added = true;
+        }
+    }
+    let if_map = parse_interface_address_map(section_leaf_list_option(section, "interface_address"));
+    if (if_map != null) {
+        rule.interface_address = if_map;
+        added = true;
+    }
+    let net_if_map = parse_interface_address_map(section_leaf_list_option(section, "network_interface_address"));
+    if (net_if_map != null) {
+        rule.network_interface_address = net_if_map;
+        added = true;
+    }
+    let pref_raw = section_leaf_list_option(section, "preferred_by");
+    if (length(pref_raw) > 0) {
+        let prefs = [];
+        for (let p in pref_raw) {
+            let clean = trim(as_string(p || ""));
+            if (clean != "" && !array_contains(prefs, clean))
+                push(prefs, clean);
+        }
+        if (length(prefs) > 0) {
+            rule.preferred_by = single_or_array(prefs);
+            added = true;
+        }
+    }
+    return added;
 }
 
 
@@ -2351,65 +4642,162 @@ function load_community_subnet_cidrs(community, filter_mode) {
     return [];
 }
 
-function add_combined_route_for_section(config, section) {
+function build_inverted_subrules(config, section_name, inverted_conditions) {
+    let subs = [];
+    for (let neg in array_or_empty(inverted_conditions)) {
+        if (type(neg) != "object")
+            continue;
+        let sub = { invert: true };
+        let ndom = domain_conditions(neg);
+        add_domain_array(sub, "domain", ndom.domain);
+        add_domain_array(sub, "domain_suffix", ndom.domain_suffix);
+        add_domain_array(sub, "domain_keyword", ndom.domain_keyword);
+        add_domain_array(sub, "domain_regex", ndom.domain_regex);
+        let nip = core_ip.normalize_to_cidrs(legacy_condition_values(neg, "ip_cidr"));
+        if (length(nip) > 0)
+            sub.ip_cidr = single_or_array(nip);
+        let nsrc_raw = [];
+        for (let v in legacy_condition_values(neg, "source_ip_cidr")) push(nsrc_raw, v);
+        for (let m in list_option(neg, "source_macs")) push(nsrc_raw, m);
+        let nsrc = core_ip.normalize_to_cidrs(nsrc_raw);
+        if (length(nsrc) > 0)
+            sub.source_ip_cidr = single_or_array(nsrc);
+        add_port_matchers(sub, neg);
+        add_protocol_matchers(sub, neg);
+        add_interface_address_matchers(sub, neg);
+        let ntw = trim(option(neg, "time_window", ""));
+        if (ntw != "")
+            sub.time_window = ntw;
+        let nrs = [];
+        let neg_subnets_enabled = community_subnets_enabled(neg);
+        for (let comm in list_option(neg, "community_lists")) {
+            let comm_str = as_string(comm);
+            let ens = ensure_community_ruleset(config, section_name, comm_str);
+            if (ens && ens.tag && index(nrs, ens.tag) < 0)
+                push(nrs, ens.tag);
+            if (neg_subnets_enabled && ens && ens.kind == "domains" && rule_config.community_service_has_subnet_list(comm_str)) {
+                let sub_tag = ensure_community_subnet_ruleset(config, comm_str);
+                if (sub_tag != null && index(nrs, sub_tag) < 0)
+                    push(nrs, sub_tag);
+            }
+        }
+        for (let rset in list_option(neg, "rule_set")) {
+            let ens = ensure_custom_ruleset(config, as_string(rset), section_name);
+            if (ens && ens.tag && index(nrs, ens.tag) < 0)
+                push(nrs, ens.tag);
+        }
+        for (let rset_sub in list_option(neg, "rule_set_with_subnets")) {
+            let ref_str = as_string(rset_sub);
+            let ens = ensure_custom_ruleset(config, ref_str, section_name);
+            if (ens && ens.tag && index(nrs, ens.tag) < 0)
+                push(nrs, ens.tag);
+            if (ens && runtime_rulesets.is_community(ref_str) && ens.kind == "domains" && rule_config.community_service_has_subnet_list(ref_str)) {
+                let sub_tag = ensure_community_subnet_ruleset(config, ref_str);
+                if (sub_tag != null && index(nrs, sub_tag) < 0)
+                    push(nrs, sub_tag);
+            }
+        }
+        if (length(nrs) > 0)
+            sub.rule_set = single_or_array(nrs);
+        if (length(keys(sub)) > 1)
+            push(subs, sub);
+    }
+    return subs;
+}
+
+function add_combined_route_for_clause(config, section) {
+    active_route_section = section;
     let domains = domain_conditions(section);
     let domain = domains.domain;
     let domain_suffix = domains.domain_suffix;
     let domain_keyword = domains.domain_keyword;
     let domain_regex = domains.domain_regex;
-    let ip_cidr = legacy_condition_values(section, "ip_cidr");
+    let ip_cidr = core_ip.normalize_to_cidrs(legacy_condition_values(section, "ip_cidr"));
     let source_ip_cidr = core_ip.normalize_to_cidrs(legacy_condition_values(section, "source_ip_cidr"));
     let excluded_cidrs = core_ip.normalize_to_cidrs(list_option(section, "excluded_ips"));
+    let dns_excluded_cidrs = core_ip.expand_ipv4_mapped_cidrs(excluded_cidrs);
     let rule_set_tags = [];
     let dns_query_rule_set_tags = [];
     let dns_response_rule_set_tags = [];
+    // The query-side tags that also match addresses. A set like that may not
+    // produce FakeIP: the match would lose the real destination and could not
+    // match the DPI rule afterwards.
+    let dns_non_domain_query_tags = [];
     let section_name = section[".name"];
+    let base_inv_subrules = build_inverted_subrules(config, section_name, section.__inverted_conditions);
+    let exc_proto_subrules = build_excluded_protocol_subrules(section);
+    let exc_dom_subrules = build_excluded_domain_subrules(section);
+    let inv_subrules = [];
+    for (let sub in base_inv_subrules)
+        push(inv_subrules, sub);
+    for (let sub in exc_proto_subrules)
+        push(inv_subrules, sub);
+    for (let sub in exc_dom_subrules)
+        push(inv_subrules, sub);
 
-    add_excluded_protocol_rule(config, section);
-    add_fully_routed_ips_rule(config, section);
 
-
-    let include_community_subnets = bool_option(section, "community_subnets", true);
+    let include_community_subnets = community_subnets_enabled(section);
     let discord_cf_subnets = [];
     for (let community in connections.community_lists(section)) {
         let service = as_string(community);
         let ensured = ensure_community_ruleset(config, section_name, service);
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || service == "discord")
+        if (ensured.kind == "domains" || service == "discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
 
         if (include_community_subnets) {
-            for (let cidr in load_community_subnet_cidrs(community, "exclude_cloudflare"))
-                push(ip_cidr, cidr);
             if (service == "discord") {
+                for (let cidr in load_community_subnet_cidrs(community, "exclude_cloudflare"))
+                    push(ip_cidr, cidr);
                 for (let cidr in load_community_subnet_cidrs(community, "only_cloudflare"))
                     push(discord_cf_subnets, cidr);
+            } else if (service == "telegram") {
+                for (let cidr in load_community_subnet_cidrs(community, null))
+                    push(ip_cidr, cidr);
+            } else if (ensured.kind == "domains" && rule_config.community_service_has_subnet_list(service)) {
+                let sub_tag = ensure_community_subnet_ruleset(config, service);
+                if (sub_tag != null && index(rule_set_tags, sub_tag) < 0)
+                    push(rule_set_tags, sub_tag);
+            } else if (ensured == null || !ensured.tag) {
+                for (let cidr in load_community_subnet_cidrs(community, "exclude_cloudflare"))
+                    push(ip_cidr, cidr);
             }
         }
     }
     for (let reference in connections.rule_sets(section)) {
         let ref_str = as_string(reference);
-        let ensured = ensure_custom_ruleset(config, ref_str);
+        let ensured = ensure_custom_ruleset(config, ref_str, section_name);
         if (ensured == null)
             continue;
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord")
+        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
     }
     for (let reference in connections.rule_sets_with_subnets(section)) {
         let ref_str = as_string(reference);
-        let ensured = ensure_custom_ruleset(config, ref_str);
+        let ensured = ensure_custom_ruleset(config, ref_str, section_name);
         if (ensured == null)
             continue;
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord")
+        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
+        if (runtime_rulesets.is_community(ref_str) && ensured.kind == "domains" && rule_config.community_service_has_subnet_list(ref_str)) {
+            let sub_tag = ensure_community_subnet_ruleset(config, ref_str);
+            if (sub_tag != null && index(rule_set_tags, sub_tag) < 0)
+                push(rule_set_tags, sub_tag);
+        }
     }
     add_domain_ip_list_ruleset(
         config,
@@ -2427,27 +4815,46 @@ function add_combined_route_for_section(config, section) {
     if (target.unsupported)
         ctx.runtime_generate_unsupported(target.unsupported);
 
-    let country_list = connections.geoip_country_list(section);
-    let country_mode = connections.geoip_country_mode(section);
-    let geo_tags = [];
-    if ((target.outbound || target.action) && length(country_list) > 0) {
-        for (let cc in country_list) {
-            let ip_ruleset = ensure_community_ruleset(config, section_name, "geoip_" + cc);
-            if (ip_ruleset && ip_ruleset.tag)
-                push(geo_tags, ip_ruleset.tag);
-
-            if (cc == "ru") {
-                let site_ruleset = ensure_community_ruleset(config, section_name, "geosite_ru");
-                if (site_ruleset && site_ruleset.tag)
-                    push(geo_tags, site_ruleset.tag);
-            }
-        }
-    }
-
     let has_domain = length(domain) > 0 || length(domain_suffix) > 0 ||
         length(domain_keyword) > 0 || length(domain_regex) > 0;
     let has_ruleset = length(rule_set_tags) > 0;
     let has_ip_cidr = length(ip_cidr) > 0;
+
+    let country_list = connections.geoip_country_list(section);
+    let country_mode = connections.geoip_country_mode(section);
+    if (option(section, "action", "") == "bypass" &&
+        country_mode == "exclude" &&
+        !has_domain && !has_ruleset && !has_ip_cidr &&
+        length(discord_cf_subnets) == 0 &&
+        length(source_ip_cidr) == 0 &&
+        !bool_option(section, "match_all", false)) {
+        country_mode = "include";
+    }
+    let bypass_geo_only = option(section, "action", "") == "bypass" &&
+        !has_domain && !has_ruleset && !has_ip_cidr &&
+        length(discord_cf_subnets) == 0 &&
+        !geoip_mode_inverts(country_mode) &&
+        length(country_list) > 0;
+    let geo_tags = [];
+    if ((target.outbound || target.action) && length(country_list) > 0) {
+        for (let cc in country_list) {
+            let ip_ruleset = ensure_community_ruleset(config, section_name, "geoip_" + cc);
+            if (ip_ruleset && ip_ruleset.tag) {
+                push(geo_tags, ip_ruleset.tag);
+                if (bypass_geo_only && index(dns_response_rule_set_tags, ip_ruleset.tag) < 0)
+                    push(dns_response_rule_set_tags, ip_ruleset.tag);
+            }
+
+            if (cc == "ru") {
+                let site_ruleset = ensure_community_ruleset(config, section_name, "geosite_ru");
+                if (site_ruleset && site_ruleset.tag) {
+                    push(geo_tags, site_ruleset.tag);
+                    if (bypass_geo_only && index(dns_query_rule_set_tags, site_ruleset.tag) < 0)
+                        push(dns_query_rule_set_tags, site_ruleset.tag);
+                }
+            }
+        }
+    }
 
     let create_section_route_rule = function() {
         let r = {
@@ -2458,13 +4865,19 @@ function add_combined_route_for_section(config, section) {
             r.outbound = target.outbound;
         if (length(source_ip_cidr) > 0)
             r.source_ip_cidr = single_or_array(source_ip_cidr);
+        if (length(inv_subrules) > 0)
+            r.__inv_subrules = inv_subrules;
         add_port_matchers(r, section);
         add_dscp_matchers(r, section);
         add_protocol_matchers(r, section);
+        add_interface_address_matchers(r, section);
+        let tw = trim(option(section, "time_window", ""));
+        if (tw != "")
+            r.time_window = tw;
         return r;
     };
 
-    let closed_geo = connections.geoip_country_mode_is_closed(section);
+    let closed_geo = connections.geoip_country_mode_is_closed(section) && length(geo_tags) > 0;
     if (closed_geo && (has_domain || has_ruleset || has_ip_cidr || length(discord_cf_subnets) > 0))
         warn("Section " + section_name + ": GeoIP mode '" + country_mode +
             "' defines the whole section, so the other matchers in it are ignored\n");
@@ -2481,7 +4894,7 @@ function add_combined_route_for_section(config, section) {
             if (type(resolve) == "object" && resolve.warning)
                 warn(resolve.warning, "\n");
             else if (type(resolve) == "object" && resolve.rule)
-                push_route_matcher_rule(config, apply_excluded_source_ips(resolve.rule, excluded_cidrs));
+                push_route_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(resolve.rule, excluded_cidrs), exc_dom_subrules));
         }
 
         push_section_route_rule(config, domain_rule, target.outbound, excluded_cidrs, geo_tags, country_mode);
@@ -2496,7 +4909,7 @@ function add_combined_route_for_section(config, section) {
             if (type(resolve) == "object" && resolve.warning)
                 warn(resolve.warning, "\n");
             else if (type(resolve) == "object" && resolve.rule)
-                push_route_matcher_rule(config, apply_excluded_source_ips(resolve.rule, excluded_cidrs));
+                push_route_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(resolve.rule, excluded_cidrs), exc_dom_subrules));
         }
 
         push_section_route_rule(config, rs_rule, target.outbound, excluded_cidrs, geo_tags, country_mode);
@@ -2509,6 +4922,14 @@ function add_combined_route_for_section(config, section) {
     }
 
     if (length(discord_cf_subnets) > 0 && !closed_geo) {
+        if (target.outbound) {
+            for (let outb in (config.outbounds || [])) {
+                if (as_string(outb.tag) == target.outbound && as_string(outb.type) == "desync" && outb.udp_fake !== false) {
+                    outb.udp_fake = true;
+                    cached_udp_support_by_tag = {};
+                }
+            }
+        }
         let voice_rule = create_section_route_rule();
         voice_rule.network = "udp";
         voice_rule.ip_cidr = discord_cf_subnets;
@@ -2540,7 +4961,13 @@ function add_combined_route_for_section(config, section) {
             let fallback_rule = create_section_route_rule();
             let has_any_matcher = fallback_rule.source_ip_cidr != null ||
                 fallback_rule.port != null || fallback_rule.port_range != null ||
-                fallback_rule.protocol != null;
+                fallback_rule.protocol != null || fallback_rule.network != null ||
+                fallback_rule.default_interface_address != null ||
+                fallback_rule.interface_address != null ||
+                fallback_rule.network_interface_address != null ||
+                fallback_rule.preferred_by != null ||
+                fallback_rule.time_window != null ||
+                length(base_inv_subrules) > 0;
             if (has_any_matcher)
                 push_section_route_rule(config, fallback_rule, target.outbound, excluded_cidrs);
         }
@@ -2549,111 +4976,165 @@ function add_combined_route_for_section(config, section) {
     if (closed_geo && length(geo_tags) > 0)
         push_section_geoip_remainder(config, create_section_route_rule(), target, excluded_cidrs, geo_tags, country_mode);
 
-    let rewrite_ttl = int_option(ctx.runtime_settings(), "dns_rewrite_ttl", "60");
+    if (bypass_geo_only) {
+        let cctld_map = {
+            ru: [ "ru", "su", "xn--p1ai" ],
+            ua: [ "ua", "xn--j1amh" ],
+            by: [ "by", "xn--90ais" ],
+            kz: [ "kz", "xn--80ao21a" ]
+        };
+        let cctlds = [];
+        for (let cc in country_list) {
+            cc = lc(trim(as_string(cc)));
+            if (match(cc, /^[a-z]{2}$/) == null)
+                continue;
+            for (let tld in (cctld_map[cc] || [ cc ])) {
+                if (index(cctlds, tld) < 0)
+                    push(cctlds, tld);
+                if (index(domain_suffix, tld) < 0)
+                    push(domain_suffix, tld);
+            }
+        }
+        if (length(cctlds) > 0) {
+            let cctld_rule = create_section_route_rule();
+            add_domain_array(cctld_rule, "domain_suffix", cctlds);
+            push_section_route_rule(config, cctld_rule, target.outbound, excluded_cidrs, null, country_mode);
+        }
+    }
+
+    let r_settings = ctx.runtime_settings ? ctx.runtime_settings() : {};
+    let explicit_rewrite_ttl = trim(option(r_settings, "dns_rewrite_ttl", "")) != "";
+    let rewrite_ttl = int_option(r_settings, "dns_rewrite_ttl", "15");
     let dns_server_tag = section_dns_server(section);
-    let ipv4_only_dpi = section_is_ipv4_only_dpi(section) &&
+    let use_rewrite_ttl = dns_server_tag != runtime_constants.DNS_SERVER_TAG || explicit_rewrite_ttl;
+    let eff_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+    let ipv4_only_sec = !section_ipv6_supported(section);
+    let ipv4_only_dpi = ipv4_only_sec &&
         dns_server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG;
+    let emit_sec_aaaa_noerror = eff_state != null && eff_state.ipv6_active && ipv4_only_sec &&
+        !section_is_dns_block_eligible(section);
     if (length(domain) > 0 || length(domain_suffix) > 0 || length(domain_keyword) > 0 || length(domain_regex) > 0) {
+        let domain_matchers = [
+            [ "domain", domain ],
+            [ "domain_suffix", domain_suffix ],
+            [ "domain_keyword", domain_keyword ],
+            [ "domain_regex", domain_regex ]
+        ];
+        for (let dm in domain_matchers) {
+            let key = dm[0];
+            let values = dm[1];
+            if (length(values) == 0)
+                continue;
+            let dns_rule = {
+                action: "route",
+                server: dns_server_tag
+            };
+            if (use_rewrite_ttl)
+                dns_rule.rewrite_ttl = rewrite_ttl;
+            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_sec);
+            add_domain_array(dns_rule, key, values);
+            add_source_dns_matchers(dns_rule, source_ip_cidr);
+            if (emit_sec_aaaa_noerror)
+                push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(build_section_aaaa_noerror_rule(dns_rule), dns_excluded_cidrs), exc_dom_subrules));
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs);
+            if (!emit_sec_aaaa_noerror && eff_state == null && ipv4_only_dpi) {
+                let aaaa_rule = {
+                    action: "route",
+                    server: runtime_constants.DNS_SERVER_TAG,
+                    rewrite_ttl,
+                    query_type: [ "AAAA" ]
+                };
+                add_domain_array(aaaa_rule, key, values);
+                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+                push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(aaaa_rule, dns_excluded_cidrs), exc_dom_subrules));
+            }
+        }
+    }
+    // The tags that match domains only. A set that also matches addresses may
+    // not produce FakeIP: the match would lose the real destination and could
+    // not match the DPI rule afterwards.
+    let domain_only_dns_tags = [];
+    for (let tag in dns_query_rule_set_tags)
+        if (index(dns_non_domain_query_tags, tag) < 0)
+            push(domain_only_dns_tags, tag);
+    if (length(dns_query_rule_set_tags) > 0) {
         let dns_rule = {
             action: "route",
             server: dns_server_tag,
-            rewrite_ttl
+            rule_set: single_or_array(dns_query_rule_set_tags)
         };
-        add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
-        add_domain_array(dns_rule, "domain", domain);
-        add_domain_array(dns_rule, "domain_suffix", domain_suffix);
-        add_domain_array(dns_rule, "domain_keyword", domain_keyword);
-        add_domain_array(dns_rule, "domain_regex", domain_regex);
+        if (use_rewrite_ttl)
+            dns_rule.rewrite_ttl = rewrite_ttl;
+        add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_sec);
         add_source_dns_matchers(dns_rule, source_ip_cidr);
-        push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
-        if (ipv4_only_dpi) {
+        if (emit_sec_aaaa_noerror)
+            push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(build_section_aaaa_noerror_rule(dns_rule), dns_excluded_cidrs), exc_dom_subrules));
+        push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs, domain_only_dns_tags);
+        if (!emit_sec_aaaa_noerror && eff_state == null && ipv4_only_dpi) {
             let aaaa_rule = {
                 action: "route",
                 server: runtime_constants.DNS_SERVER_TAG,
                 rewrite_ttl,
-                query_type: [ "AAAA" ]
-            };
-            add_domain_array(aaaa_rule, "domain", domain);
-            add_domain_array(aaaa_rule, "domain_suffix", domain_suffix);
-            add_domain_array(aaaa_rule, "domain_keyword", domain_keyword);
-            add_domain_array(aaaa_rule, "domain_regex", domain_regex);
-            add_source_dns_matchers(aaaa_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
-        }
-    }
-    let is_1_14 = ctx.is_sb_1_14_plus && ctx.is_sb_1_14_plus();
-    if (is_1_14) {
-        if (length(dns_query_rule_set_tags) > 0) {
-            let dns_rule = {
-                action: "route",
-                server: dns_server_tag,
-                rewrite_ttl,
+                query_type: [ "AAAA" ],
                 rule_set: single_or_array(dns_query_rule_set_tags)
             };
-            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
-            add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
-            if (ipv4_only_dpi) {
-                let aaaa_rule = {
-                    action: "route",
-                    server: runtime_constants.DNS_SERVER_TAG,
-                    rewrite_ttl,
-                    query_type: [ "AAAA" ],
-                    rule_set: single_or_array(dns_query_rule_set_tags)
-                };
-                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
-                push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
-            }
-        }
-        if (length(dns_response_rule_set_tags) > 0) {
-            let eval_rule = {
-                action: "evaluate",
-                server: runtime_constants.DNS_SERVER_TAG
-            };
-            add_source_dns_matchers(eval_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(eval_rule, excluded_cidrs));
-
-            let dns_rule = {
-                action: "route",
-                server: dns_server_tag,
-                rewrite_ttl,
-                rule_set: single_or_array(dns_response_rule_set_tags),
-                match_response: true
-            };
-            add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+            push_dns_matcher_rule(config, apply_inverted_subrules(apply_excluded_source_ips(aaaa_rule, dns_excluded_cidrs), exc_dom_subrules));
         }
     }
-    else {
-        let all_dns_tags = [];
-        for (let tag in dns_query_rule_set_tags)
-            push(all_dns_tags, tag);
-        for (let tag in dns_response_rule_set_tags)
-            push(all_dns_tags, tag);
+    if (length(dns_response_rule_set_tags) > 0) {
+        let eval_rule = {
+            action: "evaluate",
+            server: runtime_constants.DNS_SERVER_TAG
+        };
+        add_source_dns_matchers(eval_rule, source_ip_cidr);
 
-        if (length(all_dns_tags) > 0) {
-            let dns_rule = {
-                action: "route",
-                server: dns_server_tag,
-                rewrite_ttl,
-                rule_set: single_or_array(all_dns_tags)
-            };
-            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
-            add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
-            if (ipv4_only_dpi) {
-                let aaaa_rule = {
-                    action: "route",
-                    server: runtime_constants.DNS_SERVER_TAG,
-                    rewrite_ttl,
-                    query_type: [ "AAAA" ],
-                    rule_set: single_or_array(all_dns_tags)
-                };
-                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
-                push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
-            }
+        let dns_rule = {
+            action: "route",
+            server: dns_server_tag,
+            rule_set: single_or_array(dns_response_rule_set_tags),
+            match_response: true
+        };
+        if (use_rewrite_ttl)
+            dns_rule.rewrite_ttl = rewrite_ttl;
+        add_source_dns_matchers(dns_rule, source_ip_cidr);
+        if (config.__defer_dns_response_rules) {
+            if (type(config.__deferred_dns_response_rules) != "array")
+                config.__deferred_dns_response_rules = [];
+            push(config.__deferred_dns_response_rules, {
+                section_name: section[".name"],
+                section: section,
+                eval_rule: apply_excluded_source_ips(eval_rule, dns_excluded_cidrs),
+                dns_rule: dns_rule,
+                excluded_cidrs: excluded_cidrs
+            });
+        } else {
+            push_dns_matcher_rule(config, apply_excluded_source_ips(eval_rule, dns_excluded_cidrs));
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs);
         }
     }
+    if (bool_option(section, "match_all", false) && !closed_geo &&
+        !has_domain && length(dns_query_rule_set_tags) == 0 && length(dns_response_rule_set_tags) == 0 &&
+        dns_server_tag != runtime_constants.DNS_SERVER_TAG) {
+        let dns_rule = {
+            action: "route",
+            server: dns_server_tag
+        };
+        if (use_rewrite_ttl)
+            dns_rule.rewrite_ttl = rewrite_ttl;
+        add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_sec);
+        add_source_dns_matchers(dns_rule, source_ip_cidr);
+        if (emit_sec_aaaa_noerror)
+            push_dns_matcher_rule(config, apply_excluded_source_ips(build_section_aaaa_noerror_rule(dns_rule), dns_excluded_cidrs));
+        push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs);
+    }
+}
+
+function add_combined_route_for_section(config, section) {
+    add_fully_routed_ips_rule(config, section);
+    add_server_domain_rules_for_section(config, section);
+    for (let clause in connections.section_effective_clauses(section))
+        add_combined_route_for_clause(config, clause);
 }
 
 function unsupported_matcher_key(section) {
@@ -2675,7 +5156,7 @@ function add_outbound_for_section(config, section, taken, sections) {
         return;
     let action = option(section, "action", "");
     if (!valid_section_name(section_name))
-        ctx.runtime_generate_unsupported("section name is not safe for sing-box config generation");
+        ctx.runtime_generate_unsupported("section name is not safe for tachyon-core config generation");
     let unsupported_matcher = unsupported_matcher_key(section);
     if (unsupported_matcher != "")
         ctx.runtime_generate_unsupported("section has unsupported matcher " + unsupported_matcher);
@@ -2700,16 +5181,26 @@ function add_outbound_for_section(config, section, taken, sections) {
         ctx.outbounds.add_masque_outbound(config, section);
     else if (action == "openvpn")
         ctx.outbounds.add_openvpn_endpoint(config, section);
-    else if (action == "zapret")
-        ctx.outbounds.add_zapret_outbound(config, section, sections);
-    else if (action == "zapret2")
-        ctx.outbounds.add_zapret2_outbound(config, section, sections);
-    else if (action == "byedpi")
-        ctx.outbounds.add_byedpi_outbound(config, section, sections);
+    else if (action == "openconnect")
+        ctx.outbounds.add_openconnect_outbound(config, section);
+    else if (action == "tewfai")
+        ctx.outbounds.add_tewfai_outbound(config, section);
+    else if (action == "trusttunnel")
+        ctx.outbounds.add_trusttunnel_outbound(config, section);
+    else if (action == "mtproto")
+        ctx.outbounds.add_mtproto_outbound(config, section);
+    else if (action == "shadowtls")
+        ctx.outbounds.add_shadowtls_outbound(config, section);
+    else if (action == "desync")
+        ctx.outbounds.add_desync_outbound(config, section);
+    else if (action == "chain")
+        ctx.outbounds.add_chain_outbound(config, section);
+    else if (action == "tailscale")
+        ctx.outbounds.add_tailscale_client_endpoint(config, section);
     else if (action == "wdtt")
-        ctx.outbounds.add_wdtt_outbound(config, section, sections);
-    else if (action == "olcrtc")
-        ctx.outbounds.add_olcrtc_outbound(config, section, sections);
+        ctx.outbounds.add_wdtt_outbound(config, section);
+    else if (action == "csqtt")
+        ctx.outbounds.add_csqtt_outbound(config, section);
     else if (action == "fptn")
         ctx.outbounds.add_fptn_outbound(config, section, sections);
     else if (action == "group") {
@@ -2740,14 +5231,20 @@ function reserve_section_outbound_tags(sections, taken) {
     for (let section in sections) {
         let action = option(section, "action", "");
         if (connections.is_connections_action(action) ||
-            action == "awg" || action == "warp" || action == "byedpi" || action == "zapret" || action == "zapret2" ||
-            action == "wdtt" || action == "olcrtc" || action == "fptn" ||
+            action == "awg" || action == "warp" ||
+            action == "wdtt" || action == "csqtt" || action == "fptn" ||
             action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
-            action == "masque" || action == "openvpn")
+            action == "masque" || action == "openvpn" || action == "openconnect" ||
+            action == "tewfai" || action == "trusttunnel" || action == "mtproto" || action == "shadowtls" ||
+            action == "desync" || action == "chain" || action == "tailscale")
             taken[outbound_tag(section[".name"])] = true;
 
         if (action == "group") {
             taken[urltest_outbound_tag(section[".name"], "urltest")] = true;
+            for (let urltest_id in connections.urltests(section))
+                taken[urltest_outbound_tag(section[".name"], urltest_id)] = true;
+            for (let group_id in connections.priority_groups(section))
+                taken[priority_outbound_tag(section[".name"], group_id)] = true;
             continue;
         }
 
@@ -2761,19 +5258,24 @@ function reserve_section_outbound_tags(sections, taken) {
     }
 }
 
-function add_route_for_section(config, section) {
+function add_route_for_section(config, section, phase) {
     let override = section_fail_policy_override_target(section);
+    if (ctx.quarantined_sections && ctx.quarantined_sections[section[".name"]] && override == null)
+        return;
     if (ctx.deferred_sections && ctx.deferred_sections[section[".name"]] && override == null)
         return;
     let action = option(section, "action", "");
     if (action == "dns")
-        add_dns_action_rules_for_section(config, section);
+        add_dns_action_rules_for_section(config, section, phase);
     else if (action == "hosts") {
         /* hosts-only action — entries are consumed globally via combined cache */
     }
     else if (action == "group") {
-        /* group container — members keep their own rules, repointed at the
-           group urltest; the group itself matches no traffic */
+        // Members keep their own rules repointed at the group urltest; if the
+        // group section itself also has matchers configured, route them through
+        // the group urltest too.
+        if (group_outbound_tag_for_section(section) != "" || override != null)
+            add_combined_route_for_section(config, section);
     }
     else
         add_combined_route_for_section(config, section);
@@ -2786,10 +5288,12 @@ function failover_candidate(sections) {
             continue;
         let action = option(section, "action", "");
         if (connections.is_connections_action(action) ||
-            action == "awg" || action == "warp" || action == "byedpi" || action == "zapret" || action == "zapret2" ||
-            action == "wdtt" || action == "olcrtc" ||
+            action == "awg" || action == "warp" ||
+            action == "wdtt" || action == "csqtt" ||
             action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
-            action == "masque" || action == "openvpn") {
+            action == "masque" || action == "openvpn" || action == "openconnect" ||
+            action == "tewfai" || action == "trusttunnel" || action == "mtproto" || action == "shadowtls" ||
+            action == "desync" || action == "chain" || action == "tailscale") {
             push(result, section);
         }
     }
@@ -2819,12 +5323,21 @@ function failover_default_name(candidates) {
 
 const FAILOVER_GROUP_TAG = "tachyon-failover";
 
+function section_by_name(sections, name) {
+    name = as_string(name);
+    for (let section in sections)
+        if (as_string(section[".name"]) == name)
+            return section;
+    return null;
+}
+
 function add_service_route_rules(config, sections) {
     let settings = object_or_empty(ctx.uci_cursor().get_all(CONFIG_NAME, "settings"));
     if (bool_option(settings, "dns_detour_enabled", false)) {
         let detour_section = option(settings, "dns_detour_section", "");
         if (detour_section != "" && !(ctx.deferred_sections && ctx.deferred_sections[detour_section])) {
-            let detour_target = outbound_tag(detour_section);
+            let detour_sec_obj = section_by_name(sections, detour_section);
+            let detour_target = (detour_sec_obj && group_outbound_tag_for_section(detour_sec_obj)) || outbound_tag(detour_section);
             let dns_servers = list_option(settings, "dns_server");
             if (length(dns_servers) == 0) {
                 let single_dns = option(settings, "dns_server", "");
@@ -2878,10 +5391,64 @@ function add_service_route_rules(config, sections) {
         }
     }
 
+    let client_ts_endpoints = [];
+    let has_ts_server_rule = false;
+    for (let ep in array_or_empty(config.endpoints)) {
+        if (type(ep) != "object" || ep.type != "tailscale")
+            continue;
+        let ep_tag = as_string(ep.tag || "");
+        if (ep_tag == "")
+            continue;
+        if (match(ep_tag, /^server-.+-in$/) != null) {
+            has_ts_server_rule = true;
+            continue;
+        }
+        push(client_ts_endpoints, ep);
+    }
+    if (length(client_ts_endpoints) > 0) {
+        if (type(config.route) != "object")
+            config.route = {};
+        if (type(config.route.rules) != "array")
+            config.route.rules = [];
+        if (!has_ts_server_rule) {
+            for (let rule in config.route.rules) {
+                if (type(rule) != "object")
+                    continue;
+                let cidr = rule.ip_cidr;
+                if (cidr == "100.64.0.0/10" || cidr == "fd7a:115c:a1e0::/48" ||
+                    (type(cidr) == "array" && (index(cidr, "100.64.0.0/10") >= 0 || index(cidr, "fd7a:115c:a1e0::/48") >= 0))) {
+                    has_ts_server_rule = true;
+                    break;
+                }
+            }
+        }
+        if (!has_ts_server_rule) {
+            push(config.route.rules, {
+                action: "route",
+                ip_cidr: [ "100.64.0.0/10", "fd7a:115c:a1e0::/48" ],
+                outbound: as_string(client_ts_endpoints[0].tag)
+            });
+        }
+        if (ctx.is_tachyon_core != null && ctx.is_tachyon_core(null)) {
+            for (let ep in client_ts_endpoints) {
+                let ep_tag = as_string(ep.tag || "");
+                if (ep_tag == "")
+                    continue;
+                if (ep.accept_routes !== false && as_string(ep.exit_node || "") == "") {
+                    push(config.route.rules, {
+                        action: "route",
+                        preferred_by: ep_tag,
+                        outbound: ep_tag
+                    });
+                }
+            }
+        }
+    }
+
     let candidates = failover_candidate(sections);
     let proxy_candidates = [];
     for (let section in candidates) {
-        if (connections.is_remote_proxy_action(option(section, "action", "")))
+        if (connections.is_remote_proxy_section ? connections.is_remote_proxy_section(section) : connections.is_remote_proxy_action(option(section, "action", "")))
             push(proxy_candidates, section);
     }
     let target_candidates = length(proxy_candidates) > 0 ? proxy_candidates : candidates;
@@ -2898,14 +5465,19 @@ function add_service_route_rules(config, sections) {
         let catchall_target = outbound_tag(first[".name"]);
         if (failover_active) {
             let member_tags = [];
-            for (let section in target_candidates)
+            let failover_interrupt = true;
+            for (let section in target_candidates) {
                 push(member_tags, outbound_tag(section[".name"]));
+                if (!connections.section_interrupt_exist_connections(section))
+                    failover_interrupt = false;
+            }
+            let def_name = failover_default_name(target_candidates);
             push(config.outbounds, {
                 type: "selector",
                 tag: FAILOVER_GROUP_TAG,
                 outbounds: member_tags,
-                default: outbound_tag(failover_default_name(target_candidates)),
-                interrupt_exist_connections: true
+                default: outbound_tag(def_name),
+                interrupt_exist_connections: failover_interrupt
             });
             catchall_target = FAILOVER_GROUP_TAG;
         }
@@ -2916,11 +5488,75 @@ function add_service_route_rules(config, sections) {
             domain: runtime_constants.CHECK_PROXY_IP_DOMAIN
         }, catchall_target);
     }
+
     push(config.route.rules, {
         action: "route-options",
         domain: runtime_constants.FAKEIP_TEST_DOMAIN,
         override_port: 8443
     });
+}
+
+function add_full_tunnel_route_rule(config, sections) {
+    let settings = object_or_empty(ctx.uci_cursor().get_all(CONFIG_NAME, "settings"));
+    let is_full_tunnel = option(settings, "routing_strategy", option(settings, "global_routing_mode", "split")) == "full_tunnel";
+    if (!is_full_tunnel)
+        return;
+
+    // Fail-Closed: a tunnel section that is down (deferred until its
+    // subscription loads, quarantined, failed) must not hand the catch-all to
+    // the next section or to route.final, which is Direct; it rejects instead.
+    let reject_all = function() {
+        push_route_matcher_rule(config, { action: "reject", inbound: tproxy_inbound_matcher() });
+    };
+    let down_fail_closed = function(section) {
+        return section_is_fail_closed(section) && section_is_failed_or_quarantined(section[".name"]);
+    };
+    let def_tunnel_name = trim(option(settings, "default_tunnel_section", ""));
+    let full_tunnel_target = "";
+    if (def_tunnel_name != "") {
+        let def_sec = section_by_name(sections, def_tunnel_name);
+        if (def_sec != null && section_enabled(def_sec) && down_fail_closed(def_sec))
+            return reject_all();
+        if (def_sec != null && section_enabled(def_sec) && !(ctx.deferred_sections && ctx.deferred_sections[def_tunnel_name]))
+            full_tunnel_target = group_outbound_tag_for_section(def_sec) || outbound_tag(def_tunnel_name);
+    }
+    if (full_tunnel_target == "" || !is_valid_detour(config, full_tunnel_target)) {
+        full_tunnel_target = "";
+        let fallback_dpi_target = "";
+        for (let section in sections) {
+            if (!section_enabled(section))
+                continue;
+            let action = option(section, "action", "");
+            let tunnel_action = connections.is_connections_action(action) || action == "awg" || action == "fptn" || action == "group";
+            if (tunnel_action && down_fail_closed(section))
+                return reject_all();
+            if (ctx.deferred_sections && ctx.deferred_sections[section[".name"]])
+                continue;
+            if (tunnel_action) {
+                let cand_tag = group_outbound_tag_for_section(section) || outbound_tag(section[".name"]);
+                if (is_valid_detour(config, cand_tag)) {
+                    if (connections.is_dpi_or_desync_only_section && connections.is_dpi_or_desync_only_section(section)) {
+                        if (fallback_dpi_target == "")
+                            fallback_dpi_target = cand_tag;
+                    } else {
+                        full_tunnel_target = cand_tag;
+                        break;
+                    }
+                }
+            }
+        }
+        if (full_tunnel_target == "" && fallback_dpi_target != "")
+            full_tunnel_target = fallback_dpi_target;
+    }
+    if (full_tunnel_target != "" && is_valid_detour(config, full_tunnel_target)) {
+        push_section_route_rule(config, {
+            action: "route",
+            inbound: tproxy_inbound_matcher(),
+            outbound: full_tunnel_target
+        }, full_tunnel_target);
+    }
+    else if (require("service.kill_switch").veto(settings, sections) != "")
+        reject_all();
 }
 
 function enabled_sections() {
@@ -2935,28 +5571,60 @@ function enabled_sections() {
 function enabled_servers() {
     let result = [];
     ctx.uci_cursor().foreach(CONFIG_NAME, "server", function(section) {
-        if (section_enabled(section))
+        if (section_enabled(section) && !(ctx.deferred_sections && ctx.deferred_sections[section[".name"]]))
             push(result, section);
     });
     return result;
 }
 
-function section_by_name(sections, name) {
-    name = as_string(name);
-    for (let section in sections)
-        if (as_string(section[".name"]) == name)
-            return section;
-    return null;
+function has_outbound_tag(config, tag_name) {
+    if (type(config) != "object" || type(config.outbounds) != "array")
+        return false;
+    for (let item in config.outbounds) {
+        if (type(item) == "object" && as_string(item.tag) == as_string(tag_name))
+            return true;
+    }
+    return false;
+}
+
+function ensure_dnsmasq_dns_server(config) {
+    if (type(config) != "object" || type(config.dns) != "object")
+        return;
+    if (type(config.dns.servers) != "array")
+        config.dns.servers = [];
+    for (let s in config.dns.servers) {
+        if (type(s) == "object" && as_string(s.tag) == runtime_constants.DNSMASQ_DNS_SERVER_TAG)
+            return;
+    }
+    push(config.dns.servers, {
+        type: "udp",
+        tag: runtime_constants.DNSMASQ_DNS_SERVER_TAG,
+        server: "127.0.0.1",
+        server_port: 53
+    });
 }
 
 function add_server_routes(config, servers, sections) {
+    let has_lo_direct = has_outbound_tag(config, runtime_constants.LO_DIRECT_OUTBOUND_TAG);
+    let has_lan_direct = has_outbound_tag(config, runtime_constants.LAN_DIRECT_OUTBOUND_TAG);
+    let lan_cidrs = type(config.__lan_interface_cidrs) == "array" ? config.__lan_interface_cidrs : [];
     for (let server in servers) {
-        // Native-mode Tailscale runs outside sing-box: no inbound, no rules.
-        if (runtime_servers.is_native_tailscale(server))
-            continue;
+        ctx.current_section = server[".name"];
         runtime_servers.add_sniff_rule(config, server);
 
-        let inbound = runtime_constants.server_inbound_tag(server[".name"]);
+        let base_inbound = runtime_constants.server_inbound_tag(server[".name"]);
+        let inbound = base_inbound;
+        if (option(server, "protocol", "vless") == "shadowtls" &&
+            trim(as_string(option(server, "shadowtls_detour", ""))) == "") {
+            push(config.route.rules, {
+                action: "route",
+                inbound: base_inbound,
+                outbound: has_lo_direct ? runtime_constants.LO_DIRECT_OUTBOUND_TAG : runtime_constants.DIRECT_OUTBOUND_TAG,
+                override_address: "127.0.0.1",
+                override_port: runtime_servers.shadowtls_inner_port(server)
+            });
+            inbound = base_inbound + "-inner";
+        }
 
         let isolate_lan = bool_option(server, "isolate_lan_for_users", false) || bool_option(server, "block_private_for_users", false);
         let isolated_users = list_option(server, "isolated_users");
@@ -2989,6 +5657,33 @@ function add_server_routes(config, servers, sections) {
         });
 
         if (!isolate_lan) {
+            ensure_dnsmasq_dns_server(config);
+            if (type(config.dns) == "object" && type(config.dns.rules) == "array") {
+                unshift(config.dns.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    domain_suffix: [ "lan", "local", "internal", "home.arpa", "localdomain" ],
+                    server: runtime_constants.DNSMASQ_DNS_SERVER_TAG
+                });
+            }
+            if (has_lo_direct) {
+                let eff_v6_state = ctx.ipv6_effective_state ? ctx.ipv6_effective_state() : null;
+                let allow_lo_v6 = eff_v6_state != null ? eff_v6_state.ipv6_active : core_ip.ipv6_supported();
+                push(config.route.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    ip_cidr: allow_lo_v6 ? [ "127.0.0.0/8", "::1/128" ] : [ "127.0.0.0/8" ],
+                    outbound: runtime_constants.LO_DIRECT_OUTBOUND_TAG
+                });
+            }
+            if (has_lan_direct && length(lan_cidrs) > 0) {
+                push(config.route.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    ip_cidr: lan_cidrs,
+                    outbound: runtime_constants.LAN_DIRECT_OUTBOUND_TAG
+                });
+            }
             push(config.route.rules, {
                 action: "route",
                 inbound: inbound,
@@ -3012,10 +5707,38 @@ function add_server_routes(config, servers, sections) {
         }
 
         let routing_mode = option(server, "routing_mode", "rules");
+        let routing_section_name = option(server, "routing_section", "");
+        if (routing_mode == "rules" && connections.source_inbounds) {
+            let srv_name = as_string(server[".name"]);
+            for (let sec in sections) {
+                let sec_name = as_string(sec[".name"]);
+                if (ctx.deferred_sections && ctx.deferred_sections[sec_name])
+                    continue;
+                let sec_act = option(sec, "action", "");
+                if (sec_act == "block" || sec_act == "dns" || sec_act == "hosts")
+                    continue;
+                let sec_inbounds = connections.source_inbounds(sec);
+                if (array_contains(sec_inbounds, srv_name) ||
+                    array_contains(sec_inbounds, base_inbound) ||
+                    array_contains(sec_inbounds, inbound)) {
+                    if (sec_act == "bypass") {
+                        routing_mode = "direct";
+                    } else {
+                        routing_mode = "section";
+                        routing_section_name = sec_name;
+                    }
+                    break;
+                }
+            }
+        }
         if (routing_mode == "rules") {
+            let client_inbounds = tproxy_inbound_matcher();
+            let primary_client_inbound = length(client_inbounds) > 0
+                ? client_inbounds[0]
+                : runtime_constants.TPROXY_INBOUND_TAG;
             runtime_servers.clone_rules_for_inbound(
                 config,
-                runtime_constants.TPROXY_INBOUND_TAG,
+                primary_client_inbound,
                 inbound,
                 runtime_constants.CHECK_PROXY_IP_DOMAIN
             );
@@ -3028,10 +5751,9 @@ function add_server_routes(config, servers, sections) {
             });
         }
         else if (routing_mode == "section") {
-            let routing_section_name = option(server, "routing_section", "");
             let routing_section = section_by_name(sections, routing_section_name);
-            if (routing_section == null)
-                ctx.runtime_generate_unsupported("server references missing routing section " + routing_section_name);
+            if (routing_section == null || (ctx.deferred_sections && ctx.deferred_sections[routing_section_name]))
+                ctx.runtime_generate_unsupported("server references missing or quarantined routing section " + routing_section_name);
             let action = option(routing_section, "action", "");
             if (action == "bypass" || action == "block")
                 ctx.runtime_generate_unsupported("server routing section " + routing_section_name + " cannot use action " + action);
@@ -3056,8 +5778,16 @@ function add_server_routes(config, servers, sections) {
                 ip_cidr: [ "100.64.0.0/10", "fd7a:115c:a1e0::/48" ],
                 outbound: inbound
             });
+            if (bool_option(server, "tailscale_accept_routes", false) || trim(option(server, "tailscale_exit_node", "")) != "") {
+                push(config.route.rules, {
+                    action: "route",
+                    preferred_by: inbound,
+                    outbound: inbound
+                });
+            }
         }
     }
+    ctx.current_section = null;
 }
 
 return {
@@ -3082,10 +5812,13 @@ return {
     domain_conditions,
     add_domain_array,
     push_dns_matcher_rule,
+    push_section_dns_matcher_rule,
     section_dns_server,
     add_dns_server_for_section,
     add_dns_action_rules_for_section,
     add_port_matchers,
+    parse_interface_address_map,
+    add_interface_address_matchers,
     add_fully_routed_ips_rule,
     add_excluded_ips_rule,
     add_combined_route_for_section,
@@ -3094,6 +5827,7 @@ return {
     reserve_section_outbound_tags,
     add_route_for_section,
     add_service_route_rules,
+    add_full_tunnel_route_rule,
     enabled_sections,
     enabled_servers,
     section_by_name,
@@ -3106,5 +5840,8 @@ return {
     load_community_subnet_cidrs,
     section_excluded_candidate_tags,
     urltest_exclude_outbounds,
-    urltest_filtered_outbounds
+    urltest_filtered_outbounds,
+    filter_tags_by_group_spec,
+    urltest_idle_timeout,
+    finalize_remote_custom_rulesets_state
 };

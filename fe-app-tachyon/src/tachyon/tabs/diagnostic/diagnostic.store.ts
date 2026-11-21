@@ -1,27 +1,17 @@
 import { DIAGNOSTICS_CHECKS, DIAGNOSTICS_CHECKS_MAP } from './checks/constants';
 import { IDiagnosticsChecksStoreItem, StoreType } from '../../services';
 
-export type ActiveEngine = 'sing-box' | 'steer' | 'steer-extended';
+export type ActiveEngine = 'tachyon-core';
 
-/** Returns true for any Steer variant (base or extended). */
-export function isSteerEngine(engine: string | undefined): boolean {
-  return engine === 'steer' || engine === 'steer-extended';
-}
-
-/** Returns the engine check code for the given active engine.
- *  Add new engines here when Mihomo/Xray support is needed. */
+/** Returns the engine check code for the given active engine. */
 export function getEngineCheckCode(
-  engine: string | undefined,
+  _engine: string | undefined,
 ): DIAGNOSTICS_CHECKS {
-  if (isSteerEngine(engine)) return DIAGNOSTICS_CHECKS.STEER;
-  return DIAGNOSTICS_CHECKS.SINGBOX;
+  return DIAGNOSTICS_CHECKS.TACHYON_CORE;
 }
 
 export interface DiagnosticsProviderOptions {
   activeEngine?: string;
-  includeZapret?: boolean;
-  includeZapret2?: boolean;
-  includeByedpi?: boolean;
   includeInbounds?: boolean;
 }
 
@@ -52,21 +42,11 @@ export function getDiagnosticsChecks(
     checks.push(DIAGNOSTICS_CHECKS.INBOUNDS);
   }
 
-  checks.push(DIAGNOSTICS_CHECKS.NFT);
-
-  if (options.includeZapret) {
-    checks.push(DIAGNOSTICS_CHECKS.ZAPRET);
-  }
-
-  if (options.includeZapret2) {
-    checks.push(DIAGNOSTICS_CHECKS.ZAPRET2);
-  }
-
-  if (options.includeByedpi) {
-    checks.push(DIAGNOSTICS_CHECKS.BYEDPI);
-  }
-
-  checks.push(DIAGNOSTICS_CHECKS.OUTBOUNDS, DIAGNOSTICS_CHECKS.FAKEIP);
+  checks.push(
+    DIAGNOSTICS_CHECKS.NFT,
+    DIAGNOSTICS_CHECKS.OUTBOUNDS,
+    DIAGNOSTICS_CHECKS.FAKEIP,
+  );
 
   return checks.map((code) => createDiagnosticCheck(code, description));
 }
@@ -96,58 +76,20 @@ export const initialDiagnosticStore: Pick<
     tachyon_commit_sha: '',
     tachyon_latest_version: 'loading',
     luci_app_version: 'loading',
-    sing_box_version: 'loading',
-    sing_box_extended: 0,
-    sing_box_tiny: 0,
-    sing_box_compressed: 0,
-    sing_box_lx: 0,
-    sing_box_tachyon_core: 0,
-    sing_box_fptn: 0,
-    sing_box_tailscale: 1,
-    sing_box_cert_pin: 0,
-    sing_box_repo_url: '',
-    sing_box_backup_version: '',
-    sing_box_backup_time: 0,
-    steer_version: 'loading',
-    steer_installed: 0,
-    steer_extended: 0,
-    steer_repo_url: 'https://github.com/xyzmean/steer',
-    steer_backup_version: '',
-    steer_backup_time: 0,
-    active_engine: 'sing-box',
-    zapret_version: 'loading',
-    zapret_installed: 0,
-    zapret_backup_version: '',
-    zapret_backup_time: 0,
-    zapret2_version: 'loading',
-    zapret2_installed: 0,
-    zapret2_backup_version: '',
-    zapret2_backup_time: 0,
-    byedpi_version: 'loading',
-    byedpi_installed: 0,
-    byedpi_backup_version: '',
-    byedpi_backup_time: 0,
-    wdtt_version: 'loading',
-    wdtt_installed: 0,
-    wdtt_backup_version: '',
-    wdtt_backup_time: 0,
-    olcrtc_version: 'loading',
-    olcrtc_installed: 0,
-    olcrtc_backup_version: '',
-    olcrtc_backup_time: 0,
-    tailscale_version: 'loading',
-    tailscale_installed: 0,
-    tailscale_backup_version: '',
-    tailscale_backup_time: 0,
-    fptn_version: 'loading',
-    fptn_installed: 0,
-    fptn_mode: 'component',
-    fptn_backup_version: '',
-    fptn_backup_time: 0,
+    tachyon_core_version: 'loading',
+    tachyon_core_fptn: 1,
+    tachyon_core_tailscale: 1,
+    tachyon_core_cert_pin: 1,
+    tachyon_core_repo_url: '',
+    tachyon_core_backup_version: '',
+    tachyon_core_backup_time: 0,
+    active_engine: 'tachyon-core',
     server_inbounds_enabled_count: -1,
     direct_bypass_enabled: 0,
     direct_bypass_address: '',
     direct_bypass_port: '',
+    torrserver_installed: 0,
+    torrserver_version: 'not installed',
     torrserver_running: 0,
     torrserver_direct_available: 0,
     torrserver_direct_enabled: 0,
@@ -183,7 +125,7 @@ export const initialDiagnosticStore: Pick<
     viewLogs: {
       loading: false,
     },
-    showSingBoxConfig: {
+    showTachyonCoreConfig: {
       loading: false,
     },
     generateBugReport: {
@@ -200,69 +142,21 @@ export const initialDiagnosticStore: Pick<
     tachyonInstall: { loading: false },
     tachyonReinstall: { loading: false },
     tachyonRollback: { loading: false },
-    singBoxCheck: { loading: false },
-    singBoxInstall: { loading: false },
-    singBoxRollback: { loading: false },
-    singBoxInstallExtended: { loading: false },
-    singBoxInstallExtendedCompressed: { loading: false },
-    singBoxInstallLx: { loading: false },
-    singBoxInstallTachyonCore: { loading: false },
-    singBoxInstallTiny: { loading: false },
-    singBoxInstallStable: { loading: false },
-    zapretCheck: { loading: false },
-    zapretInstall: { loading: false },
-    zapretRemove: { loading: false },
-    zapretRollback: { loading: false },
-    zapret2Check: { loading: false },
-    zapret2Install: { loading: false },
-    zapret2Remove: { loading: false },
-    zapret2Rollback: { loading: false },
-    byedpiCheck: { loading: false },
-    byedpiInstall: { loading: false },
-    byedpiRemove: { loading: false },
-    byedpiRollback: { loading: false },
-    wdttCheck: { loading: false },
-    wdttInstall: { loading: false },
-    wdttRemove: { loading: false },
-    wdttRollback: { loading: false },
-    olcrtcCheck: { loading: false },
-    olcrtcInstall: { loading: false },
-    olcrtcRemove: { loading: false },
-    olcrtcRollback: { loading: false },
-    fptnCheck: { loading: false },
-    fptnInstall: { loading: false },
-    fptnRemove: { loading: false },
-    fptnRollback: { loading: false },
-    fptnSetNativeMode: { loading: false },
-    fptnSetComponentMode: { loading: false },
-    tailscaleCheck: { loading: false },
-    tailscaleInstall: { loading: false },
-    tailscaleRemove: { loading: false },
-    tailscaleRollback: { loading: false },
-    steerCheck: { loading: false },
-    steerInstall: { loading: false },
-    steerRemove: { loading: false },
-    steerRollback: { loading: false },
+    tachyonCoreCheck: { loading: false },
+    tachyonCoreInstall: { loading: false },
+    tachyonCoreRollback: { loading: false },
     directBypassEnable: { loading: false },
     directBypassDisable: { loading: false },
+    torrserverDirectCheck: { loading: false },
+    torrserverDirectInstall: { loading: false },
+    torrserverDirectRemove: { loading: false },
     torrserverDirectEnable: { loading: false },
     torrserverDirectDisable: { loading: false },
-    engineSwitch: { loading: false },
   },
   updatesChecks: {
     tachyon: { status: null, latest_version: '', release_url: '' },
-    sing_box: { status: null, latest_version: '', release_url: '' },
-    zapret: { status: null, latest_version: '', release_url: '' },
-    zapret2: { status: null, latest_version: '', release_url: '' },
-    byedpi: { status: null, latest_version: '', release_url: '' },
-    wdtt: { status: null, latest_version: '', release_url: '' },
-    olcrtc: { status: null, latest_version: '', release_url: '' },
-    fptn: { status: null, latest_version: '', release_url: '' },
-    tailscale: { status: null, latest_version: '', release_url: '' },
-    steer: { status: null, latest_version: '', release_url: '' },
-    'steer-extended': { status: null, latest_version: '', release_url: '' },
+    'tachyon-core': { status: null, latest_version: '', release_url: '' },
     direct_bypass: { status: null, latest_version: '', release_url: '' },
     torrserver_direct: { status: null, latest_version: '', release_url: '' },
-    engine: { status: null, latest_version: '', release_url: '' },
   },
 };

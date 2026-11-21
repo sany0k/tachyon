@@ -2,6 +2,7 @@
 "require baseclass";
 "require fs";
 "require ui";
+"require view.tachyon.main as main";
 
 const DEFAULT_DOMAINS = [
   "google.com",
@@ -51,6 +52,17 @@ function normalizeDomains(value) {
     throw new Error(_("Choose between 1 and 32 test domains."));
   }
   return domains;
+}
+
+function renderFallbackSettingsSvg(size = 14) {
+  if (typeof document === "undefined") return "*";
+  const span = document.createElement("span");
+  span.className = "tachyon-fallback-icon";
+  span.style.display = "inline-flex";
+  span.style.alignItems = "center";
+  span.style.verticalAlign = "middle";
+  span.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-settings"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`;
+  return span;
 }
 
 function formatMs(value) {
@@ -211,7 +223,12 @@ function createController() {
   }
 
   function isSupportedProtocol(protocol) {
-    return protocol === "doh" || protocol === "udp";
+    return (
+      protocol === "doh" ||
+      protocol === "udp" ||
+      protocol === "dot" ||
+      protocol === "doq"
+    );
   }
 
   function updateControls() {
@@ -226,7 +243,7 @@ function createController() {
     progress.textContent = running
       ? _("Testing selected DNS…")
       : !canRun
-        ? _("This speed test supports DoH and UDP DNS servers.")
+        ? _("This speed test supports DoH, DoT, DoQ, and UDP DNS servers.")
         : "";
     listEntries.forEach(({ node, alwaysEnabled }) => {
       if (!node) return;
@@ -425,9 +442,15 @@ function createController() {
           class: "cbi-button",
           title: _("Test domains"),
           "aria-label": _("Test domains"),
+          style:
+            "display: inline-flex; align-items: center; justify-content: center;",
           click: configureDomains,
         },
-        "⚙",
+        typeof main !== "undefined" &&
+          main &&
+          typeof main.renderSettingsIcon === "function"
+          ? main.renderSettingsIcon(14)
+          : renderFallbackSettingsSvg(14),
       );
       progress = E("span", { role: "status", "aria-live": "polite" });
       toolbar = E("div", { class: "tachyon-dns-speed-toolbar" }, [
@@ -439,11 +462,11 @@ function createController() {
           {},
           `
           .tachyon-dns-speed-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem}
-          .tachyon-dns-speed-enabled{max-width:calc(100% - 112px)}
-          @media(max-width:600px){.tachyon-dns-speed-enabled{min-width:0}.tachyon-dns-speed-enabled .add-item .cbi-dropdown{min-width:0;max-width:100%}}
+          .tachyon-dns-speed-enabled,.tachyon-workspace-body .cbi-value-field .cbi-dynlist.tachyon-dns-speed-enabled,.cbi-modal .cbi-value-field .cbi-dynlist.tachyon-dns-speed-enabled,#modal_overlay > .modal .cbi-value-field .cbi-dynlist.tachyon-dns-speed-enabled{max-width:calc(100% - 112px)!important;width:calc(100% - 112px)!important;box-sizing:border-box}
+          @media(max-width:600px){.tachyon-dns-speed-enabled,.tachyon-workspace-body .cbi-value-field .cbi-dynlist.tachyon-dns-speed-enabled{min-width:0;max-width:calc(100% - 98px)!important;width:calc(100% - 98px)!important}.tachyon-dns-speed-enabled .add-item .cbi-dropdown{min-width:0;max-width:100%}}
           .tachyon-dns-speed-list .item{position:relative;overflow:visible}
           .tachyon-dns-speed-value{display:none!important}
-          .tachyon-dns-speed-enabled .tachyon-dns-speed-value{display:block!important;position:absolute;left:calc(100% + 10px);top:50%;transform:translateY(-50%);min-width:96px;max-width:102px;font-size:.85rem;white-space:nowrap}
+          .tachyon-dns-speed-enabled .tachyon-dns-speed-value{display:block!important;position:absolute;left:calc(100% + 8px);top:50%;transform:translateY(-50%);min-width:90px;max-width:102px;font-size:.82rem;padding:4px 8px;white-space:nowrap;box-sizing:border-box}
           .tachyon-dns-speed-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:1rem;margin:1rem 0}
           .tachyon-dns-speed-results{width:100%;table-layout:fixed;margin:1rem 0;border:1px solid var(--border-color-medium,#666)}
           .tachyon-dns-speed-results th,.tachyon-dns-speed-results td{padding:9px 12px;text-align:left;vertical-align:middle;border-bottom:1px solid var(--border-color-low,#555)}
@@ -454,7 +477,19 @@ function createController() {
         ),
       ]);
       updateControls();
-      window.setTimeout(poll, 0);
+      if (typeof IntersectionObserver !== "undefined") {
+        let initialPolled = false;
+        const visObserver = new IntersectionObserver((entries) => {
+          if (entries.some((e) => e.isIntersecting) && !initialPolled) {
+            initialPolled = true;
+            visObserver.disconnect();
+            poll();
+          }
+        });
+        visObserver.observe(toolbar);
+      } else {
+        window.setTimeout(poll, 0);
+      }
       return toolbar;
     },
     attachList(node, opts) {
@@ -462,17 +497,45 @@ function createController() {
       const alwaysEnabled = Boolean(opts && opts.alwaysEnabled);
       // LuCI registers the lists while the form is still detached. Replace a
       // rerender of the same field, but keep the other off-document lists.
-      listEntries = listEntries.filter(
-        (entry) =>
-          entry.node &&
-          entry.node !== node &&
-          (!node.id || entry.node.id !== node.id),
-      );
-      listEntries.push({ node, alwaysEnabled });
+      const keptEntries = [];
+      for (const entry of listEntries) {
+        if (!entry.node) {
+          entry.cleanup?.();
+          continue;
+        }
+        if (entry.node.isConnected) entry.wasConnected = true;
+        const staleDetached = entry.wasConnected && !entry.node.isConnected;
+        const isReplaced =
+          entry.node === node || (node.id && entry.node.id === node.id);
+        if (staleDetached || isReplaced) {
+          entry.cleanup?.();
+        } else {
+          keptEntries.push(entry);
+        }
+      }
+      listEntries = keptEntries;
       node.classList.add("tachyon-dns-speed-list");
-      node.addEventListener("cbi-dynlist-change", updateRows);
-      new MutationObserver(() => updateRows()).observe(node, {
+      const onChange = () => updateRows();
+      node.addEventListener("cbi-dynlist-change", onChange);
+      const observer =
+        typeof MutationObserver === "function"
+          ? new MutationObserver(() => updateRows())
+          : null;
+      observer?.observe(node, {
         childList: true,
+      });
+      listEntries.push({
+        node,
+        alwaysEnabled,
+        wasConnected: Boolean(node.isConnected),
+        cleanup: () => {
+          if (typeof node.removeEventListener === "function") {
+            node.removeEventListener("cbi-dynlist-change", onChange);
+          }
+          if (observer && typeof observer.disconnect === "function") {
+            observer.disconnect();
+          }
+        },
       });
       updateControls();
       updateRows();
@@ -481,4 +544,8 @@ function createController() {
   };
 }
 
-return baseclass.extend({ createController, normalizeDomains, formatMs });
+return baseclass.extend({
+  createController,
+  normalizeDomains,
+  formatMs,
+});

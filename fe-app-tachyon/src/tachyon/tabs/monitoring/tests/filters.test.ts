@@ -1,7 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect } from 'vitest';
+import { styles as monitoringStyles } from '../styles';
 import {
   normalizeConnectionsPayload,
+  getConnectionDataSource,
+  getConnectionTupleKey,
+  mergeCoreAndConntrackConnections,
   getListValues,
   getUrlTestIds,
   getUrlTestTag,
@@ -16,6 +20,8 @@ import {
   getSourceCellParts,
   getTargetCellParts,
   getNetwork,
+  formatMatchedRuleSummary,
+  getRouteTooltip,
   sortConnections,
   normalizeSearchValue,
   getSearchValues,
@@ -303,5 +309,320 @@ describe('monitoring filters and resolution', () => {
     });
     expect(searchFiltered.length).toBe(1);
     expect(searchFiltered[0].id).toBe('2');
+  });
+
+  it.each(['active', 'closed'] as const)(
+    'searches session targets instead of candidate rule sets in the %s tab',
+    (tab) => {
+      const rule =
+        'rule_set=[tachyon-community-rutracker_lampa-rs tachyon-community-youtube-rs] => route(desync-out)';
+      const connections: MonitoredConnection[] = [
+        {
+          id: 'dota',
+          lastSeenAt: 1000,
+          metadata: { host: 'cdn.dota2.net', network: 'tcp' },
+          rule,
+        },
+        {
+          id: 'image',
+          lastSeenAt: 1000,
+          metadata: { host: 'i.ytimg.com', network: 'udp' },
+          rulePayload: rule,
+        },
+        {
+          id: 'tracker',
+          lastSeenAt: 1000,
+          metadata: { host: 'rutracker.net', network: 'tcp' },
+          rule,
+          rulePayload: rule,
+        },
+      ];
+      const search = (searchQuery: string) =>
+        filterVisibleConnections({
+          deviceFilter: 'all',
+          routeFilter: 'all',
+          searchQuery,
+          tab,
+          activeConnections: tab === 'active' ? connections : [],
+          closedConnections: tab === 'closed' ? connections : [],
+        })
+          .map((connection) => connection.id)
+          .sort();
+
+      expect(search('rutracker')).toEqual(['tracker']);
+      expect(search('  RuTracker  ')).toEqual(['tracker']);
+      expect(search('rutracker.net')).toEqual(['tracker']);
+      expect(search('.net')).toEqual(['dota', 'tracker']);
+      expect(search('.com')).toEqual(['image']);
+      expect(search('rutracker_lampa')).toEqual([]);
+      expect(search('community:rutracker_lampa')).toEqual([]);
+      expect(search('youtube')).toEqual([]);
+      expect(search('')).toEqual(['dota', 'image', 'tracker']);
+    },
+  );
+
+  it('distinguishes QUIC from plain UDP and builds matched rule tooltips', () => {
+    const plainUdp: MonitoredConnection = {
+      id: 'u1',
+      lastSeenAt: 1000,
+      metadata: {
+        network: 'udp',
+        destinationIP: '8.8.8.8',
+        destinationPort: 53,
+      },
+    };
+    const quicByPort443Host: MonitoredConnection = {
+      id: 'q1',
+      lastSeenAt: 1000,
+      metadata: {
+        network: 'udp',
+        host: 'gemini.google.com',
+        destinationPort: 443,
+      },
+      chains: ['Main-out', 'NL VLESS #1'],
+      rule: 'inbound=[tproxy-in tproxy6-in] rule_set=[Main-community-google_ai-rs] => route(Main-out)',
+      rulePayload: 'rule_set=Main-community-google_ai-rs',
+    };
+    const quicByProtocol: MonitoredConnection = {
+      id: 'q2',
+      lastSeenAt: 1000,
+      metadata: {
+        network: 'udp',
+        protocol: 'quic',
+        destinationPort: 8443,
+      },
+    };
+
+    expect(getNetwork(plainUdp)).toBe('udp');
+    expect(getNetwork(quicByPort443Host)).toBe('quic');
+    expect(getNetwork(quicByProtocol)).toBe('quic');
+
+    expect(formatMatchedRuleSummary(quicByPort443Host)).toBe(
+      'rule_set=community:google_ai',
+    );
+    const tooltip = getRouteTooltip(quicByPort443Host, 'Main');
+    expect(tooltip).toContain('Section: Main');
+    expect(tooltip).toContain(
+      'Matched condition: rule_set=community:google_ai',
+    );
+    expect(tooltip).toContain('Node: NL VLESS #1');
+
+    const prevL = (globalThis as any).L;
+    try {
+      (globalThis as any).L = { env: { lang: 'ru' } };
+      const ruTooltip = getRouteTooltip(quicByPort443Host, 'Main');
+      expect(ruTooltip).toContain('Секция: Main');
+      expect(ruTooltip).toContain(
+        'Сработавшее условие: rule_set=community:google_ai',
+      );
+      expect(ruTooltip).toContain('Правило:');
+      expect(ruTooltip).toContain('Узел: NL VLESS #1');
+      expect(ruTooltip).not.toContain('Matched condition:');
+    } finally {
+      (globalThis as any).L = prevL;
+    }
+  });
+
+  it('prevents protocol badges from truncating tcp/udp/quic into single-letter ellipsis', () => {
+    const networkRuleMatch = monitoringStyles.match(
+      /\.tachyon_monitoring-page__network\s*\{([^}]+)\}/,
+    );
+    expect(networkRuleMatch).not.toBeNull();
+    const networkDeclarations = networkRuleMatch?.[1] || '';
+    expect(networkDeclarations).toContain('box-sizing: border-box');
+    expect(networkDeclarations).toContain('max-width: none');
+    expect(networkDeclarations).toContain('overflow: visible');
+    expect(networkDeclarations).toContain('text-overflow: clip');
+
+    const col2WidthMatch = monitoringStyles.match(
+      /\.tachyon_monitoring-page__table th:nth-child\(2\)\s*\{\s*width:\s*([\d.]+)%/,
+    );
+    expect(col2WidthMatch).not.toBeNull();
+    expect(Number(col2WidthMatch?.[1])).toBeGreaterThanOrEqual(8);
+  });
+
+  it('filters connections by multiple selected routes, sources, and network protocols', () => {
+    buildRouteDisplayNames([
+      {
+        '.name': 'main',
+        '.type': 'section',
+        label: 'Main',
+        enabled: '1',
+      } as any,
+      {
+        '.name': 'desync_youtube_section',
+        '.type': 'section',
+        label: 'desync_youtube_section',
+        action: 'desync',
+        enabled: '1',
+      } as any,
+    ]);
+
+    const connections: MonitoredConnection[] = [
+      {
+        id: 'c1',
+        lastSeenAt: 1000,
+        chains: ['main-out'],
+        metadata: {
+          network: 'tcp',
+          sourceIP: '192.168.1.8',
+          host: 'api.telegram.org',
+        },
+      },
+      {
+        id: 'c2',
+        lastSeenAt: 1000,
+        chains: ['desync_youtube_section-out'],
+        metadata: {
+          network: 'udp',
+          sourceIP: '192.168.1.44',
+          host: 'www.youtube.com',
+          destinationPort: 443,
+        },
+      },
+      {
+        id: 'c3',
+        lastSeenAt: 1000,
+        chains: ['bypass-out'],
+        metadata: {
+          network: 'tcp',
+          sourceIP: 'vless_h',
+          host: 'mtalk.google.com',
+          destinationPort: 5228,
+        },
+      },
+      {
+        id: 'c4',
+        lastSeenAt: 1000,
+        chains: ['direct-out'],
+        metadata: {
+          network: 'udp',
+          sourceIP: 'vless_h',
+          destinationIP: '8.8.8.8',
+          destinationPort: 53,
+        },
+      },
+    ];
+
+    const byTwoRoutes = filterVisibleConnections({
+      routeFilters: new Set(['Main', 'Bypass']),
+      searchQuery: '',
+      tab: 'active',
+      activeConnections: connections,
+      closedConnections: [],
+    });
+    expect(byTwoRoutes.map((c) => c.id)).toEqual(['c1', 'c3']);
+
+    const byTwoDevices = filterVisibleConnections({
+      deviceFilters: ['192.168.1.44', 'vless_h'],
+      searchQuery: '',
+      tab: 'active',
+      activeConnections: connections,
+      closedConnections: [],
+    });
+    expect(byTwoDevices.map((c) => c.id)).toEqual(['c2', 'c3', 'c4']);
+
+    const byQuicAndTcp = filterVisibleConnections({
+      networkFilters: new Set(['quic', 'tcp']),
+      searchQuery: '',
+      tab: 'active',
+      activeConnections: connections,
+      closedConnections: [],
+    });
+    expect(byQuicAndTcp.map((c) => c.id)).toEqual(['c1', 'c2', 'c3']);
+  });
+
+  it('deduplicates core and conntrack connections by 5-tuple and filters by dataSourceFilter', () => {
+    const coreConns = [
+      {
+        id: 'core-1',
+        metadata: {
+          network: 'tcp',
+          sourceIP: '192.168.1.50',
+          sourcePort: '54321',
+          destinationIP: '142.250.74.110',
+          destinationPort: '443',
+          host: 'www.youtube.com',
+        },
+        chains: ['youtube-out'],
+      },
+    ];
+    const conntrackConns = [
+      {
+        // Duplicate 5-tuple of core-1 -> must be deduplicated
+        id: 'ct:tcp:192.168.1.50:54321:142.250.74.110:443',
+        dataSource: 'conntrack' as const,
+        metadata: {
+          network: 'tcp',
+          type: 'conntrack',
+          sourceIP: '192.168.1.50',
+          sourcePort: '54321',
+          destinationIP: '142.250.74.110',
+          destinationPort: '443',
+        },
+        chains: ['direct-out'],
+      },
+      {
+        // Unique conntrack session bypassing core -> must be preserved
+        id: 'ct:udp:192.168.1.50:60123:1.1.1.1:443',
+        dataSource: 'conntrack' as const,
+        metadata: {
+          network: 'udp',
+          type: 'conntrack',
+          sourceIP: '192.168.1.50',
+          sourcePort: '60123',
+          destinationIP: '1.1.1.1',
+          destinationPort: '443',
+        },
+        chains: ['desync-out'],
+      },
+    ];
+
+    expect(getConnectionTupleKey(coreConns[0])).toBe(
+      'tcp|192.168.1.50|54321|142.250.74.110|443',
+    );
+    const merged = mergeCoreAndConntrackConnections(coreConns, conntrackConns);
+    expect(merged.map((c) => c.id)).toEqual([
+      'core-1',
+      'ct:udp:192.168.1.50:60123:1.1.1.1:443',
+    ]);
+    expect(getConnectionDataSource(merged[0])).toBe('core');
+    expect(getConnectionDataSource(merged[1])).toBe('conntrack');
+
+    const monitored = merged.map((c, idx) => ({
+      ...c,
+      id: c.id || String(idx),
+      lastSeenAt: 1000,
+    }));
+
+    expect(
+      filterVisibleConnections({
+        dataSourceFilter: 'all',
+        searchQuery: '',
+        tab: 'active',
+        activeConnections: monitored,
+        closedConnections: [],
+      }).map((c) => c.id),
+    ).toEqual(['core-1', 'ct:udp:192.168.1.50:60123:1.1.1.1:443']);
+
+    expect(
+      filterVisibleConnections({
+        dataSourceFilter: 'core',
+        searchQuery: '',
+        tab: 'active',
+        activeConnections: monitored,
+        closedConnections: [],
+      }).map((c) => c.id),
+    ).toEqual(['core-1']);
+
+    expect(
+      filterVisibleConnections({
+        dataSourceFilter: 'conntrack',
+        searchQuery: '',
+        tab: 'active',
+        activeConnections: monitored,
+        closedConnections: [],
+      }).map((c) => c.id),
+    ).toEqual(['ct:udp:192.168.1.50:60123:1.1.1.1:443']);
   });
 });

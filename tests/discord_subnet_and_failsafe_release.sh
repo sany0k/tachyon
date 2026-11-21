@@ -78,7 +78,7 @@ done
   fail "these live Discord addresses fall outside $base/$prefix and would bypass the section:$missing"
 ok
 
-# The literals in the nft and singbox fallbacks must not drift back to /21.
+# The literals in the nft and tachyon_core fallbacks must not drift back to /21.
 for f in "$TACHYON_LIB/nft/apply.uc" "$TACHYON_LIB/tachyon_core/generator_routes.uc"; do
   [ -f "$f" ] || fail "missing $f"
   if grep -q '162\.159\.128\.0/21' "$f"; then
@@ -100,8 +100,8 @@ ok
 # Clearing the flag without rebuilding nft would report healthy while the router
 # still bypasses the proxy, so the rebuild has to happen inside the handler.
 handler="$(sed -n '/^function release_emergency_failsafe_if_recovered/,/^}/p' "$WATCHDOG")"
-printf '%s' "$handler" | grep -q 'reload-firewall' ||
-  fail "the handler must rebuild the nft runtime (lifecycle reload-firewall) before clearing, or the router stays in bypass while reporting healthy"
+printf '%s' "$handler" | grep -Eq 'reload[-_]firewall' ||
+  fail "the handler must rebuild the nft runtime before clearing, or the router stays in bypass while reporting healthy"
 ok
 
 printf '%s' "$handler" | grep -q 'healthy_streak' ||

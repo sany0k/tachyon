@@ -47,11 +47,39 @@ let candidates = url.download_candidates("https://github.com/owner/repo/blob/mai
 assert(candidates[0] == "https://raw.githubusercontent.com/owner/repo/main/hosts", "download_candidates first entry normalized");
 
 let twitch_candidates = url.download_candidates("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/twitch.srs");
+assert(length(twitch_candidates) >= 2, "twitch ruleset download_candidates must include canonical GitHub raw and jsDelivr CDN");
 assert(twitch_candidates[0] == "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/twitch.srs", "twitch candidate 0 is raw github");
 assert(twitch_candidates[1] == "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/twitch.srs", "twitch candidate 1 is jsdelivr cdn");
+let allowed_hosts = [
+    "raw.githubusercontent.com",
+    "cdn.jsdelivr.net",
+    "ghfast.top",
+    "gh-proxy.com",
+    "gh.llkk.cc",
+    "ghproxy.net",
+    "mirror.ghproxy.com",
+    "github.moeyy.xyz"
+];
 for (let c in twitch_candidates) {
-    assert(index(c, "forkop") < 0, "no forkop mirrors allowed");
+    let h = url.host(c);
+    assert(index(allowed_hosts, h) >= 0, "unexpected mirror host: " + h);
 }
+
+for (let original in [
+    "https://provider.example/sub/private-token",
+    "https://ghfast.top/https://github.com/owner/repo/raw/main/file",
+    "https://provider.example/github.com/owner/repo/blob/main/file",
+    "https://provider.example/sub?url=https://github.com/owner/repo/blob/main/file",
+    "https://github.com.provider.example/sub",
+    "https://raw.githubusercontent.com@provider.example/sub",
+    "https://provider.example/sub#github.com",
+    "file:///tmp/github.com/owner/repo/blob/main/file"
+]) {
+    let direct = url.download_candidates(original);
+    assert(length(direct) == 1 && direct[0] == original, "non-GitHub URL must stay unchanged: " + original);
+}
+assert(length(url.download_candidates("https://api.github.com/repos/owner/repo/releases/latest")) > 1, "GitHub API keeps mirrors");
+assert(length(url.download_candidates("https://release-assets.githubusercontent.com/asset")) > 1, "GitHub release assets keep mirrors");
 
 // authority, host, port, userinfo with @ in query parameters
 let complex = "vless://user-uuid@example.com:8443?authority=name@channel&mode=gun#my-fragment";

@@ -1,5 +1,19 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { renderButton } from '../../../../partials';
+import {
+  renderCheckIcon,
+  renderWrenchIcon,
+  renderTvIcon,
+  renderSmartphoneIcon,
+  renderLaptopIcon,
+  renderGamepad2Icon,
+  renderServerIcon,
+  renderGlobeIcon,
+  renderShieldIcon,
+  renderHourglassIcon,
+  renderAlertTriangleIcon,
+  renderXIcon,
+} from '../../../../icons';
 import { showToast } from '../../../../helpers/showToast';
 import { TachyonShellMethods } from '../../../methods';
 import { logger } from '../../../services';
@@ -16,7 +30,6 @@ export interface AiDoctorModalOptions {
   quickFixes?: string[];
   backendNodes?: Array<{ name: string; status: 'OK' | 'WARN' | 'FAIL' }> | null;
   onRefreshServices?: () => Promise<void>;
-  isTachyonCore?: boolean;
 }
 
 const AI_DOCTOR_HISTORY_STORAGE_KEY = 'tachyon_ai_doctor_history';
@@ -44,12 +57,13 @@ export function saveAiDoctorHistory(entry: AiDoctorHistoryEntry): void {
 }
 
 export const FIX_LABELS: Record<string, string> = {
-  start_singbox: _('Start sing-box'),
+  doctor_fix: _('Auto-repair config & IPv6 rules (doctor --fix)'),
+  start_tachyon_core: _('Start Tachyon Core'),
   rebuild_rules: _('Rebuild firewall rules'),
   fix_dnsmasq: _('Restart dnsmasq'),
   fix_resolv_symlink: _('Fix resolv.conf'),
   start_watchdog: _('Start watchdog'),
-  restart_singbox_dns: _('Restart sing-box DNS'),
+  restart_tachyon_core_dns: _('Restart Tachyon Core DNS'),
   fix_uci_config: _('Restore config backup'),
   fix_wan_interface: _('Reconnect WAN'),
   fix_gateway: _('Resolve gateway'),
@@ -57,7 +71,6 @@ export const FIX_LABELS: Record<string, string> = {
   update_subscriptions: _('Update subscriptions'),
   reset_firewall: _('Restart firewall'),
   restart_network: _('Restart network'),
-  restart_zapret: _('Restart Zapret/ByeDPI'),
   optimize_memory: _('Optimize RAM memory'),
   switch_to_doh: _('Switch DNS to DoH'),
   heal_network_stack: _('Auto-Heal Network Stack'),
@@ -69,11 +82,7 @@ export const FIX_LABELS: Record<string, string> = {
   optimize_mtu: _('Optimize AWG MTU'),
 };
 
-export function getFixLabel(code: string, isTachyonCore?: boolean): string {
-  if (isTachyonCore) {
-    if (code === 'start_singbox') return _('Start Tachyon Core');
-    if (code === 'restart_singbox_dns') return _('Restart Tachyon Core DNS');
-  }
+export function getFixLabel(code: string): string {
   return FIX_LABELS[code] || code;
 }
 
@@ -86,7 +95,7 @@ function getUi(): any {
   return null;
 }
 
-export function getDeviceIcon(hostname: string): string {
+export function getDeviceIcon(hostname: string, size = 16): SVGElement {
   const h = hostname.toLowerCase();
   if (
     h.includes('tv') ||
@@ -96,7 +105,7 @@ export function getDeviceIcon(hostname: string): string {
     h.includes('roku') ||
     h.includes('appletv')
   )
-    return '📺';
+    return renderTvIcon(size);
   if (
     h.includes('phone') ||
     h.includes('iphone') ||
@@ -105,7 +114,7 @@ export function getDeviceIcon(hostname: string): string {
     h.includes('xiaomi') ||
     h.includes('galaxy')
   )
-    return '📱';
+    return renderSmartphoneIcon(size);
   if (
     h.includes('mac') ||
     h.includes('pc') ||
@@ -113,7 +122,7 @@ export function getDeviceIcon(hostname: string): string {
     h.includes('desktop') ||
     h.includes('thinkpad')
   )
-    return '💻';
+    return renderLaptopIcon(size);
   if (
     h.includes('playstation') ||
     h.includes('ps4') ||
@@ -122,8 +131,8 @@ export function getDeviceIcon(hostname: string): string {
     h.includes('switch') ||
     h.includes('nintendo')
   )
-    return '🎮';
-  return '📟';
+    return renderGamepad2Icon(size);
+  return renderServerIcon(size);
 }
 
 export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
@@ -154,10 +163,9 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
           : ('OK' as const),
     },
     {
-      name: options.isTachyonCore ? 'Tachyon Core' : 'sing-box',
+      name: 'Tachyon Core',
       status:
-        (repLower.includes('sing-box') ||
-          repLower.includes('tachyon-core') ||
+        (repLower.includes('tachyon-core') ||
           repLower.includes('tachyon core') ||
           repLower.includes('proxy')) &&
         (repLower.includes('остановлен') ||
@@ -226,9 +234,7 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
     const nodeSummary = nodes.map((n) => `${n.name}: ${n.status}`).join(' | ');
     const fixesSummary =
       quickFixes.length > 0
-        ? quickFixes
-            .map((f) => getFixLabel(f, options.isTachyonCore))
-            .join(', ')
+        ? quickFixes.map((f) => getFixLabel(f)).join(', ')
         : _('None');
     const clientsSummary =
       currentClients.length > 0
@@ -285,16 +291,29 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
             : node.status === 'WARN'
               ? 'label-warning'
               : 'label-danger';
-        const icon =
-          node.status === 'OK' ? '✓' : node.status === 'WARN' ? '⚠' : '✕';
+        const iconEl =
+          node.status === 'OK'
+            ? renderCheckIcon(12)
+            : node.status === 'WARN'
+              ? renderAlertTriangleIcon(12)
+              : renderXIcon(12);
         return E(
           'span',
           {
             class: `label ${labelClass}`,
             style:
-              'font-size: 11px; padding: 4px 10px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; font-weight: bold;',
+              'font-size: 11px; padding: 4px 10px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; font-weight: 600;',
           },
-          [E('span', {}, node.name), E('span', {}, `${icon} ${node.status}`)],
+          [
+            E('span', {}, node.name),
+            E(
+              'span',
+              {
+                style: 'display: inline-flex; align-items: center; gap: 3px;',
+              },
+              [iconEl, node.status],
+            ),
+          ],
         );
       }),
     );
@@ -325,9 +344,9 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
                 'div',
                 {
                   style:
-                    'font-weight: bold; margin-bottom: 8px; font-size: 12px;',
+                    'font-weight: 600; margin-bottom: 8px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px;',
                 },
-                '🛠️ ' + _('Recommended Quick Fixes:'),
+                [renderWrenchIcon(14), _('Recommended Quick Fixes:')],
               ),
               E(
                 'div',
@@ -336,10 +355,7 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
                 },
                 quickFixes.map((code) => {
                   let applied = false;
-                  const friendlyLabel = getFixLabel(
-                    code,
-                    options.isTachyonCore,
-                  );
+                  const friendlyLabel = getFixLabel(code);
                   const btn = renderButton({
                     classNames: ['cbi-button-apply'],
                     text: friendlyLabel,
@@ -387,16 +403,19 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
                 style:
                   'margin-top: 12px; padding: 8px 12px; font-size: 12px; border-radius: 6px;',
               },
-              '⚠️ ' + _('Issues detected. Review the diagnosis above.'),
+              _('Issues detected. Review the diagnosis above.'),
             )
           : E(
               'div',
               {
                 class: 'alert-message success',
                 style:
-                  'margin-top: 12px; padding: 8px 12px; font-size: 12px; border-radius: 6px;',
+                  'margin-top: 12px; padding: 8px 12px; font-size: 12px; border-radius: 6px; display: inline-flex; align-items: center; gap: 6px;',
               },
-              '✓ ' + _('No issues detected. System is running normally.'),
+              [
+                renderCheckIcon(14),
+                _('No issues detected. System is running normally.'),
+              ],
             ),
     ]);
   };
@@ -407,9 +426,10 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
         'div',
         {
           class: 'cbi-section-node',
-          style: 'padding: 20px; text-align: center; font-size: 13px;',
+          style:
+            'padding: 20px; text-align: center; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;',
         },
-        '⏳ ' + _('Loading connected LAN devices...'),
+        [renderHourglassIcon(14), _('Loading connected LAN devices...')],
       );
     }
 
@@ -441,8 +461,14 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
         [
           E(
             'span',
-            { style: 'font-weight: bold; font-size: 12px;' },
-            `📱 ${_('Connected Devices')}: ${lanClients.length}`,
+            {
+              style:
+                'font-weight: 600; font-size: 12px; display: inline-flex; align-items: center; gap: 6px;',
+            },
+            [
+              renderSmartphoneIcon(14),
+              `${_('Connected Devices')}: ${lanClients.length}`,
+            ],
           ),
           renderButton({
             classNames: ['cbi-button-neutral'],
@@ -474,11 +500,13 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
                   style: 'display: flex; align-items: center; gap: 8px;',
                 },
                 [
-                  E('span', { style: 'font-size: 18px;' }, icon),
+                  E('span', { style: 'display: flex; align-items: center;' }, [
+                    icon,
+                  ]),
                   E('div', {}, [
                     E(
                       'div',
-                      { style: 'font-weight: bold; font-size: 12px;' },
+                      { style: 'font-weight: 600; font-size: 12px;' },
                       client.hostname,
                     ),
                     E(
@@ -500,11 +528,11 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
                     {
                       class: `label ${isDirect ? 'label-warning' : 'label-success'}`,
                       style:
-                        'font-size: 11px; padding: 3px 8px; border-radius: 4px;',
+                        'font-size: 11px; padding: 3px 8px; border-radius: 4px; display: inline-flex; align-items: center; gap: 5px;',
                     },
                     isDirect
-                      ? '🌐 ' + _('Direct WAN')
-                      : '🛡️ ' + _('Proxy / DPI'),
+                      ? [renderGlobeIcon(11), _('Direct WAN')]
+                      : [renderShieldIcon(11), _('Proxy / DPI')],
                   ),
                   renderButton({
                     classNames: [
@@ -568,7 +596,7 @@ export function renderAiDoctorModal(options: AiDoctorModalOptions): void {
               'div',
               {
                 style:
-                  'display: flex; justify-content: space-between; font-weight: bold; font-size: 11px; margin-bottom: 6px; opacity: 0.8;',
+                  'display: flex; justify-content: space-between; font-weight: 600; font-size: 11px; margin-bottom: 6px; opacity: 0.8;',
               },
               [
                 E('span', {}, `#${historyEntries.length - i}`),

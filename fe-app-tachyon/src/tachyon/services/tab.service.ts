@@ -24,7 +24,16 @@ class TabService {
   }
 
   private init() {
-    this.observer = new MutationObserver(() => this.handleMutations());
+    if (
+      typeof MutationObserver === 'undefined' ||
+      typeof document === 'undefined' ||
+      !document?.body
+    ) {
+      return;
+    }
+    this.observer = new MutationObserver((mutations) =>
+      this.handleMutations(mutations),
+    );
     this.observer.observe(document.body, {
       subtree: true,
       childList: true,
@@ -35,7 +44,39 @@ class TabService {
     this.notify();
   }
 
-  private handleMutations() {
+  private isTabMutation(mutations: MutationRecord[]): boolean {
+    for (const m of mutations) {
+      if (m.type === 'attributes') {
+        const el = m.target as HTMLElement;
+        if (
+          el.dataset?.tab !== undefined ||
+          el.classList?.contains('cbi-tab') ||
+          el.classList?.contains('cbi-tab-disabled')
+        ) {
+          return true;
+        }
+        continue;
+      }
+      for (let i = 0; i < m.addedNodes.length; i++) {
+        const node = m.addedNodes[i];
+        if (
+          node instanceof HTMLElement &&
+          (node.dataset?.tab !== undefined ||
+            node.classList?.contains('cbi-tab') ||
+            node.classList?.contains('cbi-tab-disabled') ||
+            node.querySelector?.('.cbi-tab, .cbi-tab-disabled') !== null)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private handleMutations(mutations: MutationRecord[]) {
+    if (!this.isTabMutation(mutations)) {
+      return;
+    }
     this.notify();
   }
 
@@ -81,3 +122,18 @@ class TabService {
 }
 
 export const TabServiceInstance = TabService.getInstance();
+
+let appShellNavActivator: ((navKey: string) => boolean) | null = null;
+
+export function registerAppShellNavActivator(
+  fn: ((navKey: string) => boolean) | null,
+): void {
+  appShellNavActivator = fn;
+}
+
+export function activateAppShellNavKey(navKey: string): boolean {
+  if (!navKey || typeof appShellNavActivator !== 'function') {
+    return false;
+  }
+  return appShellNavActivator(navKey);
+}

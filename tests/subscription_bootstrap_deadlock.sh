@@ -64,8 +64,8 @@ for (let t in targets)
 
 assert_eq "vpn1" "$(cat "$WORK_DIR/targets.out")" "subscription_download_targets should include vpn1"
 
-# 3. Test singbox config generator with deferred section
-printf 'Testing singbox config generator skips deferred section...\n'
+# 3. Test tachyon-core config generator with deferred section
+printf 'Testing tachyon-core config generator skips deferred section...\n'
 mkdir -p "$WORK_DIR/runtime"
 
 cat > "$WORK_DIR/fixture.json" <<'JSON'
@@ -141,6 +141,15 @@ const inbounds = (cfg.inbounds || []).map(i => i.tag);
 console.log("inbound tags:", JSON.stringify(inbounds));
 if (!inbounds.includes('service-subscription-vpn1-in')) {
   console.error("Generated config must include service-subscription-vpn1-in inbound for subscription download");
+  process.exit(1);
+}
+if (!inbounds.includes('service-mixed-in')) {
+  console.error("Generated config must retain service-mixed-in inbound for healthchecks and mixed proxy");
+  process.exit(1);
+}
+const mixedInb = (cfg.inbounds || []).find(i => i.tag === 'service-mixed-in');
+if (!mixedInb || mixedInb.listen_port !== 4534) {
+  console.error("service-mixed-in must listen on port 4534");
   process.exit(1);
 }
 console.log("CONFIG_VERIFIED_OK");

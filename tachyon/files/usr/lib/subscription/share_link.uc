@@ -34,11 +34,15 @@ function base64_encode(value) {
     return replace(b64enc(as_string(value)), /=+$/, "");
 }
 
-function host_port(server, port) {
+function uri_host(server) {
     server = as_string(server);
     if (index(server, ":") >= 0 && !starts_with(server, "["))
-        server = "[" + server + "]";
-    return server + ":" + as_string(port);
+        return "[" + server + "]";
+    return server;
+}
+
+function host_port(server, port) {
+    return uri_host(server) + ":" + as_string(port);
 }
 
 function hysteria2_server_port_entry(value) {
@@ -92,11 +96,17 @@ function add_xhttp_extra_query(params, transport) {
     for (let item in [
         ["xPaddingBytes", "x_padding_bytes"],
         ["noGRPCHeader", "no_grpc_header"],
+        ["noSSEHeader", "no_sse_header"],
         ["scMaxEachPostBytes", "sc_max_each_post_bytes"],
         ["scMinPostsIntervalMs", "sc_min_posts_interval_ms"],
+        ["scMaxBufferedPosts", "sc_max_buffered_posts"],
+        ["scMaxConcurrentPosts", "sc_max_concurrent_posts"],
+        ["serverMaxHeaderBytes", "server_max_header_bytes"],
         ["scStreamUpServerSecs", "sc_stream_up_server_secs"],
         ["sessionPlacement", "session_placement"],
         ["sessionKey", "session_key"],
+        ["sessionTable", "session_table"],
+        ["sessionLength", "session_length"],
         ["seqPlacement", "seq_placement"],
         ["seqKey", "seq_key"],
         ["uplinkDataPlacement", "uplink_data_placement"],
@@ -112,6 +122,9 @@ function add_xhttp_extra_query(params, transport) {
         if (transport[item[1]] != null)
             extra[item[0]] = transport[item[1]];
     }
+
+    if (type(transport.headers) == "object" && length(keys(transport.headers)) > 0)
+        extra.headers = transport.headers;
 
     if (type(transport.xmux) == "object") {
         let xmux = {};
@@ -147,6 +160,11 @@ function add_tls_query(params, outbound, trojan_default_tls) {
         add_query(params, "security", "reality");
         add_query(params, "pbk", reality.public_key);
         add_query(params, "sid", reality.short_id);
+        // The hybrid key share is a property of the server, so it has to
+        // survive a round trip through a share link: a link built from a
+        // config that has it must not silently lose it.
+        if (reality.support_x25519mlkem768 != null)
+            add_query(params, "support-x25519mlkem768", reality.support_x25519mlkem768 === true ? "1" : "0");
     }
     else {
         add_query(params, "security", "tls");
@@ -303,7 +321,17 @@ function serialize_hysteria2(outbound) {
     if (type(outbound.obfs) == "object") {
         add_query(params, "obfs", outbound.obfs.type);
         add_query(params, "obfs-password", outbound.obfs.password);
+        if (outbound.obfs.min_packet_size != null && int(outbound.obfs.min_packet_size) > 0)
+            add_query(params, "min_packet_size", outbound.obfs.min_packet_size);
+        if (outbound.obfs.max_packet_size != null && int(outbound.obfs.max_packet_size) > 0)
+            add_query(params, "max_packet_size", outbound.obfs.max_packet_size);
     }
+    if (outbound.up_mbps != null && int(outbound.up_mbps) > 0)
+        add_query(params, "upmbps", outbound.up_mbps);
+    if (outbound.down_mbps != null && int(outbound.down_mbps) > 0)
+        add_query(params, "downmbps", outbound.down_mbps);
+    if (as_string(outbound.hop_interval || "") != "")
+        add_query(params, "mport_hop", outbound.hop_interval);
 
     return "hysteria2://" + uri_encode(outbound.password) + "@" +
         host_port(outbound.server, port) + query_string(params) + fragment(outbound);
@@ -394,6 +422,303 @@ function serialize_vmess(outbound) {
     return encoded == "" ? "" : "vmess://" + encoded;
 }
 
+function serialize_anytls(outbound) {
+    if (as_string(outbound.password) == "" || as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let params = [];
+    add_tls_query(params, outbound, true);
+    if (outbound.min_idle_session != null)
+        add_query(params, "min_idle_session", outbound.min_idle_session);
+    if (as_string(outbound.idle_session_check_interval || "") != "")
+        add_query(params, "idle_session_check_interval", outbound.idle_session_check_interval);
+    if (as_string(outbound.idle_session_timeout || "") != "")
+        add_query(params, "idle_session_timeout", outbound.idle_session_timeout);
+    return "anytls://" + uri_encode(outbound.password) + "@" +
+        host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_naive(outbound) {
+    if (as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let scheme = outbound.quic === true ? "naive+quic" : "naive+https";
+    let auth = "";
+    if (as_string(outbound.username) != "") {
+        auth = uri_encode(outbound.username);
+        if (as_string(outbound.password) != "")
+            auth += ":" + uri_encode(outbound.password);
+        auth += "@";
+    }
+    let params = [];
+    if (type(outbound.tls) == "object") {
+        add_query(params, "sni", outbound.tls.server_name);
+        if (outbound.tls.insecure === true)
+            add_query(params, "insecure", "1");
+        add_cert_pin_query(params, outbound.tls);
+    }
+    if (as_string(outbound.quic_congestion_control || "") != "")
+        add_query(params, "quic_congestion_control", outbound.quic_congestion_control);
+    if (outbound.insecure_concurrency != null)
+        add_query(params, "insecure_concurrency", outbound.insecure_concurrency);
+    if (outbound.udp_over_tcp === true || (type(outbound.udp_over_tcp) == "object" && outbound.udp_over_tcp.enabled === true))
+        add_query(params, "uot", "1");
+    return scheme + "://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_snell(outbound) {
+    if (as_string(outbound.psk) == "" || as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let params = [];
+    if (outbound.version != null && int(outbound.version) != 5)
+        add_query(params, "version", outbound.version);
+    if (type(outbound.obfs) == "object" && as_string(outbound.obfs.mode || "") != "") {
+        add_query(params, "obfs", outbound.obfs.mode);
+        add_query(params, "obfs-host", outbound.obfs.host);
+    }
+    if (outbound.udp_over_tcp === true)
+        add_query(params, "uot", "1");
+    return "snell://" + uri_encode(outbound.psk) + "@" +
+        host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_mieru(outbound) {
+    let port_specs = [];
+    if (type(outbound.server_ports) == "array" && length(outbound.server_ports) > 0) {
+        for (let p in outbound.server_ports) {
+            let spec = replace(trim(as_string(p)), ":", "-");
+            if (spec != "")
+                push(port_specs, spec);
+        }
+    }
+    if (length(port_specs) == 0 && outbound.server_port != null) {
+        let sp = int(outbound.server_port);
+        if (sp >= 1 && sp <= 65535)
+            push(port_specs, as_string(sp));
+    }
+    if (as_string(outbound.username) == "" || as_string(outbound.password) == "" ||
+        as_string(outbound.server) == "" || length(port_specs) == 0)
+        return "";
+    let params = [];
+    let tag_val = as_string(outbound.tag || "");
+    if (tag_val != "")
+        add_query(params, "profile", tag_val);
+    for (let spec in port_specs)
+        add_query(params, "port", spec);
+    add_query(params, "protocol", uc(as_string(outbound.transport || "TCP")));
+    if (as_string(outbound.multiplexing || "") != "")
+        add_query(params, "multiplexing", outbound.multiplexing);
+    if (as_string(outbound.handshake_mode || "") != "")
+        add_query(params, "handshake-mode", outbound.handshake_mode);
+    if (as_string(outbound.traffic_pattern || "") != "")
+        add_query(params, "traffic-pattern", outbound.traffic_pattern);
+    let userinfo = uri_encode(outbound.username) + ":" + uri_encode(outbound.password);
+    return "mierus://" + userinfo + "@" + uri_host(outbound.server) + query_string(params) + fragment(outbound);
+}
+
+function serialize_mtproto(outbound) {
+    if (as_string(outbound.secret) == "" || as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let params = [];
+    add_query(params, "server", outbound.server);
+    add_query(params, "port", outbound.server_port);
+    add_query(params, "secret", outbound.secret);
+    return "tg://proxy" + query_string(params) + fragment(outbound);
+}
+
+function serialize_shadowtls(outbound) {
+    if (as_string(outbound.password) == "" || as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let params = [];
+    add_query(params, "version", outbound.version || 3);
+    add_tls_query(params, outbound, true);
+    return "shadowtls://" + uri_encode(outbound.password) + "@" +
+        host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_tewfai(outbound) {
+    if (as_string(outbound.uuid) == "" || as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let userinfo = uri_encode(outbound.uuid);
+    if (as_string(outbound.password || "") != "")
+        userinfo += ":" + uri_encode(outbound.password);
+    let params = [];
+    add_tls_query(params, outbound, true);
+    if (type(outbound.transport) == "array" && length(outbound.transport) > 0)
+        add_query(params, "transport", join(",", outbound.transport));
+    else if (type(outbound.transport) == "string" && outbound.transport != "")
+        add_query(params, "transport", outbound.transport);
+    add_query(params, "inner_cipher", outbound.inner_cipher);
+    add_query(params, "morph_profile", outbound.morph_profile);
+    if (outbound.pqc === true || (type(outbound.pqc) == "object" && outbound.pqc.enabled === true))
+        add_query(params, "pqc", "1");
+    if (outbound.handover === true || (type(outbound.handover) == "object" && outbound.handover.enabled !== false)) {
+        add_query(params, "handover", "1");
+        if (type(outbound.handover) == "object") {
+            if (int(outbound.handover.rotate_secs || 0) > 0)
+                add_query(params, "rotate_secs", as_string(outbound.handover.rotate_secs));
+            if (int(outbound.handover.rotate_mb || 0) > 0)
+                add_query(params, "rotate_mb", as_string(outbound.handover.rotate_mb));
+        }
+    }
+    if (outbound.fec === true || (type(outbound.fec) == "object" && outbound.fec.enabled === true))
+        add_query(params, "fec", "1");
+    if (outbound.desync === true || (type(outbound.desync) == "object" && outbound.desync.enabled === true))
+        add_query(params, "desync", "1");
+    if (type(outbound.shaper) == "object" && (outbound.shaper.enabled === true || outbound.shaper.mode != null)) {
+        add_query(params, "shaper", "1");
+        add_query(params, "shaper_profile", outbound.shaper.mode || outbound.shaper.profile);
+    }
+    if (int(outbound.mtu || 0) > 0)
+        add_query(params, "mtu", as_string(outbound.mtu));
+    return "tewfai://" + userinfo + "@" +
+        host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_trusttunnel(outbound) {
+    if (as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let auth = "";
+    if (as_string(outbound.username || "") != "") {
+        auth = uri_encode(outbound.username);
+        if (as_string(outbound.password || "") != "")
+            auth += ":" + uri_encode(outbound.password);
+        auth += "@";
+    } else if (as_string(outbound.password || "") != "") {
+        auth = uri_encode(outbound.password) + "@";
+    }
+    let params = [];
+    add_tls_query(params, outbound, true);
+    if (outbound.quic === true || outbound.quic == "true")
+        add_query(params, "quic", "1");
+    add_query(params, "quic_congestion_control", outbound.quic_congestion_control);
+    return "trusttunnel://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_masque(outbound) {
+    if (as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let auth = "";
+    if (as_string(outbound.username || "") != "") {
+        auth = uri_encode(outbound.username);
+        if (as_string(outbound.password || "") != "")
+            auth += ":" + uri_encode(outbound.password);
+        auth += "@";
+    } else if (as_string(outbound.private_key || "") != "") {
+        auth = uri_encode(outbound.private_key) + "@";
+    }
+    let params = [];
+    add_tls_query(params, outbound, true);
+    add_query(params, "profile", outbound.profile);
+    add_query(params, "vhttp", outbound.vhttp);
+    add_query(params, "public_key", outbound.public_key);
+    add_query(params, "ip", outbound.ip);
+    add_query(params, "ipv6", outbound.ipv6);
+    add_query(params, "uri", outbound.uri);
+    if (outbound.mtu != null)
+        add_query(params, "mtu", outbound.mtu);
+    return "masque://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_openconnect(outbound) {
+    if (as_string(outbound.server) == "" || outbound.server_port == null)
+        return "";
+    let auth = "";
+    if (as_string(outbound.username || "") != "") {
+        auth = uri_encode(outbound.username);
+        if (as_string(outbound.password || "") != "")
+            auth += ":" + uri_encode(outbound.password);
+        auth += "@";
+    } else if (as_string(outbound.password || "") != "") {
+        auth = uri_encode(outbound.password) + "@";
+    } else if (as_string(outbound.cookie || "") != "") {
+        auth = uri_encode(outbound.cookie) + "@";
+    }
+    let params = [];
+    add_tls_query(params, outbound, true);
+    add_query(params, "flavor", outbound.flavor);
+    add_query(params, "cookie", outbound.cookie);
+    add_query(params, "urlpath", outbound.urlpath);
+    add_query(params, "realm", outbound.realm);
+    add_query(params, "region", outbound.region);
+    add_query(params, "user_agent", outbound.user_agent);
+    add_query(params, "local_hostname", outbound.local_hostname);
+    add_query(params, "server_cert_pin", outbound.server_cert_pin);
+    add_query(params, "address", outbound.address);
+    add_query(params, "address_v6", outbound.address_v6);
+    if (outbound.ip === true)
+        add_query(params, "ip", "1");
+    if (outbound.esp === true)
+        add_query(params, "esp", "1");
+    if (outbound.dtls === true)
+        add_query(params, "dtls", "1");
+    if (outbound.hip_report === true)
+        add_query(params, "hip_report", "1");
+    if (outbound.mtu != null)
+        add_query(params, "mtu", outbound.mtu);
+    return "openconnect://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+}
+
+function serialize_wdtt(outbound) {
+    let server = as_string(outbound.server || "");
+    let pass = as_string(outbound.password || "");
+    if (server == "" || pass == "")
+        return "";
+    let mode = lc(as_string(outbound.mode || "wg"));
+    let port = int(outbound.server_port || ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000));
+    if (port < 1 || port > 65535)
+        port = (mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000;
+
+    if (mode == "csqtt" || mode == "csqtt_v1") {
+        let params = [];
+        add_query(params, "v", mode == "csqtt_v1" ? "1" : "2");
+        add_query(params, "host", server);
+        add_query(params, "peer", port);
+        add_query(params, "password", pass);
+        if (mode == "csqtt_v1")
+            add_query(params, "mode", "csqtt_v1");
+        if (type(outbound.hashes) == "string" && trim(outbound.hashes) != "")
+            add_query(params, "hashes", trim(outbound.hashes));
+        else if (type(outbound.hashes) == "array" && length(outbound.hashes) > 0) {
+            let enc = [];
+            for (let h in outbound.hashes) {
+                h = trim(as_string(h));
+                if (h != "")
+                    push(enc, uri_encode(h));
+            }
+            if (length(enc) > 0)
+                push(params, "hashes=" + join("+", enc));
+        }
+        add_query(params, "token", outbound.vk_token);
+        if (outbound.workers != null && int(outbound.workers) >= 1 && int(outbound.workers) <= 126)
+            add_query(params, "workers", int(outbound.workers));
+        add_query(params, "obfs", outbound.obfs);
+        add_query(params, "did", outbound.device_id);
+        add_query(params, "turn_transport", outbound.turn_transport);
+        return "csqtt://connect?" + join("&", params) + fragment(outbound);
+    }
+
+    let payload = {
+        v: 1,
+        ip: server,
+        dtls: port,
+        pass: pass
+    };
+    if (outbound.raw_port != null && int(outbound.raw_port) > 0)
+        payload.raw = int(outbound.raw_port);
+    if (mode != "" && mode != "wg")
+        payload.vpn = mode;
+    if (as_string(outbound.obfs || "") != "" && lc(as_string(outbound.obfs)) != "audio")
+        payload.obfs = outbound.obfs;
+    if (as_string(outbound.device_id || "") != "")
+        payload.did = outbound.device_id;
+    if (outbound.workers != null && int(outbound.workers) > 0)
+        payload.workers = int(outbound.workers);
+    if (type(outbound.hashes) == "string" && outbound.hashes != "")
+        payload.hash = outbound.hashes;
+    else if (type(outbound.hashes) == "array" && length(outbound.hashes) > 0)
+        payload.hash = join(",", outbound.hashes);
+    return "wdtt://" + base64_encode(sprintf("%J", payload)) + fragment(outbound);
+}
+
 function serialize_outbound_link(outbound) {
     if (type(outbound) != "object")
         return "";
@@ -415,6 +740,28 @@ function serialize_outbound_link(outbound) {
         return serialize_tuic(outbound);
     if (outbound_type == "vmess")
         return serialize_vmess(outbound);
+    if (outbound_type == "anytls")
+        return serialize_anytls(outbound);
+    if (outbound_type == "naive")
+        return serialize_naive(outbound);
+    if (outbound_type == "snell")
+        return serialize_snell(outbound);
+    if (outbound_type == "mieru")
+        return serialize_mieru(outbound);
+    if (outbound_type == "mtproto")
+        return serialize_mtproto(outbound);
+    if (outbound_type == "shadowtls")
+        return serialize_shadowtls(outbound);
+    if (outbound_type == "tewfai")
+        return serialize_tewfai(outbound);
+    if (outbound_type == "trusttunnel")
+        return serialize_trusttunnel(outbound);
+    if (outbound_type == "masque")
+        return serialize_masque(outbound);
+    if (outbound_type == "openconnect")
+        return serialize_openconnect(outbound);
+    if (outbound_type == "wdtt")
+        return serialize_wdtt(outbound);
     return "";
 }
 
@@ -424,8 +771,14 @@ function is_copyable_link(value) {
         "vless://", "vmess://", "trojan://", "ss://", "ssr://",
         "hysteria2://", "hy2://", "tuic://",
         "socks4://", "socks4a://", "socks5://",
-        "http://", "https://", "vpn://",
-        "fptn://", "fptnb://", "fptn:", "fptnb:"
+        "http://", "https://", "vpn://", "amneziawg://", "awg://",
+        "fptn://", "fptnb://", "fptn:", "fptnb:",
+        "anytls://", "naive+https://", "naive+quic://",
+        "snell://", "mieru://", "mierus://",
+        "tg://", "mtproto://", "shadowtls://",
+        "tewfai://", "trusttunnel://", "masque://",
+        "openconnect://", "anyconnect://",
+        "csqtt://", "wdtt://", "qwdtt://"
     ];
     for (let prefix in prefixes) {
         if (starts_with(value, prefix))

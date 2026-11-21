@@ -12,8 +12,269 @@
 
 const UCI_PACKAGE = main.TACHYON_UCI_PACKAGE;
 
-function isSingBoxDuration(value) {
+function _tr(ru, en) {
+  const envLang =
+    (typeof L !== "undefined" && L.env && L.env.lang) ||
+    (typeof window !== "undefined" &&
+      window.L &&
+      window.L.env &&
+      window.L.env.lang) ||
+    "";
+  const docLang = (
+    (typeof document !== "undefined" &&
+      document.documentElement &&
+      document.documentElement.lang) ||
+    (typeof document !== "undefined" &&
+      document.querySelector("html")?.getAttribute("lang")) ||
+    ""
+  ).toLowerCase();
+  const lang = (envLang || docLang).toLowerCase();
+  const isRu =
+    lang.startsWith("ru") ||
+    (typeof _ === "function" &&
+      (_("Status") === "Статус" ||
+        _("Overview") === "Обзор" ||
+        _("Save") === "Сохранить"));
+  return isRu ? ru : en;
+}
+
+function isCoreDuration(value) {
   return /^(?=.*[1-9])([0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h|d))+$/.test(value);
+}
+
+let cachedIpv6RuntimeInfo = null;
+let ipv6RuntimeInfoPromise = null;
+
+function fetchIpv6RuntimeInfo() {
+  if (cachedIpv6RuntimeInfo) {
+    return Promise.resolve(cachedIpv6RuntimeInfo);
+  }
+  if (ipv6RuntimeInfoPromise) {
+    return ipv6RuntimeInfoPromise;
+  }
+  ipv6RuntimeInfoPromise = fs
+    .exec("/usr/bin/tachyon", ["get_system_info"])
+    .then((res) => {
+      if (res && res.code === 0 && res.stdout) {
+        try {
+          cachedIpv6RuntimeInfo = JSON.parse(res.stdout);
+          return cachedIpv6RuntimeInfo;
+        } catch (_e) {}
+      }
+      return null;
+    })
+    .catch(() => null)
+    .finally(() => {
+      ipv6RuntimeInfoPromise = null;
+    });
+  return ipv6RuntimeInfoPromise;
+}
+
+function readSectionSetting(section, section_id, key, fallback) {
+  if (section && typeof section.formvalue === "function") {
+    const formVal = section.formvalue(section_id, key);
+    if (formVal !== undefined && formVal !== null && formVal !== "") {
+      return String(formVal);
+    }
+  }
+  const uciVal = uci.get(UCI_PACKAGE, section_id, key);
+  if (uciVal !== undefined && uciVal !== null && uciVal !== "") {
+    return String(uciVal);
+  }
+  return fallback;
+}
+
+function updateDnsIpv6OnlyWarningElement(el, value) {
+  if (!el) return;
+  el.style.display = value === "ipv6_only" ? "block" : "none";
+}
+
+function normalizeIpv6ModeUi(value) {
+  const v = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (
+    v === "off" ||
+    v === "ipv4_only" ||
+    v === "ipv4" ||
+    v === "0" ||
+    v === "false"
+  ) {
+    return "off";
+  }
+  if (v === "dual_stack" || v === "ipv4_ipv6" || v === "on" || v === "full") {
+    return "dual_stack";
+  }
+  if (v === "tunnel_over_v4" || v === "v6_over_v4") {
+    return "tunnel_over_v4";
+  }
+  return "auto";
+}
+
+function renderIpv6SummaryBannerContent(box, section, section_id) {
+  if (!box) return;
+  const ipv6Mode = normalizeIpv6ModeUi(
+    readSectionSetting(section, section_id, "ipv6_mode", "auto"),
+  );
+  const leakGuard =
+    readSectionSetting(section, section_id, "ipv6_leak_guard", "1") !== "0";
+  const fakeipEnabled =
+    readSectionSetting(section, section_id, "fakeip_enabled", "1") !== "0";
+  const fakeip6Range = readSectionSetting(
+    section,
+    section_id,
+    "fakeip_inet6_range",
+    "fc00::/18",
+  );
+  const dnsStrategy = readSectionSetting(
+    section,
+    section_id,
+    "dns_strategy",
+    "prefer_ipv4",
+  );
+
+  const modeLabels = {
+    off: _tr(
+      "Только IPv4 (без IPv6 на устройствах)",
+      "IPv4 Only (no IPv6 on LAN devices)",
+    ),
+    auto: _tr(
+      "IPv4 + IPv6: Авто (рекомендуется)",
+      "IPv4 + IPv6: Auto (Recommended)",
+    ),
+    dual_stack: _tr(
+      "IPv4 + IPv6: Двойной стек (Dual-Stack)",
+      "IPv4 + IPv6: Full Dual-Stack",
+    ),
+    tunnel_over_v4: _tr(
+      "IPv4 + IPv6: Через IPv4-туннель",
+      "IPv4 + IPv6: Over IPv4 Tunnel",
+    ),
+  };
+
+  while (box.firstChild) box.removeChild(box.firstChild);
+
+  const pills = E("div", {
+    style: "display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%;",
+  });
+
+  pills.appendChild(
+    E(
+      "span",
+      {
+        class:
+          "tachyon-ipv6-status-pill " +
+          (ipv6Mode === "off"
+            ? "tachyon-ipv6-status-pill"
+            : "tachyon-ipv6-status-pill--ok"),
+      },
+      `IPv6: ${modeLabels[ipv6Mode] || ipv6Mode}`,
+    ),
+  );
+
+  pills.appendChild(
+    E(
+      "span",
+      {
+        class:
+          "tachyon-ipv6-status-pill " +
+          (leakGuard
+            ? "tachyon-ipv6-status-pill--ok"
+            : "tachyon-ipv6-status-pill--warn"),
+      },
+      leakGuard
+        ? _tr("Защита от утечек IPv6: Активна", "IPv6 Leak Guard: Active")
+        : _tr("Защита от утечек IPv6: Выкл", "IPv6 Leak Guard: Off"),
+    ),
+  );
+
+  pills.appendChild(
+    E(
+      "span",
+      {
+        class:
+          "tachyon-ipv6-status-pill " +
+          (fakeipEnabled
+            ? "tachyon-ipv6-status-pill--ok"
+            : "tachyon-ipv6-status-pill"),
+      },
+      fakeipEnabled
+        ? `FakeIP: IPv4 + IPv6 (${fakeip6Range})`
+        : _tr("FakeIP: Выкл", "FakeIP: Off"),
+    ),
+  );
+
+  const info = cachedIpv6RuntimeInfo;
+  const infoWan6Pd =
+    info && Array.isArray(info.wan6_pd) && info.wan6_pd.length > 0
+      ? String(info.wan6_pd[0] || "")
+      : "";
+  const infoWan6Label =
+    (info && (info.wan6_prefix || infoWan6Pd || info.wan_ipv6)) || "";
+  if (info && infoWan6Label) {
+    const wanText =
+      info.wan6_prefix || infoWan6Pd
+        ? `WAN6 PD: ${info.wan6_prefix || infoWan6Pd}`
+        : `WAN6: ${info.wan_ipv6}`;
+    pills.appendChild(
+      E(
+        "span",
+        { class: "tachyon-ipv6-status-pill tachyon-ipv6-status-pill--ok" },
+        wanText,
+      ),
+    );
+  } else if (info) {
+    pills.appendChild(
+      E(
+        "span",
+        { class: "tachyon-ipv6-status-pill" },
+        _tr(
+          "WAN6: не обнаружен (только IPv4)",
+          "WAN6: not detected (IPv4 only)",
+        ),
+      ),
+    );
+  }
+
+  box.appendChild(pills);
+
+  if (ipv6Mode !== "off" && dnsStrategy === "ipv6_only") {
+    box.appendChild(
+      E(
+        "div",
+        {
+          class: "tachyon-ipv6-warning-banner",
+          style: "width:100%;margin-top:4px;",
+        },
+        _tr(
+          "Внимание: в настройках DNS выбрана стратегия «Только DNS IPv6 (AAAA)». Сайты без AAAA-записей и ресурсы при отсутствии сквозного IPv6 перестанут открываться.",
+          'Warning: DNS strategy is set to "IPv6 DNS only (AAAA)". Destinations without AAAA records or end-to-end IPv6 will fail to open.',
+        ),
+      ),
+    );
+  } else if (ipv6Mode === "off" && !leakGuard) {
+    box.appendChild(
+      E(
+        "div",
+        {
+          class: "tachyon-ipv6-warning-banner",
+          style: "width:100%;margin-top:4px;",
+        },
+        _tr(
+          "В режиме «Только IPv4» устройства в LAN не получают IPv6 и работают строго по IPv4. Рекомендуется оставлять «Защиту от утечек IPv6» включённой.",
+          "In IPv4 Only mode, LAN devices receive no IPv6 and work strictly over IPv4. Keeping IPv6 Leak Guard enabled is recommended.",
+        ),
+      ),
+    );
+  }
+}
+
+function refreshIpv6SummaryBanner(section, section_id) {
+  if (typeof document === "undefined") return;
+  const boxes = document.querySelectorAll('[data-tachyon-ipv6-summary="1"]');
+  boxes.forEach((box) => {
+    renderIpv6SummaryBannerContent(box, section, section_id);
+  });
 }
 
 function latencyTestUrlChoices() {
@@ -27,12 +288,179 @@ function validateLatencyTestUrl(value) {
   return validation.valid ? true : validation.message;
 }
 
+function renderFallbackCheckSvg(size = 12) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M20 6 9 17l-5-5");
+  svg.appendChild(path);
+  return svg;
+}
+
+function renderFallbackXSvg(size = 12) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M18 6 6 18M6 6l12 12");
+  svg.appendChild(path);
+  return svg;
+}
+
+function renderFallbackHourglassSvg(size = 12) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute(
+    "d",
+    "M5 22h14M5 2h14M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2",
+  );
+  svg.appendChild(path);
+  return svg;
+}
+
+function disablePasswordAutofill(option) {
+  if (!option || typeof option.renderWidget !== "function") return;
+  const origRenderWidget = option.renderWidget;
+  const origFormvalue = option.formvalue;
+  option.renderWidget = function (section_id, option_index, cfgvalue) {
+    const initialValue =
+      cfgvalue != null
+        ? String(cfgvalue)
+        : String(this.cfgvalue(section_id) || "");
+    const node = origRenderWidget.call(
+      this,
+      section_id,
+      option_index,
+      initialValue,
+    );
+    const applyAttrs = function (el) {
+      if (!el) return;
+      const input = el.querySelector ? el.querySelector("input") || el : el;
+      if (input && input.setAttribute) {
+        // Switch from type="password" to type="text" with CSS disc masking
+        // BEFORE the node enters the document so browser password managers
+        // (Chrome, Yandex, Safari, Firefox) never autofill the router root
+        // password on page load or after Save & Apply (map.reset()).
+        input.setAttribute("type", "text");
+        try {
+          input.type = "text";
+        } catch (_e) {}
+        input.style.webkitTextSecurity = "disc";
+        input.style.textSecurity = "disc";
+        input.dataset.masked = "1";
+        input.dataset.userEdited = "0";
+        input.dataset.initialValue = initialValue;
+        input.value = initialValue;
+        input.readOnly = true;
+        input.setAttribute("autocomplete", "off");
+        input.setAttribute("autocorrect", "off");
+        input.setAttribute("autocapitalize", "off");
+        input.setAttribute("spellcheck", "false");
+        input.setAttribute("data-form-type", "other");
+        input.setAttribute("data-lpignore", "true");
+        input.setAttribute("data-1p-ignore", "true");
+        input.setAttribute("data-bwignore", "true");
+
+        const unlockForUser = function () {
+          input.readOnly = false;
+        };
+        const markUserEdited = function () {
+          input.readOnly = false;
+          input.dataset.userEdited = "1";
+        };
+        input.addEventListener("mousedown", unlockForUser);
+        input.addEventListener("touchstart", unlockForUser, { passive: true });
+        input.addEventListener("focus", unlockForUser);
+        input.addEventListener("keydown", markUserEdited);
+        input.addEventListener("paste", markUserEdited);
+        input.addEventListener("drop", markUserEdited);
+        input.addEventListener("cut", markUserEdited);
+        input.addEventListener("input", function (ev) {
+          if (
+            input.dataset.userEdited !== "1" &&
+            (!ev || !ev.inputType || ev.inputType === "insertReplacementText")
+          ) {
+            input.value = input.dataset.initialValue || "";
+            return;
+          }
+          input.dataset.userEdited = "1";
+        });
+
+        const revealBtn =
+          el.querySelector && el.querySelector("button, .cbi-button");
+        if (revealBtn && !revealBtn.dataset.tachyonMaskBound) {
+          revealBtn.dataset.tachyonMaskBound = "1";
+          revealBtn.addEventListener(
+            "click",
+            function (ev) {
+              ev.preventDefault();
+              ev.stopImmediatePropagation();
+              const isMasked = input.dataset.masked !== "0";
+              input.dataset.masked = isMasked ? "0" : "1";
+              input.setAttribute("type", "text");
+              try {
+                input.type = "text";
+              } catch (_e) {}
+              input.style.webkitTextSecurity = isMasked ? "none" : "disc";
+              input.style.textSecurity = isMasked ? "none" : "disc";
+            },
+            true,
+          );
+        }
+      }
+    };
+    if (node instanceof Promise) {
+      return node.then(function (res) {
+        applyAttrs(res);
+        return res;
+      });
+    }
+    applyAttrs(node);
+    return node;
+  };
+  if (typeof origFormvalue === "function") {
+    option.formvalue = function (section_id) {
+      const val = origFormvalue.call(this, section_id);
+      if (typeof document !== "undefined") {
+        const id = "widget." + this.cbid(section_id);
+        const input = document.getElementById(id);
+        if (input && input.dataset && input.dataset.userEdited !== "1") {
+          return this.cfgvalue(section_id) || "";
+        }
+      }
+      return val;
+    };
+  }
+}
+
 function isDownloadSectionAction(action, capabilities) {
   switch (action) {
     case "connection":
     case "proxy":
     case "outbound":
     case "vpn":
+    case "group":
     case "fptn":
     case "awg":
     case "warp":
@@ -42,14 +470,11 @@ function isDownloadSectionAction(action, capabilities) {
     case "naive":
     case "sudoku":
     case "masque":
+    case "tewfai":
+    case "csqtt":
+    case "wdtt":
     case "openvpn":
       return true;
-    case "zapret":
-      return !capabilities?.loaded || Boolean(capabilities.zapretInstalled);
-    case "zapret2":
-      return !capabilities?.loaded || Boolean(capabilities.zapret2Installed);
-    case "byedpi":
-      return !capabilities?.loaded || Boolean(capabilities.byedpiInstalled);
     default:
       return false;
   }
@@ -71,6 +496,64 @@ function refreshDownloadSectionChoices(option, capabilities) {
       option.value(secName, sec.label || secName);
     }
   }
+}
+
+// Enabled sections with fail_policy=block, exactly as
+// kill_switch.is_fail_closed_section() counts them: these force some global
+// settings at runtime whatever is stored. A fail_policy left on a section that
+// never proxies (bypass, block, dns, hosts) does not count.
+function failClosedSectionNames() {
+  return (uci.sections(UCI_PACKAGE, "section") || [])
+    .filter(function (s) {
+      const enabled = `${s.enabled ?? ""}`.trim().toLowerCase() || "1";
+      const action = `${s.action ?? ""}`.trim().toLowerCase();
+      return (
+        ["1", "true", "yes", "on"].indexOf(enabled) >= 0 &&
+        ["bypass", "block", "dns", "hosts"].indexOf(action) < 0 &&
+        `${s.fail_policy || ""}`.trim().toLowerCase() === "block"
+      );
+    })
+    .map(function (s) {
+      return s.label || s[".name"];
+    });
+}
+
+// Show a setting that Fail-Closed forces at runtime as its effective value,
+// read-only, without touching the stored value.
+function showForcedByFailClosed(option, effective, note) {
+  const sections = failClosedSectionNames();
+  if (sections.length === 0) return;
+  option.readonly = true;
+  option.cfgvalue = function () {
+    return effective;
+  };
+  option.write = function () {};
+  option.remove = function () {};
+  option.description += " " + note.format(sections.join(", "));
+}
+
+// Ask before a change that would let Fail-Closed sections leak directly; on
+// "no" the widget goes back to the stored value and nothing is saved.
+function guardFailClosedChange(option, breaks, consequence) {
+  const previous = option.onchange;
+  option.onchange = function (ev, section_id, value) {
+    const sections = failClosedSectionNames();
+    if (
+      sections.length > 0 &&
+      breaks(value) &&
+      typeof window !== "undefined" &&
+      !window.confirm(
+        _(
+          "Fail-Closed is set in sections: %s. %s Their traffic could then leave directly. Change it anyway?",
+        ).format(sections.join(", "), consequence),
+      )
+    ) {
+      const el = this.getUIElement(section_id);
+      if (el) el.setValue(this.cfgvalue(section_id) ?? this.default);
+      return;
+    }
+    if (previous) return previous.apply(this, [ev, section_id, value]);
+  };
 }
 
 function configureDownloadSectionOption(option, sectionOption, capabilities) {
@@ -97,6 +580,50 @@ function configureDownloadSectionOption(option, sectionOption, capabilities) {
   };
   option.validate = function (_section_id, value) {
     return value ? true : _("Select a section");
+  };
+}
+
+function configureDefaultTunnelSectionOption(
+  option,
+  sectionOption,
+  capabilities,
+) {
+  option.default = "";
+  option.rmempty = true;
+  option.cfgvalue = function (section_id) {
+    return uci.get(UCI_PACKAGE, section_id, sectionOption) || "";
+  };
+  option.load = function (section_id) {
+    const sections = this.map?.data?.state?.values?.[UCI_PACKAGE] ?? {};
+    this.keylist = [""];
+    this.vallist = [
+      _tr(
+        "Автоматически (первая активная секция)",
+        "Auto (First available active section)",
+      ),
+    ];
+    for (const secName in sections) {
+      const sec = sections[secName];
+      if (
+        sec[".type"] === "section" &&
+        sec.enabled !== "0" &&
+        isDownloadSectionAction(sec.action, capabilities)
+      ) {
+        this.value(secName, sec.label || secName);
+      }
+    }
+    return this.cfgvalue(section_id);
+  };
+  option.write = function (section_id, value) {
+    const normalized = value ? `${value}`.trim() : "";
+    if (normalized) {
+      uci.set(UCI_PACKAGE, section_id, sectionOption, normalized);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, sectionOption);
+    }
+  };
+  option.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, sectionOption);
   };
 }
 
@@ -291,8 +818,8 @@ function configureDnsDuration(
   option.rmempty = false;
   option.validate = function (_section_id, value) {
     const normalized = `${value || ""}`.trim();
-    if (!normalized || !isSingBoxDuration(normalized)) {
-      return _("Use sing-box duration format like 10s, 1m or 2m30s");
+    if (!normalized || !isCoreDuration(normalized)) {
+      return _("Use duration format like 10s, 1m or 2m30s");
     }
     return true;
   };
@@ -361,7 +888,20 @@ function createWatchdogStatusWidget() {
     }
   }
 
-  function refreshWdStatus() {
+  let wdInFlight = false;
+  let wdHasMounted = false;
+  let wdLoadedOnce = false;
+
+  function refreshWdStatus(force) {
+    if (wdInFlight) return Promise.resolve();
+    if (
+      !force &&
+      (!wrapper.isConnected || wrapper.offsetParent === null || document.hidden)
+    ) {
+      return Promise.resolve();
+    }
+    wdInFlight = true;
+    wdLoadedOnce = true;
     return fs
       .exec("/usr/bin/tachyon", ["watchdog", "status"])
       .then(function (res) {
@@ -376,6 +916,9 @@ function createWatchdogStatusWidget() {
       .catch(function () {
         dot.style.background = "#aaa";
         statusText.textContent = _("Unknown");
+      })
+      .finally(function () {
+        wdInFlight = false;
       });
   }
 
@@ -385,7 +928,7 @@ function createWatchdogStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["watchdog_start"])
       .then(function () {
         msgEl.textContent = "";
-        return refreshWdStatus();
+        return refreshWdStatus(true);
       })
       .catch(function () {
         msgEl.textContent = _("Failed to start watchdog");
@@ -399,7 +942,7 @@ function createWatchdogStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["watchdog_stop"])
       .then(function () {
         msgEl.textContent = "";
-        return refreshWdStatus();
+        return refreshWdStatus(true);
       })
       .catch(function () {
         msgEl.textContent = _("Failed to stop watchdog");
@@ -412,16 +955,28 @@ function createWatchdogStatusWidget() {
   wrapper.appendChild(btnStop);
   wrapper.appendChild(msgEl);
 
-  refreshWdStatus();
+  let wdVisibilityObserver = null;
+  if (typeof IntersectionObserver !== "undefined") {
+    wdVisibilityObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !wdLoadedOnce) {
+        refreshWdStatus(true);
+      }
+    });
+    wdVisibilityObserver.observe(wrapper);
+  } else {
+    refreshWdStatus(true);
+  }
 
-  const wdTimer = setInterval(refreshWdStatus, 10000);
-  const wdObserver = new MutationObserver(function () {
-    if (!document.body.contains(wrapper)) {
+  const wdTimer = setInterval(function () {
+    if (wrapper.isConnected) {
+      wdHasMounted = true;
+    } else if (wdHasMounted) {
       clearInterval(wdTimer);
-      wdObserver.disconnect();
+      if (wdVisibilityObserver) wdVisibilityObserver.disconnect();
+      return;
     }
-  });
-  wdObserver.observe(document.body, { childList: true, subtree: true });
+    refreshWdStatus(false);
+  }, 10000);
 
   return wrapper;
 }
@@ -447,30 +1002,55 @@ function createResetSettingsWidget() {
     if (btnReset.disabled) return;
     btnReset.disabled = true;
     msgEl.textContent = _("Resetting\u2026");
+    try {
+      if (typeof uci !== "undefined" && typeof uci.unload === "function") {
+        uci.unload(UCI_PACKAGE);
+      }
+    } catch (_e) {}
+    const finishResetUi = function () {
+      msgEl.textContent = "";
+      ui.addNotification(
+        null,
+        E(
+          "p",
+          {},
+          _("Settings have been reset to defaults. The page will reload."),
+        ),
+        "info",
+      );
+      setTimeout(function () {
+        location.reload();
+      }, 1500);
+    };
     fs.exec("/usr/bin/tachyon", ["reset_settings"])
       .then(function (res) {
         let success = false;
         try {
-          success = JSON.parse((res && res.stdout) || "").success !== false;
+          const raw = String((res && res.stdout) || "").trim();
+          const jsonLines = raw
+            .split(/\r?\n/)
+            .map(function (line) {
+              return line.trim();
+            })
+            .filter(function (line) {
+              return line.startsWith("{") && line.endsWith("}");
+            });
+          const payload = JSON.parse(
+            jsonLines[jsonLines.length - 1] || raw || "",
+          );
+          success = Boolean(payload && payload.success !== false);
         } catch (e) {
           success = false;
         }
         if (!success) throw new Error("reset failed");
-        msgEl.textContent = "";
-        ui.addNotification(
-          null,
-          E(
-            "p",
-            {},
-            _("Settings have been reset to defaults. The page will reload."),
-          ),
-          "info",
-        );
-        setTimeout(function () {
-          location.reload();
-        }, 1500);
+        finishResetUi();
       })
-      .catch(function () {
+      .catch(function (err) {
+        const msg = `${String((err && err.name) || "")} ${String((err && err.message) || err || "")}`;
+        if (/TimeoutError|timed out|NetworkError|Failed to fetch/i.test(msg)) {
+          finishResetUi();
+          return;
+        }
         msgEl.textContent = _("Failed to reset settings");
         btnReset.disabled = false;
       });
@@ -526,7 +1106,7 @@ function createResetSettingsWidget() {
 function createSnapshotsWidget() {
   const wrapper = E("div", {
     id: "tachyon-snapshots-widget",
-    style: "display:flex;flex-direction:column;gap:8px;padding:4px 0;",
+    class: "tachyon-snapshots-widget",
   });
 
   const btnSave = E("button", {
@@ -541,8 +1121,20 @@ function createSnapshotsWidget() {
   });
   btnImport.textContent = _("Import Profile");
 
+  const btnCopyCode = E("button", {
+    class: "btn cbi-button cbi-button-action",
+    type: "button",
+  });
+  btnCopyCode.textContent = _("Copy Transfer Code");
+
+  const btnPasteCode = E("button", {
+    class: "btn cbi-button cbi-button-neutral",
+    type: "button",
+  });
+  btnPasteCode.textContent = _("Paste Transfer Code");
+
   const listEl = E("div", {
-    style: "display:flex;flex-direction:column;gap:6px;",
+    class: "tachyon-snapshots-list tachyon-snapshots-list--empty",
   });
 
   function formatStamp(stamp) {
@@ -555,9 +1147,9 @@ function createSnapshotsWidget() {
 
   function formatSize(size) {
     if (size == null) return "";
-    if (size >= 1048576) return (size / 1048576).toFixed(1) + " MB";
-    if (size >= 1024) return Math.round(size / 1024) + " KB";
-    return size + " B";
+    if (size >= 1048576) return (size / 1048576).toFixed(1) + " " + _("MB");
+    if (size >= 1024) return Math.round(size / 1024) + " " + _("KB");
+    return size + " " + _("B");
   }
 
   function execSnapshotJson(args) {
@@ -650,8 +1242,71 @@ function createSnapshotsWidget() {
       });
   }
 
+  function readExportFileChunked() {
+    let acc = "";
+    const step = 32768;
+    function nextChunk(offset) {
+      return execSnapshotJson([
+        "snapshot_export",
+        "read-chunk:" + String(offset) + ":" + String(step),
+      ]).then(function (res) {
+        const piece = typeof res.chunk === "string" ? res.chunk : "";
+        acc += piece;
+        if (res.eof || !piece) {
+          const parsed = JSON.parse(acc.trim());
+          const prof = parsed && parsed.profile ? parsed.profile : parsed;
+          if (!prof || prof.format !== "tachyon-profile-v1") {
+            throw new Error("invalid_export_profile");
+          }
+          return { success: true, profile: prof };
+        }
+        return nextChunk(offset + piece.length);
+      });
+    }
+    return nextChunk(0);
+  }
+
+  function readExportFallbackFile(err) {
+    return fs
+      .read("/tmp/tachyon-snapshot-export.json")
+      .catch(function () {
+        return fs.read("/var/run/tachyon/ui-state/snapshot-export.json");
+      })
+      .catch(function () {
+        return typeof fs.read_direct === "function"
+          ? fs.read_direct("/tmp/tachyon-snapshot-export.json", "text")
+          : Promise.reject(err);
+      })
+      .then(function (raw) {
+        const parsed =
+          raw && typeof raw === "object"
+            ? raw
+            : JSON.parse(String(raw || "").trim());
+        const prof = parsed && parsed.profile ? parsed.profile : parsed;
+        if (!prof || prof.format !== "tachyon-profile-v1") {
+          throw err;
+        }
+        return { success: true, profile: prof };
+      })
+      .catch(function () {
+        return readExportFileChunked();
+      });
+  }
+
   function performExport(snap) {
     execSnapshotJson(["snapshot_export", snap.file])
+      .then(function (data) {
+        if (
+          data &&
+          (data.chunked_export || (data.profile && data.profile.chunked_export))
+        ) {
+          return readExportFallbackFile(new Error("chunked_export"));
+        }
+        return data;
+      })
+      .catch(function (err) {
+        return readExportFallbackFile(err);
+      })
       .then(function (data) {
         const payload = JSON.stringify(data.profile || data, null, 2);
         const blob = new Blob([payload], { type: "application/json" });
@@ -720,6 +1375,7 @@ function createSnapshotsWidget() {
 
   function loadSnapshots() {
     listEl.innerHTML = "";
+    listEl.className = "tachyon-snapshots-list tachyon-snapshots-list--empty";
     fs.exec("/usr/bin/tachyon", ["snapshot_list"])
       .then(function (res) {
         let snapshots = [];
@@ -735,32 +1391,75 @@ function createSnapshotsWidget() {
             E(
               "span",
               {
-                style: "font-size:12px;color:var(--text-color-medium,#888);",
+                class: "tachyon-snapshots-hint",
               },
               _("No snapshots yet"),
             ),
           );
           return;
         }
+        listEl.className = "tachyon-snapshots-list";
         snapshots.forEach(function (snap) {
+          const snapName = String(snap.name || "");
+          const isHexId = /^[0-9a-f]{8}$/.test(snapName);
           const row = E("div", {
-            style:
-              "display:flex;align-items:center;gap:10px;padding:2px 0;flex-wrap:wrap;",
+            class: "tachyon-snapshot-row",
           });
           row.appendChild(
-            E("span", { style: "font-weight:bold;" }, snap.name || ""),
+            E(
+              "span",
+              {
+                class:
+                  "tachyon-snapshot-name" +
+                  (isHexId ? " tachyon-snapshot-name--id" : ""),
+                title: snapName,
+              },
+              snapName,
+            ),
           );
           row.appendChild(
             E(
               "span",
               {
-                style: "font-size:12px;color:var(--text-color-medium,#888);",
+                class: "tachyon-snapshot-meta",
               },
               formatStamp(snap.stamp) +
                 (snap.size != null ? " \u00b7 " + formatSize(snap.size) : ""),
             ),
           );
-          row.appendChild(
+
+          const badgesWrap = E("div", {
+            class: "tachyon-snapshot-badges",
+          });
+          const components = Array.isArray(snap.components)
+            ? snap.components
+            : [];
+          components.forEach(function (comp) {
+            if (!comp || typeof comp !== "object") return;
+            const cName = String(comp.name || "").trim();
+            const cVer = String(comp.version || "").trim();
+            if (!cName || !cVer) return;
+            const isPrimary =
+              String(comp.id || "").toLowerCase() === "tachyon" ||
+              cName.toLowerCase() === "tachyon";
+            badgesWrap.appendChild(
+              E(
+                "span",
+                {
+                  class:
+                    "tachyon-snapshot-badge" +
+                    (isPrimary ? " tachyon-snapshot-badge--primary" : ""),
+                },
+                cName + " " + cVer,
+              ),
+            );
+          });
+          row.appendChild(badgesWrap);
+
+          const actionsWrap = E("div", {
+            class: "tachyon-snapshot-actions",
+          });
+          actionsWrap.appendChild(
             E(
               "button",
               {
@@ -773,7 +1472,7 @@ function createSnapshotsWidget() {
               _("Diff"),
             ),
           );
-          row.appendChild(
+          actionsWrap.appendChild(
             E(
               "button",
               {
@@ -786,7 +1485,7 @@ function createSnapshotsWidget() {
               _("Export"),
             ),
           );
-          row.appendChild(
+          actionsWrap.appendChild(
             E(
               "button",
               {
@@ -803,7 +1502,7 @@ function createSnapshotsWidget() {
                           "This will replace the current Tachyon settings with the snapshot",
                         ) +
                           ": \u201c" +
-                          (snap.name || "") +
+                          snapName +
                           "\u201d. The service will restart.",
                       ),
                       E("div", { class: "button-row" }, [
@@ -839,7 +1538,7 @@ function createSnapshotsWidget() {
               _("Restore"),
             ),
           );
-          row.appendChild(
+          actionsWrap.appendChild(
             E(
               "button",
               {
@@ -854,7 +1553,7 @@ function createSnapshotsWidget() {
                         {},
                         _("Delete the snapshot") +
                           ": \u201c" +
-                          (snap.name || "") +
+                          snapName +
                           "\u201d?",
                       ),
                       E("div", { class: "button-row" }, [
@@ -890,15 +1589,18 @@ function createSnapshotsWidget() {
               _("Delete"),
             ),
           );
+          row.appendChild(actionsWrap);
           listEl.appendChild(row);
         });
       })
       .catch(function () {
+        listEl.className =
+          "tachyon-snapshots-list tachyon-snapshots-list--empty";
         listEl.appendChild(
           E(
             "span",
             {
-              style: "font-size:12px;color:var(--text-color-medium,#888);",
+              class: "tachyon-snapshots-hint",
             },
             _("Failed to load snapshots"),
           ),
@@ -913,7 +1615,36 @@ function createSnapshotsWidget() {
       style: "width:100%;",
       maxlength: 64,
     });
-    input.placeholder = _("Snapshot name");
+    input.placeholder = _("Snapshot name (optional)");
+
+    function submitSaveSnapshot() {
+      const name = (input.value || "").trim();
+      ui.hideModal();
+      execSnapshot(["snapshot_save", name])
+        .then(function () {
+          loadSnapshots();
+        })
+        .catch(function (err) {
+          ui.addNotification(
+            null,
+            E(
+              "p",
+              {},
+              _("Failed to save snapshot") +
+                (err && err.message ? ": " + err.message : ""),
+            ),
+            "error",
+          );
+        });
+    }
+
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        submitSaveSnapshot();
+      }
+    });
+
     ui.showModal(
       _("Save Snapshot"),
       [
@@ -921,7 +1652,7 @@ function createSnapshotsWidget() {
           "p",
           {},
           _(
-            "Give the snapshot a name. It is saved with the current date and can be restored from this list later.",
+            "Enter a snapshot name or leave the field empty to assign a unique random ID automatically.",
           ),
         ),
         input,
@@ -942,22 +1673,7 @@ function createSnapshotsWidget() {
             {
               class: "btn cbi-button cbi-button-positive",
               type: "button",
-              click: function () {
-                const name = (input.value || "").trim();
-                if (!name) return;
-                ui.hideModal();
-                execSnapshot(["snapshot_save", name])
-                  .then(function () {
-                    loadSnapshots();
-                  })
-                  .catch(function () {
-                    ui.addNotification(
-                      null,
-                      E("p", {}, _("Failed to save snapshot")),
-                      "error",
-                    );
-                  });
-              },
+              click: submitSaveSnapshot,
             },
             _("Save"),
           ),
@@ -965,14 +1681,25 @@ function createSnapshotsWidget() {
       ],
       "cbi-modal",
     );
+    setTimeout(function () {
+      try {
+        input.focus();
+      } catch (_e) {
+        // ignore focus errors
+      }
+    }, 30);
   });
 
   btnImport.addEventListener("click", function () {
+    let loadedFileText = "";
     const textarea = E("textarea", {
       class: "cbi-input-textarea",
       style:
         "width:100%;min-height:140px;font-family:monospace;font-size:12px;",
       placeholder: '{"format": "tachyon-profile-v1", ...}',
+    });
+    textarea.addEventListener("input", function () {
+      loadedFileText = "";
     });
     const fileInput = E("input", {
       type: "file",
@@ -984,10 +1711,56 @@ function createSnapshotsWidget() {
       if (!f) return;
       const reader = new FileReader();
       reader.onload = function (ev) {
-        textarea.value = String((ev && ev.target && ev.target.result) || "");
+        const text = String((ev && ev.target && ev.target.result) || "");
+        loadedFileText = text;
+        textarea.value =
+          text.length > 65536
+            ? text.slice(0, 4096) +
+              "\n... (" +
+              Math.round(text.length / 1024) +
+              " KB)"
+            : text;
       };
       reader.readAsText(f);
     });
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    function uploadImportChunks(rawText, tmpImportPath) {
+      const bytes =
+        typeof TextEncoder !== "undefined"
+          ? new TextEncoder().encode(rawText)
+          : new Uint8Array(
+              Array.from(unescape(encodeURIComponent(rawText))).map((ch) =>
+                ch.charCodeAt(0),
+              ),
+            );
+      const chunkByteSize = 24576; // Multiple of 3 bytes -> 32768 base64 chars
+      return execSnapshot(["snapshot_import", "chunk-init"])
+        .then(function () {
+          let chain = Promise.resolve();
+          for (let offset = 0; offset < bytes.length; offset += chunkByteSize) {
+            const slice = bytes.subarray(
+              offset,
+              Math.min(bytes.length, offset + chunkByteSize),
+            );
+            const b64 = bytesToBase64(slice);
+            chain = chain.then(function () {
+              return execSnapshot(["snapshot_import", "chunk-append:" + b64]);
+            });
+          }
+          return chain;
+        })
+        .then(function () {
+          return execSnapshot(["snapshot_import", tmpImportPath]);
+        });
+    }
 
     ui.showModal(
       _("Import Snapshot Profile"),
@@ -1019,10 +1792,48 @@ function createSnapshotsWidget() {
               class: "btn cbi-button cbi-button-positive",
               type: "button",
               click: function () {
-                const raw = (textarea.value || "").trim();
+                const raw = (loadedFileText || textarea.value || "").trim();
                 if (!raw) return;
                 ui.hideModal();
-                execSnapshot(["snapshot_import", raw])
+                const tmpImportPath = "/tmp/tachyon-snapshot-import.json";
+                const buildSlimPayload = function (text) {
+                  try {
+                    const obj = JSON.parse(text);
+                    const prof = obj && obj.profile ? obj.profile : obj;
+                    if (
+                      prof &&
+                      prof.format === "tachyon-profile-v1" &&
+                      typeof prof.config_text === "string" &&
+                      prof.config_text.trim() !== "" &&
+                      typeof prof.archive_base64 === "string" &&
+                      prof.archive_base64.length > 65536
+                    ) {
+                      return JSON.stringify(
+                        Object.assign({}, prof, { archive_base64: "" }),
+                      );
+                    }
+                  } catch (_e) {}
+                  return text;
+                };
+                uploadImportChunks(raw, tmpImportPath)
+                  .catch(function () {
+                    return fs
+                      .write(tmpImportPath, raw)
+                      .catch(function () {
+                        const slim = buildSlimPayload(raw);
+                        if (slim !== raw) {
+                          return fs.write(tmpImportPath, slim);
+                        }
+                        throw new Error("write_failed");
+                      })
+                      .then(function () {
+                        return execSnapshot(["snapshot_import", tmpImportPath]);
+                      });
+                  })
+                  .catch(function () {
+                    const slim = buildSlimPayload(raw);
+                    return execSnapshot(["snapshot_import", slim]);
+                  })
                   .then(function () {
                     loadSnapshots();
                   })
@@ -1043,30 +1854,639 @@ function createSnapshotsWidget() {
     );
   });
 
+  function formatTransferCountsSummary(counts, sectionNames) {
+    if (!counts || typeof counts !== "object") return "";
+    const parts = [];
+    parts.push(_("Sections") + ": " + String(counts.sections || 0));
+    parts.push(_("Nodes") + ": " + String(counts.servers || 0));
+    if (counts.sources) {
+      parts.push(_("Subscriptions") + ": " + String(counts.sources));
+    }
+    if (counts.balancers) {
+      parts.push(_("Balancers") + ": " + String(counts.balancers));
+    }
+    if (counts.conditions) {
+      parts.push(_("Conditions") + ": " + String(counts.conditions));
+    }
+    if (counts.files) {
+      parts.push(_("Files") + ": " + String(counts.files));
+    }
+    let summaryText = parts.join(" \u00b7 ");
+    if (Array.isArray(sectionNames) && sectionNames.length > 0) {
+      summaryText +=
+        " (" +
+        sectionNames.slice(0, 6).join(", ") +
+        (sectionNames.length > 6 ? "\u2026" : "") +
+        ")";
+    }
+    return summaryText;
+  }
+
+  function uploadCodeBufferIfNeeded(rawCode) {
+    const clean = (rawCode || "").trim();
+    if (clean.length <= 8192) {
+      return Promise.resolve(clean);
+    }
+    const tmpImportPath = "/tmp/tachyon-snapshot-import.json";
+    const bytes =
+      typeof TextEncoder !== "undefined"
+        ? new TextEncoder().encode(clean)
+        : new Uint8Array(
+            Array.from(unescape(encodeURIComponent(clean))).map((ch) =>
+              ch.charCodeAt(0),
+            ),
+          );
+    const chunkByteSize = 24576;
+    return execSnapshot(["snapshot_import", "chunk-init"])
+      .then(function () {
+        let chain = Promise.resolve();
+        for (let offset = 0; offset < bytes.length; offset += chunkByteSize) {
+          const slice = bytes.subarray(
+            offset,
+            Math.min(bytes.length, offset + chunkByteSize),
+          );
+          let binary = "";
+          for (let i = 0; i < slice.length; i++) {
+            binary += String.fromCharCode(slice[i]);
+          }
+          const b64 = btoa(binary);
+          chain = chain.then(function () {
+            return execSnapshot(["snapshot_import", "chunk-append:" + b64]);
+          });
+        }
+        return chain;
+      })
+      .then(function () {
+        return tmpImportPath;
+      });
+  }
+
+  btnCopyCode.addEventListener("click", function () {
+    let currentScope = "routes";
+    let currentCode = "";
+
+    const radioRoutes = E("input", {
+      type: "radio",
+      name: "tachyon-transfer-scope",
+      value: "routes",
+      checked: "checked",
+    });
+
+    const radioFull = E("input", {
+      type: "radio",
+      name: "tachyon-transfer-scope",
+      value: "full",
+    });
+
+    const summaryEl = E(
+      "div",
+      {
+        style:
+          "font-size:12px;color:var(--text-color-medium,#888);margin:4px 0;",
+      },
+      _("Generating transfer code..."),
+    );
+
+    const codeArea = E("textarea", {
+      class: "cbi-input-textarea",
+      readonly: "readonly",
+      style:
+        "width:100%;min-height:56px;font-family:monospace;font-size:13px;word-break:break-all;",
+      placeholder: "tachyon://cfg1/...",
+    });
+
+    function loadCodeForScope(scope) {
+      currentScope = scope;
+      currentCode = "";
+      codeArea.value = "";
+      summaryEl.textContent = _("Generating transfer code...");
+      execSnapshotJson(["snapshot_export", "code:" + scope])
+        .then(function (data) {
+          if (data && data.chunked_export) {
+            return readExportFallbackFile(new Error("chunked_export")).then(
+              function (fb) {
+                const prof = (fb && fb.profile) || fb || {};
+                return {
+                  code: prof.transfer_code || prof.code || "",
+                  counts: prof.counts || data.counts,
+                  section_names: prof.section_names || data.section_names,
+                };
+              },
+            );
+          }
+          return data;
+        })
+        .catch(function (err) {
+          return readExportFallbackFile(err).then(function (fb) {
+            const prof = (fb && fb.profile) || fb || {};
+            return {
+              code: prof.transfer_code || prof.code || "",
+              counts: prof.counts,
+              section_names: prof.section_names,
+            };
+          });
+        })
+        .then(function (res) {
+          currentCode = String((res && res.code) || "").trim();
+          codeArea.value = currentCode;
+          const summaryStr = formatTransferCountsSummary(
+            res && res.counts,
+            res && res.section_names,
+          );
+          summaryEl.textContent =
+            summaryStr +
+            (currentCode
+              ? " \u00b7 " + String(currentCode.length) + " " + _("chars")
+              : "");
+        })
+        .catch(function () {
+          summaryEl.textContent = _("Failed to generate transfer code");
+        });
+    }
+
+    radioRoutes.addEventListener("change", function () {
+      if (radioRoutes.checked && currentScope !== "routes") {
+        loadCodeForScope("routes");
+      }
+    });
+    radioFull.addEventListener("change", function () {
+      if (radioFull.checked && currentScope !== "full") {
+        loadCodeForScope("full");
+      }
+    });
+
+    ui.showModal(
+      _("Copy Transfer Code"),
+      [
+        E(
+          "p",
+          { style: "margin-bottom:8px;" },
+          _(
+            "Copy a compact transfer code to move routes or the entire configuration to another router.",
+          ),
+        ),
+        E(
+          "div",
+          {
+            style:
+              "display:flex;flex-direction:column;gap:6px;margin-bottom:8px;",
+          },
+          [
+            E(
+              "label",
+              {
+                style:
+                  "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;",
+              },
+              [
+                radioRoutes,
+                E(
+                  "span",
+                  {},
+                  _(
+                    "Routes only (sections, nodes, subscriptions, balancers, conditions)",
+                  ),
+                ),
+              ],
+            ),
+            E(
+              "label",
+              {
+                style:
+                  "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;",
+              },
+              [
+                radioFull,
+                E(
+                  "span",
+                  {},
+                  _("Full configuration (including system settings)"),
+                ),
+              ],
+            ),
+          ],
+        ),
+        summaryEl,
+        codeArea,
+        E("div", { class: "button-row" }, [
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-neutral",
+              type: "button",
+              click: function () {
+                ui.hideModal();
+              },
+            },
+            _("Close"),
+          ),
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-action",
+              type: "button",
+              click: function () {
+                const textToCopy = (currentCode || codeArea.value || "").trim();
+                if (!textToCopy) return;
+                const payload = JSON.stringify(
+                  {
+                    format: "tachyon-transfer-v1",
+                    scope: currentScope,
+                    created_at: new Date().toISOString(),
+                    code: textToCopy,
+                  },
+                  null,
+                  2,
+                );
+                const blob = new Blob([payload], {
+                  type: "application/json;charset=utf-8",
+                });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download =
+                  currentScope === "routes"
+                    ? "tachyon-routes.json"
+                    : "tachyon-config.json";
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(function () {
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                }, 100);
+              },
+            },
+            _("Download File (.json)"),
+          ),
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-positive",
+              type: "button",
+              click: function () {
+                const textToCopy = (currentCode || codeArea.value || "").trim();
+                if (!textToCopy) return;
+                const onCopied = function () {
+                  ui.addNotification(
+                    null,
+                    E("p", {}, _("Transfer code copied to clipboard")),
+                    "info",
+                  );
+                };
+                if (
+                  navigator.clipboard &&
+                  typeof navigator.clipboard.writeText === "function"
+                ) {
+                  navigator.clipboard
+                    .writeText(textToCopy)
+                    .then(onCopied)
+                    .catch(function () {
+                      codeArea.focus();
+                      codeArea.select();
+                      document.execCommand("copy");
+                      onCopied();
+                    });
+                } else {
+                  codeArea.focus();
+                  codeArea.select();
+                  document.execCommand("copy");
+                  onCopied();
+                }
+              },
+            },
+            _("Copy to Clipboard"),
+          ),
+        ]),
+      ],
+      "cbi-modal",
+    );
+
+    loadCodeForScope("routes");
+  });
+
+  btnPasteCode.addEventListener("click", function () {
+    let applyMode = "replace";
+    let inspectedSource = "";
+    let inspectPromise = null;
+    let inspectTimer = null;
+
+    function normalizeTransferInput(rawText) {
+      const trimmed = (rawText || "").trim();
+      if (trimmed.indexOf("{") === 0) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === "object") {
+            if (typeof parsed.code === "string" && parsed.code.trim()) {
+              return parsed.code.trim();
+            }
+            if (
+              typeof parsed.transfer_code === "string" &&
+              parsed.transfer_code.trim()
+            ) {
+              return parsed.transfer_code.trim();
+            }
+          }
+        } catch (_e) {
+          // Keep original string if JSON parse fails
+        }
+      }
+      return trimmed;
+    }
+
+    const codeInput = E("textarea", {
+      class: "cbi-input-textarea",
+      style:
+        "width:100%;min-height:56px;font-family:monospace;font-size:13px;word-break:break-all;",
+      placeholder: "tachyon://cfg1/...",
+    });
+
+    const transferFileInput = E("input", {
+      type: "file",
+      accept: ".json,.txt,application/json,text/plain",
+      style: "display:none;",
+    });
+
+    const previewBox = E(
+      "div",
+      {
+        style:
+          "padding:8px 10px;border-radius:4px;border:1px solid var(--border-color,#dee2e6);background:var(--background-color-low,#f8f9fa);font-size:12px;margin:8px 0;",
+      },
+      _("Paste a tachyon://cfg1/... code above to preview its contents."),
+    );
+
+    const radioReplace = E("input", {
+      type: "radio",
+      name: "tachyon-transfer-apply-mode",
+      value: "replace",
+      checked: "checked",
+    });
+
+    const radioMerge = E("input", {
+      type: "radio",
+      name: "tachyon-transfer-apply-mode",
+      value: "merge",
+    });
+
+    radioReplace.addEventListener("change", function () {
+      if (radioReplace.checked) applyMode = "replace";
+    });
+    radioMerge.addEventListener("change", function () {
+      if (radioMerge.checked) applyMode = "merge";
+    });
+
+    function runInspect(rawText) {
+      const clean = normalizeTransferInput(rawText);
+      if (!clean) {
+        inspectedSource = "";
+        inspectPromise = null;
+        previewBox.textContent = _(
+          "Paste a tachyon://cfg1/... code above to preview its contents.",
+        );
+        return;
+      }
+      previewBox.textContent = _("Checking transfer code...");
+      const uploadReq = uploadCodeBufferIfNeeded(clean);
+      inspectPromise = uploadReq;
+      uploadReq
+        .then(function (argTarget) {
+          inspectedSource = argTarget;
+          return execSnapshotJson([
+            "snapshot_import",
+            "code-inspect:" + argTarget,
+          ]);
+        })
+        .then(function (info) {
+          const scopeLabel =
+            info && info.scope === "full"
+              ? _("Full configuration")
+              : _("Routes only");
+          const summaryStr = formatTransferCountsSummary(
+            info && info.counts,
+            info && info.section_names,
+          );
+          previewBox.innerHTML = "";
+          previewBox.appendChild(
+            E(
+              "div",
+              { style: "font-weight:600;margin-bottom:2px;" },
+              _("Code type") + ": " + scopeLabel,
+            ),
+          );
+          previewBox.appendChild(E("div", {}, summaryStr));
+        })
+        .catch(function (err) {
+          inspectedSource = "";
+          inspectPromise = null;
+          previewBox.textContent =
+            _("Invalid transfer code") +
+            (err && err.message ? ": " + err.message : "");
+        });
+    }
+
+    transferFileInput.addEventListener("change", function () {
+      const file = transferFileInput.files && transferFileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function () {
+        const text = normalizeTransferInput(String(reader.result || ""));
+        codeInput.value = text;
+        inspectedSource = "";
+        inspectPromise = null;
+        if (inspectTimer) clearTimeout(inspectTimer);
+        runInspect(text);
+      };
+      reader.readAsText(file);
+      transferFileInput.value = "";
+    });
+
+    codeInput.addEventListener("input", function () {
+      inspectedSource = "";
+      inspectPromise = null;
+      if (inspectTimer) clearTimeout(inspectTimer);
+      const val = normalizeTransferInput(codeInput.value || "");
+      if (val.indexOf("tachyon://") === 0) {
+        inspectTimer = setTimeout(function () {
+          runInspect(val);
+        }, 250);
+      }
+    });
+
+    ui.showModal(
+      _("Paste Transfer Code"),
+      [
+        E(
+          "p",
+          { style: "margin-bottom:8px;" },
+          _(
+            "Paste a transfer code from another Tachyon router, review the preview, and choose how to apply it.",
+          ),
+        ),
+        transferFileInput,
+        E(
+          "div",
+          {
+            style: "display:flex;justify-content:flex-end;margin-bottom:6px;",
+          },
+          [
+            E(
+              "button",
+              {
+                class: "btn cbi-button cbi-button-neutral",
+                type: "button",
+                click: function () {
+                  transferFileInput.click();
+                },
+              },
+              _("Load from File (.json)"),
+            ),
+          ],
+        ),
+        codeInput,
+        previewBox,
+        E(
+          "div",
+          {
+            style: "display:flex;flex-direction:column;gap:6px;margin:8px 0;",
+          },
+          [
+            E(
+              "label",
+              {
+                style:
+                  "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;",
+              },
+              [radioReplace, E("span", {}, _("Replace current routes"))],
+            ),
+            E(
+              "label",
+              {
+                style:
+                  "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;",
+              },
+              [radioMerge, E("span", {}, _("Merge (add to existing routes)"))],
+            ),
+          ],
+        ),
+        E("div", { class: "button-row" }, [
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-neutral",
+              type: "button",
+              click: function () {
+                ui.hideModal();
+              },
+            },
+            _("Cancel"),
+          ),
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-action",
+              type: "button",
+              click: function () {
+                runInspect(codeInput.value || "");
+              },
+            },
+            _("Preview Code"),
+          ),
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-positive",
+              type: "button",
+              click: function () {
+                if (inspectTimer) {
+                  clearTimeout(inspectTimer);
+                  inspectTimer = null;
+                }
+                const raw = normalizeTransferInput(codeInput.value || "");
+                if (!raw) return;
+                ui.hideModal();
+                const targetPromise = inspectedSource
+                  ? Promise.resolve(inspectedSource)
+                  : inspectPromise || uploadCodeBufferIfNeeded(raw);
+                targetPromise
+                  .then(function (argTarget) {
+                    return execSnapshotJson([
+                      "snapshot_import",
+                      "code-apply:" + applyMode + ":" + argTarget,
+                    ]);
+                  })
+                  .then(function () {
+                    ui.addNotification(
+                      null,
+                      E(
+                        "p",
+                        {},
+                        _(
+                          "Transfer code applied. The service restarts and the page will reload.",
+                        ),
+                      ),
+                      "info",
+                    );
+                    setTimeout(function () {
+                      location.reload();
+                    }, 2500);
+                  })
+                  .catch(function (err) {
+                    ui.addNotification(
+                      null,
+                      E(
+                        "p",
+                        {},
+                        _("Failed to apply transfer code") +
+                          (err && err.message ? ": " + err.message : ""),
+                      ),
+                      "error",
+                    );
+                  });
+              },
+            },
+            _("Apply Configuration"),
+          ),
+        ]),
+      ],
+      "cbi-modal",
+    );
+  });
+
   wrapper.appendChild(
     E(
       "div",
       {
-        style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap;",
+        class: "tachyon-snapshots-toolbar",
       },
-      [
-        btnSave,
-        btnImport,
-        E(
-          "span",
-          {
-            style: "font-size:12px;color:var(--text-color-medium,#888);",
-          },
-          _(
-            "Up to 10 snapshots are kept; the oldest ones are removed automatically.",
-          ),
-        ),
-      ],
+      [btnSave, btnImport, btnCopyCode, btnPasteCode],
+    ),
+  );
+  wrapper.appendChild(
+    E(
+      "div",
+      {
+        class: "tachyon-snapshots-hint",
+      },
+      _(
+        "Up to 10 snapshots are kept; the oldest ones are removed automatically.",
+      ),
     ),
   );
   wrapper.appendChild(listEl);
 
-  loadSnapshots();
+  if (typeof IntersectionObserver !== "undefined") {
+    let snapshotsLoaded = false;
+    const snapObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !snapshotsLoaded) {
+        snapshotsLoaded = true;
+        snapObserver.disconnect();
+        loadSnapshots();
+      }
+    });
+    snapObserver.observe(wrapper);
+  } else {
+    loadSnapshots();
+  }
 
   return wrapper;
 }
@@ -1077,6 +2497,7 @@ function createSmartDetectSectionsWidget(section_id) {
     "proxy",
     "outbound",
     "vpn",
+    "group",
     "awg",
     "warp",
     "anytls",
@@ -1084,16 +2505,19 @@ function createSmartDetectSectionsWidget(section_id) {
     "mieru",
     "sudoku",
     "masque",
+    "tewfai",
+    "csqtt",
     "openvpn",
     "wdtt",
-    "olcrtc",
     "fptn",
   ];
+  const sectionActionByName = {};
   const allSections = (uci.sections(UCI_PACKAGE, "section") || [])
     .filter(function (s) {
       return s.enabled !== "0" && TESTABLE_ACTIONS.indexOf(s.action) >= 0;
     })
     .map(function (s) {
+      sectionActionByName[s[".name"]] = s.action;
       return s[".name"];
     });
 
@@ -1206,6 +2630,18 @@ function createSmartDetectSectionsWidget(section_id) {
 
     row.appendChild(cb);
     row.appendChild(label);
+    if (sectionActionByName[name] === "group") {
+      const groupBadge = E("span", {
+        "data-section-type": "group",
+        title: _(
+          "Routing rule target: detected domains are saved to the group's rules, and the group's own logic selects the active member.",
+        ),
+        style:
+          "display:inline-block;padding:1px 6px;font-size:0.75rem;font-weight:600;line-height:1.4;border-radius:4px;background:rgba(49,130,206,0.12);color:var(--blue-color,#3182ce);border:1px solid rgba(49,130,206,0.3);user-select:none;",
+      });
+      groupBadge.textContent = _("Group");
+      row.appendChild(groupBadge);
+    }
     row.appendChild(upBtn);
     row.appendChild(downBtn);
     return row;
@@ -1226,83 +2662,254 @@ function createSmartDetectSectionsWidget(section_id) {
 }
 
 function createMenuTabsOrderWidget(option, section_id) {
+  const MENU_GROUPS = [
+    { key: "overview", title: _tr("Обзор", "Overview") },
+    { key: "routing", title: _tr("Маршруты", "Routing") },
+    { key: "clients", title: _tr("Клиенты и сеть", "Clients & Network") },
+    { key: "analytics", title: _tr("Аналитика", "Analytics") },
+    { key: "settings", title: _tr("Настройки", "Settings") },
+  ];
+
   const ALL_MENU_TABS = [
     {
       id: "dashboard",
-      label: _("Dashboard"),
-      desc: _("Main overview and status widgets"),
+      groupKey: "overview",
+      group: _tr("Обзор", "Overview"),
+      label: _tr("Обзор (Дашборд)", "Overview (Dashboard)"),
+      desc: _tr(
+        "Главный экран, сводка трафика и статус служб роутера",
+        "Main overview, traffic summary and router service status",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "section",
-      label: _("Sections"),
-      desc: _("Routing sections, rules and strategies"),
+      groupKey: "routing",
+      group: _tr("Маршруты", "Routing"),
+      label: _tr("Секции маршрутов", "Routing Sections"),
+      desc: _tr(
+        "Секции маршрутизации, правила и стратегии",
+        "Routing sections, rules and strategies",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "outbounds",
+      groupKey: "routing",
+      group: _tr("Маршруты", "Routing"),
+      label: _tr("Узлы и подписки", "Nodes & Subscriptions"),
+      desc: _tr(
+        "Глобальный пул подписок, прокси-ссылок, туннелей и Desync",
+        "Global pool of subscriptions, proxy links, tunnels and Desync",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "conditions",
+      groupKey: "routing",
+      group: _tr("Маршруты", "Routing"),
+      label: _tr("Условия трафика", "Traffic Conditions"),
+      desc: _tr(
+        "Атомарные и составные булевы правила фильтрации (AND / OR / NOT)",
+        "Atomic and composite boolean traffic matching rules",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "balancers",
+      groupKey: "routing",
+      group: _tr("Маршруты", "Routing"),
+      label: _tr("Балансировщики", "Balancers"),
+      desc: _tr(
+        "Политики автоматического выбора URLTest и отказоустойчивости Priority",
+        "URLTest auto-selection and Priority failover policies",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "server",
-      label: _("Servers"),
-      desc: _("External inbound proxy servers"),
+      groupKey: "clients",
+      group: _tr("Клиенты и сеть", "Clients & Network"),
+      label: _tr("Серверы (Inbound)", "Inbound Servers"),
+      desc: _tr(
+        "Собственные VPN и прокси-серверы на роутере для внешних устройств",
+        "External inbound VPN and proxy servers on the router",
+      ),
       defaultVisible: false,
       fixed: false,
     },
     {
       id: "profile",
-      label: _("Family Profiles"),
-      desc: _("Family profiles and device grouping"),
-      defaultVisible: false,
-      fixed: false,
-    },
-    {
-      id: "schedule",
-      label: _("Parental Control"),
-      desc: _("Access schedule and screen time limits"),
-      defaultVisible: false,
-      fixed: false,
-    },
-    {
-      id: "guest_mode",
-      label: _("Guest Mode"),
-      desc: _("Guest network isolation and device quotas"),
+      groupKey: "clients",
+      group: _tr("Клиенты и сеть", "Clients & Network"),
+      label: _tr("Семейные профили", "Family Profiles"),
+      desc: _tr(
+        "Семейные профили и группы устройств",
+        "Family profiles and device grouping",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
-      id: "monitoring",
-      label: _("Monitoring"),
-      desc: _("Traffic statistics and active connections"),
+      id: "schedule",
+      groupKey: "clients",
+      group: _tr("Клиенты и сеть", "Clients & Network"),
+      label: _tr("Родительский контроль", "Parental Control"),
+      desc: _tr(
+        "Расписание доступа и лимиты экранного времени",
+        "Access schedule and screen time limits",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "guest_mode",
+      groupKey: "clients",
+      group: _tr("Клиенты и сеть", "Clients & Network"),
+      label: _tr("Гостевой режим", "Guest Mode"),
+      desc: _tr(
+        "Изоляция гостевой сети и квоты устройств",
+        "Guest network isolation and device quotas",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "diagnostic",
-      label: _("Diagnostics"),
-      desc: _("System diagnostics, AI Doctor and logs"),
+      groupKey: "analytics",
+      group: _tr("Аналитика", "Analytics"),
+      label: _tr("Диагностика", "Diagnostics"),
+      desc: _tr(
+        "Системная диагностика, AI Доктор и журналы",
+        "System diagnostics, AI Doctor and logs",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "monitoring",
+      groupKey: "analytics",
+      group: _tr("Аналитика", "Analytics"),
+      label: _tr("Мониторинг сессий", "Live Monitoring"),
+      desc: _tr(
+        "Статистика трафика и активные соединения",
+        "Traffic statistics and active connections",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_dns",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("DNS и защита", "DNS & Protection"),
+      desc: _tr(
+        "Параметры DNS-резолвера, шифрования DoH/DoT и отказоустойчивости",
+        "DNS resolver, DoH/DoT encryption and failover settings",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_network",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Сеть и TUN", "Network & TUN"),
+      desc: _tr(
+        "Параметры перехвата трафика, интерфейсов LAN/WAN и TUN",
+        "Traffic interception, LAN/WAN interfaces and TUN settings",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_services",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Сервисы и порты", "Services & Ports"),
+      desc: _tr(
+        "Порты прокси, панель YACD, P2P и сопутствующие службы",
+        "Proxy ports, YACD panel, P2P and companion services",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_advanced",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Система и бэкап", "System & Backup"),
+      desc: _tr(
+        "Параметры ядра, резервное копирование конфигурации и логирование",
+        "Core settings, configuration backup and logging",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "updates",
-      label: _("Components"),
-      desc: _("Component versions and update manager"),
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Компоненты и ядро", "Components & Core"),
+      desc: _tr(
+        "Версии компонентов и менеджер обновлений",
+        "Component versions and update manager",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "telegram",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Телеграм-бот", "Telegram Bot"),
+      desc: _tr(
+        "Удаленное управление через Telegram",
+        "Remote management Telegram daemon",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_ai",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("ИИ и самоисцеление", "AI & Self-Healing"),
+      desc: _tr(
+        "Автоматический сторож (Watchdog), восстановление и ИИ-агент",
+        "Automated Watchdog recovery and AI diagnostics agent",
+      ),
+      defaultVisible: true,
+      fixed: false,
+    },
+    {
+      id: "settings_updates",
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Обновления списков", "Lists & Presets"),
+      desc: _tr(
+        "Расписание обновления гео-баз, правил и компонентов",
+        "Geo-databases, rulesets and component update schedule",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "settings",
-      label: _("Settings"),
-      desc: _("Core configuration and preferences"),
+      groupKey: "settings",
+      group: _tr("Настройки", "Settings"),
+      label: _tr("Интерфейс и меню", "Menu & Navigation"),
+      desc: _tr(
+        "Управление боковым меню, вкладками и видом дашборда",
+        "Sidebar navigation, tabs order and dashboard layout",
+      ),
       defaultVisible: true,
       fixed: true,
-    },
-    {
-      id: "telegram",
-      label: _("Telegram Bot"),
-      desc: _("Remote management Telegram daemon"),
-      defaultVisible: true,
-      fixed: false,
     },
   ];
 
@@ -1351,17 +2958,10 @@ function createMenuTabsOrderWidget(option, section_id) {
 
   const wrapper = E("div", { id: "menu-tabs-order-widget-" + section_id });
   const listEl = E("div", {
-    style:
-      "border:1px solid var(--border-color,#dee2e6);border-radius:6px;overflow:hidden;margin-bottom:8px;max-width:560px;background:var(--card-bg,transparent);",
+    class: "tachyon-settings-tabs-groups",
   });
 
   function syncToUci() {
-    // Only write what actually differs. This ran unconditionally at the end of
-    // every widget render, so simply opening the settings page rewrote the whole
-    // tab_order list plus one show_tab_* option per tab into the UCI session -
-    // a burst of add_list operations on /etc/config/tachyon for a value that had
-    // not changed. That is flash wear for nothing, and it is what showed up in a
-    // Telegram ticket as a config change list with nothing actually changed.
     const sameOrder =
       Array.isArray(savedOrder) &&
       savedOrder.length === ordered.length &&
@@ -1388,32 +2988,32 @@ function createMenuTabsOrderWidget(option, section_id) {
     });
   }
 
-  function renderTabRow(id, idx, totalLen) {
-    const tabMeta = tabMap[id] || { id: id, label: id, desc: "", fixed: false };
+  function renderTabRow(id, idxInGroup, groupLen, groupTabs) {
+    const tabMeta = tabMap[id] || {
+      id: id,
+      groupKey: "routing",
+      group: "",
+      label: id,
+      desc: "",
+      fixed: false,
+    };
     const isVisible = Boolean(visibility[id]);
     const isFixed = Boolean(tabMeta.fixed);
+    const isOverview = tabMeta.groupKey === "overview";
 
     const row = E("div", {
-      style: [
-        "display:flex;align-items:center;gap:12px;padding:8px 12px;",
-        idx < totalLen - 1
-          ? "border-bottom:1px solid var(--border-color,#dee2e6);"
-          : "",
-        isVisible ? "" : "opacity:0.5;background:rgba(0,0,0,0.02);",
-      ].join(""),
+      class: "tachyon-settings-list-row" + (isVisible ? "" : " is-hidden"),
     });
 
     const badge = E(
       "span",
       {
         style:
-          "font-size:0.75rem;font-weight:bold;color:var(--text-color-medium,#888);min-width:18px;text-align:center;",
+          "font-size:0.75rem;font-weight: 600;color:var(--text-color-medium,#888);min-width:22px;text-align:center;",
       },
-      String(idx + 1),
+      String(idxInGroup + 1),
     );
 
-    // Use a <button> toggle instead of <input type="checkbox"> to avoid LuCI
-    // theme pointer-events overrides that swallow checkbox click events.
     const toggleBtn = E("button", {
       type: "button",
       title: isFixed
@@ -1422,17 +3022,21 @@ function createMenuTabsOrderWidget(option, section_id) {
           ? _("Click to hide")
           : _("Click to show"),
       style: [
-        "width:20px;height:20px;padding:0;border-radius:3px;border:2px solid;",
+        "width:22px;height:22px;padding:0;border-radius:6px;border:2px solid;",
         "display:flex;align-items:center;justify-content:center;",
-        "font-size:13px;font-weight:bold;line-height:1;cursor:",
+        "font-size:13px;font-weight: 600;line-height:1;cursor:",
         isFixed ? "default;" : "pointer;",
         "flex-shrink:0;",
         isFixed || isVisible
-          ? "border-color:var(--primary-color,#2196f3);background:var(--primary-color,#2196f3);color:#fff;"
-          : "border-color:var(--border-color,#aaa);background:transparent;color:transparent;",
+          ? "border-color:#7c3aed;background:#7c3aed;color:#fff;"
+          : "border-color:var(--border-color-medium,#94a3b8);background:transparent;color:transparent;",
       ].join(""),
     });
-    toggleBtn.textContent = "✓";
+    const checkIcon =
+      typeof main !== "undefined" && main.renderCheckIcon
+        ? main.renderCheckIcon(12)
+        : renderFallbackCheckSvg(12);
+    toggleBtn.appendChild(checkIcon);
     if (isFixed) toggleBtn.disabled = true;
 
     if (!isFixed) {
@@ -1441,23 +3045,26 @@ function createMenuTabsOrderWidget(option, section_id) {
         visibility[id] = !visibility[id];
         syncToUci();
         renderList();
+        if (main && typeof main.refreshTachyonAppShell === "function") {
+          main.refreshTachyonAppShell();
+        }
       });
     }
 
     const textCol = E(
       "div",
       {
-        style: "flex:1;display:flex;flex-direction:column;",
+        style: "flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;",
       },
       [
-        E("span", { style: "font-weight:600;font-size:0.95rem;" }, [
+        E("span", { style: "font-weight: 600;font-size:0.88rem;" }, [
           tabMeta.label,
           isFixed
             ? E(
                 "em",
                 {
                   style:
-                    "font-size:0.75rem;font-weight:normal;margin-left:6px;color:var(--text-color-medium,#888);",
+                    "font-size:0.72rem;font-weight:normal;margin-left:6px;color:var(--text-color-medium,#888);",
                 },
                 " (" + _("Always visible") + ")",
               )
@@ -1481,20 +3088,29 @@ function createMenuTabsOrderWidget(option, section_id) {
         class: "btn cbi-button",
         type: "button",
         title: _("Move Up"),
-        style:
-          "padding:2px 8px;font-size:0.8rem;line-height:1.2;cursor:pointer;",
+        style: [
+          "padding:3px 9px;font-size:0.78rem;line-height:1.2;border-radius:7px;cursor:pointer;",
+          isOverview ? "visibility:hidden;" : "",
+        ].join(""),
       },
       "▲",
     );
-    upBtn.disabled = idx === 0;
+    upBtn.disabled = isOverview || idxInGroup === 0;
     upBtn.addEventListener("click", function (ev) {
       ev.preventDefault();
-      if (idx > 0) {
-        const tmp = ordered[idx - 1];
-        ordered[idx - 1] = ordered[idx];
-        ordered[idx] = tmp;
-        syncToUci();
-        renderList();
+      if (!isOverview && idxInGroup > 0) {
+        const prevTabId = groupTabs[idxInGroup - 1].id;
+        const curIdx = ordered.indexOf(id);
+        const prevIdx = ordered.indexOf(prevTabId);
+        if (curIdx >= 0 && prevIdx >= 0) {
+          ordered[curIdx] = prevTabId;
+          ordered[prevIdx] = id;
+          syncToUci();
+          renderList();
+          if (main && typeof main.refreshTachyonAppShell === "function") {
+            main.refreshTachyonAppShell();
+          }
+        }
       }
     });
 
@@ -1504,20 +3120,29 @@ function createMenuTabsOrderWidget(option, section_id) {
         class: "btn cbi-button",
         type: "button",
         title: _("Move Down"),
-        style:
-          "padding:2px 8px;font-size:0.8rem;line-height:1.2;cursor:pointer;",
+        style: [
+          "padding:3px 9px;font-size:0.78rem;line-height:1.2;border-radius:7px;cursor:pointer;",
+          isOverview ? "visibility:hidden;" : "",
+        ].join(""),
       },
       "▼",
     );
-    downBtn.disabled = idx === totalLen - 1;
+    downBtn.disabled = isOverview || idxInGroup >= groupLen - 1;
     downBtn.addEventListener("click", function (ev) {
       ev.preventDefault();
-      if (idx < ordered.length - 1) {
-        const tmp = ordered[idx + 1];
-        ordered[idx + 1] = ordered[idx];
-        ordered[idx] = tmp;
-        syncToUci();
-        renderList();
+      if (!isOverview && idxInGroup < groupLen - 1) {
+        const nextTabId = groupTabs[idxInGroup + 1].id;
+        const curIdx = ordered.indexOf(id);
+        const nextIdx = ordered.indexOf(nextTabId);
+        if (curIdx >= 0 && nextIdx >= 0) {
+          ordered[curIdx] = nextTabId;
+          ordered[nextIdx] = id;
+          syncToUci();
+          renderList();
+          if (main && typeof main.refreshTachyonAppShell === "function") {
+            main.refreshTachyonAppShell();
+          }
+        }
       }
     });
 
@@ -1531,8 +3156,33 @@ function createMenuTabsOrderWidget(option, section_id) {
 
   function renderList() {
     while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
-    ordered.forEach(function (id, idx) {
-      listEl.appendChild(renderTabRow(id, idx, ordered.length));
+    MENU_GROUPS.forEach(function (group) {
+      const groupTabs = ordered
+        .map((id) => tabMap[id])
+        .filter((t) => t && t.groupKey === group.key);
+      if (groupTabs.length === 0) return;
+
+      const groupCard = E("div", {
+        class: "tachyon-settings-list-card",
+        style: "margin-bottom: 12px;",
+      });
+      const groupHead = E(
+        "div",
+        {
+          style:
+            "padding: 7px 12px; font-weight: 600; font-size: 0.76rem; letter-spacing: 0.05em; color: var(--text-color-medium, #888); background: rgba(128, 128, 128, 0.06); border-bottom: 1px solid var(--border-color-low, rgba(128, 128, 128, 0.13));",
+        },
+        group.title,
+      );
+      groupCard.appendChild(groupHead);
+
+      groupTabs.forEach((tabMeta, idxInGroup) => {
+        groupCard.appendChild(
+          renderTabRow(tabMeta.id, idxInGroup, groupTabs.length, groupTabs),
+        );
+      });
+
+      listEl.appendChild(groupCard);
     });
   }
 
@@ -1548,77 +3198,40 @@ function createComponentsVisibilityWidget(option, section_id) {
     {
       id: "tachyon",
       label: "Tachyon",
-      desc: _("Core orchestration service and LuCI application"),
+      desc: _tr(
+        "Основной сервис оркестрации и веб-интерфейс LuCI",
+        "Core orchestration service and LuCI application",
+      ),
       defaultVisible: true,
       fixed: true,
     },
     {
-      id: "sing_box",
-      label: "Sing-box",
-      desc: _("Universal proxy platform routing engine"),
+      id: "tachyon_core",
+      label: "Tachyon Core",
+      desc: _tr(
+        "Универсальный нативный движок маршрутизации",
+        "Native proxy routing core engine",
+      ),
       defaultVisible: true,
       fixed: true,
-    },
-    {
-      id: "zapret",
-      label: "Zapret",
-      desc: _("DPI bypass engine (nfqws v1)"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "zapret2",
-      label: "Zapret2",
-      desc: _("Advanced DPI bypass engine with Lua scripts (nfqws2)"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "byedpi",
-      label: "ByeDPI",
-      desc: _("Local SOCKS proxy desynchronizer (ciadpi)"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "wdtt",
-      label: "WDTT",
-      desc: _("WireGuard over TURN Tunnel"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "olcrtc",
-      label: "OlcRTC",
-      desc: _("Real-time WebRTC anti-censorship tunnel"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "fptn",
-      label: "FPTN",
-      desc: _("Fast packet transport network client"),
-      defaultVisible: true,
-      fixed: false,
-    },
-    {
-      id: "tailscale",
-      label: "Tailscale",
-      desc: _("Zero config mesh VPN daemon"),
-      defaultVisible: true,
-      fixed: false,
     },
     {
       id: "direct_bypass",
-      label: _("Direct Proxy"),
-      desc: _("Dedicated direct HTTP/SOCKS5 outbound proxy"),
+      label: _tr("Direct Proxy", "Direct Proxy"),
+      desc: _tr(
+        "Выделенный прямой прокси HTTP/SOCKS5",
+        "Dedicated direct HTTP/SOCKS5 outbound proxy",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "torrserver_direct",
-      label: _("TorrServer Direct"),
-      desc: _("Direct cgroup bypass for TorrServer"),
+      label: _tr("TorrServer Direct", "TorrServer Direct"),
+      desc: _tr(
+        "Прямой обход cgroup для TorrServer",
+        "Direct cgroup bypass for TorrServer",
+      ),
       defaultVisible: true,
       fixed: false,
     },
@@ -1643,8 +3256,7 @@ function createComponentsVisibilityWidget(option, section_id) {
     id: "components-visibility-widget-" + section_id,
   });
   const listEl = E("div", {
-    style:
-      "border:1px solid var(--border-color,#dee2e6);border-radius:6px;overflow:hidden;margin-bottom:8px;max-width:560px;background:var(--card-bg,transparent);",
+    class: "tachyon-settings-list-card",
   });
 
   function syncToUci() {
@@ -1666,18 +3278,12 @@ function createComponentsVisibilityWidget(option, section_id) {
 
   function renderList() {
     listEl.innerHTML = "";
-    ALL_COMPONENTS.forEach(function (c, idx) {
+    ALL_COMPONENTS.forEach(function (c, _idx) {
       const isVisible = Boolean(visibility[c.id]);
       const isFixed = Boolean(c.fixed);
 
       const row = E("div", {
-        style: [
-          "display:flex;align-items:center;gap:12px;padding:8px 12px;",
-          idx < ALL_COMPONENTS.length - 1
-            ? "border-bottom:1px solid var(--border-color,#dee2e6);"
-            : "",
-          isVisible ? "" : "opacity:0.5;background:rgba(0,0,0,0.02);",
-        ].join(""),
+        class: "tachyon-settings-list-row" + (isVisible ? "" : " is-hidden"),
       });
 
       const toggleBtn = E("button", {
@@ -1688,17 +3294,21 @@ function createComponentsVisibilityWidget(option, section_id) {
             ? _("Click to hide")
             : _("Click to show"),
         style: [
-          "width:20px;height:20px;padding:0;border-radius:3px;border:2px solid;",
+          "width:22px;height:22px;padding:0;border-radius:6px;border:2px solid;",
           "display:flex;align-items:center;justify-content:center;",
-          "font-size:13px;font-weight:bold;line-height:1;cursor:",
+          "font-size:13px;font-weight: 600;line-height:1;cursor:",
           isFixed ? "default;" : "pointer;",
           "flex-shrink:0;",
           isFixed || isVisible
-            ? "border-color:var(--primary-color,#2196f3);background:var(--primary-color,#2196f3);color:#fff;"
-            : "border-color:var(--border-color,#aaa);background:transparent;color:transparent;",
+            ? "border-color:#7c3aed;background:#7c3aed;color:#fff;"
+            : "border-color:var(--border-color-medium,#94a3b8);background:transparent;color:transparent;",
         ].join(""),
       });
-      toggleBtn.textContent = "✓";
+      const checkIcon =
+        typeof main !== "undefined" && main.renderCheckIcon
+          ? main.renderCheckIcon(12)
+          : renderFallbackCheckSvg(12);
+      toggleBtn.appendChild(checkIcon);
       if (isFixed) toggleBtn.disabled = true;
 
       if (!isFixed) {
@@ -1744,8 +3354,28 @@ function createComponentsVisibilityWidget(option, section_id) {
   return wrapper;
 }
 
+function preserveHiddenTabOptions(section) {
+  // LuCI CBIAbstractValue initializes `retain = false`, so dependency-hidden or
+  // inactive options trigger `uci.unset` unless `retain` is forced to `true`.
+  if (!section || !Array.isArray(section.children)) return;
+  for (const opt of section.children) {
+    if (
+      !opt ||
+      opt.disable ||
+      typeof opt.option !== "string" ||
+      opt.option.startsWith("_")
+    ) {
+      continue;
+    }
+    opt.retain = true;
+  }
+}
+
 function createSettingsContent(section, capabilities) {
-  section.tab("navigation", _("Menu & Navigation"));
+  section.tab(
+    "navigation",
+    _tr("Дашборд и интерфейс", "Dashboard & Interface"),
+  );
   section.tab("dns", _("DNS Settings"));
   section.tab("network", _("Network & Interfaces"));
   section.tab("services", _("Services & Access"));
@@ -1755,23 +3385,49 @@ function createSettingsContent(section, capabilities) {
 
   // ── Navigation & Menu Settings ──────────────────────────────────────────
 
+  const dashLayoutOpt = section.taboption(
+    "navigation",
+    form.Value,
+    "_dashboard_layout_widget",
+    _tr("Виджеты и пресеты дашборда", "Dashboard Widgets & Presets"),
+    _tr(
+      "Выберите один из 5 готовых пресетов дашборда или настройте вид отображения, ширину (100% / 50%), видимость и расположение каждого виджета на 2-колоночном макете.",
+      "Select one of 5 dashboard presets or customize the display view, width (100% / 50%), visibility, and placement of every widget on the 2-column layout.",
+    ),
+  );
+  dashLayoutOpt.renderWidget = function (section_id) {
+    if (main && typeof main.renderDashboardLayoutSettingsPanel === "function") {
+      return main.renderDashboardLayoutSettingsPanel(section_id);
+    }
+    return E("div", {}, "");
+  };
+  dashLayoutOpt.formvalue = function (section_id) {
+    const el = document.getElementById("dashboard-layout-editor-" + section_id);
+    return el && el._layoutConfig ? JSON.stringify(el._layoutConfig) : "";
+  };
+  dashLayoutOpt.write = function (_section_id) {};
+  dashLayoutOpt.remove = function () {};
+
   let o = section.taboption(
     "navigation",
     form.ListValue,
     "default_tab",
-    _("Default Tab on Startup"),
-    _("Select which tab opens automatically when entering Tachyon."),
+    _tr("Вкладка по умолчанию при входе", "Default Tab on Startup"),
+    _tr(
+      "Выберите, какая вкладка открывается автоматически при входе в Tachyon.",
+      "Select which tab opens automatically when entering Tachyon.",
+    ),
   );
-  o.value("dashboard", _("Dashboard"));
-  o.value("section", _("Sections"));
-  o.value("server", _("Servers"));
-  o.value("profile", _("Family Profiles"));
-  o.value("schedule", _("Parental Control"));
-  o.value("monitoring", _("Monitoring"));
-  o.value("diagnostic", _("Diagnostics"));
-  o.value("updates", _("Components"));
-  o.value("settings", _("Settings"));
-  o.value("telegram", _("Telegram Bot"));
+  o.value("dashboard", _tr("Дашборд", "Dashboard"));
+  o.value("section", _tr("Секции", "Sections"));
+  o.value("server", _tr("Серверы", "Servers"));
+  o.value("profile", _tr("Семейные профили", "Family Profiles"));
+  o.value("schedule", _tr("Родительский контроль", "Parental Control"));
+  o.value("monitoring", _tr("Мониторинг", "Monitoring"));
+  o.value("diagnostic", _tr("Диагностика", "Diagnostics"));
+  o.value("updates", _tr("Компоненты", "Components"));
+  o.value("settings", _tr("Настройки", "Settings"));
+  o.value("telegram", _tr("Телеграм-бот", "Telegram Bot"));
   o.default = "dashboard";
   o.rmempty = false;
 
@@ -1779,8 +3435,9 @@ function createSettingsContent(section, capabilities) {
     "navigation",
     form.Value,
     "_tabs_order_widget",
-    _("Tab Order & Visibility"),
-    _(
+    _tr("Порядок и видимость вкладок меню", "Tab Order & Visibility"),
+    _tr(
+      "Настройте порядок и видимость вкладок главного меню. Используйте стрелки для перемещения и переключатели для показа/скрытия.",
       "Customize the order and visibility of tabs in the main navigation menu. Use the arrows to reorder and checkboxes to show or hide tabs.",
     ),
   );
@@ -1802,8 +3459,9 @@ function createSettingsContent(section, capabilities) {
     "navigation",
     form.Value,
     "_components_visibility_widget",
-    _("Component Cards Visibility"),
-    _(
+    _tr("Видимость карточек компонентов", "Component Cards Visibility"),
+    _tr(
+      "Настройте, какие карточки компонентов отображаются во вкладке «Компоненты».",
       "Customize which component cards are displayed in the Components tab. Checkboxes show or hide components.",
     ),
   );
@@ -1816,13 +3474,8 @@ function createSettingsContent(section, capabilities) {
     );
     return el ? JSON.stringify(el._vis) : "";
   };
-  compVisOpt.write = function (section_id) {
-    const el = document.getElementById(
-      "components-visibility-widget-" + section_id,
-    );
-    if (el && typeof el._syncToUci === "function") {
-      el._syncToUci();
-    }
+  compVisOpt.write = function (_section_id) {
+    // UCI is written directly by syncToUci() inside the widget on every interaction.
   };
   compVisOpt.remove = function () {};
 
@@ -1834,7 +3487,7 @@ function createSettingsContent(section, capabilities) {
     "_dns_benchmark_btn",
     _("DNS Auto-Tuner & Benchmark"),
     _(
-      "Automatically benchmark latency, packet loss, and anti-censorship reliability of major DNS servers (UDP/DoH) from this router to find and apply the optimal configuration.",
+      "Automatically benchmark latency, packet loss, and reachability reliability of major DNS servers (UDP/DoH) from this router to find and apply the optimal configuration.",
     ),
   );
   dnsBenchmarkBtn.inputtitle = _("Auto-Tune & Benchmark DNS");
@@ -1865,7 +3518,10 @@ function createSettingsContent(section, capabilities) {
         settingsDnsDynamicState.dnsType ||
         "udp";
       const mainServers =
-        protocol === "doh" || protocol === "udp"
+        protocol === "doh" ||
+        protocol === "udp" ||
+        protocol === "dot" ||
+        protocol === "doq"
           ? optionListValues(dnsOption, section_id)
           : [];
       const udpServers = [
@@ -2002,7 +3658,14 @@ function createSettingsContent(section, capabilities) {
 
     const refreshers = settingsDnsDynamicState.refreshers.get(section_id);
     if (refreshers) {
-      refreshers.forEach((fn) => fn());
+      refreshers.forEach((fn) => {
+        if (fn() === false) {
+          refreshers.delete(fn);
+        }
+      });
+      if (refreshers.size === 0) {
+        settingsDnsDynamicState.refreshers.delete(section_id);
+      }
     }
   };
 
@@ -2012,7 +3675,7 @@ function createSettingsContent(section, capabilities) {
     "fallback_wan_main",
     _("Enable WAN DNS Fallback for Main DNS"),
     _(
-      "⚠️ If all Main DNS fail 3 times, queries will be sent to your ISP's DNS in plaintext. Only use as a last resort to prevent complete internet loss.",
+      "If all Main DNS fail 3 times, queries will be sent to your ISP's DNS in plaintext. Only use as a last resort to prevent complete internet loss.",
     ),
   );
   o.default = o.disabled;
@@ -2023,7 +3686,7 @@ function createSettingsContent(section, capabilities) {
     "fallback_wan_bootstrap",
     _("Enable WAN DNS Fallback for Bootstrap DNS"),
     _(
-      "⚠️ If all Bootstrap DNS fail 3 times, queries will be sent to your ISP's DNS in plaintext. Only use as a last resort to prevent complete internet loss.",
+      "If all Bootstrap DNS fail 3 times, queries will be sent to your ISP's DNS in plaintext. Only use as a last resort to prevent complete internet loss.",
     ),
   );
   o.default = o.disabled;
@@ -2051,7 +3714,7 @@ function createSettingsContent(section, capabilities) {
     _("DNS Check Interval"),
     _("How often to check the active DNS servers."),
   );
-  configureDnsDuration(o, "10s", dnsOption, bootstrapOption, fallbackDnsOption);
+  configureDnsDuration(o, "30s", dnsOption, bootstrapOption, fallbackDnsOption);
   configureTimingVisibility(o);
 
   o = section.taboption(
@@ -2233,20 +3896,227 @@ function createSettingsContent(section, capabilities) {
     return node;
   };
 
-  // ─── DNS Strategy ────────────────────────────────────────────────────────
+  // ─── DNS Strategy & FakeIP ───────────────────────────────────────────────
 
   o = section.taboption(
     "dns",
     form.ListValue,
     "dns_strategy",
-    _("DNS Strategy"),
+    _tr("Приоритет DNS (IPv4 / IPv6)", "DNS IPv4 / IPv6 Priority"),
+    _tr(
+      "Определяет приоритет DNS-запросов A (IPv4) и AAAA (IPv6). В режиме «Только IPv4 (без IPv6 на устройствах)» всегда используется только IPv4 (A).",
+      "Controls DNS resolution priority between A (IPv4) and AAAA (IPv6) records. In IPv4 Only mode, IPv4-only DNS (A) is always enforced.",
+    ),
   );
-  o.value("prefer_ipv4", _("Prefer IPv4"));
-  o.value("ipv4_only", _("IPv4 only"));
-  o.value("prefer_ipv6", _("Prefer IPv6"));
-  o.value("ipv6_only", _("IPv6 only"));
+  o.value("prefer_ipv4", _tr("Приоритет IPv4", "Prefer IPv4"));
+  o.value("prefer_ipv6", _tr("Приоритет IPv6", "Prefer IPv6"));
+  o.value("ipv4_only", _tr("Только DNS IPv4 (A)", "IPv4 DNS only (A)"));
+  o.value("ipv6_only", _tr("Только DNS IPv6 (AAAA)", "IPv6 DNS only (AAAA)"));
   o.default = "prefer_ipv4";
   o.rmempty = false;
+  o.depends("ipv6_mode", "auto");
+  o.depends("ipv6_mode", "dual_stack");
+  o.depends("ipv6_mode", "tunnel_over_v4");
+  // Keep user's saved dns_strategy if ipv6_mode is temporarily set to "off"
+  o.remove = function () {};
+  const dnsStrategyOrigRender = o.renderWidget;
+  o.renderWidget = function (section_id, option_index, cfgvalue) {
+    const node = dnsStrategyOrigRender.call(
+      this,
+      section_id,
+      option_index,
+      cfgvalue,
+    );
+    const val =
+      cfgvalue != null
+        ? String(cfgvalue)
+        : String(this.cfgvalue(section_id) || "prefer_ipv4");
+    const warn = E(
+      "div",
+      {
+        class: "tachyon-ipv6-warning-banner",
+        "data-tachyon-dns-ipv6-warning": "1",
+      },
+      _tr(
+        "Внимание: стратегия «Только DNS IPv6 (AAAA)» отключает DNS-запросы IPv4 (A). Ресурсы без AAAA-записей перестанут открываться при отсутствии полной IPv6-связности.",
+        'Warning: "IPv6 DNS only (AAAA)" disables IPv4 (A) DNS lookups. Resources without AAAA records will fail to open unless end-to-end IPv6 connectivity is available.',
+      ),
+    );
+    updateDnsIpv6OnlyWarningElement(warn, val);
+    if (node && typeof node.appendChild === "function") {
+      node.appendChild(warn);
+    }
+    return node;
+  };
+  o.onchange = function (_ev, section_id, value) {
+    if (typeof document !== "undefined") {
+      document
+        .querySelectorAll('[data-tachyon-dns-ipv6-warning="1"]')
+        .forEach((el) => updateDnsIpv6OnlyWarningElement(el, value));
+    }
+    refreshIpv6SummaryBanner(this.section, section_id);
+  };
+
+  const dnsStrategyLockedOpt = section.taboption(
+    "dns",
+    form.DummyValue,
+    "_dns_strategy_ipv4_locked",
+    _tr("Приоритет DNS (IPv4 / IPv6)", "DNS IPv4 / IPv6 Priority"),
+    _tr(
+      "Пока выбран режим IPv6 «Только IPv4 (без IPv6 на устройствах)», ядро всегда использует только IPv4-резолв (A).",
+      "While IPv6 mode is set to IPv4 Only (no IPv6 on LAN devices), the core always enforces IPv4-only DNS (A).",
+    ),
+  );
+  dnsStrategyLockedOpt.depends("ipv6_mode", "off");
+  dnsStrategyLockedOpt.rawhtml = true;
+  dnsStrategyLockedOpt.renderWidget = function () {
+    return E(
+      "div",
+      { class: "tachyon-ipv6-status-box" },
+      E(
+        "span",
+        { class: "tachyon-ipv6-status-pill" },
+        _tr(
+          "Только DNS IPv4 (A) — фиксировано в режиме «Только IPv4»",
+          "IPv4 DNS only (A) — locked in IPv4 Only mode",
+        ),
+      ),
+    );
+  };
+
+  o = section.taboption(
+    "dns",
+    form.Flag,
+    "fakeip_enabled",
+    _tr("Включить FakeIP", "Enable FakeIP"),
+    _tr(
+      "Выдаёт виртуальные IPv4/IPv6 адреса доменам для быстрой маршрутизации без задержки внешнего DNS. Выключение переводит DNS на прямой резолв.",
+      "Assigns virtual IPv4/IPv6 addresses to domains for fast routing without waiting on external DNS. Disabling falls back to direct DNS resolution.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+  o.onchange = function (_ev, section_id) {
+    refreshIpv6SummaryBanner(this.section, section_id);
+  };
+
+  o = section.taboption(
+    "dns",
+    form.Value,
+    "fakeip_inet4_range",
+    _tr("Диапазон FakeIP IPv4 (CIDR)", "FakeIP IPv4 Range (CIDR)"),
+    _tr(
+      "Подсеть IPv4 для виртуальных FakeIP-ответов (по умолчанию: 198.18.0.0/15). Не должна пересекаться с подсетью TUN IPv4.",
+      "IPv4 CIDR range reserved for FakeIP responses (default: 198.18.0.0/15). Must not overlap with the TUN IPv4 subnet.",
+    ),
+  );
+  o.depends("fakeip_enabled", "1");
+  o.default = "198.18.0.0/15";
+  o.placeholder = "198.18.0.0/15";
+  o.rmempty = false;
+  o.validate = function (section_id, value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) {
+      return _("This field is required");
+    }
+    const res = main.validateCidr(trimmed, 4);
+    if (!res.valid) {
+      return res.message;
+    }
+    const tun4 = readSectionSetting(
+      this.section,
+      section_id,
+      "tun_inet4",
+      "172.19.0.1/30",
+    );
+    if (tun4 && main.cidrsOverlap(trimmed, tun4)) {
+      return _tr(
+        "Диапазон FakeIP IPv4 не должен пересекаться с подсетью TUN IPv4",
+        "FakeIP IPv4 range must not overlap with the TUN IPv4 subnet",
+      );
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "dns",
+    form.Value,
+    "fakeip_inet6_range",
+    _tr("Диапазон FakeIP IPv6 (CIDR)", "FakeIP IPv6 Range (CIDR)"),
+    _tr(
+      "Подсеть IPv6 для виртуальных FakeIP-ответов (по умолчанию: fc00::/18). Не должна пересекаться с подсетью TUN IPv6.",
+      "IPv6 CIDR range reserved for FakeIP responses (default: fc00::/18). Must not overlap with the TUN IPv6 subnet.",
+    ),
+  );
+  o.depends("fakeip_enabled", "1");
+  o.default = "fc00::/18";
+  o.placeholder = "fc00::/18";
+  o.rmempty = false;
+  o.onchange = function (_ev, section_id) {
+    refreshIpv6SummaryBanner(this.section, section_id);
+  };
+  o.validate = function (section_id, value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) {
+      return _("This field is required");
+    }
+    const res = main.validateCidr(trimmed, 6);
+    if (!res.valid) {
+      return res.message;
+    }
+    const tun6 = readSectionSetting(
+      this.section,
+      section_id,
+      "tun_inet6",
+      "fdfe:dcba:9876::1/126",
+    );
+    if (tun6 && main.cidrsOverlap(trimmed, tun6)) {
+      return _tr(
+        "Диапазон FakeIP IPv6 не должен пересекаться с подсетью TUN IPv6",
+        "FakeIP IPv6 range must not overlap with the TUN IPv6 subnet",
+      );
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "dns",
+    form.DynamicList,
+    "fakeip_exclude",
+    _tr(
+      "Исключения FakeIP (домены / подсети)",
+      "FakeIP Exclude (Domains / Subnets)",
+    ),
+    _tr(
+      "Домены и подсети (IPv4/IPv6), для которых не выдаются адреса FakeIP (например: lan, 192.168.0.0/16, fe80::/10).",
+      "Domains or IPv4/IPv6 CIDRs excluded from FakeIP resolution (e.g. lan, 192.168.0.0/16, fe80::/10).",
+    ),
+  );
+  o.depends("fakeip_enabled", "1");
+  o.placeholder = "example.com, 192.168.0.0/16, fe80::/10";
+  o.rmempty = true;
+  o.validate = function (_section_id, value) {
+    const items = Array.isArray(value)
+      ? value
+      : value != null && `${value}`.trim() !== ""
+        ? [`${value}`]
+        : [];
+    for (const raw of items) {
+      const item = String(raw || "").trim();
+      if (!item) continue;
+      if (
+        !main.validateDomain(item).valid &&
+        !main.validateSubnet(item).valid &&
+        !main.validateIPWithZone(item).valid
+      ) {
+        return _tr(
+          `Некорректный домен или IP/CIDR: ${item}`,
+          `Invalid domain or IP/CIDR entry: ${item}`,
+        );
+      }
+    }
+    return true;
+  };
 
   o = section.taboption(
     "dns",
@@ -2268,6 +4138,453 @@ function createSettingsContent(section, capabilities) {
 
   o = section.taboption(
     "network",
+    form.ListValue,
+    "routing_strategy",
+    _tr("Глобальная стратегия маршрутизации", "Global Routing Strategy"),
+    _tr(
+      "Выберите общую модель маршрутизации: выборочный обход (по спискам секций) или «Всё в туннель» (весь трафик через прокси, кроме исключений).",
+      "Choose overall routing model: Selective split routing (only domains/subnets from sections go to proxy) or Full tunnel (all traffic routes through proxy, sections define exceptions and bypasses).",
+    ),
+  );
+  o.value(
+    "split",
+    _tr(
+      "Выборочная маршрутизация (по умолчанию)",
+      "Selective Split Routing (Default)",
+    ),
+  );
+  o.value(
+    "full_tunnel",
+    _tr(
+      "Всё в туннель, кроме исключений",
+      "Full Tunnel (All traffic via proxy, exceptions direct)",
+    ),
+  );
+  o.default = "split";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "default_tunnel_section",
+    _tr("Основная секция для туннеля", "Default Tunnel Section"),
+    _tr(
+      "Секция (прокси, VPN или группа), через которую будет направляться весь остальной трафик в режиме «Всё в туннель».",
+      "Section (proxy, VPN, or group) through which all remaining traffic will be routed in Full Tunnel mode.",
+    ),
+  );
+  o.depends("routing_strategy", "full_tunnel");
+  configureDefaultTunnelSectionOption(
+    o,
+    "default_tunnel_section",
+    capabilities,
+  );
+
+  // ─── IPv6 Mode & Leak Protection ────────────────────────────────────────
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "ipv6_mode",
+    _tr("Режим IPv6", "IPv6 Mode"),
+    _tr(
+      "Только IPv4: полностью отключает выдачу IPv6 (RA/DHCPv6/ULA) на устройства в LAN — они работают строго по IPv4. Авто: включает IPv4 + IPv6 при наличии WAN6 провайдера и защищает от утечек без него. Двойной стек: нативный IPv4 + IPv6. Через IPv4-туннель: передаёт IPv6-трафик поверх IPv4-прокси.",
+      "IPv4 Only: completely disables IPv6 addressing (RA/DHCPv6/ULA) on LAN devices so clients work strictly over IPv4. Auto: enables IPv4 + IPv6 when ISP WAN6 is available and enforces leak guard otherwise. Full Dual-Stack: native IPv4 + IPv6. Over IPv4 Tunnel: encapsulates IPv6 traffic over IPv4 proxies.",
+    ),
+  );
+  o.value(
+    "off",
+    _tr(
+      "Только IPv4 (без IPv6 на устройствах)",
+      "IPv4 Only (no IPv6 on LAN devices)",
+    ),
+  );
+  o.value(
+    "auto",
+    _tr("IPv4 + IPv6: Авто (рекомендуется)", "IPv4 + IPv6: Auto (Recommended)"),
+  );
+  o.value(
+    "dual_stack",
+    _tr(
+      "IPv4 + IPv6: Двойной стек (Dual-Stack)",
+      "IPv4 + IPv6: Full Dual-Stack",
+    ),
+  );
+  o.value(
+    "tunnel_over_v4",
+    _tr("IPv4 + IPv6: Через IPv4-туннель", "IPv4 + IPv6: Over IPv4 Tunnel"),
+  );
+  o.default = "auto";
+  o.rmempty = false;
+  o.cfgvalue = function (section_id) {
+    const raw =
+      this.map?.data?.get?.(UCI_PACKAGE, section_id, "ipv6_mode") ??
+      uci.get(UCI_PACKAGE, section_id, "ipv6_mode");
+    return raw != null && raw !== "" ? normalizeIpv6ModeUi(raw) : "auto";
+  };
+  o.onchange = function (_ev, section_id) {
+    refreshIpv6SummaryBanner(this.section, section_id);
+  };
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "ipv6_leak_guard",
+    _tr(
+      "Защита от утечек IPv6 (Leak Guard)",
+      "IPv6 Leak Protection (Leak Guard)",
+    ),
+    _tr(
+      "Блокирует незащищённый IPv6-трафик на границе WAN/LAN, если IPv6-туннелирование отключено или недоступно, предотвращая утечку адреса провайдера.",
+      "Drops or rejects unproxied IPv6 traffic across WAN/LAN boundaries when IPv6 proxying is disabled or unavailable.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+  o.onchange = function (_ev, section_id) {
+    refreshIpv6SummaryBanner(this.section, section_id);
+  };
+
+  const ipv6SummaryOpt = section.taboption(
+    "network",
+    form.DummyValue,
+    "_ipv6_simple_summary",
+    _tr("Статус IPv6 и FakeIP", "IPv6 & FakeIP Status"),
+  );
+  ipv6SummaryOpt.rawhtml = true;
+  ipv6SummaryOpt.renderWidget = function (section_id) {
+    const box = E("div", {
+      class: "tachyon-ipv6-status-box",
+      "data-tachyon-ipv6-summary": "1",
+    });
+    renderIpv6SummaryBannerContent(box, this.section, section_id);
+    if (!cachedIpv6RuntimeInfo) {
+      fetchIpv6RuntimeInfo().then((info) => {
+        if (info && box.isConnected) {
+          renderIpv6SummaryBannerContent(box, this.section, section_id);
+        }
+      });
+    }
+    return box;
+  };
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "proxy_mode",
+    _tr("Режим перехвата трафика", "Traffic Interception Mode"),
+    _tr(
+      "TProxy: ядро Tachyon перехватывает трафик через nftables (по умолчанию). TUN: ядро само владеет маршрутами через tun-интерфейс, nftables не перехватывает. SOCKS: прокси доступен только по SOCKS/HTTP на порту Tachyon.",
+      "TProxy: the Tachyon core intercepts traffic through nftables (default). TUN: the core owns the routes itself through a tun interface, nftables does not intercept. SOCKS: the proxy is only reachable over SOCKS/HTTP on the Tachyon port.",
+    ),
+  );
+  o.value(
+    "tproxy",
+    _tr("TProxy + nftables (по умолчанию)", "TProxy + nftables (Default)"),
+  );
+  o.value(
+    "tun",
+    _tr("TUN (ядро владеет маршрутами)", "TUN (the core owns the routes)"),
+  );
+  o.value(
+    "socks",
+    _tr(
+      "SOCKS/HTTP только (без перехвата)",
+      "SOCKS/HTTP only (no interception)",
+    ),
+  );
+  o.default = "tproxy";
+  o.rmempty = false;
+  guardFailClosedChange(
+    o,
+    (value) => value === "socks",
+    _("SOCKS mode does not intercept LAN traffic at all."),
+  );
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "tun_kill_switch",
+    _tr(
+      "Kill-switch TUN при падении ядра",
+      "TUN kill-switch if the core fails",
+    ),
+    _tr(
+      "Пока есть секции Fail-Closed: если ядро упало и tun-интерфейс пропал, клиенты LAN не выходят в интернет напрямую (маршрут по умолчанию для LAN закрыт). Локальные сети, VPN-маршруты и сам роутер продолжают работать.",
+      "While a section is Fail-Closed: if the core dies and the tun interface disappears, LAN clients do not reach the Internet directly (their default route is closed). Local networks, VPN routes and the router itself keep working.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "1";
+  o.rmempty = false;
+  guardFailClosedChange(
+    o,
+    (value) => value === "0",
+    _tr(
+      "Без kill-switch TUN весь трафик LAN уходит напрямую, пока ядро не работает.",
+      "Without the TUN kill-switch all LAN traffic leaves directly while the core is down.",
+    ),
+  );
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_interface",
+    _tr("Имя TUN-интерфейса", "TUN Interface Name"),
+    _tr(
+      "Имя tun-интерфейса, который создаёт ядро в режиме TUN.",
+      "The name of the tun interface the core creates in TUN mode.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "tun0";
+  o.value("tun0", _("tun0 (Default)"));
+  o.value("tachyon0", "tachyon0");
+  o.value("singtun0", "singtun0");
+  o.value("utun0", "utun0");
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "tun_stack",
+    _tr("Сетевой стек TUN", "TUN Network Stack"),
+    _tr(
+      "Стек пользовательского пространства в tun-интерфейсе: mixed (быстрее), system (системный стек ядра), gvisor.",
+      "The user-space stack behind the tun interface: mixed (faster), system (the kernel stack), gvisor.",
+    ),
+  );
+  o.value("mixed", _tr("Mixed (по умолчанию)", "Mixed (Default)"));
+  o.value("system", _tr("System", "System"));
+  o.value("gvisor", _tr("gVisor", "gVisor"));
+  o.depends("proxy_mode", "tun");
+  o.default = "mixed";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "tun_auto_route",
+    _tr(
+      "Ядро само ставит маршрут по умолчанию",
+      "The core installs the default route itself",
+    ),
+    _tr(
+      "Ядро переносит маршрут по умолчанию в таблицу 2022 и не трогает main. Выключите, если маршруты управляются вручную.",
+      "The core moves the default route into table 2022 and leaves main alone. Turn this off when the routes are managed by hand.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "1";
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_mtu",
+    _tr("MTU TUN-интерфейса", "TUN Interface MTU"),
+    _tr(
+      "MTU tun-интерфейса. Слишком большое значение ломает передачу пакетов, слишком маленькое снижает скорость.",
+      "The MTU of the tun interface. Too large a value breaks packet delivery, too small a value costs throughput.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "9000";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "tun_gso",
+    _tr("GSO для TUN-интерфейса", "TUN Generic Segmentation Offload (GSO)"),
+    _tr(
+      "Включает пакетную разгрузку сегментации (GSO) на tun-интерфейсе для снижения нагрузки на CPU при высокой скорости.",
+      "Enables Generic Segmentation Offload (GSO) on the tun interface to lower CPU usage at high throughput.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "0";
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "tun_endpoint_independent_nat",
+    _tr("Endpoint-Independent NAT в TUN", "TUN Endpoint-Independent NAT"),
+    _tr(
+      "Улучшает прохождение STUN/WebRTC и голосового UDP-трафика в стеке gVisor/Mixed.",
+      "Improves STUN/WebRTC and UDP voice traversal in the gVisor/Mixed stack.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "0";
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_udp_timeout",
+    _tr("Таймаут UDP-сессий в TUN", "TUN UDP Session Timeout"),
+    _tr(
+      "Время жизни неактивных UDP-сессий в TUN (например: 5m, 300s).",
+      "Idle timeout for UDP sessions in TUN mode (e.g. 5m, 300s).",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.placeholder = "5m";
+  o.rmempty = true;
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_inet4",
+    _tr("Адрес TUN IPv4 (CIDR)", "TUN IPv4 Address (CIDR)"),
+    _tr(
+      "Адрес и маска TUN-интерфейса для IPv4 (по умолчанию: 172.19.0.1/30). Не должен пересекаться с FakeIP IPv4.",
+      "IPv4 CIDR address for the TUN interface (default: 172.19.0.1/30). Must not overlap with FakeIP IPv4.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.placeholder = "172.19.0.1/30";
+  o.rmempty = true;
+  o.validate = function (section_id, value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return true;
+    const res = main.validateCidr(trimmed, 4);
+    if (!res.valid) return res.message;
+    const f4 = readSectionSetting(
+      this.section,
+      section_id,
+      "fakeip_inet4_range",
+      "198.18.0.0/15",
+    );
+    if (f4 && main.cidrsOverlap(trimmed, f4)) {
+      return _tr(
+        "Адрес TUN IPv4 не должен пересекаться с диапазоном FakeIP IPv4",
+        "TUN IPv4 address must not overlap with FakeIP IPv4 range",
+      );
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_inet6",
+    _tr("Адрес TUN IPv6 (CIDR)", "TUN IPv6 Address (CIDR)"),
+    _tr(
+      "Адрес и маска TUN-интерфейса для IPv6 (по умолчанию: fdfe:dcba:9876::1/126). Не должен пересекаться с FakeIPv6 (fc00::/18).",
+      "IPv6 CIDR address for the TUN interface (default: fdfe:dcba:9876::1/126). Must not overlap with FakeIPv6 (fc00::/18).",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.placeholder = "fdfe:dcba:9876::1/126";
+  o.rmempty = true;
+  o.validate = function (section_id, value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return true;
+    const res = main.validateCidr(trimmed, 6);
+    if (!res.valid) return res.message;
+    const f6 = readSectionSetting(
+      this.section,
+      section_id,
+      "fakeip_inet6_range",
+      "fc00::/18",
+    );
+    if (f6 && main.cidrsOverlap(trimmed, f6)) {
+      return _tr(
+        "Адрес TUN IPv6 не должен пересекаться с диапазоном FakeIP IPv6",
+        "TUN IPv6 address must not overlap with FakeIP IPv6 range",
+      );
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "smart_queue",
+    _tr(
+      "Приоритизация интерактивного трафика (Smart Queue)",
+      "Interactive Traffic Prioritization (Smart Queue)",
+    ),
+    _tr(
+      "Встроенный планировщик очередей tachyon-core (CAKE-lite): отдаёт приоритет DNS, рукопожатиям, голосовым пакетам и играм перед фоновыми загрузками.",
+      "Built-in tachyon-core queue scheduler (CAKE-lite): prioritizes DNS, handshakes, voice packets, and gaming ahead of bulk downloads.",
+    ),
+  );
+  o.default = "0";
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "tcp_profile",
+    _tr(
+      "Профиль TCP-стека исходящих подключений",
+      "Outbound TCP Stack Profile",
+    ),
+    _tr(
+      "Параметры TCP-сокетов (TTL, MSS, окно приёма) для исходящих прокси и адаптивных подключений tachyon-core.",
+      "TCP socket parameters (TTL, MSS, receive window) for outbound proxy and adaptive connections in tachyon-core.",
+    ),
+  );
+  o.value("", _tr("По умолчанию (системный стек)", "Default (System Stack)"));
+  o.value(
+    "auto",
+    _tr("Авто (под отпечаток TLS uTLS)", "Auto (Match TLS uTLS Fingerprint)"),
+  );
+  o.value(
+    "windows",
+    _tr(
+      "Windows (TTL 128, MSS 1460, RCVBUF 64K)",
+      "Windows (TTL 128, MSS 1460, RCVBUF 64K)",
+    ),
+  );
+  o.value(
+    "macos",
+    _tr(
+      "macOS (TTL 64, MSS 1460, RCVBUF 128K)",
+      "macOS (TTL 64, MSS 1460, RCVBUF 128K)",
+    ),
+  );
+  o.value(
+    "ios",
+    _tr(
+      "iOS (TTL 64, MSS 1460, RCVBUF 64K)",
+      "iOS (TTL 64, MSS 1460, RCVBUF 64K)",
+    ),
+  );
+  o.value(
+    "android",
+    _tr(
+      "Android (TTL 64, MSS 1460, RCVBUF 64K)",
+      "Android (TTL 64, MSS 1460, RCVBUF 64K)",
+    ),
+  );
+  o.value(
+    "linux",
+    _tr(
+      "Linux (TTL 64, MSS 1460, RCVBUF 85K)",
+      "Linux (TTL 64, MSS 1460, RCVBUF 85K)",
+    ),
+  );
+  o.default = "";
+  o.rmempty = true;
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "selector_auto_failover",
+    _tr(
+      "Автопереключение при сбое (в ручном выборе)",
+      "Auto-switch on failure (manual selector)",
+    ),
+    _tr(
+      "Автоматически переключать селектор секции на рабочий узел, если выбранный вручную узел не отвечает при проверке задержки (без балансировщиков). Оставьте выключенным, чтобы исключить самопроизвольную смену IP-адреса.",
+      "Automatically switch the section selector to a working node if the manually selected node fails a latency check (without balancers). Leave disabled to prevent unexpected IP changes.",
+    ),
+  );
+  o.default = "0";
+
+  o = section.taboption(
+    "network",
     widgets.DeviceSelect,
     "source_network_interfaces",
     _("Source Network Interface"),
@@ -2278,30 +4595,16 @@ function createSettingsContent(section, capabilities) {
   o.nobridges = false;
   o.noinactive = false;
   o.multiple = true;
-  o.filter = function (section_id, value) {
-    // Block specific interface names from being selectable
-    const blocked = ["wan", "phy0-ap0", "phy1-ap0", "pppoe-wan"];
-    if (blocked.includes(value)) {
+  o.filter = function (_section_id, value) {
+    if (
+      !value ||
+      value === "lo" ||
+      value === "loopback" ||
+      value.startsWith("@")
+    ) {
       return false;
     }
-
-    // Try to find the device object by its name
-    const device = this.devices.find((dev) => dev.getName() === value);
-
-    // If no device is found, allow the value
-    if (!device) {
-      return true;
-    }
-
-    // Check the type of the device
-    const type = device.getType();
-
-    // Consider any Wi-Fi / wireless / wlan device as invalid
-    const isWireless =
-      type === "wifi" || type === "wireless" || type.includes("wlan");
-
-    // Allow only non-wireless devices
-    return !isWireless;
+    return true;
   };
 
   o = section.taboption(
@@ -2322,49 +4625,20 @@ function createSettingsContent(section, capabilities) {
     _("Select the network interface to which the traffic will originate"),
   );
   o.noaliases = true;
+  o.nobridges = false;
+  o.noinactive = false;
   o.multiple = false;
   o.depends("enable_output_network_interface", "1");
-  o.filter = function (section_id, value) {
-    // Blocked interface names that should never be selectable
-    const blockedInterfaces = ["br-lan"];
-
-    // Reject immediately if the value matches any blocked interface
-    if (blockedInterfaces.includes(value)) {
-      return false;
-    }
-
-    // Reject lan*
-    if (value.startsWith("lan")) {
-      return false;
-    }
-
-    // Reject tun*, wg*, vpn*, awg*, oc*
+  o.filter = function (_section_id, value) {
     if (
-      value.startsWith("tun") ||
-      value.startsWith("wg") ||
-      value.startsWith("vpn") ||
-      value.startsWith("awg") ||
-      value.startsWith("oc")
+      !value ||
+      value === "lo" ||
+      value === "loopback" ||
+      value.startsWith("@")
     ) {
       return false;
     }
-
-    // Try to find the device object with the given name
-    const device = this.devices.find((dev) => dev.getName() === value);
-
-    // If no device is found, allow the value
-    if (!device) {
-      return true;
-    }
-
-    // Get the device type (e.g., "wifi", "ethernet", etc.)
-    const type = device.getType();
-
-    // Reject wireless-related devices
-    const isWireless =
-      type === "wifi" || type === "wireless" || type.includes("wlan");
-
-    return !isWireless;
+    return true;
   };
 
   o = section.taboption(
@@ -2372,7 +4646,9 @@ function createSettingsContent(section, capabilities) {
     form.Flag,
     "enable_badwan_interface_monitoring",
     _("Interface Monitoring"),
-    _("Interface monitoring for Bad WAN"),
+    _(
+      "Monitor WAN interfaces for state changes, Multi-WAN switching, and automatic proxy reload",
+    ),
   );
   o.default = "0";
   o.rmempty = false;
@@ -2422,6 +4698,96 @@ function createSettingsContent(section, capabilities) {
   o = section.taboption(
     "network",
     form.Flag,
+    "wan_failover_enabled",
+    _("Automatic WAN Failover"),
+    _(
+      "Automatically probe the primary WAN interface and switch the default route to the backup WAN interface (e.g. 4G modem or secondary router) when the primary provider loses connectivity, without breaking routing or firewall rules.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    widgets.NetworkSelect,
+    "wan_failover_primary",
+    _("Primary WAN Interface"),
+    _("Main internet interface (e.g. wan). Used by default when reachable."),
+  );
+  o.depends("wan_failover_enabled", "1");
+  o.multiple = false;
+  o.default = "wan";
+  o.rmempty = false;
+  o.filter = function (section_id, value) {
+    if (["lan", "loopback"].includes(value) || value.startsWith("@")) {
+      return false;
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "network",
+    widgets.NetworkSelect,
+    "wan_failover_backup",
+    _("Backup WAN Interface"),
+    _(
+      "Fallback internet interface (e.g. wan2, wwan, usb, tethering) activated when the primary WAN fails.",
+    ),
+  );
+  o.depends("wan_failover_enabled", "1");
+  o.multiple = false;
+  o.default = "wan2";
+  o.rmempty = true;
+  o.filter = function (section_id, value) {
+    if (["lan", "loopback"].includes(value) || value.startsWith("@")) {
+      return false;
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "network",
+    form.DynamicList,
+    "wan_failover_probe_hosts",
+    _("WAN Failover Probe Hosts"),
+    _(
+      "IP addresses pinged through the primary WAN interface to verify internet connectivity (default: 77.88.8.8, 1.1.1.1, 8.8.8.8).",
+    ),
+  );
+  o.depends("wan_failover_enabled", "1");
+  o.placeholder = "77.88.8.8";
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "wan_failover_failure_threshold",
+    _("Failover Threshold (failed checks)"),
+    _(
+      "Number of consecutive failed checks before switching to the backup WAN (1-30, default: 3).",
+    ),
+  );
+  o.depends("wan_failover_enabled", "1");
+  o.datatype = "range(1,30)";
+  o.default = "3";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "wan_failover_recovery_threshold",
+    _("Recovery Threshold (successful checks)"),
+    _(
+      "Number of consecutive successful checks on the primary WAN before switching back from backup WAN (1-30, default: 3).",
+    ),
+  );
+  o.depends("wan_failover_enabled", "1");
+  o.datatype = "range(1,30)";
+  o.default = "3";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Flag,
     "route_router_traffic",
     _("Route Router's Own Traffic"),
     _(
@@ -2445,11 +4811,24 @@ function createSettingsContent(section, capabilities) {
   );
 
   o = section.taboption(
+    "network",
+    form.Flag,
+    "tcp_bbr",
+    _tr("TCP BBR (контроль перегрузки ядра)", "TCP BBR Congestion Control"),
+    _tr(
+      "Включает алгоритм управления перегрузкой TCP BBR на уровне ядра Linux (при наличии поддержки bbr и планировщика fq или fq_codel) для более стабильной пропускной способности на каналах с потерями и высокой задержкой. Если модуль ядра отсутствует, настройка безопасно пропускается.",
+      "Enables Linux kernel TCP BBR congestion control (when bbr and fq or fq_codel qdisc are supported by the kernel) for higher throughput on high-latency or lossy links. Safely skipped if kernel support is unavailable.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.taboption(
     "services",
     form.Flag,
     "enable_yacd",
     _("Enable YACD"),
-    `<a href="${main.getClashUIUrl()}" target="_blank">${main.getClashUIUrl()}</a>`,
+    `<a id="tachyon-yacd-ui-link" href="${main.getClashUIUrl()}" target="_blank">${main.getClashUIUrl()}</a>`,
   );
   o.default = "0";
   o.rmempty = false;
@@ -2473,11 +4852,30 @@ function createSettingsContent(section, capabilities) {
     "yacd_secret_key",
     _("YACD Secret Key"),
     _(
-      "Secret key for authenticating remote access to YACD when WAN access is enabled.",
+      "Secret key for authenticating access to YACD and Clash API (required when YACD WAN access is enabled, optional for LAN).",
     ),
   );
-  o.depends("enable_yacd_wan_access", "1");
-  o.rmempty = false;
+  o.depends("enable_yacd", "1");
+  o.rmempty = true;
+  o.onchange = function (_ev, _section_id, value) {
+    if (typeof document === "undefined") return;
+    const link = document.getElementById("tachyon-yacd-ui-link");
+    if (link) {
+      const nextUrl = main.getClashUIUrl(String(value || ""));
+      link.setAttribute("href", nextUrl);
+      link.textContent = nextUrl;
+    }
+  };
+  o.validate = function (section_id, value) {
+    if (
+      this.section.formvalue(section_id, "enable_yacd") === "1" &&
+      this.section.formvalue(section_id, "enable_yacd_wan_access") === "1" &&
+      (!value || !`${value}`.trim())
+    ) {
+      return _("Secret key is required when YACD WAN access is enabled");
+    }
+    return true;
+  };
 
   o = section.taboption(
     "services",
@@ -2485,18 +4883,24 @@ function createSettingsContent(section, capabilities) {
     "disable_quic",
     _("Disable QUIC"),
     _(
-      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming. Tunneled also rejects QUIC handed to the proxy; All rejects every UDP/443 outright.",
+      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming. Tunneled rejects QUIC for proxied traffic; All rejects every UDP/443 outright.",
     ),
   );
-  o.value("off", _("Off"));
-  o.value("tunneled", _("Tunneled"));
-  o.value("all", _("All"));
+  o.value("off", _("No"));
+  o.value("tunneled", _("Only for proxy"));
+  o.value("all", _("Yes (all traffic)"));
   o.default = "off";
   o.rmempty = false;
   o.cfgvalue = function (section_id) {
     const value = uci.get(UCI_PACKAGE, section_id, "disable_quic");
     // legacy flag values keep their meaning across the mode split
-    if (value === "1" || value === "true" || value === "yes" || value === "on")
+    if (
+      value === "tunneled" ||
+      value === "1" ||
+      value === "true" ||
+      value === "yes" ||
+      value === "on"
+    )
       return "tunneled";
     return value === "all" ? "all" : "off";
   };
@@ -2512,6 +4916,39 @@ function createSettingsContent(section, capabilities) {
   );
   o.default = "0";
   o.rmempty = false;
+
+  o = section.taboption(
+    "services",
+    form.ListValue,
+    "dns_intercept_all",
+    _("Intercept All LAN DNS"),
+    _(
+      "Redirect every LAN DNS query (port 53) to the router resolver, refuse DNS-over-TLS (853) and block well-known DNS-over-HTTPS resolvers, so clients with their own DNS cannot bypass domain sections. Excluded clients are not affected.",
+    ),
+  );
+  o.value("auto", _("Auto (on while a section is Fail-Closed)"));
+  o.value("1", _("On"));
+  o.value("0", _("Off"));
+  o.default = "auto";
+  o.rmempty = false;
+  guardFailClosedChange(
+    o,
+    (value) => value === "0",
+    _(
+      "With the intercept off, clients using their own DNS get real addresses and skip domain-based sections.",
+    ),
+  );
+  // Auto follows Fail-Closed at runtime (service/kill_switch.uc); say so loudly,
+  // since the stored value alone reads as a plain default.
+  const dnsFailClosedSections = failClosedSectionNames();
+  if (dnsFailClosedSections.length > 0) {
+    o.description +=
+      " <strong>" +
+      _(
+        "Fail-Closed is set in sections %h, so in Auto mode the intercept is ON now. Choose Off if clients need their own DNS (for example a VPN app).",
+      ).format(dnsFailClosedSections.join(", ")) +
+      "</strong>";
+  }
 
   o = section.taboption(
     "services",
@@ -2644,6 +5081,23 @@ function createSettingsContent(section, capabilities) {
 
   o = section.taboption(
     "updates",
+    form.ListValue,
+    "subscription_engine",
+    _("Subscription Fetch & Parse Engine"),
+    _(
+      "Choose how subscriptions are downloaded and parsed. Tachyon Core uses the native Rust binary (tachyon-core subscription) with adaptive User-Agent retry cascade, full Xray config array parsing, and multi-hop detour chains, automatically falling back to the built-in ucode script if unavailable.",
+    ),
+  );
+  o.value(
+    "core",
+    _("Tachyon Core Binary (Adaptive User-Agent & Xray Chains) (Recommended)"),
+  );
+  o.value("ucode", _("Built-in Script (curl + ucode)"));
+  o.default = "core";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "updates",
     form.Flag,
     "list_update_enabled",
     _("Enable list updates"),
@@ -2652,12 +5106,61 @@ function createSettingsContent(section, capabilities) {
   o.default = "1";
   o.rmempty = false;
 
+  // ── GitHub API token (issue #226) ─────────────────────────────────────────
+  // GitHub counts the unauthenticated API budget per IP. Everyone behind the
+  // same exit node (WARP, CGNAT) shares 60 requests/hour; a personal access
+  // token lifts that to 5000 per account without any other change.
+  const isValidGithubToken = function (val) {
+    return /^(?:gh[pousr]_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{22,255}|[A-Fa-f0-9]{40})$/.test(
+      val,
+    );
+  };
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "github_token",
+    _("GitHub API Token (optional)"),
+    _(
+      "Personal access token to avoid the 60 req/hour per-IP GitHub API limit during update checks. Leave empty if update checks work fine.",
+    ),
+  );
+  o.password = true;
+  o.rmempty = true;
+  o.cfgvalue = function (section_id) {
+    const raw = (uci.get(UCI_PACKAGE, section_id, "github_token") || "").trim();
+    if (raw !== "" && !isValidGithubToken(raw)) {
+      uci.unset(UCI_PACKAGE, section_id, "github_token");
+      return "";
+    }
+    return raw;
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val && isValidGithubToken(val)) {
+      uci.set(UCI_PACKAGE, section_id, "github_token", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "github_token");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "github_token");
+  };
+  o.validate = function (section_id, value) {
+    const v = (value || "").trim();
+    if (v !== "" && !isValidGithubToken(v))
+      return _(
+        "Does not look like a GitHub token (expected ghp_… / github_pat_… or a 40-hex classic token)",
+      );
+    return true;
+  };
+  disablePasswordAutofill(o);
+
   o = section.taboption(
     "updates",
     form.Value,
     "update_interval",
     _("List Update Frequency"),
-    _("Use sing-box duration format like 1d, 12h or 30m"),
+    _("Use duration format like 1d, 12h or 30m"),
   );
   o.depends("list_update_enabled", "1");
   o.placeholder = "1d";
@@ -2679,14 +5182,14 @@ function createSettingsContent(section, capabilities) {
     const normalized = value ? `${value}`.trim() : "";
 
     if (!normalized.length) {
-      return _("Use sing-box duration format like 1d, 12h or 30m");
+      return _("Use duration format like 1d, 12h or 30m");
     }
 
-    if (isSingBoxDuration(normalized)) {
+    if (isCoreDuration(normalized)) {
       return true;
     }
 
-    return _("Use sing-box duration format like 1d, 12h or 30m");
+    return _("Use duration format like 1d, 12h or 30m");
   };
 
   const updateListsBtn = section.taboption(
@@ -2712,30 +5215,47 @@ function createSettingsContent(section, capabilities) {
           "span",
           {
             style:
-              "color: var(--color-green-base, #2ecc71); font-weight: bold;",
+              "display: inline-flex; align-items: center; color: var(--color-green-base, #2ecc71); font-weight: 600;",
           },
-          "\u2713",
+          [
+            typeof main !== "undefined" && main.renderCheckIcon
+              ? main.renderCheckIcon(14)
+              : "\u2713",
+          ],
         );
       if (state === "error")
         return E(
           "span",
           {
-            style: "color: var(--color-red-base, #e74c3c); font-weight: bold;",
+            style:
+              "display: inline-flex; align-items: center; color: var(--color-red-base, #e74c3c); font-weight: 600;",
           },
-          "\u2717",
+          [
+            typeof main !== "undefined" && main.renderXIcon
+              ? main.renderXIcon(14)
+              : "\u2717",
+          ],
         );
       if (state === "active")
         return E(
           "span",
           {
             class: "spinning",
-            style: "color: var(--color-blue-base, #3498db);",
+            style:
+              "display: inline-flex; align-items: center; color: var(--color-blue-base, #3498db);",
           },
-          "\u25CB",
+          [
+            typeof main !== "undefined" && main.renderRotateCcwIcon24
+              ? main.renderRotateCcwIcon24()
+              : "\u25CB",
+          ],
         );
       return E(
         "span",
-        { style: "color: var(--text-color-medium, #999);" },
+        {
+          style:
+            "display: inline-flex; align-items: center; color: var(--text-color-medium, #999);",
+        },
         "\u25CB",
       );
     }
@@ -2863,11 +5383,23 @@ function createSettingsContent(section, capabilities) {
       ),
     ]);
 
+    let checkInFlight = false;
+
     function checkStatus() {
+      if (checkInFlight) return;
+      if (!modalBody.isConnected) {
+        stopPolling();
+        return;
+      }
+      checkInFlight = true;
       pollAttempts++;
       return fs
         .exec("/usr/bin/tachyon", ["list_update_status"])
         .then(function (res) {
+          if (!modalBody.isConnected) {
+            stopPolling();
+            return;
+          }
           let data = {};
           try {
             data = JSON.parse((res.stdout || "").trim() || "{}");
@@ -2882,7 +5414,7 @@ function createSettingsContent(section, capabilities) {
             }
             if (pollAttempts >= maxPollAttempts) {
               stopPolling();
-              ui.hideModal();
+              if (modalBody.isConnected) ui.hideModal();
               ui.addNotification(
                 null,
                 E(
@@ -2903,7 +5435,7 @@ function createSettingsContent(section, capabilities) {
               );
               detailText.style.color = "var(--color-green-base, #2ecc71)";
               setTimeout(function () {
-                ui.hideModal();
+                if (modalBody.isConnected) ui.hideModal();
                 ui.addNotification(
                   null,
                   E("p", _("Lists and rule sets successfully updated!")),
@@ -2915,7 +5447,7 @@ function createSettingsContent(section, capabilities) {
               detailText.textContent = data.message || _("Update failed");
               detailText.style.color = "var(--color-red-base, #e74c3c)";
               setTimeout(function () {
-                ui.hideModal();
+                if (modalBody.isConnected) ui.hideModal();
                 ui.addNotification(
                   null,
                   E(
@@ -2933,8 +5465,11 @@ function createSettingsContent(section, capabilities) {
         .catch(function () {
           if (pollAttempts >= maxPollAttempts) {
             stopPolling();
-            ui.hideModal();
+            if (modalBody.isConnected) ui.hideModal();
           }
+        })
+        .finally(function () {
+          checkInFlight = false;
         });
     }
 
@@ -2981,7 +5516,7 @@ function createSettingsContent(section, capabilities) {
     form.Value,
     "component_update_check_interval",
     _("Component update check interval"),
-    _("Use sing-box duration format like 1d, 12h or 30m"),
+    _("Use duration format like 1d, 12h or 30m"),
   );
   o.depends("component_update_check_enabled", "1");
   o.placeholder = "1d";
@@ -3005,11 +5540,11 @@ function createSettingsContent(section, capabilities) {
   o.validate = function (_section_id, value) {
     const normalized = value ? `${value}`.trim() : "";
 
-    if (normalized.length && isSingBoxDuration(normalized)) {
+    if (normalized.length && isCoreDuration(normalized)) {
       return true;
     }
 
-    return _("Use sing-box duration format like 1d, 12h or 30m");
+    return _("Use duration format like 1d, 12h or 30m");
   };
 
   o = section.taboption(
@@ -3062,6 +5597,85 @@ function createSettingsContent(section, capabilities) {
     return _("Enter a valid time in HH:MM format (00:00 to 23:59)");
   };
 
+  const validateWindowTime = function (_section_id, value) {
+    const normalized = value ? `${value}`.trim() : "";
+    if (
+      normalized === "" ||
+      /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(normalized)
+    ) {
+      return true;
+    }
+    return _("Enter a valid time in HH:MM format (00:00 to 23:59)");
+  };
+
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "component_auto_update_window_start",
+    _("Update window start"),
+    _(
+      "Start of the daily update window in HH:MM (24h). Inside the window the router waits for a quiet moment instead of updating at a fixed minute. Empty uses the scheduled time above.",
+    ),
+  );
+  o.depends({
+    component_auto_update_enabled: "1",
+    component_auto_update_mode: "schedule",
+  });
+  o.placeholder = "04:00";
+  o.rmempty = true;
+  o.validate = validateWindowTime;
+
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "component_auto_update_window_end",
+    _("Update window end"),
+    _(
+      "End of the daily update window in HH:MM (24h). An end earlier than the start means the window crosses midnight, e.g. 22:00 to 06:00. Empty means one hour after the start.",
+    ),
+  );
+  o.depends({
+    component_auto_update_enabled: "1",
+    component_auto_update_mode: "schedule",
+  });
+  o.placeholder = "05:00";
+  o.rmempty = true;
+  o.validate = validateWindowTime;
+
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "component_auto_update_max_connections",
+    _("Max active connections"),
+    _(
+      "Skip scheduled updates while the core has more active connections than this. 0 disables the limit.",
+    ),
+  );
+  o.depends({
+    component_auto_update_enabled: "1",
+    component_auto_update_mode: "schedule",
+  });
+  o.datatype = "uinteger";
+  o.placeholder = "0";
+  o.rmempty = true;
+
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "component_auto_update_max_clients",
+    _("Max active clients"),
+    _(
+      "Skip scheduled updates while more LAN clients have active connections. 0 disables the limit.",
+    ),
+  );
+  o.depends({
+    component_auto_update_enabled: "1",
+    component_auto_update_mode: "schedule",
+  });
+  o.datatype = "uinteger";
+  o.placeholder = "0";
+  o.rmempty = true;
+
   o = section.taboption(
     "updates",
     form.MultiValue,
@@ -3071,13 +5685,9 @@ function createSettingsContent(section, capabilities) {
   );
   o.depends("component_auto_update_enabled", "1");
   o.value("all", _("All components"));
-  o.value("tachyon", _("Tachyon Core"));
+  o.value("tachyon", _("Tachyon"));
+  o.value("tachyon-core", _("Tachyon Core"));
   o.value("luci_app_tachyon", _("LuCI Web UI"));
-  o.value("sing_box", _("sing-box"));
-  o.value("zapret", _("Zapret"));
-  o.value("zapret2", _("Zapret2"));
-  o.value("byedpi", _("ByeDPI"));
-  o.value("tailscale", _("Tailscale"));
   o.default = ["all"];
   o.rmempty = false;
 
@@ -3109,6 +5719,20 @@ function createSettingsContent(section, capabilities) {
   o.validate = function (_section_id, value) {
     return validateLatencyTestUrl(value);
   };
+
+  o = section.taboption(
+    "updates",
+    form.ListValue,
+    "latency_test_mode",
+    _("Latency Measurement Mode"),
+    _(
+      "Standard measures full connection establishment + HTTP HEAD request. KeepAlive / Warm Latency (via experimental.unified_delay) measures the 2nd HTTP HEAD request over an already established TLS session (similar to Happ KeepAlive mode; does not reflect initial handshake RTT).",
+    ),
+  );
+  o.default = "standard";
+  o.rmempty = false;
+  o.value("standard", _("Standard (Handshake + HTTP HEAD)"));
+  o.value("keepalive", _("KeepAlive / Warm Latency (Established Session)"));
 
   o = section.taboption(
     "updates",
@@ -3157,12 +5781,35 @@ function createSettingsContent(section, capabilities) {
   o = section.taboption(
     "advanced",
     form.Flag,
+    "lite_mode",
+    _tr(
+      "Tachyon Lite (Эко-режим для слабых MIPS/MIPSEL роутеров)",
+      "Tachyon Lite (Eco Mode for Low-Power MIPS/MIPSEL Routers)",
+    ),
+    _tr(
+      "Комплексная защита слабых процессоров (QCA9531 / MT7628, 650 МГц) от 100% загрузки и отвала Wi-Fi/LuCI при прокачке трафика (VLESS WS, Hysteria2): понижает приоритет прокси (nice 15), включает мгновенный пропуск установленных сессий через ct mark Short-Circuit + connlimit в nftables, ужимает таймауты conntrack (600с / буферы 256КБ) и замораживает фоновые проверки при активном трафике.",
+      "Comprehensive stabilization for low-power MIPS/MIPSEL routers (QCA9531 / MT7628, 650 MHz) to prevent 100% CPU lockups and Wi-Fi/LuCI drops under heavy VLESS WS / Hysteria2 traffic: lowers proxy priority (nice 15), enables nftables ct mark Short-Circuit + connlimit, tightens conntrack timeouts (600s / 256KB buffers), and hibernates background probes during active traffic.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "advanced",
+    form.Flag,
     "dont_touch_dhcp",
     _("Dont Touch My DHCP!"),
     _("Tachyon will not modify your DHCP configuration"),
   );
   o.default = "0";
   o.rmempty = false;
+  guardFailClosedChange(
+    o,
+    (value) => value === "1",
+    _(
+      "Without Tachyon managing dnsmasq, LAN clients stop getting answers through Tachyon and skip domain-based sections.",
+    ),
+  );
 
   o = section.taboption(
     "advanced",
@@ -3198,8 +5845,14 @@ function createSettingsContent(section, capabilities) {
       "Select path for tachyon-core config file. Change this ONLY if you know what you are doing",
     ),
   );
-  o.value("/etc/tachyon-core/config.json", "Flash (/etc/tachyon-core/config.json)");
-  o.value("/tmp/tachyon-core/config.json", "RAM (/tmp/tachyon-core/config.json)");
+  o.value(
+    "/etc/tachyon-core/config.json",
+    "Flash (/etc/tachyon-core/config.json)",
+  );
+  o.value(
+    "/tmp/tachyon-core/config.json",
+    "RAM (/tmp/tachyon-core/config.json)",
+  );
   o.default = "/etc/tachyon-core/config.json";
   o.rmempty = false;
 
@@ -3245,7 +5898,7 @@ function createSettingsContent(section, capabilities) {
     form.ListValue,
     "log_level",
     _("Log Level"),
-    _("Select the log level for sing-box"),
+    _("Select the log level for Tachyon Core"),
   );
   o.value("trace", "Trace");
   o.value("debug", "Debug");
@@ -3260,15 +5913,35 @@ function createSettingsContent(section, capabilities) {
   // Anonymization and Security
   o = section.taboption(
     "advanced",
-    form.Flag,
+    form.ListValue,
     "webrtc_leak_protect",
     _("WebRTC Leak Protection"),
     _(
       "Detects and drops STUN/TURN packets in nftables to prevent real IP leaks via WebRTC.",
     ),
   );
-  o.default = "0";
+  o.value("auto", _("Auto (on while a section is Fail-Closed)"));
+  o.value("1", _("On"));
+  o.value("0", _("Off"));
+  o.default = "auto";
   o.rmempty = false;
+  guardFailClosedChange(
+    o,
+    (value) => value === "0",
+    _(
+      "With WebRTC protection off, a site opened through the proxy can learn the real address over STUN.",
+    ),
+  );
+  // Auto follows Fail-Closed at runtime (service/kill_switch.uc).
+  const webrtcFailClosedSections = failClosedSectionNames();
+  if (webrtcFailClosedSections.length > 0) {
+    o.description +=
+      " <strong>" +
+      _(
+        "Fail-Closed is set in sections %h, so in Auto mode WebRTC protection is ON now. Choose Off if direct calls or games need STUN.",
+      ).format(webrtcFailClosedSections.join(", ")) +
+      "</strong>";
+  }
 
   o = section.taboption(
     "advanced",
@@ -3276,7 +5949,7 @@ function createSettingsContent(section, capabilities) {
     "dns_doq_ech",
     _("Strict ECH + DoQ DNS Enforcer"),
     _(
-      "Forces sing-box to tunnel DNS requests via DoQ with Encrypted Client Hello (ECH) for SNI hiding.",
+      "Forces Tachyon Core to tunnel DNS requests via DoQ with Encrypted Client Hello (ECH) for SNI hiding.",
     ),
   );
   o.default = "0";
@@ -3330,32 +6003,39 @@ function createSettingsContent(section, capabilities) {
       }
     }
 
+    const currentVal = this.cfgvalue(section_id);
+    if (currentVal && !this.keylist.includes(currentVal)) {
+      this.value(currentVal, `${_("Interface")}: ${currentVal}`);
+    }
+
     if (
       typeof network !== "undefined" &&
       typeof network.getDevices === "function"
     ) {
-      return network.getDevices().then(
-        L.bind(function (devices) {
-          (devices || []).forEach((dev) => {
-            const name =
-              typeof dev.getName === "function" ? dev.getName() : dev.name;
-            if (name && name !== "lo" && !this.keylist.includes(name)) {
-              const type =
-                typeof dev.getTypeI18n === "function"
-                  ? dev.getTypeI18n()
-                  : typeof dev.getType === "function"
-                    ? dev.getType()
-                    : "";
-              const desc = type ? ` (${type})` : "";
-              this.value(name, `${_("Interface")}: ${name}${desc}`);
-            }
-          });
-          return this.cfgvalue(section_id);
-        }, this),
-      );
+      network
+        .getDevices()
+        .then(
+          L.bind(function (devices) {
+            (devices || []).forEach((dev) => {
+              const name =
+                typeof dev.getName === "function" ? dev.getName() : dev.name;
+              if (name && name !== "lo" && !this.keylist.includes(name)) {
+                const type =
+                  typeof dev.getTypeI18n === "function"
+                    ? dev.getTypeI18n()
+                    : typeof dev.getType === "function"
+                      ? dev.getType()
+                      : "";
+                const desc = type ? ` (${type})` : "";
+                this.value(name, `${_("Interface")}: ${name}${desc}`);
+              }
+            });
+          }, this),
+        )
+        .catch(() => null);
     }
 
-    return this.cfgvalue(section_id);
+    return currentVal;
   };
   o.write = function (section_id, value) {
     const normalized = value ? `${value}`.trim() : "";
@@ -3391,6 +6071,9 @@ function createSettingsContent(section, capabilities) {
   resetOpt.cfgvalue = function () {
     return createResetSettingsWidget();
   };
+  resetOpt.renderWidget = function () {
+    return createResetSettingsWidget();
+  };
 
   const snapshotsOpt = section.taboption(
     "advanced",
@@ -3403,6 +6086,9 @@ function createSettingsContent(section, capabilities) {
   );
   snapshotsOpt.rawhtml = true;
   snapshotsOpt.cfgvalue = function () {
+    return createSnapshotsWidget();
+  };
+  snapshotsOpt.renderWidget = function () {
     return createSnapshotsWidget();
   };
 
@@ -3430,6 +6116,7 @@ function createSettingsContent(section, capabilities) {
   );
   o.password = true;
   o.rmempty = true;
+  disablePasswordAutofill(o);
 
   // AI Doctor (ChatGPT / LLM Integration)
   o = section.taboption(
@@ -3468,7 +6155,7 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_model",
     _("AI Model"),
     _(
-      "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2).",
+      "Model name to use. Leave empty to auto-detect or use provider default (gpt-4o-mini / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2).",
     ),
   );
   o.depends("enable_ai_doctor", "1");
@@ -3499,6 +6186,7 @@ function createSettingsContent(section, capabilities) {
   o.depends("enable_ai_doctor", "1");
   o.password = true;
   o.rmempty = true;
+  disablePasswordAutofill(o);
 
   o = section.taboption(
     "ai",
@@ -3506,14 +6194,12 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_custom_url",
     _("Custom API Endpoint URL"),
     _(
-      "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions or https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)",
+      "Custom OpenAI-compatible API endpoint or base URL (e.g. http://192.168.1.100:1234 or http://192.168.1.100:11434/v1/chat/completions). Leave empty to use official provider URL.",
     ),
   );
-  o.depends("ai_doctor_provider", "custom");
-  o.depends("ai_doctor_provider", "ollama");
-  o.depends("ai_doctor_provider", "lmstudio");
+  o.depends("enable_ai_doctor", "1");
   o.rmempty = true;
-  o.placeholder = "http://192.168.1.100:11434/v1/chat/completions";
+  o.placeholder = "http://192.168.1.100:1234/v1/chat/completions";
 
   // RAG (Knowledge Base Retrieval)
   o = section.taboption(
@@ -3562,9 +6248,9 @@ function createSettingsContent(section, capabilities) {
     form.Value,
     "ai_proxy_health_interval",
     _("Proxy Health Check Interval (s)"),
-    _("How often to check proxy health in seconds (fast tier, default 30)."),
+    _("How often to check proxy health in seconds (fast tier, default 60)."),
   );
-  o.default = "30";
+  o.default = "60";
   o.datatype = "min(15)";
   o.depends("ai_proxy_health_enabled", "1");
 
@@ -3589,6 +6275,28 @@ function createSettingsContent(section, capabilities) {
   o.default = "https://cp.cloudflare.com/generate_204";
   o.depends("ai_proxy_health_enabled", "1");
 
+  o = section.taboption(
+    "ai",
+    form.Flag,
+    "emergency_direct_bypass",
+    _("Emergency Direct Bypass"),
+    _(
+      "When every recovery attempt fails, route all traffic directly and resolve DNS via WAN to keep the Internet working. Disable to block instead (kill-switch for all sections). Always off while any section uses Fail-Closed.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+  o.depends("enable_watchdog", "1");
+  // Fail-Closed sections veto the bypass at runtime (service/kill_switch.uc)
+  // whatever is stored here, so show the effective state instead of a ticked
+  // box. The stored value is left alone: it applies again once no section is
+  // Fail-Closed.
+  showForcedByFailClosed(
+    o,
+    "0",
+    _("Off now: Fail-Closed is set in sections: %s."),
+  );
+
   // DNS Continuous Check
   o = section.taboption(
     "ai",
@@ -3608,9 +6316,9 @@ function createSettingsContent(section, capabilities) {
     form.Value,
     "ai_dns_interval",
     _("DNS Check Interval (s)"),
-    _("How often to check DNS health in seconds (default 60)."),
+    _("How often to check DNS health in seconds (default 180)."),
   );
-  o.default = "60";
+  o.default = "180";
   o.datatype = "min(30)";
   o.depends("ai_dns_continuous_enabled", "1");
 
@@ -3674,7 +6382,7 @@ function createSettingsContent(section, capabilities) {
     "ai_config_validation_enabled",
     _("Enable Config Validation"),
     _(
-      "Validates sing-box config before restart to prevent boot loops on broken configs.",
+      "Validates Tachyon Core config before restart to prevent boot loops on broken configs.",
     ),
   );
   o.default = "1";
@@ -3730,7 +6438,7 @@ function createSettingsContent(section, capabilities) {
     "ai_anomaly_detection_enabled",
     _("Enable Anomaly Detection"),
     _(
-      "Monitors sing-box reconnect frequency. Alerts if too many reconnects per hour.",
+      "Monitors Tachyon Core reconnect frequency. Alerts if too many reconnects per hour.",
     ),
   );
   o.default = "1";
@@ -3747,18 +6455,6 @@ function createSettingsContent(section, capabilities) {
   o.default = "10";
   o.datatype = "min(1)";
   o.depends("ai_anomaly_detection_enabled", "1");
-
-  o = section.taboption(
-    "ai",
-    form.Value,
-    "memory_limit_mb",
-    _("Memory Limit (MB)"),
-    _(
-      "Dynamic GOMEMLIMIT memory cap in MB for sing-box / tachyon-core. Set 0 for auto (50% RAM on low-memory devices or when OOM occurs).",
-    ),
-  );
-  o.default = "0";
-  o.datatype = "uinteger";
 
   // ─── End AI Watchdog Settings ──────────────────────────────────────────────
 
@@ -3778,7 +6474,7 @@ function createSettingsContent(section, capabilities) {
   // Default is the upstream 1.4.4 detector; Plus is explicitly opt-in.
   const smartDetectDescriptions = {
     default: _(
-      "Default: uses sing-box error logs and HTTPS HEAD probes. Adds the detected hostname after repeated Direct failures confirmed at least 120 seconds apart and a successful shared proxy probe.",
+      "Default: uses Tachyon Core error logs and HTTPS HEAD probes. Adds the detected hostname after repeated Direct failures confirmed at least 120 seconds apart and a successful shared proxy probe.",
     ),
     plus: _(
       "Plus: also watches stalled LAN HTTP/HTTPS connections and checks full GET responses. Two failed Direct GET probes and a successful shared proxy GET are required. Saves the main domain with its subdomains using the Public Suffix List. DNS resolution and local certificate errors defer detection.",
@@ -3950,6 +6646,8 @@ function createSettingsContent(section, capabilities) {
     html += "</ul>";
     return html;
   };
+
+  preserveHiddenTabOptions(section);
 }
 
 function createTelegramStatusWidget() {
@@ -3962,7 +6660,7 @@ function createTelegramStatusWidget() {
   const indicator = E("span", {
     id: "tachyon-telegram-status-indicator",
     style:
-      "display:inline-flex;align-items:center;gap:6px;font-weight:bold;font-size:14px;",
+      "display:inline-flex;align-items:center;gap:6px;font-weight: 600;font-size:14px;",
   });
 
   const dot = E("span", {
@@ -4014,7 +6712,20 @@ function createTelegramStatusWidget() {
     }
   }
 
-  function refreshStatus() {
+  let tgInFlight = false;
+  let tgHasMounted = false;
+  let tgLoadedOnce = false;
+
+  function refreshStatus(force) {
+    if (tgInFlight) return Promise.resolve();
+    if (
+      !force &&
+      (!wrapper.isConnected || wrapper.offsetParent === null || document.hidden)
+    ) {
+      return Promise.resolve();
+    }
+    tgInFlight = true;
+    tgLoadedOnce = true;
     return fs
       .exec("/usr/bin/tachyon", ["telegram_status"])
       .then(function (res) {
@@ -4026,6 +6737,9 @@ function createTelegramStatusWidget() {
       .catch(function () {
         dot.style.background = "#aaa";
         statusText.textContent = _("Unknown");
+      })
+      .finally(function () {
+        tgInFlight = false;
       });
   }
 
@@ -4035,7 +6749,7 @@ function createTelegramStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["telegram_start"])
       .then(function () {
         statusMsg.textContent = "";
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function () {
         statusMsg.textContent = _("Failed to start bot");
@@ -4049,7 +6763,7 @@ function createTelegramStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["telegram_stop"])
       .then(function () {
         statusMsg.textContent = "";
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function () {
         statusMsg.textContent = _("Failed to stop bot");
@@ -4062,17 +6776,30 @@ function createTelegramStatusWidget() {
   wrapper.appendChild(btnStop);
   wrapper.appendChild(statusMsg);
 
-  // Initial status fetch
-  refreshStatus();
+  let tgVisibilityObserver = null;
+  if (typeof IntersectionObserver !== "undefined") {
+    tgVisibilityObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !tgLoadedOnce) {
+        refreshStatus(true);
+      }
+    });
+    tgVisibilityObserver.observe(wrapper);
+  } else {
+    refreshStatus(true);
+  }
+
   // Refresh every 10s while visible
-  const timer = setInterval(refreshStatus, 10000);
-  const observer = new MutationObserver(function () {
-    if (!document.body.contains(wrapper)) {
+  const timer = setInterval(function () {
+    if (wrapper.isConnected) {
+      tgHasMounted = true;
+    } else if (tgHasMounted) {
       clearInterval(timer);
-      observer.disconnect();
+      if (tgVisibilityObserver) tgVisibilityObserver.disconnect();
+      return;
     }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+    if (typeof document !== "undefined" && document.hidden) return;
+    refreshStatus(false);
+  }, 10000);
 
   return wrapper;
 }
@@ -4114,6 +6841,7 @@ function createTelegramContent(section) {
     }
     return true;
   };
+  disablePasswordAutofill(o);
   o.write = function (section_id, value) {
     const val = value ? `${value}`.trim() : "";
     if (val) {
@@ -4217,7 +6945,7 @@ function createTelegramContent(section) {
     "notify_crash",
     _("Notify on Core Crashes"),
     _(
-      "Send a Telegram notification if sing-box or nftables rules crash and get auto-restored.",
+      "Send a Telegram notification if Tachyon Core or nftables rules crash and get auto-restored.",
     ),
   );
   o.depends("enabled", "1");
@@ -4289,6 +7017,109 @@ function createTelegramContent(section) {
   o.rmempty = false;
 
   o = section.option(
+    form.Flag,
+    "notify_auto_update",
+    _("Notify on Automatic Updates"),
+    _(
+      "Send a Telegram notification when components are automatically updated.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_smart_detect",
+    _tr("Уведомления Smart Detect", "Notify on Smart Detect"),
+    _tr(
+      "Отправлять сообщение в Telegram при автоматическом добавлении домена через Smart Detect.",
+      "Send a Telegram notification when Smart Detect automatically adds a domain.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_failover",
+    _tr(
+      "Уведомления Failover и Fail Policy",
+      "Notify on Failover & Fail Policy",
+    ),
+    _tr(
+      "Отправлять сообщение при переключении активной секции или срабатывании политики отказа.",
+      "Send a Telegram notification on section failover switches or fail policy transitions.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_wan",
+    _tr("Уведомления WAN и интерфейсов", "Notify on WAN & Interfaces"),
+    _tr(
+      "Отправлять сообщение при изменении состояния интерфейсов WAN, WAN Failover и попытках восстановления шлюза.",
+      "Send a Telegram notification on WAN interface up/down events, WAN Failover, and gateway recovery.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_update_available",
+    _tr("Уведомления о доступных обновлениях", "Notify on Available Updates"),
+    _tr(
+      "Отправлять сообщение в Telegram при обнаружении новых версий компонентов.",
+      "Send a Telegram notification when component updates become available.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_parental",
+    _tr("Уведомления квот и расписаний", "Notify on Quotas & Schedules"),
+    _tr(
+      "Отправлять сообщения при превышении квот устройств, гостевого режима и срабатывании расписаний.",
+      "Send Telegram notifications for device/guest quota events and schedule activity.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Flag,
+    "notify_route_alert",
+    _tr(
+      "Уведомления о сбоях связи с API бота",
+      "Notify on Bot API Route Alerts",
+    ),
+    _tr(
+      "Отправлять предупреждение при повторяющихся ошибках соединения с Telegram Bot API.",
+      "Send a warning when Telegram Bot API polling fails repeatedly.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.option(
     form.ListValue,
     "bot_proxy_section",
     _("Proxy Section for Bot"),
@@ -4327,6 +7158,168 @@ function createTelegramContent(section) {
     uci.unset(UCI_PACKAGE, "telegram", "bot_proxy_section");
   };
 
+  o = section.option(
+    form.ListValue,
+    "language",
+    _("Bot Language"),
+    _("Language for Telegram bot replies and notifications."),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "";
+  o.rmempty = true;
+  o.value("", _("Auto (follow LuCI)"));
+  o.value("en", "English");
+  o.value("ru", "Русский");
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val) {
+      uci.set(UCI_PACKAGE, section_id, "language", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "language");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "language");
+  };
+
+  o = section.option(
+    form.Value,
+    "fallback_socks",
+    _("Fallback SOCKS5 Proxy"),
+    _(
+      "Optional SOCKS5 proxy address (host:port, for example 127.0.0.1:1080) used when connecting to Telegram API.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.placeholder = "127.0.0.1:1080";
+  o.rmempty = true;
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val) {
+      uci.set(UCI_PACKAGE, section_id, "fallback_socks", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "fallback_socks");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "fallback_socks");
+  };
+
+  const validateHourOption = (value) => {
+    const raw = value ? `${value}`.trim() : "";
+    if (!raw) return true;
+    if (!/^[0-9]+$/.test(raw)) return _("Enter an hour from 0 to 23");
+    const num = parseInt(raw, 10);
+    if (isNaN(num) || num < 0 || num > 23) {
+      return _("Enter an hour from 0 to 23");
+    }
+    return true;
+  };
+
+  o = section.option(
+    form.Flag,
+    "daily_report_enabled",
+    _("Daily Status Report"),
+    _("Send a daily summary of system health and proxy status to Telegram."),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Value,
+    "daily_report_hour",
+    _("Daily Report Hour (0-23)"),
+    _("Hour of the day to send the daily report (default: 8)."),
+  );
+  o.depends({ enabled: "1", daily_report_enabled: "1" });
+  o.retain = true;
+  o.default = "8";
+  o.placeholder = "8";
+  o.rmempty = true;
+  o.validate = function (_section_id, value) {
+    return validateHourOption(value);
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val && val !== "8") {
+      uci.set(UCI_PACKAGE, section_id, "daily_report_hour", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "daily_report_hour");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "daily_report_hour");
+  };
+
+  o = section.option(
+    form.Flag,
+    "quiet_hours_enabled",
+    _("Quiet Hours"),
+    _(
+      "Suppress non-critical Telegram notifications during the configured night window.",
+    ),
+  );
+  o.depends("enabled", "1");
+  o.retain = true;
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.option(
+    form.Value,
+    "quiet_hours_start",
+    _("Quiet Hours Start (0-23)"),
+    _("Hour when quiet hours begin (default: 23)."),
+  );
+  o.depends({ enabled: "1", quiet_hours_enabled: "1" });
+  o.retain = true;
+  o.default = "23";
+  o.placeholder = "23";
+  o.rmempty = true;
+  o.validate = function (_section_id, value) {
+    return validateHourOption(value);
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val && val !== "23") {
+      uci.set(UCI_PACKAGE, section_id, "quiet_hours_start", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "quiet_hours_start");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "quiet_hours_start");
+  };
+
+  o = section.option(
+    form.Value,
+    "quiet_hours_end",
+    _("Quiet Hours End (0-23)"),
+    _("Hour when quiet hours end (default: 7)."),
+  );
+  o.depends({ enabled: "1", quiet_hours_enabled: "1" });
+  o.retain = true;
+  o.default = "7";
+  o.placeholder = "7";
+  o.rmempty = true;
+  o.validate = function (_section_id, value) {
+    return validateHourOption(value);
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val && val !== "7") {
+      uci.set(UCI_PACKAGE, section_id, "quiet_hours_end", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "quiet_hours_end");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "quiet_hours_end");
+  };
+
   // ── Telegram API Connection Test ──────────────────────────────────────────
 
   const testOpt = section.option(
@@ -4337,29 +7330,52 @@ function createTelegramContent(section) {
   testOpt.rawhtml = true;
   testOpt.cfgvalue = function () {
     const wrapper = E("div", { style: "margin-top: 8px;" });
+    const createBtnContent = (isTesting) => {
+      const icon = isTesting
+        ? typeof main !== "undefined" && main.renderHourglassIcon
+          ? main.renderHourglassIcon(14)
+          : renderFallbackHourglassSvg(14)
+        : typeof main !== "undefined" && main.renderPlugIcon
+          ? main.renderPlugIcon(14)
+          : null;
+      const label = isTesting ? _("Testing…") : _("Test Connection");
+      return [icon, E("span", { style: "margin-left: 6px;" }, label)].filter(
+        Boolean,
+      );
+    };
+
     const btn = E(
       "button",
       {
         class: "btn cbi-button cbi-button-action",
         type: "button",
         id: "tachyon-telegram-test-btn",
+        style: "display: inline-flex; align-items: center;",
       },
-      "\uD83D\uDD0C " + _("Test Connection"),
+      createBtnContent(false),
     );
     const result = E("div", {
       id: "tachyon-telegram-test-result",
       style:
-        "margin-top: 8px; white-space: pre-wrap; font-family: monospace; font-size: 12px; display: none;",
+        "margin-top: 8px; font-family: monospace; font-size: 12px; display: none;",
     });
     wrapper.appendChild(btn);
     wrapper.appendChild(result);
 
+    const resetBtn = () => {
+      btn.disabled = false;
+      while (btn.firstChild) btn.removeChild(btn.firstChild);
+      createBtnContent(false).forEach((el) => btn.appendChild(el));
+    };
+
     btn.addEventListener("click", function () {
       btn.disabled = true;
-      btn.textContent = "\u23F3 " + _("Testing…");
+      while (btn.firstChild) btn.removeChild(btn.firstChild);
+      createBtnContent(true).forEach((el) => btn.appendChild(el));
+
       result.style.display = "block";
-      result.style.color = "";
-      result.textContent = _("Running diagnostics…");
+      while (result.firstChild) result.removeChild(result.firstChild);
+      result.appendChild(E("div", {}, _("Running diagnostics…")));
 
       fs.exec("/usr/bin/tachyon", ["telegram_diagnose"])
         .then(function (res) {
@@ -4370,48 +7386,123 @@ function createTelegramContent(section) {
             data = null;
           }
 
+          while (result.firstChild) result.removeChild(result.firstChild);
+
           if (!data || !data.checks) {
-            result.textContent =
-              "\u274C " +
-              _("Failed to run diagnostics — is the tachyon binary installed?");
-            btn.disabled = false;
-            btn.textContent = "\uD83D\uDD0C " + _("Test Connection");
+            const failIcon =
+              typeof main !== "undefined" && main.renderXIcon
+                ? main.renderXIcon(14)
+                : renderFallbackXSvg(14);
+            result.appendChild(
+              E(
+                "div",
+                {
+                  style:
+                    "display: flex; align-items: center; gap: 6px; color: var(--error-color, #e53935);",
+                },
+                [
+                  failIcon,
+                  E(
+                    "span",
+                    {},
+                    _(
+                      "Failed to run diagnostics — is the tachyon binary installed?",
+                    ),
+                  ),
+                ],
+              ),
+            );
+            resetBtn();
             return;
           }
 
-          var lines = [];
-          for (var i = 0; i < data.checks.length; i++) {
-            var c = data.checks[i];
-            lines.push((c.ok ? "\u2705" : "\u274C") + " " + c.message);
-          }
+          data.checks.forEach(function (c) {
+            const icon = c.ok
+              ? typeof main !== "undefined" && main.renderCheckIcon
+                ? main.renderCheckIcon(14)
+                : renderFallbackCheckSvg(14)
+              : typeof main !== "undefined" && main.renderXIcon
+                ? main.renderXIcon(14)
+                : renderFallbackXSvg(14);
+            result.appendChild(
+              E(
+                "div",
+                {
+                  style: `display: flex; align-items: center; gap: 6px; margin-bottom: 4px; color: ${
+                    c.ok
+                      ? "var(--success-color, #28a745)"
+                      : "var(--error-color, #e53935)"
+                  };`,
+                },
+                [icon, E("span", {}, c.message)],
+              ),
+            );
+          });
+
           if (data.ok) {
-            lines.push("");
-            lines.push(
-              "\u2705 " +
-                _("All checks passed — Telegram bot should work correctly"),
+            const passIcon =
+              typeof main !== "undefined" && main.renderCheckIcon
+                ? main.renderCheckIcon(14)
+                : renderFallbackCheckSvg(14);
+            result.appendChild(
+              E(
+                "div",
+                {
+                  style:
+                    "display: flex; align-items: center; gap: 6px; margin-top: 6px; font-weight: 600; color: var(--success-color, #28a745);",
+                },
+                [
+                  passIcon,
+                  E(
+                    "span",
+                    {},
+                    _("All checks passed — Telegram bot should work correctly"),
+                  ),
+                ],
+              ),
             );
           }
-          result.textContent = lines.join("\n");
-          result.style.color = data.ok ? "" : "#e53935";
-          btn.disabled = false;
-          btn.textContent = "\uD83D\uDD0C " + _("Test Connection");
+          resetBtn();
         })
         .catch(function () {
-          result.textContent =
-            "\u274C " +
-            _("Failed to run diagnostics — is the tachyon binary installed?");
-          btn.disabled = false;
-          btn.textContent = "\uD83D\uDD0C " + _("Test Connection");
+          while (result.firstChild) result.removeChild(result.firstChild);
+          const failIcon =
+            typeof main !== "undefined" && main.renderXIcon
+              ? main.renderXIcon(14)
+              : renderFallbackXSvg(14);
+          result.appendChild(
+            E(
+              "div",
+              {
+                style:
+                  "display: flex; align-items: center; gap: 6px; color: var(--error-color, #e53935);",
+              },
+              [
+                failIcon,
+                E(
+                  "span",
+                  {},
+                  _(
+                    "Failed to run diagnostics — is the tachyon binary installed?",
+                  ),
+                ),
+              ],
+            ),
+          );
+          resetBtn();
         });
     });
 
     return wrapper;
   };
+
+  preserveHiddenTabOptions(section);
 }
 
 const EntryPoint = {
   createSettingsContent,
   createTelegramContent,
+  preserveHiddenTabOptions,
 };
 
 return baseclass.extend(EntryPoint);

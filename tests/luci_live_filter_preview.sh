@@ -33,25 +33,166 @@ const source = fs.readFileSync(process.argv[2], "utf8");
 const startIdx = source.indexOf("function normalizeProtocolName(protocol)");
 const regionFallbacksIdx = source.indexOf("const REGION_NAME_FALLBACKS =");
 const plainObjIdx = source.indexOf("function plainObject(value)");
-const endIdx = source.indexOf("function loadOutboundNameChoices(section_id)");
+const endIdx = source.indexOf("function normalizeDynamicListItems(value)");
+const draftStartIdx = source.indexOf("function getOutboundTypeForName(section_id, name)");
+const draftEndIdx = source.indexOf("function currentSectionPrefixChoices(section_id");
+const notifyStartIdx = source.indexOf("function invalidateSectionOutboundChoicesCache(section_id)");
+const notifyEndIdx = source.indexOf("function isDownloadThroughTargetSection(section");
 
-if (startIdx < 0 || regionFallbacksIdx < 0 || plainObjIdx < 0 || endIdx < 0) {
+if (
+  startIdx < 0 ||
+  regionFallbacksIdx < 0 ||
+  plainObjIdx < 0 ||
+  endIdx < 0 ||
+  draftStartIdx < 0 ||
+  draftEndIdx < 0 ||
+  notifyStartIdx < 0 ||
+  notifyEndIdx < 0
+) {
   console.error("FAIL: could not locate filter preview helper functions in section.js");
   process.exit(1);
 }
 
 const protocolBlock = source.slice(startIdx, regionFallbacksIdx);
 const filterBlock = source.slice(plainObjIdx, endIdx);
+const draftBlock = source.slice(draftStartIdx, draftEndIdx);
+const notifyBlock = source.slice(notifyStartIdx, notifyEndIdx);
 
 const contextCode = `
-const fs = { read: () => Promise.resolve("{}") };
+const mockFiles = {
+  "/etc/tachyon/subscription-cache/Pool_src_sub_riot-subscription-1.json": JSON.stringify({
+    outbounds: [
+      {
+        type: "vless",
+        tag: "🇩🇪 Germany Pool 1",
+        server: "de1.example.com",
+        server_port: 443,
+        tls: { enabled: true, reality: { enabled: true } }
+      },
+      {
+        type: "vless",
+        tag: "🇳🇱 Netherlands Pool 2",
+        server: "nl2.example.com",
+        server_port: 443,
+        tls: { enabled: true, reality: { enabled: true } }
+      }
+    ]
+  })
+};
+const UCI_PACKAGE = "tachyon";
+const mockUciSections = {
+  section: [
+    {
+      ".name": "VPN",
+      ".type": "section",
+      enabled: "1",
+      action: "connection",
+      outbound_source_refs: ["src_sub_riot", "src_manual_de"],
+      balancer_refs: ["urltest", "priority"]
+    },
+    {
+      ".name": "FptnSec",
+      ".type": "section",
+      enabled: "1",
+      action: "connection",
+      outbound_source_refs: ["src_fptn_pool"]
+    }
+  ],
+  outbound_source: [
+    {
+      ".name": "src_fptn_pool",
+      ".type": "outbound_source",
+      enabled: "1",
+      name: "FPTN",
+      source_type: "fptn",
+      access_token: "fptnb://compressed-brotli-token"
+    },
+    {
+      ".name": "src_sub_riot",
+      ".type": "outbound_source",
+      enabled: "1",
+      name: "subscribeRiot",
+      source_type: "subscription",
+      url: "https://sub.example.com/riot",
+      prefix_nodes: "0"
+    },
+    {
+      ".name": "src_manual_de",
+      ".type": "outbound_source",
+      enabled: "1",
+      name: "🇩🇪 Германия | VLESS | Multi",
+      source_type: "proxy_links",
+      proxy_links: ["vless://11111111-1111-1111-1111-111111111111@de.example.com:443#🇩🇪%20Германия%20%7C%20VLESS%20%7C%20Multi"]
+    }
+  ],
+  outbound_group: [],
+  balancer: [
+    { ".name": "urltest", ".type": "balancer", enabled: "1", balancer_type: "urltest" },
+    { ".name": "priority", ".type": "balancer", enabled: "1", balancer_type: "priority" }
+  ]
+};
+const uci = {
+  sections: (_pkg, type) => mockUciSections[type] || [],
+  get: (_pkg, secId, opt) => {
+    for (const list of Object.values(mockUciSections)) {
+      const hit = list.find((s) => s[".name"] === secId);
+      if (hit) return opt ? hit[opt] : hit;
+    }
+    return null;
+  }
+};
+const main = {
+  getProxyUrlName: (url) => {
+    const idx = String(url || "").indexOf("#");
+    return idx >= 0 ? decodeURIComponent(String(url).slice(idx + 1)) : "";
+  }
+};
+function normalizeOptionValues(val) {
+  if (!val) return [];
+  return Array.isArray(val) ? val : String(val).trim().split(/\\s+/).filter(Boolean);
+}
+function normalizeDynamicListItems(val) {
+  return normalizeOptionValues(val);
+}
+function currentSourceOptionValues(secId, opt) {
+  return normalizeOptionValues(uci.get(UCI_PACKAGE, secId, opt));
+}
+function getConfigListValues(secId, opt) {
+  return normalizeOptionValues(uci.get(UCI_PACKAGE, secId, opt));
+}
+function getRuleResolvedAction(secId) {
+  return uci.get(UCI_PACKAGE, secId, "action") || "connection";
+}
+function readItemSettingsMap() {
+  return {};
+}
+const fs = {
+  read: (p) => Promise.resolve(mockFiles[p] || "{}"),
+  list: () => Promise.resolve([])
+};
 const SECTION_CACHE_DIR = "/var/run/tachyon/section-cache";
+const SUBSCRIPTION_CACHE_DIR = "/etc/tachyon/subscription-cache";
+const OUTBOUND_NAME_CHOICES_TTL_MS = 10000;
+const outboundNameChoicesCache = new Map();
+const outboundNameChoicesFetchedAt = new Map();
+const outboundNameChoicesInflight = new Map();
+const outboundTypeByNameCache = new Map();
+const dashboardFilterChoiceRefreshers = new Map();
+const outboundNameSourceOptions = new Map();
 ${protocolBlock}
 ${filterBlock}
+${draftBlock}
+${notifyBlock}
 return {
   filteredOutboundMetadataFromCache,
+  readOutboundMetadataFromSectionCache,
   extractCountryFromFlagEmojiName,
-  evaluateLiveServerFilterPreview
+  evaluateLiveServerFilterPreview,
+  loadOutboundNameChoices,
+  currentOutboundNameChoices,
+  currentDraftOutboundNames,
+  outboundNameChoicesCache,
+  dashboardFilterChoiceRefreshers
 };
 `;
 
@@ -112,6 +253,123 @@ const resMixed = helpers.evaluateLiveServerFilterPreview(cached, {
 });
 assert.strictEqual(resMixed.matchedCount, 2);
 assert.strictEqual(resMixed.excludedCount, 1);
+
+// 6. Verify includePrefixes + includeCountries intersect with AND (#384)
+const cachedWithSources = helpers.filteredOutboundMetadataFromCache({
+  outboundMetadata: {
+    names: {
+      s1: "🇩🇪 Germany Sub 1",
+      s2: "🇳🇱 Netherlands Sub 2",
+      m1: "🇩🇪 Germany Manual",
+    },
+    countries: { s1: "DE", s2: "NL", m1: "DE" },
+    protocols: { s1: "vless", s2: "vless", m1: "vless" },
+    transports: { s1: "tcp", s2: "tcp", m1: "tcp" },
+    securities: { s1: "reality", s2: "reality", m1: "reality" },
+    ports: { s1: 443, s2: 443, m1: 443 },
+    sources: { s1: "sub:1", s2: "sub:1", m1: "src_manual_de" },
+    source_ids: { s1: "src_sub_riot", s2: "src_sub_riot", m1: "src_manual_de" },
+    source_names: {
+      s1: "subscribeRiot",
+      s2: "subscribeRiot",
+      m1: "Germany Manual",
+    },
+  },
+});
+const resSubAndCountry = helpers.evaluateLiveServerFilterPreview(
+  cachedWithSources,
+  {
+    filterMode: "include",
+    detectServerCountry: "flag_emoji",
+    includePrefixes: ["subscribeRiot"],
+    includeCountries: ["DE"],
+  },
+);
+assert.strictEqual(resSubAndCountry.totalCount, 3);
+assert.strictEqual(resSubAndCountry.matchedCount, 1);
+assert.strictEqual(resSubAndCountry.matchedServers[0].tag, "s1");
+
+// 7. Verify readOutboundMetadataFromSectionCache loads subscription pool cache + manual links (#384, #386)
+helpers.readOutboundMetadataFromSectionCache("VPN").then((vpnMeta) => {
+  const namesList = Object.values(vpnMeta.names || {});
+  assert.strictEqual(namesList.length, 3, "Expected 2 subscription nodes + 1 manual link, got: " + JSON.stringify(namesList));
+  assert(namesList.includes("🇩🇪 Germany Pool 1"));
+  assert(namesList.includes("🇳🇱 Netherlands Pool 2"));
+  assert(namesList.includes("🇩🇪 Германия | VLESS | Multi"));
+  const preview = helpers.evaluateLiveServerFilterPreview(vpnMeta, {
+    filterMode: "include",
+    detectServerCountry: "flag_emoji",
+    includePrefixes: ["subscribeRiot"],
+    includeCountries: ["DE"],
+  });
+  assert.strictEqual(preview.totalCount, 3);
+  assert.strictEqual(preview.matchedCount, 1);
+  assert.strictEqual(preview.matchedServers[0].name, "🇩🇪 Germany Pool 1");
+
+  // 8. Verify loadOutboundNameChoices populates cache AND keeps it intact for refresher callbacks
+  let refreshedChoices = null;
+  helpers.dashboardFilterChoiceRefreshers.set("VPN", new Set([
+    () => {
+      refreshedChoices = helpers.currentOutboundNameChoices("VPN", []);
+      return true;
+    }
+  ]));
+  return helpers.loadOutboundNameChoices("VPN").then((loadedChoices) => {
+    assert.strictEqual(loadedChoices.length, 3, "loadOutboundNameChoices must return 3 servers for VPN");
+    assert(helpers.outboundNameChoicesCache.has("VPN"), "outboundNameChoicesCache must retain VPN choices after loadOutboundNameChoices resolves");
+    assert(Array.isArray(refreshedChoices) && refreshedChoices.length === 3, "refresher must see 3 populated choices instead of an invalidated empty cache");
+    const fptnDraftNames = helpers.currentDraftOutboundNames("FptnSec");
+    assert(!fptnDraftNames.includes("FPTN"), "currentDraftOutboundNames must not inject the FPTN source name as a server choice");
+
+    // 9. Verify exclude/include matching across subscription telemetry updates without false collisions
+    const telemetryMeta = helpers.filteredOutboundMetadataFromCache({
+      outboundMetadata: {
+        names: {
+          e1: "🇪🇺 [LTE] Europe 1 [151.02 GiB]",
+          e11: "🇪🇺 [LTE] Europe 1.1 [151.02 GiB]",
+          e12: "🇪🇺 [LTE] Europe 1.2 | 151.02 GiB | 27d",
+          g10: "🇩🇪 Germany 1 [10 Gbps]",
+          g1: "🇩🇪 Germany 1 [1 Gbps]",
+          s1: "Server (1) (98,5 ГБ)",
+          s2: "Server (2) (98,5 ГБ)",
+        },
+        countries: { e1: "EU", e11: "EU", e12: "EU", g10: "DE", g1: "DE", s1: "NL", s2: "NL" },
+        protocols: { e1: "vless", e11: "vless", e12: "vless", g10: "vless", g1: "vless", s1: "vless", s2: "vless" },
+        transports: { e1: "tcp", e11: "tcp", e12: "tcp", g10: "tcp", g1: "tcp", s1: "tcp", s2: "tcp" },
+        securities: { e1: "reality", e11: "reality", e12: "reality", g10: "reality", g1: "reality", s1: "reality", s2: "reality" },
+        ports: { e1: 443, e11: 443, e12: 443, g10: 443, g1: 443, s1: 443, s2: 443 },
+      },
+    });
+    const resDynExclude = helpers.evaluateLiveServerFilterPreview(telemetryMeta, {
+      filterMode: "exclude",
+      excludeOutbounds: [
+        "🇪🇺 [LTE] Europe 1 [154.77 GiB]",
+        "🇩🇪 Germany 1 [10 Gbps]",
+        "Server (1) (154,77 ГБ)",
+      ],
+    });
+    const matchedDynTags = resDynExclude.matchedServers.map((s) => s.tag);
+    assert(!matchedDynTags.includes("e1"), "Europe 1 must stay excluded when quota telemetry changes");
+    assert(matchedDynTags.includes("e11"), "Europe 1.1 must not match Europe 1 exclusion");
+    assert(matchedDynTags.includes("e12"), "Europe 1.2 must remain matched");
+    assert(!matchedDynTags.includes("g10"), "Germany 1 [10 Gbps] must be excluded");
+    assert(matchedDynTags.includes("g1"), "Germany 1 [1 Gbps] must not be matched by [10 Gbps]");
+    assert(!matchedDynTags.includes("s1"), "Server (1) must stay excluded when quota changes");
+    assert(matchedDynTags.includes("s2"), "Server (2) must not be matched by Server (1)");
+
+    const resDynInclude = helpers.evaluateLiveServerFilterPreview(telemetryMeta, {
+      filterMode: "include",
+      includeOutbounds: [
+        "🇪🇺 [LTE] Europe 1.2 | 12.4 / 200 GB | 28d",
+      ],
+    });
+    assert.strictEqual(resDynInclude.matchedCount, 1);
+    assert.strictEqual(resDynInclude.matchedServers[0].tag, "e12");
+  });
+}).catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
 NODE
 
 echo "luci_live_filter_preview: PASS"

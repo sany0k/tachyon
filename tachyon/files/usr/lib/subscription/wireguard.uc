@@ -3,16 +3,18 @@ let common = require('core.common');
 let amnezia = require('subscription.amnezia');
 let core_ip = require('core.ip');
 let as_string = common.as_string;
-let numbers = ['jc', 'jmin', 'jmax', 's1', 's2', 's3', 's4'];
+let numbers = ['jc', 'jmin', 'jmax', 's1', 's2', 's3', 's4', 'itime'];
 let ranges = ['h1', 'h2', 'h3', 'h4', 'content_padding_addition',
     'rekey_after_time', 'rekey_timeout', 'reject_after_time',
     'keepalive_timeout', 'max_handshake_attempts'];
-let strings = ['i1', 'i2', 'i3', 'i4', 'i5', 'header_protection_key'];
+let strings = ['i1', 'i2', 'i3', 'i4', 'i5', 'j1', 'j2', 'j3', 'header_protection_key'];
 let flags = ['random_trailers', 'disable_cookies'];
 let aliases = {
-    privatekey:'private_key', publickey:'public_key', peer_public_key:'public_key',
-    presharedkey:'pre_shared_key', preshared_key:'pre_shared_key', psk:'pre_shared_key',
-    local_address:'address', ip:'address', persistentkeepalive:'keepalive',
+    privatekey:'private_key', client_priv_key:'private_key',
+    publickey:'public_key', peer_public_key:'public_key', server_pub_key:'public_key',
+    presharedkey:'pre_shared_key', preshared_key:'pre_shared_key', psk:'pre_shared_key', psk_key:'pre_shared_key',
+    local_address:'address', ip:'address', client_ip:'address',
+    persistentkeepalive:'keepalive',
     persistent_keepalive:'keepalive', persistent_keepalive_interval:'keepalive',
     allowedips:'allowed_ips', headerprotectionkey:'header_protection_key',
     contentpaddingaddition:'content_padding_addition', rekeyaftertime:'rekey_after_time',
@@ -30,15 +32,24 @@ function fields(values) {
 }
 function key32(value) {
     // The generic URI parser treats '+' as a space; restore it only in keys.
-    value = replace(as_string(value), / /g, '+');
+    value = trim(replace(as_string(value), / /g, '+'));
+    value = replace(replace(value, /-/g, '+'), /_/g, '/');
+    if (length(value) == 43 && match(value, /^[A-Za-z0-9+\/]{43}$/))
+        value += '=';
     if (!match(value, /^[A-Za-z0-9+\/]{43}=$/)) return null;
     let bytes = null;
     try { bytes = b64dec(value); } catch(e) {}
     return bytes != null && length(bytes) == 32 ? value : null;
 }
-function range(value) {
+function range(value, allow_signed32) {
     value = trim(as_string(value));
-    let m = match(value, /^([0-9]+)(-([0-9]+))?$/);
+    if (allow_signed32 && match(value, /^-[0-9]+$/)) {
+        let signed = int(value, 10);
+        if (signed >= -2147483648 && signed < 0)
+            return 4294967296 + signed;
+        return null;
+    }
+    let m = match(value, /^([0-9]+)[ \t]*(-[ \t]*([0-9]+))?$/);
     if (!m) return null;
     let low = int(m[1], 10), high = m[3] != null ? int(m[3], 10) : low;
     if (low > high || high > 4294967295) return null;
@@ -75,31 +86,35 @@ function build(input, host, port, name, raw) {
         if (peer.persistent_keepalive_interval == null) return null;
     }
     let endpoint = {type:'wireguard', private_key, address:addresses, peers:[peer], mtu:1280};
-    if (v.mtu != null) {
+    if (v.mtu != null && v.mtu != '' && v.mtu != '0' && substr(v.mtu, 0, 1) != '$') {
         if (!match(v.mtu, /^[0-9]+$/)) return null;
         endpoint.mtu = int(v.mtu, 10);
         if (endpoint.mtu < 576 || endpoint.mtu > 65535) return null;
     }
     for (let k in numbers) {
-        if (v[k] == null) continue;
+        if (v[k] == null || v[k] == '' || substr(v[k], 0, 1) == '$') continue;
         let n = range(v[k]);
         if (type(n) != 'int') return null;
         endpoint[k] = n;
     }
     for (let k in ranges) {
-        if (v[k] == null || v[k] == '') continue;
-        endpoint[k] = range(v[k]);
+        if (v[k] == null || v[k] == '' || substr(v[k], 0, 1) == '$') continue;
+        endpoint[k] = range(v[k], index(['h1', 'h2', 'h3', 'h4'], k) >= 0);
         if (endpoint[k] == null) return null;
     }
     for (let k in strings) {
-        if (v[k] != null && v[k] != '') endpoint[k] = v[k];
+        if (v[k] != null && v[k] != '' && substr(v[k], 0, 1) != '$') endpoint[k] = v[k];
     }
     if (endpoint.header_protection_key != null) {
         endpoint.header_protection_key = key32(endpoint.header_protection_key);
         if (!endpoint.header_protection_key) return null;
+        for (let sk in ['s1', 's2', 's3', 's4']) {
+            if (endpoint[sk] == null || int(endpoint[sk], 10) < 12)
+                endpoint[sk] = 20;
+        }
     }
     for (let k in flags) {
-        if (v[k] == null) continue;
+        if (v[k] == null || v[k] == '' || substr(v[k], 0, 1) == '$') continue;
         let value = lc(v[k]);
         if (index(['1','true','on','yes','0','false','off','no'], value) < 0) return null;
         endpoint[k] = index(['1','true','on','yes'], value) >= 0;
@@ -121,8 +136,9 @@ function from_conf_endpoints(text, raw, name) {
             if (!name) name = trim(substr(line, 1));
             continue;
         }
-        if (line == '[Interface]') { current = interface; continue; }
-        if (line == '[Peer]') { current = {}; push(peers, current); continue; }
+        let lower_line = lc(line);
+        if (lower_line == '[interface]') { current = interface; continue; }
+        if (lower_line == '[peer]') { current = {}; push(peers, current); continue; }
         if (substr(line, 0, 1) == '[') return [];
         let eq = index(line, '=');
         if (eq < 1 || current == null) continue;
@@ -130,6 +146,8 @@ function from_conf_endpoints(text, raw, name) {
         // Only data fields are read. PostUp/PreDown and other hooks are ignored.
         current[key] = trim(substr(line, eq + 1));
     }
+    if (!length(peers) && (interface.publickey || interface.public_key || interface.peer_public_key) && interface.endpoint)
+        push(peers, {});
     if (!length(peers)) return [];
     let endpoints = [];
     for (let i = 0; i < length(peers); i++) {
@@ -155,9 +173,12 @@ function from_conf(text, raw, name) {
     return length(endpoints) ? endpoints[0] : null;
 }
 function from_vpn_endpoints(raw) {
-    let payload = split(substr(raw, 6), '#')[0];
+    let parts = split(substr(raw, 6), '#');
+    let payload = parts[0];
+    let frag_name = length(parts) > 1 ? trim(replace(parts[1], /%([0-9A-Fa-f]{2})/g, (all, n) => chr(hex(n)))) : '';
     if (length(payload) > 131072) return null;
     payload = replace(payload, /%([0-9A-Fa-f]{2})/g, (all, n) => chr(hex(n)));
+    payload = replace(payload, /[\r\n\t ]+/g, '');
     payload = replace(replace(payload, /-/g, '+'), /_/g, '/');
     if (!match(payload, /^[A-Za-z0-9+\/]*={0,2}$/) || length(payload) % 4 == 1) return null;
     while (length(payload) % 4) payload += '=';
@@ -166,7 +187,7 @@ function from_vpn_endpoints(raw) {
     if (text == null) return null;
     let decoded = amnezia.decode(text);
     if (!decoded) return null;
-    let endpoints = from_conf_endpoints(decoded.text, raw, decoded.name);
+    let endpoints = from_conf_endpoints(decoded.text, raw, decoded.name != '' ? decoded.name : frag_name);
     if (!length(endpoints)) return null;
     // An AWG export without obfuscation fields must not silently become WG.
     if (decoded.awg && !has_awg(endpoints[0])) return null;

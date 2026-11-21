@@ -1,0 +1,6 @@
+/etc/config/tachyon
+/etc/tachyon/
+/etc/tachyon-core/
+/etc/init.d/tachyon-core
+/usr/bin/tachyon-core
+/usr/lib/libcronet.so

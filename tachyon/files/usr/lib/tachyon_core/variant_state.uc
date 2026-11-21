@@ -1,36 +1,50 @@
-// Which core is installed right now, for callers that cannot ask
-// tachyon_core/runtime.uc: its command-line dispatch runs on load and would take
-// the generator down, and diagnostics only needs the state files anyway.
+// Core state helpers for callers that cannot spawn tachyon_core/runtime.uc
+// directly (requiring runtime.uc runs its CLI dispatcher on load).
 //
-// The marker file is what components/action.uc wrote when it put this binary
-// in place; the version covers a build that names itself in its number
-// ("-lx", "-tachyon."). The pure table lookup lives in singbox/core_profile.uc.
+// tachyon-core is the sole routing core; this module reads the recorded
+// tachyon-core version state file and answers version-gated schema queries
+// via tachyon_core/core_profile.uc.
 let fs = require("fs");
 let core_profile = require("tachyon_core.core_profile");
 
-const VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-const VERSION_STATE_FILE = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
+const VERSION_STATE_FILE = getenv("TACHYON_CORE_VERSION_FILE") || "/etc/tachyon/tachyon-core-version";
 
-function current_profile() {
-    let version = trim(fs.readfile(VERSION_STATE_FILE) || "");
-    let marker = trim(fs.readfile(VARIANT_STATE_FILE) || "");
-    // A build that names itself in its version outranks the marker: the marker
-    // describes what was installed previously and can lag behind a swapped
-    // binary. Same order as sing_box_core_identity_marker() in
-    // tachyon_core/runtime.uc, minus the banner probe - the generator never spawns.
-    let from_version = core_profile.profile_by_version(version);
-    return from_version != "" ? from_version : core_profile.profile(version, marker);
+function read_variant_marker() {
+    return "tachyon-core";
 }
 
-// AWG is an endpoint with its fields at the root on sing-box-lx and on our own
-// core; on extended it stays an inbound with an amnezia object, and upstream
-// rejects a wireguard inbound outright ("unknown inbound type: wireguard").
+function read_version_state() {
+    return trim(fs.readfile(VERSION_STATE_FILE) || "");
+}
+
+function current_profile() {
+    return "tachyon-core";
+}
+
 function awg_endpoint_schema() {
-    let profile = current_profile();
-    return profile == "lx" || profile == "tachyon-core";
+    return true;
+}
+
+function is_tachyon_core() {
+    return true;
+}
+
+function supports_native_balancer(live_version) {
+    let version = trim(live_version || "");
+    if (version == "")
+        version = read_version_state();
+    if (version == "")
+        version = trim(getenv("TACHYON_CORE_VERSION_OVERRIDE") || "");
+    if (version != "")
+        return core_profile.supports_native_balancer(version, "tachyon-core") === true;
+    return true;
 }
 
 return {
+    read_variant_marker,
+    read_version_state,
     current_profile,
-    awg_endpoint_schema
+    awg_endpoint_schema,
+    is_tachyon_core,
+    supports_native_balancer
 };

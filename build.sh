@@ -31,14 +31,14 @@ SDK_CACHE_DIR="${SDK_CACHE_DIR:-$DEFAULT_BUILD_HOME/.cache/tachyon/openwrt-sdk}"
 IPK_SDK_URL="${IPK_SDK_URL:-https://downloads.openwrt.org/releases/24.10.6/targets/x86/64/openwrt-sdk-24.10.6-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst}"
 APK_SDK_URL="${APK_SDK_URL:-https://downloads.openwrt.org/releases/25.12.3/targets/x86/64/openwrt-sdk-25.12.3-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst}"
 
-BACKEND_DESCRIPTION="Rule-based Tachyon backend with hybrid sing-box + zapret orchestration"
-APP_DESCRIPTION="Rule-based Tachyon LuCI app with hybrid sing-box + zapret orchestration"
+BACKEND_DESCRIPTION="Rule-based Tachyon backend with tachyon-core orchestration"
+APP_DESCRIPTION="Rule-based Tachyon LuCI app with tachyon-core orchestration"
 I18N_DESCRIPTION="Translation for luci-app-tachyon - Русский (Russian)"
 MAINTAINER="Dushnilin <dushnilin@gmail.com>"
 PROJECT_URL="https://github.com/Dushnilin/tachyon"
 BACKEND_CONFLICTS_IPK="https-dns-proxy, nextdns, luci-app-passwall, luci-app-passwall2"
-BACKEND_DEPENDS_IPK="libc, ca-bundle, curl, ucode, ucode-mod-fs, ucode-mod-uci, coreutils-base64, coreutils-timeout, bind-dig, nftables, ip-full, kmod-nft-tproxy, kmod-tun, kmod-inet-diag"
-BACKEND_DEPENDS_APK="bind-dig ca-bundle coreutils-base64 coreutils-timeout curl ip-full kmod-inet-diag kmod-nft-tproxy kmod-tun libc nftables ucode ucode-mod-fs ucode-mod-uci !https-dns-proxy !nextdns !luci-app-passwall !luci-app-passwall2"
+BACKEND_DEPENDS_IPK="libc, ca-bundle, curl, openssl-util, ucode, ucode-mod-fs, ucode-mod-uci, coreutils-base64, coreutils-timeout, bind-dig, nftables, ip-full, kmod-nft-tproxy, kmod-tun, kmod-inet-diag"
+BACKEND_DEPENDS_APK="bind-dig ca-bundle coreutils-base64 coreutils-timeout curl ip-full kmod-inet-diag kmod-nft-tproxy kmod-tun libc nftables openssl-util ucode ucode-mod-fs ucode-mod-uci !https-dns-proxy !nextdns !luci-app-passwall !luci-app-passwall2"
 APP_DEPENDS_IPK="libc, luci-base, tachyon"
 APP_DEPENDS_APK="libc luci-base tachyon"
 
@@ -161,12 +161,28 @@ have_unshare_root() {
 download_sdk_archive() {
   local url="$1"
   local archive_path="$SDK_CACHE_DIR/$(basename "$url")"
+  local rel_path="${url#https://downloads.openwrt.org/}"
+  local candidate_urls=(
+    "$url"
+    "https://mirror-03.infra.openwrt.org/${rel_path}"
+    "https://ftp.fau.de/openwrt/${rel_path}"
+  )
+  local candidate
 
   mkdir -p "$SDK_CACHE_DIR"
   if [[ ! -f "$archive_path" ]]; then
-    echo "Downloading SDK: $url" >&2
-    wget -O "$archive_path.part" "$url"
-    mv "$archive_path.part" "$archive_path"
+    for candidate in "${candidate_urls[@]}"; do
+      echo "Downloading SDK: $candidate" >&2
+      rm -f "$archive_path.part"
+      if curl -4 -fL --retry 2 --connect-timeout 10 --speed-time 20 --speed-limit 102400 -o "$archive_path.part" "$candidate"; then
+        mv "$archive_path.part" "$archive_path"
+        break
+      fi
+    done
+    if [[ ! -f "$archive_path" ]]; then
+      echo "Failed to download SDK from all mirrors: $url" >&2
+      exit 1
+    fi
   fi
 
   printf '%s\n' "$archive_path"
@@ -208,6 +224,7 @@ ensure_po2lmo() {
     return 0
   fi
 
+  mkdir -p "$ipk_sdk_dir"
   (
     cd "$ipk_sdk_dir"
     if [[ ! -d feeds/luci/modules/luci-base/src ]]; then
@@ -215,7 +232,13 @@ ensure_po2lmo() {
       # re-clone from scratch rather than compiling against missing sources.
       rm -rf feeds/luci
       mkdir -p feeds
-      git clone --depth 1 https://github.com/openwrt/luci.git feeds/luci >&2 || true
+      if ! (
+        git clone --depth 1 --filter=blob:none --sparse https://github.com/openwrt/luci.git feeds/luci >&2 &&
+        git -C feeds/luci sparse-checkout set modules/luci-base/src >&2
+      ); then
+        rm -rf feeds/luci
+        git clone --depth 1 https://github.com/openwrt/luci.git feeds/luci >&2 || true
+      fi
     fi
   )
 
@@ -242,6 +265,73 @@ ensure_po2lmo() {
   return 1
 }
 
+ensure_host_tools() {
+  local host_tools_dir="$SDK_CACHE_DIR/host-tools-v1"
+  local marker_file="$host_tools_dir/.tachyon-sdk-url"
+  local apk_archive
+  local temp_dir
+  local extracted_root
+  local built_po2lmo
+
+  mkdir -p "$host_tools_dir/bin" "$host_tools_dir/lib"
+
+  if [[ ! -x "$host_tools_dir/bin/ipkg-build" || ! -x "$host_tools_dir/bin/apk" || ! -x "$host_tools_dir/bin/.apk.bin" || ! -f "$host_tools_dir/lib/ld-linux-x86-64.so.2" || ! -f "$host_tools_dir/lib/runas.so" || ! -f "$marker_file" ]] || [[ "$(cat "$marker_file")" != "$APK_SDK_URL" ]]; then
+    if [[ -x "$SDK_WORK_DIR/apk/scripts/ipkg-build" && -x "$SDK_WORK_DIR/apk/staging_dir/host/bin/apk" && -x "$SDK_WORK_DIR/apk/staging_dir/host/bin/.apk.bin" ]]; then
+      cp -f "$SDK_WORK_DIR/apk/scripts/ipkg-build" "$host_tools_dir/bin/ipkg-build"
+      cp -f "$SDK_WORK_DIR/apk/staging_dir/host/bin/apk" "$host_tools_dir/bin/apk"
+      cp -f "$SDK_WORK_DIR/apk/staging_dir/host/bin/.apk.bin" "$host_tools_dir/bin/.apk.bin"
+      cp -af "$SDK_WORK_DIR/apk/staging_dir/host/lib"/ld-linux* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/runas.so \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/libc.so* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/libpthread.so* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/libdl.so* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/librt.so* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/libm.so* \
+        "$SDK_WORK_DIR/apk/staging_dir/host/lib"/libgcc_s.so* \
+        "$host_tools_dir/lib/"
+    else
+      apk_archive="$(download_sdk_archive "$APK_SDK_URL")"
+      mkdir -p "$SDK_WORK_DIR"
+      temp_dir="$(mktemp -d "$SDK_WORK_DIR/.host-tools.XXXXXX")"
+      tar --zstd -xf "$apk_archive" -C "$temp_dir" --wildcards \
+        '*/scripts/ipkg-build' \
+        '*/staging_dir/host/bin/apk' \
+        '*/staging_dir/host/bin/.apk.bin' \
+        '*/staging_dir/host/lib/ld-linux*' \
+        '*/staging_dir/host/lib/runas.so' \
+        '*/staging_dir/host/lib/libc.so*' \
+        '*/staging_dir/host/lib/libpthread.so*' \
+        '*/staging_dir/host/lib/libdl.so*' \
+        '*/staging_dir/host/lib/librt.so*' \
+        '*/staging_dir/host/lib/libm.so*' \
+        '*/staging_dir/host/lib/libgcc_s.so*'
+      extracted_root="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+      cp -f "$extracted_root/scripts/ipkg-build" "$host_tools_dir/bin/ipkg-build"
+      cp -f "$extracted_root/staging_dir/host/bin/apk" "$host_tools_dir/bin/apk"
+      cp -f "$extracted_root/staging_dir/host/bin/.apk.bin" "$host_tools_dir/bin/.apk.bin"
+      cp -af "$extracted_root/staging_dir/host/lib/"* "$host_tools_dir/lib/"
+      rm -rf "$temp_dir"
+      if [[ "${CI:-}" == "true" && "${KEEP_SDK_ARCHIVES:-0}" != "1" ]]; then
+        rm -f "$apk_archive"
+      fi
+    fi
+    chmod 0755 "$host_tools_dir/bin/ipkg-build" "$host_tools_dir/bin/apk" "$host_tools_dir/bin/.apk.bin"
+    printf '%s\n' "$APK_SDK_URL" > "$marker_file"
+  fi
+
+  if [[ ! -x "$host_tools_dir/bin/po2lmo" ]]; then
+    if [[ -x "$SDK_WORK_DIR/ipk/feeds/luci/modules/luci-base/src/po2lmo" ]]; then
+      cp -f "$SDK_WORK_DIR/ipk/feeds/luci/modules/luci-base/src/po2lmo" "$host_tools_dir/bin/po2lmo"
+    else
+      built_po2lmo="$(ensure_po2lmo "$SDK_WORK_DIR/po2lmo-build")"
+      cp -f "$built_po2lmo" "$host_tools_dir/bin/po2lmo"
+    fi
+    chmod 0755 "$host_tools_dir/bin/po2lmo"
+  fi
+
+  printf '%s\n' "$host_tools_dir"
+}
+
 make_dir() {
   mkdir -p "$1"
 }
@@ -256,10 +346,15 @@ normalize_package_root_modes() {
 build_backend_root() {
   local output_root="$1"
 
+  if command -v node >/dev/null 2>&1 && [[ -f "$ROOT_DIR/tests/lib/ucode_forward_refs.js" ]]; then
+    node "$ROOT_DIR/tests/lib/ucode_forward_refs.js" "$ROOT_DIR/tachyon/files/usr/lib"
+  fi
+
   rm -rf "$output_root"
   make_dir "$output_root/etc/init.d"
   make_dir "$output_root/etc/config"
   make_dir "$output_root/etc/hotplug.d/iface"
+  make_dir "$output_root/lib/upgrade/keep.d"
   make_dir "$output_root/usr/bin"
   make_dir "$output_root/usr/sbin"
   make_dir "$output_root/usr/lib/tachyon"
@@ -271,14 +366,9 @@ build_backend_root() {
   install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon" "$output_root/etc/init.d/tachyon"
   install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon-torrserver-direct" \
     "$output_root/etc/init.d/tachyon-torrserver-direct"
-  install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/olcrtc-yaml" \
-    "$output_root/etc/init.d/olcrtc-yaml"
-  install -m 0755 "$ROOT_DIR/tachyon/files/etc/init.d/tachyon-steer-zapret" \
-    "$output_root/etc/init.d/tachyon-steer-zapret"
   install -m 0644 "$ROOT_DIR/tachyon/files/etc/config/tachyon" "$output_root/etc/config/tachyon"
+  install -m 0644 "$ROOT_DIR/tachyon/files/lib/upgrade/keep.d/tachyon" "$output_root/lib/upgrade/keep.d/tachyon"
   install -m 0755 "$ROOT_DIR/tachyon/files/usr/bin/tachyon" "$output_root/usr/bin/tachyon"
-  install -m 0755 "$ROOT_DIR/tachyon/files/usr/sbin/steer-nfqws" \
-    "$output_root/usr/share/tachyon/steer-nfqws"
   install -m 0755 "$ROOT_DIR/tachyon/files/usr/bin/tachyon-read" "$output_root/usr/bin/tachyon-read"
   # The rpcd ACL for /usr/bin/tachyon and /usr/bin/tachyon-read ships here rather
   # than in luci-app-tachyon, so the backend and its policy update apart. That is
@@ -297,6 +387,8 @@ build_backend_root() {
   install -m 0755 "$ROOT_DIR/tachyon/files/usr/lib/cgi-bin/tachyon-agent" \
     "$output_root/usr/lib/cgi-bin/tachyon-agent"
   install -d -m 0755 "$output_root/www/cgi-bin"
+  install -m 0755 "$ROOT_DIR/tachyon/files/www/cgi-bin/tachyon-sub" \
+    "$output_root/www/cgi-bin/tachyon-sub"
   # No symlink in $output_root/www/cgi-bin: the AI agent gateway is published
   # at service start only when agent_api_token is set (issue #76).
   install -m 0644 "$ROOT_DIR/tachyon/files/usr/share/tachyon/servicecheck_profiles.json" \
@@ -304,7 +396,7 @@ build_backend_root() {
   # Registrable-domain boundaries for Smart Detect Plus (ICANN + PRIVATE, MPL-2.0).
   install -m 0644 "$ROOT_DIR/tachyon/files/usr/share/tachyon/public-suffix-list.dat" \
     "$output_root/usr/share/tachyon/public-suffix-list.dat"
-  # Curated DPI bypass strategy presets. Without it the fuzzer falls back to
+  # Curated strategy presets. Without it the fuzzer falls back to
   # downloading the file from a mirror on first use.
   install -m 0644 "$ROOT_DIR/tachyon/files/usr/share/tachyon/dpi-presets.json" \
     "$output_root/usr/share/tachyon/dpi-presets.json"
@@ -322,11 +414,10 @@ build_backend_root() {
   chmod 0755 "$output_root/etc/init.d/tachyon" "$output_root/usr/bin/tachyon" \
     "$output_root/usr/bin/tachyon-read" \
     "$output_root/etc/init.d/tachyon-torrserver-direct" \
-    "$output_root/etc/init.d/olcrtc-yaml" \
-    "$output_root/etc/init.d/tachyon-steer-zapret" \
     "$output_root/etc/hotplug.d/iface/99-tachyon-wan-monitor" \
-    "$output_root/usr/share/tachyon/steer-nfqws" \
-    "$output_root/usr/lib/cgi-bin/tachyon-agent"
+    "$output_root/usr/lib/tachyon/bin/wget" \
+    "$output_root/usr/lib/cgi-bin/tachyon-agent" \
+    "$output_root/www/cgi-bin/tachyon-sub"
   # Contains the Telegram bot token placeholder and receives user secrets.
   chmod 0600 "$output_root/etc/config/tachyon" "$output_root/usr/lib/tachyon/defaults/config"
 }
@@ -412,8 +503,6 @@ Package: tachyon
 Version: ${RELEASE_VERSION}
 Depends: ${BACKEND_DEPENDS_IPK}
 Conflicts: ${BACKEND_CONFLICTS_IPK}
-Provides: forkop
-Replaces: forkop
 License: GPL-2.0-or-later
 Section: net
 URL: ${PROJECT_URL}
@@ -431,46 +520,106 @@ EOF
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 
-# Stop and disable legacy forkop / podkop / netshift services to prevent boot conflicts
-for legacy_svc in podkop forkop netshift podkop_plus forkop_plus; do
-	if [ -f "/etc/init.d/${legacy_svc}" ]; then
-		"/etc/init.d/${legacy_svc}" stop >/dev/null 2>&1 || true
-		"/etc/init.d/${legacy_svc}" disable >/dev/null 2>&1 || true
+_backup_external_configs() {
+	_bdir="/etc/tachyon/external-configs-backup"
+	for _comp in zapret zapret2 byedpi wdtt qwdtt olcrtc sing-box; do
+		_cdir="$_bdir/$_comp"
+		case "$_comp" in
+			zapret) _srcs="/etc/config/zapret /opt/zapret/config /opt/zapret/ipset" ;;
+			zapret2) _srcs="/etc/config/zapret2 /opt/zapret2/config /opt/zapret2/ipset" ;;
+			byedpi) _srcs="/etc/config/byedpi /etc/byedpi" ;;
+			wdtt|qwdtt) _srcs="/etc/config/wdtt /etc/wdtt /etc/qwdtt" ;;
+			olcrtc) _srcs="/etc/config/olcrtc /etc/olcrtc" ;;
+			sing-box) _srcs="/etc/sing-box/config.json /etc/config/sing-box" ;;
+		esac
+		_has_src=0
+		for _s in $_srcs; do [ -e "$_s" ] && _has_src=1 && break; done
+		[ "$_has_src" -eq 0 ] && continue
+		mkdir -p "$_cdir" 2>/dev/null || continue
+		for _s in $_srcs; do
+			[ -e "$_s" ] || continue
+			_dst="$_cdir/$(basename "$_s")"
+			if [ -d "$_s" ]; then
+				cp -a -n "$_s" "$_dst" 2>/dev/null || cp -a "$_s" "${_dst}.new" 2>/dev/null || true
+			else
+				[ -f "$_dst" ] && cmp -s "$_s" "$_dst" 2>/dev/null && continue
+				cp -a "$_s" "$_dst" 2>/dev/null || true
+			fi
+		done
+	done
+}
+_is_tachyon_managed() {
+	_comp="$1"
+	[ -f "/etc/init.d/$_comp" ] && grep -q "Tachyon managed" "/etc/init.d/$_comp" 2>/dev/null && return 0
+	[ -d "/etc/tachyon/component-backups/$_comp" ] && return 0
+	[ -d "/var/run/tachyon/$_comp" ] && return 0
+	return 1
+}
+
+_backup_external_configs
+
+# Stop and clean Tachyon internal steer subsystem
+for _steer_svc in tachyon-steer-zapret steer; do
+	if [ -f "/etc/init.d/${_steer_svc}" ]; then
+		"/etc/init.d/${_steer_svc}" stop >/dev/null 2>&1 || true
+		"/etc/init.d/${_steer_svc}" disable >/dev/null 2>&1 || true
+		rm -f "/etc/init.d/${_steer_svc}" 2>/dev/null || true
 	fi
 done
-rm -f /etc/rc.d/*podkop* /etc/rc.d/*forkop* /etc/rc.d/*netshift* 2>/dev/null || true
-nft delete table inet podkop >/dev/null 2>&1 || true
-nft delete table inet PodkopTable >/dev/null 2>&1 || true
-nft delete table inet forkop >/dev/null 2>&1 || true
-nft delete table inet ForkopTable >/dev/null 2>&1 || true
-nft delete table inet netshift >/dev/null 2>&1 || true
-nft delete table inet NetShiftTable >/dev/null 2>&1 || true
+rm -rf /etc/rc.d/*steer* /etc/steer /usr/lib/tachyon/steer /usr/sbin/steer /usr/bin/steer /var/run/tachyon/*steer* /tmp/*steer* 2>/dev/null || true
+killall -9 steer >/dev/null 2>&1 || true
+nft delete table inet steer >/dev/null 2>&1 || true
 
-rm -rf /usr/lib/lua/luci/i18n/forkop.* /www/luci-static/resources/i18n/forkop.* \
-       /usr/share/luci/menu.d/luci-app-forkop.json /usr/share/rpcd/acl.d/luci-app-forkop.json \
-       /etc/uci-defaults/50_luci-forkop \
-       /usr/lib/lua/luci/i18n/netshift.* /www/luci-static/resources/i18n/netshift.* \
-       /usr/share/luci/menu.d/luci-app-netshift.json /usr/share/rpcd/acl.d/luci-app-netshift.json \
-       /etc/uci-defaults/50_luci-netshift 2>/dev/null || true
-
-if [ -f /etc/config/netshift ]; then
-	mv /etc/config/netshift /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/forkop ]; then
-	mv /etc/config/forkop /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/forkop_plus ]; then
-	mv /etc/config/forkop_plus /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/podkop ]; then
-	mv /etc/config/podkop /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-elif [ -f /etc/config/podkop_plus ]; then
-	mv /etc/config/podkop_plus /etc/config/tachyon
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop
-else
-	TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate
+# Selective cleanup of external components only if Tachyon-managed
+if [ -f /etc/init.d/tailscale ] && grep -q "Tachyon managed" /etc/init.d/tailscale 2>/dev/null; then
+	/etc/init.d/tailscale stop >/dev/null 2>&1 || true
+	/etc/init.d/tailscale disable >/dev/null 2>&1 || true
+	rm -f /etc/init.d/tailscale /etc/rc.d/*tailscale* 2>/dev/null || true
+	rm -rf /var/run/tachyon/tailscale /etc/tachyon/tailscale/*/native /etc/tachyon/component-backups/tailscale 2>/dev/null || true
+	nft delete table inet tachyon_tailscale >/dev/null 2>&1 || true
 fi
+for _comp in zapret zapret2 byedpi wdtt-client qwdtt olcrtc; do
+	_comp_marker="$_comp"
+	case "$_comp" in wdtt-client) _comp_marker="wdtt" ;; esac
+	if _is_tachyon_managed "$_comp_marker"; then
+		if [ -f "/etc/init.d/${_comp}" ]; then
+			"/etc/init.d/${_comp}" stop >/dev/null 2>&1 || true
+			"/etc/init.d/${_comp}" disable >/dev/null 2>&1 || true
+			rm -f "/etc/init.d/${_comp}" "/etc/rc.d/*${_comp}*" 2>/dev/null || true
+		fi
+		case "$_comp_marker" in
+			zapret)
+				killall -9 nfqws >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws 2>/dev/null || true
+				rm -rf /opt/zapret /etc/config/zapret /var/run/tachyon/zapret* /etc/tachyon/component-backups/zapret /var/run/tachyon/component-update-checks/zapret.json 2>/dev/null || true
+				for _tbl in zapret; do nft delete table inet "$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			zapret2)
+				killall -9 nfqws2 >/dev/null 2>&1 || true
+				rm -f /usr/bin/nfqws2 2>/dev/null || true
+				rm -rf /opt/zapret2 /etc/config/zapret2 /etc/tachyon/component-backups/zapret2 /var/run/tachyon/component-update-checks/zapret2.json 2>/dev/null || true
+				for _tbl in zapret2; do nft delete table inet "$_tbl" >/dev/null 2>&1 || true; nft delete table ip "$_tbl" >/dev/null 2>&1 || true; nft delete table ip6 "$_tbl" >/dev/null 2>&1 || true; done
+				;;
+			byedpi)
+				killall -9 ciadpi >/dev/null 2>&1 || true
+				rm -f /usr/bin/ciadpi 2>/dev/null || true
+				rm -rf /etc/config/byedpi /var/run/tachyon/byedpi /etc/tachyon/component-backups/byedpi /var/run/tachyon/component-update-checks/byedpi.json 2>/dev/null || true
+				;;
+			wdtt)
+				killall -9 wdtt qwdtt-client >/dev/null 2>&1 || true
+				rm -f /usr/bin/wdtt /usr/bin/qwdtt-client /usr/sbin/wdtt-genlists /usr/sbin/wdtt-resolve 2>/dev/null || true
+				rm -rf /etc/qwdtt /etc/wdtt /etc/config/wdtt /var/run/tachyon/wdtt /var/run/qwdtt /etc/tachyon/component-backups/wdtt /var/run/tachyon/component-update-checks/wdtt.json 2>/dev/null || true
+				;;
+			olcrtc)
+				killall -9 olcrtc >/dev/null 2>&1 || true
+				rm -f /usr/bin/olcrtc 2>/dev/null || true
+				rm -rf /etc/olcrtc /etc/config/olcrtc /var/run/tachyon/olcrtc /etc/tachyon/component-backups/olcrtc /var/run/tachyon/component-update-checks/olcrtc.json 2>/dev/null || true
+				;;
+		esac
+	fi
+done
+
+TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate
 
 /etc/init.d/tachyon enable >/dev/null 2>&1 || true
 /usr/bin/tachyon package_postinst >/dev/null 2>&1 || true
@@ -487,6 +636,9 @@ if [ -d /www/cgi-bin ]; then
 		rm -f /www/cgi-bin/tachyon-agent 2>/dev/null || true
 	fi
 fi
+
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 
 # Neutralize legacy unshielded postrm scripts on disk if upgrading from 1.3.21/1.3.22
 for p in /usr/lib/opkg/info/tachyon.postrm /usr/lib/opkg/info/luci-app-tachyon.postrm /usr/lib/opkg/info/luci-i18n-tachyon-ru.postrm; do
@@ -520,6 +672,7 @@ EOF
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 [ "$1" = "upgrade" ] && exit 0
+[ -x /usr/bin/tachyon ] && exit 0
 if [ "$1" != "remove" ] && [ "$1" != "purge" ]; then
     exit 0
 fi
@@ -528,6 +681,9 @@ if [ -e /var/run/tachyon/component-action.lock ] || [ -e /tmp/run/tachyon/compon
 fi
 rm -f /www/cgi-bin/tachyon-agent /etc/hotplug.d/iface/99-tachyon-wan-monitor 2>/dev/null || true
 rm -f /usr/share/nftables.d/chain-pre/input/10-tachyon.nft 2>/dev/null || true
+rm -f /usr/share/nftables.d/ruleset-post/90-tachyon-kill-switch.nft 2>/dev/null || true
+nft delete table inet TachyonKillSwitch >/dev/null 2>&1 || true
+for pref in 9499 9500 9501; do for fam in -4 -6; do while ip $fam rule del pref $pref >/dev/null 2>&1; do :; done; done; done
 rm -rf /tmp/ai_doctor* /tmp/tg_* /tmp/warp_* 2>/dev/null || true
 rm -rf /var/run/tachyon/section-cache /var/run/tachyon/ui-state 2>/dev/null || true
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall restart >/dev/null 2>&1 || true
@@ -549,8 +705,6 @@ write_app_ipk_control() {
 Package: luci-app-tachyon
 Version: ${RELEASE_VERSION}
 Depends: ${APP_DEPENDS_IPK}
-Provides: luci-app-forkop
-Replaces: luci-app-forkop
 License: GPL-2.0-or-later
 Section: luci
 URL: ${PROJECT_URL}
@@ -566,11 +720,17 @@ EOF
 [ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
 . ${IPKG_INSTROOT}/lib/functions.sh
 default_postinst $0 $@
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 [ -n "${IPKG_INSTROOT}" ] || /usr/bin/tachyon luci_postinst >/dev/null 2>&1 || true
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 EOF
 
   cat > "$control_dir/postinst-pkg" <<'EOF'
 [ -n "${IPKG_INSTROOT}" ] || /usr/bin/tachyon luci_postinst >/dev/null 2>&1 || true
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 EOF
 
   cat > "$control_dir/prerm" <<'EOF'
@@ -584,6 +744,7 @@ EOF
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 [ "$1" = "upgrade" ] && exit 0
+[ -x /usr/bin/tachyon ] && exit 0
 if [ "$1" != "remove" ] && [ "$1" != "purge" ]; then
     exit 0
 fi
@@ -737,39 +898,10 @@ function restore_cfg_from_backup() {
     fs.unlink(backup);
 }
 if (getenv("IPKG_INSTROOT") == null || getenv("IPKG_INSTROOT") == "") {
-    // rpcd caches ACLs, and the backend package now ships the ACL that splits the
-    // read role off the main binary. Without this the new policy stays inert
-    // until rpcd picks it up, and the stricter read role would look applied while
-    // the old one kept serving. Placed before the migrations so it happens on
-    // every exit path below, including the ones that exit early.
     system("/etc/init.d/rpcd reload >/dev/null 2>&1 || true");
-    system("for svc in podkop forkop netshift podkop_plus forkop_plus; do [ -f /etc/init.d/$svc ] && /etc/init.d/$svc stop >/dev/null 2>&1 && /etc/init.d/$svc disable >/dev/null 2>&1; done || true");
-    system("rm -f /etc/rc.d/*podkop* /etc/rc.d/*forkop* /etc/rc.d/*netshift* 2>/dev/null || true");
-    system("for tbl in podkop PodkopTable forkop ForkopTable netshift NetShiftTable; do nft delete table inet $tbl >/dev/null 2>&1 || true; done");
-    system("rm -rf /usr/lib/lua/luci/i18n/forkop.* /www/luci-static/resources/i18n/forkop.* /usr/share/luci/menu.d/luci-app-forkop.json /usr/share/rpcd/acl.d/luci-app-forkop.json /etc/uci-defaults/50_luci-forkop /usr/lib/lua/luci/i18n/netshift.* /www/luci-static/resources/i18n/netshift.* /usr/share/luci/menu.d/luci-app-netshift.json /usr/share/rpcd/acl.d/luci-app-netshift.json /etc/uci-defaults/50_luci-netshift 2>/dev/null || true");
-    if (system("test -f /etc/config/netshift") == 0) {
-        system("mv /etc/config/netshift /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/forkop") == 0) {
-        system("mv /etc/config/forkop /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/forkop_plus") == 0) {
-        system("mv /etc/config/forkop_plus /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/podkop") == 0) {
-        system("mv /etc/config/podkop /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/podkop_plus") == 0) {
-        system("mv /etc/config/podkop_plus /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    }
     restore_cfg_from_backup();
-    exit(system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate && /usr/bin/tachyon package_postinst"));
+    system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate && /etc/init.d/tachyon enable >/dev/null 2>&1 || true; /usr/bin/tachyon package_postinst >/dev/null 2>&1 || true");
+    system("for f in /www/luci-static/resources/view/tachyon/*.js; do [ -f \"$f\" ] && touch \"$f\" 2>/dev/null || true; done; [ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true");
 }
 exit(0);
 EOF
@@ -853,40 +985,11 @@ function restore_cfg_from_backup() {
     fs.unlink(backup);
 }
 if (getenv("IPKG_INSTROOT") == null || getenv("IPKG_INSTROOT") == "") {
-    // rpcd caches ACLs, and the backend package now ships the ACL that splits the
-    // read role off the main binary. Without this the new policy stays inert
-    // until rpcd picks it up, and the stricter read role would look applied while
-    // the old one kept serving. Placed before the migrations so it happens on
-    // every exit path below, including the ones that exit early.
     system("/etc/init.d/rpcd reload >/dev/null 2>&1 || true");
-    system("for svc in podkop forkop netshift podkop_plus forkop_plus; do [ -f /etc/init.d/$svc ] && /etc/init.d/$svc stop >/dev/null 2>&1 && /etc/init.d/$svc disable >/dev/null 2>&1; done || true");
-    system("rm -f /etc/rc.d/*podkop* /etc/rc.d/*forkop* /etc/rc.d/*netshift* 2>/dev/null || true");
-    system("for tbl in podkop PodkopTable forkop ForkopTable netshift NetShiftTable; do nft delete table inet $tbl >/dev/null 2>&1 || true; done");
-    system("rm -rf /usr/lib/lua/luci/i18n/forkop.* /www/luci-static/resources/i18n/forkop.* /usr/share/luci/menu.d/luci-app-forkop.json /usr/share/rpcd/acl.d/luci-app-forkop.json /etc/uci-defaults/50_luci-forkop /usr/lib/lua/luci/i18n/netshift.* /www/luci-static/resources/i18n/netshift.* /usr/share/luci/menu.d/luci-app-netshift.json /usr/share/rpcd/acl.d/luci-app-netshift.json /etc/uci-defaults/50_luci-netshift 2>/dev/null || true");
     system("if [ -d /www/cgi-bin ]; then if [ -n \"$(uci -q get tachyon.settings.agent_api_token)\" ]; then ln -sf /usr/lib/cgi-bin/tachyon-agent /www/cgi-bin/tachyon-agent 2>/dev/null || true; else rm -f /www/cgi-bin/tachyon-agent 2>/dev/null || true; fi; fi");
-    if (system("test -f /etc/config/netshift") == 0) {
-        system("mv /etc/config/netshift /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/forkop") == 0) {
-        system("mv /etc/config/forkop /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/forkop_plus") == 0) {
-        system("mv /etc/config/forkop_plus /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/podkop") == 0) {
-        system("mv /etc/config/podkop /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    } else if (system("test -f /etc/config/podkop_plus") == 0) {
-        system("mv /etc/config/podkop_plus /etc/config/tachyon");
-        system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate-podkop");
-        exit(system("/usr/bin/tachyon package_postinst"));
-    }
     restore_cfg_from_backup();
-    exit(system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate && /usr/bin/tachyon package_postinst"));
+    system("TACHYON_LIB=/usr/lib/tachyon ucode -L /usr/lib/tachyon /usr/lib/tachyon/config/migration.uc migrate && /etc/init.d/tachyon enable >/dev/null 2>&1 || true; /usr/bin/tachyon package_postinst >/dev/null 2>&1 || true");
+    system("for f in /www/luci-static/resources/view/tachyon/*.js; do [ -f \"$f\" ] && touch \"$f\" 2>/dev/null || true; done; [ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true");
 }
 exit(0);
 EOF
@@ -894,12 +997,15 @@ EOF
   cat > "$scripts_dir/backend-post-deinstall.sh" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
-[ -f /usr/bin/tachyon ] && exit 0
+[ -x /usr/bin/tachyon ] && exit 0
 if [ -e /var/run/tachyon/component-action.lock ] || [ -e /tmp/run/tachyon/component-action.lock ] || [ -e /var/run/tachyon/component-actions/action.lock ] || [ -e /tmp/run/tachyon/component-actions/action.lock ]; then
     exit 0
 fi
 rm -f /www/cgi-bin/tachyon-agent /etc/hotplug.d/iface/99-tachyon-wan-monitor 2>/dev/null || true
 rm -f /usr/share/nftables.d/chain-pre/input/10-tachyon.nft 2>/dev/null || true
+rm -f /usr/share/nftables.d/ruleset-post/90-tachyon-kill-switch.nft 2>/dev/null || true
+nft delete table inet TachyonKillSwitch >/dev/null 2>&1 || true
+for pref in 9499 9500 9501; do for fam in -4 -6; do while ip $fam rule del pref $pref >/dev/null 2>&1; do :; done; done; done
 rm -rf /tmp/ai_doctor* /tmp/tg_* /tmp/warp_* 2>/dev/null || true
 rm -rf /var/run/tachyon/section-cache /var/run/tachyon/ui-state 2>/dev/null || true
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall restart >/dev/null 2>&1 || true
@@ -917,6 +1023,7 @@ write_app_apk_scripts() {
 
   cat > "$scripts_dir/app-pre-install.sh" <<'EOF'
 #!/bin/sh
+mkdir -p /www/luci-static/resources/view/tachyon/fonts 2>/dev/null || true
 exit 0
 EOF
 
@@ -930,6 +1037,8 @@ export pkgname="luci-app-tachyon"
 add_group_and_user
 default_postinst
 [ -n "${IPKG_INSTROOT}" ] || /usr/bin/tachyon luci_postinst >/dev/null 2>&1 || true
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 EOF
 
   cat > "$scripts_dir/app-pre-deinstall.sh" <<'EOF'
@@ -958,6 +1067,8 @@ export pkgname="luci-app-tachyon"
 add_group_and_user
 default_postinst
 [ -n "${IPKG_INSTROOT}" ] || /usr/bin/tachyon luci_postinst >/dev/null 2>&1 || true
+for _f in /www/luci-static/resources/view/tachyon/*.js; do [ -f "$_f" ] && touch "$_f" 2>/dev/null || true; done
+[ -f /www/luci-static/resources/luci.js ] && touch /www/luci-static/resources/luci.js 2>/dev/null || true; [ -d /www/luci-static/resources/view/tachyon ] && touch /www/luci-static/resources/view/tachyon 2>/dev/null || true; [ -d /www/luci-static/resources ] && touch /www/luci-static/resources 2>/dev/null || true
 EOF
 
   cat > "$scripts_dir/app-post-deinstall.sh" <<'EOF'
@@ -1044,11 +1155,6 @@ build_apk_package() {
   local stderr_file
 
   local extra_args=()
-  if [[ "$package_name" == "tachyon" ]]; then
-    extra_args+=(-I "provides:forkop" -I "replaces:forkop")
-  elif [[ "$package_name" == "luci-app-tachyon" ]]; then
-    extra_args+=(-I "provides:luci-app-forkop" -I "replaces:luci-app-forkop")
-  fi
 
   rm -rf "$temp_root" "$temp_scripts"
   cp -a "$files_root" "$temp_root"
@@ -1252,10 +1358,7 @@ print_summary() {
 
 main() {
   local output_dir
-  local ipk_archive
-  local apk_archive
-  local ipk_sdk_dir
-  local apk_sdk_dir
+  local host_tools_dir
   local po2lmo_bin
   local ipkg_build_bin
   local apk_bin
@@ -1279,14 +1382,11 @@ main() {
   mkdir -p "$output_dir"
   rm -f "$output_dir"/tachyon_* "$output_dir"/luci-app-tachyon_* "$output_dir"/luci-i18n-tachyon-ru_*
 
-  ipk_archive="$(download_sdk_archive "$IPK_SDK_URL")"
-  apk_archive="$(download_sdk_archive "$APK_SDK_URL")"
-  ipk_sdk_dir="$(extract_sdk ipk "$ipk_archive" "$IPK_SDK_URL")"
-  apk_sdk_dir="$(extract_sdk apk "$apk_archive" "$APK_SDK_URL")"
-
-  po2lmo_bin="$(ensure_po2lmo "$ipk_sdk_dir")"
-  ipkg_build_bin="$ipk_sdk_dir/scripts/ipkg-build"
-  apk_bin="$apk_sdk_dir/staging_dir/host/bin/apk"
+  host_tools_dir="$(ensure_host_tools)"
+  po2lmo_bin="$host_tools_dir/bin/po2lmo"
+  ipkg_build_bin="$host_tools_dir/bin/ipkg-build"
+  apk_bin="$host_tools_dir/bin/apk"
+  [[ -x "$po2lmo_bin" ]] || { echo "po2lmo not found at $po2lmo_bin" >&2; exit 1; }
   [[ -x "$ipkg_build_bin" ]] || { echo "ipkg-build not found at $ipkg_build_bin" >&2; exit 1; }
   [[ -x "$apk_bin" ]] || { echo "apk host tool not found at $apk_bin" >&2; exit 1; }
 

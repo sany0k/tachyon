@@ -3,6 +3,7 @@
 let fs = require("fs");
 let common = require("core.common");
 let runtime_constants = require("tachyon_core.constants");
+let variant_state = require("tachyon_core.variant_state");
 let runtime_subscription = require("tachyon_core.subscription");
 let runtime_country = require("tachyon_core.country");
 let runtime_dns = require("tachyon_core.dns");
@@ -11,14 +12,15 @@ let runtime_url = require("core.url");
 let subscription_share_link = require("subscription.share_link");
 let subscription_parser = require("subscription.parser");
 let connections = require("config.connections");
+let desync_udp = require("config.desync_udp");
 let subscription_wireguard = require("subscription.wireguard");
 let subscription_amnezia = require("subscription.amnezia_config");
+let amnezia_decoder = require("subscription.amnezia");
 let exec = require("core.exec");
 let core_ip = require("core.ip");
 
 let as_string = common.as_string;
 let option = common.option;
-let option_or_legacy = common.option_or_legacy;
 let list_option = common.list_option;
 let bool_option = common.bool_option;
 let int_option = common.int_option;
@@ -167,10 +169,32 @@ function is_dummy_outbound_server(server, port) {
     return false;
 }
 
+function outbound_has_port_ranges(outbound) {
+    if (type(outbound) != "object")
+        return false;
+    let sp = outbound.server_ports;
+    if (type(sp) == "array" && length(sp) > 0)
+        return true;
+    if (type(sp) == "string" && trim(sp) != "")
+        return true;
+    return false;
+}
+
+function normalize_vless_flow_value(value) {
+    let flow = lc(trim(as_string(value)));
+    if (flow == "" || flow == "none")
+        return "";
+    if (flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443")
+        return "xtls-rprx-vision";
+    return null;
+}
+
 function supported_subscription_outbound(outbound) {
     if (type(outbound) != "object")
         return false;
     let t = as_string(outbound.type);
+    if (t == "vless" && outbound.flow != null && normalize_vless_flow_value(outbound.flow) == null)
+        return false;
     if (t == "wireguard") {
         let peer = array_or_empty(outbound.peers)[0];
         return type(peer) == "object" && !is_dummy_outbound_server(peer.address, peer.port) &&
@@ -181,11 +205,22 @@ function supported_subscription_outbound(outbound) {
         return true;
     if (t == "direct" || t == "selector" || t == "urltest" || t == "dns" || t == "block")
         return false;
+    if (t == "desync" || t == "chain" || t == "tor" || t == "tailscale")
+        return true;
+    if (t == "fptn" && as_string(outbound.token || "") != "")
+        return true;
     let is_proto = (t == "vless" || t == "vmess" || t == "trojan" || t == "shadowsocks" ||
-        t == "socks" || t == "http" || t == "hysteria2" || t == "tuic");
+        t == "socks" || t == "http" || t == "hysteria2" || t == "tuic" ||
+        t == "fptn" || t == "anytls" || t == "naive" || t == "mieru" ||
+        t == "snell" || t == "masque" || t == "sudoku" || t == "openvpn" ||
+        t == "openconnect" || t == "tewfai" || t == "trusttunnel" ||
+        t == "mtproto" || t == "shadowtls" || t == "ssh" || t == "wdtt");
     if (!is_proto)
         return false;
-    if (is_dummy_outbound_server(outbound.server, outbound.server_port))
+    if (t == "masque" && type(outbound.profile) == "object")
+        return true;
+    let check_port = outbound_has_port_ranges(outbound) ? null : outbound.server_port;
+    if (is_dummy_outbound_server(outbound.server, check_port))
         return false;
     return true;
 }
@@ -195,9 +230,20 @@ function outbound_uses_xhttp(outbound) {
         lc(as_string(outbound.transport.type || "")) == "xhttp";
 }
 
+function ensure_desync_udp_options_supported(outbound, name) {
+    if (lc(as_string(outbound.type || "")) != "desync" || !desync_udp.configured(outbound))
+        return;
+    let version = ctx.detect_core_version ? as_string(ctx.detect_core_version() || "") : "";
+    if (version == "")
+        version = variant_state.read_version_state();
+    if (!core_profile.reaches_triple(version, "0.5.9"))
+        ctx.runtime_generate_unsupported("Desync '" + as_string(name) + "' UDP payload, range and socket options require tachyon-core 0.5.9 or newer (installed: " + as_string(version) + ")");
+}
+
 function ensure_explicit_outbound_supported(outbound, source, name) {
+    ensure_desync_udp_options_supported(outbound, name);
     if (!ctx.runtime_supports_xhttp && outbound_uses_xhttp(outbound))
-        ctx.runtime_generate_unsupported(as_string(source) + " '" + as_string(name) + "' uses XHTTP transport, but sing-box-extended is not installed");
+        ctx.runtime_generate_unsupported(as_string(source) + " '" + as_string(name) + "' uses XHTTP transport, which is not supported by the installed tachyon-core");
 }
 
 function subscription_outbound_display_name(outbound) {
@@ -247,7 +293,7 @@ function compatible_subscription_outbounds(outbounds, section_name) {
         if (!supported_subscription_outbound(outbound))
             continue;
         if (!ctx.runtime_supports_xhttp && outbound_uses_xhttp(outbound)) {
-            warn_skipped_subscription_outbound(section_name, outbound, "XHTTP requires sing-box-extended");
+            warn_skipped_subscription_outbound(section_name, outbound, "XHTTP not supported");
             continue;
         }
         push(retained, outbound);
@@ -279,12 +325,31 @@ function compatible_subscription_outbounds(outbounds, section_name) {
     }
 }
 
+function sanitize_wdtt_outbound(obj) {
+    if (type(obj) != "object" || lc(as_string(obj.type || "")) != "wdtt")
+        return obj;
+    // tachyon-core <= 0.5.7 validate::WDTT_OUT_FIELDS omits srtp_mode and vk_token.
+    let ver = trim(as_string(variant_state.read_version_state() || ""));
+    if (ver == "" || !core_profile.reaches_triple(ver, "0.5.8")) {
+        delete obj.srtp_mode;
+        delete obj.vk_token;
+    }
+    return obj;
+}
+
 function copy_subscription_outbound(outbound, new_tag) {
     let copy = {};
     for (let key, value in outbound) {
         if (key != "tag" && key != "remark" && key != "share_link" &&
             key != "__tachyon_hidden" && key != "__tachyon_allow_group")
             copy[key] = value;
+    }
+    if (as_string(copy.type || "") == "vless" && copy.flow != null) {
+        let norm_flow = normalize_vless_flow_value(copy.flow);
+        if (norm_flow == "" || norm_flow == null)
+            delete copy.flow;
+        else
+            copy.flow = norm_flow;
     }
     if (as_string(copy.type || "") == "hysteria2" &&
         type(copy.tls) == "object" &&
@@ -296,6 +361,13 @@ function copy_subscription_outbound(outbound, new_tag) {
         }
         copy.tls = tls;
     }
+    if (as_string(copy.type || "") == "hysteria2" && (copy.server_port == null || copy.server_port == 0) && copy.server_ports != null) {
+        let raw = type(copy.server_ports) == "array" ? copy.server_ports[0] : copy.server_ports;
+        let parts = split(as_string(raw), ":");
+        let p = int(parts[0], 10);
+        if (p > 0)
+            copy.server_port = p;
+    }
     if (as_string(copy.type || "") == "tuic" &&
         type(copy.tls) == "object" &&
         copy.tls.utls != null) {
@@ -306,7 +378,30 @@ function copy_subscription_outbound(outbound, new_tag) {
         }
         copy.tls = tls;
     }
+    if (copy.tls == null &&
+        int(copy.server_port || 0) == 443 &&
+        type(copy.transport) == "object" &&
+        as_string(copy.transport.type || "") == "xhttp" &&
+        type(copy.transport.headers) == "object") {
+        let origin = as_string(copy.transport.headers.Origin || copy.transport.headers.origin || "");
+        if (index(lc(origin), "https://") == 0) {
+            let sni = as_string(copy.transport.host || copy.server || "");
+            let fp = lc(trim(as_string(copy.transport.headers["User-Agent"] || copy.transport.headers["user-agent"] || "")));
+            if (fp != "chrome" && fp != "firefox" && fp != "safari" && fp != "edge" && fp != "ios" && fp != "android")
+                fp = "chrome";
+            copy.tls = {
+                enabled: true,
+                server_name: sni,
+                alpn: [ "h2", "http/1.1" ],
+                utls: {
+                    enabled: true,
+                    fingerprint: fp
+                }
+            };
+        }
+    }
     copy.tag = new_tag;
+    sanitize_wdtt_outbound(copy);
     return copy;
 }
 
@@ -373,7 +468,33 @@ function urltest_leaf_candidate_outbound(outbound) {
     let t = lc(as_string(outbound.type || ""));
     if (t == "selector" || t == "urltest" || t == "dns" || t == "block")
         return false;
-    if (is_dummy_outbound_server(outbound.server, outbound.server_port))
+    if (t == "desync" || t == "tailscale" || t == "tor" || t == "chain")
+        return true;
+    if (t == "direct") {
+        if (as_string(outbound.bind_interface || "") != "")
+            return true;
+        if (outbound.routing_mark != null)
+            return true;
+        return false;
+    }
+    if (t == "fptn") {
+        if (as_string(outbound.token || "") != "")
+            return true;
+        return !is_dummy_outbound_server(outbound.server, outbound.server_port);
+    }
+    if (t == "wireguard") {
+        let peer = array_or_empty(outbound.peers)[0];
+        if (type(peer) == "object")
+            return !is_dummy_outbound_server(peer.address, peer.port);
+        return !is_dummy_outbound_server(outbound.server, outbound.server_port);
+    }
+    if (t == "warp" || t == "masque") {
+        if (type(outbound.profile) == "object" || as_string(outbound.private_key || "") != "")
+            return true;
+        return !is_dummy_outbound_server(outbound.endpoint || outbound.server, outbound.server_port);
+    }
+    let check_port = outbound_has_port_ranges(outbound) ? null : outbound.server_port;
+    if (is_dummy_outbound_server(outbound.server, check_port))
         return false;
     return true;
 }
@@ -412,13 +533,13 @@ function assert_unique_outbound_tags(config) {
     let seen = {};
     for (let outbound in array_or_empty(config.outbounds)) {
         if (type(outbound) != "object")
-            ctx.runtime_generate_unsupported("generated sing-box outbound is not an object");
+            ctx.runtime_generate_unsupported("generated tachyon-core outbound is not an object");
 
         let tag_name = as_string(outbound.tag || "");
         if (tag_name == "")
-            ctx.runtime_generate_unsupported("generated sing-box outbound has an empty tag");
+            ctx.runtime_generate_unsupported("generated tachyon-core outbound has an empty tag");
         if (seen[tag_name])
-            ctx.runtime_generate_unsupported("generated sing-box config has duplicate outbound tag '" + tag_name + "'");
+            ctx.runtime_generate_unsupported("generated tachyon-core config has duplicate outbound tag '" + tag_name + "'");
         seen[tag_name] = true;
     }
 }
@@ -459,16 +580,23 @@ function shadowsocks_userinfo_valid(value) {
 }
 
 function split_host_port(value) {
-    value = as_string(value);
+    value = trim(as_string(value));
     if (substr(value, 0, 1) == "[") {
         let close = index(value, "]");
-        if (close > 0 && substr(value, close + 1, 1) == ":")
-            return [ substr(value, 1, close - 1), substr(value, close + 2) ];
+        if (close > 0) {
+            if (substr(value, close + 1, 1) == ":")
+                return [ substr(value, 1, close - 1), substr(value, close + 2) ];
+            if (close == length(value) - 1)
+                return [ substr(value, 1, close - 1), "" ];
+        }
     }
 
+    let first_colon = index(value, ":");
     let colon = rindex(value, ":");
     if (colon < 0)
         return [ "", "" ];
+    if (first_colon >= 0 && first_colon != colon)
+        return [ value, "" ];
     return [ substr(value, 0, colon), substr(value, colon + 1) ];
 }
 
@@ -488,24 +616,26 @@ function tls_alpn_array(value, transport) {
 // generator and the validator ended up disagreeing about the same binary, and a
 // disagreement here is silent - the pin is simply dropped from the config.
 //
-// SB_VERSION_OVERRIDE still wins, because the whole point of it is to generate a
+// TACHYON_CORE_VERSION_OVERRIDE still wins, because the whole point of it is to generate a
 // config for a build that is not the one installed.
 function certificate_pin_field() {
-    let override = trim(as_string(getenv("SB_VERSION_OVERRIDE") || ""));
+    let override = trim(as_string(getenv("TACHYON_CORE_VERSION_OVERRIDE") || ""));
     let version = override != ""
         ? override
-        : trim(as_string(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version") || ""));
-    let variant = trim(as_string(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant") || ""));
+        : variant_state.read_version_state();
 
-    // With no state file to go on, let the model look at the installed binary
-    // rather than guessing from an empty version.
-    return core_profile.pin_field(version, variant);
+    return core_profile.pin_field(version, "tachyon-core");
 }
 
 function apply_link_tls(outbound, scheme, query) {
     query = object_or_empty(query);
-    let security = as_string(query.security || "");
+    let security = lc(trim(as_string(query.security || "")));
+    let pbk = trim(as_string(query.pbk || ""));
+    if (security == "" && pbk != "")
+        security = "reality";
     if (security == "" && (scheme == "hysteria2" || scheme == "hy2" || scheme == "tuic"))
+        security = "tls";
+    if (security == "xtls")
         security = "tls";
 
     if (security == "" || security == "none")
@@ -516,42 +646,64 @@ function apply_link_tls(outbound, scheme, query) {
     }
 
     let tls = { enabled: true };
-    if (as_string(query.sni || "") != "")
-        tls.server_name = as_string(query.sni);
+    let sni = trim(as_string(query.sni || query.peer || ""));
+    if (sni != "")
+        tls.server_name = sni;
     if (bool_query(query.allowInsecure || query.insecure || ""))
         tls.insecure = true;
-    let certificate_pin = common.certificate_pin_base64(as_string(query.pcs || ""));
+    let certificate_pin = common.certificate_pin_base64(as_string(query.pcs || query.pinSHA256 || ""));
     if (certificate_pin != "") {
         let pin_field = certificate_pin_field();
         if (pin_field != "")
             tls[pin_field] = [ certificate_pin ];
         else
-            warn("this sing-box build has no usable TLS pin field; certificate pin from the link ignored\n");
+            warn("this tachyon-core build has no usable TLS pin field; certificate pin from the link ignored\n");
     }
 
     let alpn = tls_alpn_array(query.alpn, query.type);
     if (length(alpn) > 0)
         tls.alpn = alpn;
 
-    if (scheme != "hysteria2" && scheme != "hy2" && scheme != "tuic" && as_string(query.fp || "") != "") {
+    let fp = trim(as_string(query.fp || ""));
+    if (fp == "" && security == "reality")
+        fp = "chrome";
+    if (scheme != "hysteria2" && scheme != "hy2" && scheme != "tuic" && fp != "") {
         tls.utls = {
             enabled: true,
-            fingerprint: as_string(query.fp)
+            fingerprint: fp
         };
     }
     if (security == "reality") {
         tls.reality = {
             enabled: true,
-            public_key: as_string(query.pbk || ""),
+            public_key: pbk,
             short_id: as_string(query.sid || "")
         };
-        // Only carry the flag when the link actually asks for it. Injecting it
-        // unconditionally broke two things: sing-box-lx and stock sing-box reject
-        // the field outright, and a server doing plain X25519 cannot complete a
-        // handshake that demands the hybrid exchange.
         let mlkem_preference = query.support_x25519mlkem768;
         if (mlkem_preference == null)
             mlkem_preference = query.supportX25519MLKEM768;
+        if (mlkem_preference == null)
+            mlkem_preference = query["support-x25519mlkem768"];
+        if (mlkem_preference == null)
+            mlkem_preference = query.pq;
+        if (mlkem_preference == null)
+            mlkem_preference = query.post_quantum;
+        if (mlkem_preference == null && as_string(query.extra || "") != "") {
+            try {
+                let extra_obj = json(as_string(query.extra));
+                if (type(extra_obj) == "object") {
+                    mlkem_preference = extra_obj.support_x25519mlkem768;
+                    if (mlkem_preference == null)
+                        mlkem_preference = extra_obj.supportX25519MLKEM768;
+                    if (mlkem_preference == null)
+                        mlkem_preference = extra_obj["support-x25519mlkem768"];
+                    if (mlkem_preference == null && trim(as_string(extra_obj.pqv || extra_obj.mldsa65Verify || "")) != "")
+                        mlkem_preference = "true";
+                }
+            } catch (e) {}
+        }
+        if (mlkem_preference == null && trim(as_string(query.pqv || query.mldsa65Verify || "")) != "")
+            mlkem_preference = "true";
         if (mlkem_preference != null)
             tls.reality.support_x25519mlkem768 = bool_query(mlkem_preference);
     }
@@ -616,7 +768,12 @@ function apply_link_transport(outbound, query) {
         // padding, sc* limits. The subscription parser already knows all of
         // that mapping — hand the query over to it instead of keeping a second,
         // dumber copy that silently drops everything extra carries.
-        let built = subscription_parser.add_transport({ query: object_or_empty(query) });
+        let q_copy = {};
+        for (let k, v in object_or_empty(query))
+            q_copy[k] = v;
+        if (as_string(q_copy.sni || "") == "" && as_string(q_copy.peer || "") != "")
+            q_copy.sni = q_copy.peer;
+        let built = subscription_parser.add_transport({ query: q_copy });
         if (type(built) != "object")
             return;
         result = built;
@@ -757,7 +914,9 @@ function manual_vless_outbound(link, tag_name) {
         server_port: port,
         uuid
     };
-    let flow = as_string(query.flow || "");
+    let flow = normalize_vless_flow_value(query.flow || "");
+    if (flow == null)
+        ctx.runtime_generate_unsupported("manual VLESS proxy link flow '" + as_string(query.flow || "") + "' is not supported");
     if (flow != "")
         outbound.flow = flow;
     let encryption = as_string(query.encryption || "");
@@ -768,6 +927,24 @@ function manual_vless_outbound(link, tag_name) {
         outbound.packet_encoding = packet_encoding;
     apply_link_tls(outbound, "vless", query);
     apply_link_transport(outbound, query);
+    if (outbound.tls == null && port == 443 && type(outbound.transport) == "object" && outbound.transport.type == "xhttp" && type(outbound.transport.headers) == "object") {
+        let origin = as_string(outbound.transport.headers.Origin || outbound.transport.headers.origin || "");
+        if (index(lc(origin), "https://") == 0) {
+            let sni = as_string(outbound.transport.host || host);
+            let fp = lc(trim(as_string(outbound.transport.headers["User-Agent"] || outbound.transport.headers["user-agent"] || "")));
+            if (fp != "chrome" && fp != "firefox" && fp != "safari" && fp != "edge" && fp != "ios" && fp != "android")
+                fp = "chrome";
+            outbound.tls = {
+                enabled: true,
+                server_name: sni,
+                alpn: [ "h2", "http/1.1" ],
+                utls: {
+                    enabled: true,
+                    fingerprint: fp
+                }
+            };
+        }
+    }
     return outbound;
 }
 
@@ -821,6 +998,14 @@ function manual_vmess_outbound(link, tag_name) {
     if (vmess.tls === true || vmess.tls == "tls" || vmess.tls == "true") {
         let tls = { enabled: true };
         optional_query_string(tls, "server_name", vmess_json_value(vmess.sni));
+        if (bool_query(vmess_json_value(vmess.allowInsecure || vmess.insecure)))
+            tls.insecure = true;
+        let certificate_pin = common.certificate_pin_base64(vmess_json_value(vmess.pcs));
+        if (certificate_pin != "") {
+            let pin_field = certificate_pin_field();
+            if (pin_field != "")
+                tls[pin_field] = [ certificate_pin ];
+        }
         let alpn = tls_alpn_array(vmess_json_value(vmess.alpn), network);
         if (length(alpn) > 0)
             tls.alpn = alpn;
@@ -878,6 +1063,10 @@ function manual_trojan_outbound(link, tag_name) {
 }
 
 function manual_hysteria2_outbound(link, tag_name) {
+    let parsed = subscription_parser.parse_share_link(link);
+    if (parsed != null)
+        return copy_subscription_outbound(parsed, tag_name);
+
     let query = url_query_params(link);
     let host = url_host(link);
     let port = parse_port(as_string(query.mport || "") != "" ? query.mport : url_port(link));
@@ -954,25 +1143,40 @@ function manual_tuic_outbound(link, tag_name) {
     return outbound;
 }
 
-function ensure_imported_vpn_lx() {
-    let variant = trim(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant") || "");
-    let version = trim(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version") || "");
-    if (variant != "lx" && variant != "tachyon-core" && index(version, "-lx") < 0 && index(version, "-tachyon.") < 0)
-        ctx.runtime_generate_unsupported("vpn:// import is available only with sing-box-lx or tachyon-core");
+function ensure_imported_vpn_supported() {
+    // tachyon-core supports vpn:// imports natively.
 }
 
-// An fptn outbound exists only in tachyon-core's protocol list: on every other
-// core the emitted config would be rejected outright, so refuse with a clear
-// error instead of shipping a broken config. fptn_transport_mode() is the one
-// resolver that already knows the answer — native exists on tachyon-core only.
+// A desync outbound exists in tachyon-core from 0.1.7 on.
+function ensure_desync_outbound_supported() {
+    let version = variant_state.read_version_state();
+    if (version == "" && ctx.detect_core_version)
+        version = as_string(ctx.detect_core_version() || "");
+    if (core_profile.supports_desync(version, "tachyon-core") === true)
+        return;
+    ctx.runtime_generate_unsupported("Native Desync requires tachyon-core 0.1.7 or newer (installed: " + as_string(version) + ")");
+}
+
 function ensure_fptn_outbound_supported() {
     if (connections && connections.fptn_transport_mode() != "native")
-        ctx.runtime_generate_unsupported("fptn:// links require tachyon-core; this core cannot dial FPTN");
+        ctx.runtime_generate_unsupported("fptn:// links require tachyon-core");
 }
 
 function add_imported_wireguard_endpoint(config, endpoint) {
-    ensure_imported_vpn_lx();
+    ensure_imported_vpn_supported();
     if (type(endpoint) == "object") {
+        if (type(endpoint.amnezia) == "object") {
+            for (let k, v in endpoint.amnezia) {
+                if (endpoint[k] == null)
+                    endpoint[k] = v;
+            }
+            delete endpoint.amnezia;
+        }
+        delete endpoint.fake_packets;
+        delete endpoint.fake_packets_size;
+        delete endpoint.fake_packets_delay;
+        delete endpoint.fake_packets_mode;
+        endpoint.__wireguard_client = true;
         if (endpoint.address != null)
             endpoint.address = core_ip.normalize_to_cidrs(endpoint.address);
         if (type(endpoint.peers) == "array") {
@@ -981,6 +1185,104 @@ function add_imported_wireguard_endpoint(config, endpoint) {
                     peer.allowed_ips = core_ip.normalize_to_cidrs(peer.allowed_ips);
             }
         }
+    }
+    push(config.endpoints, endpoint);
+}
+
+function safe_tailscale_id(value) {
+    return replace(as_string(value), /[^A-Za-z0-9_.-]/g, "_");
+}
+
+function ensure_tailscale_client_dns(config, src_or_section, ep_tag) {
+    ep_tag = as_string(ep_tag || "");
+    if (ep_tag == "")
+        return;
+    if (src_or_section != null && !bool_option(src_or_section, "tailscale_accept_dns", true))
+        return;
+    if (type(config.dns) != "object")
+        return;
+    if (type(config.dns.servers) != "array")
+        config.dns.servers = [];
+    if (type(config.dns.rules) != "array")
+        config.dns.rules = [];
+
+    let safe_ep = safe_tailscale_id(ep_tag);
+    let dns_tag = "dns-" + safe_ep;
+    let has_dns_srv = false;
+    for (let srv in config.dns.servers) {
+        if (type(srv) == "object" && srv.tag == dns_tag) {
+            has_dns_srv = true;
+            break;
+        }
+    }
+    if (!has_dns_srv) {
+        push(config.dns.servers, {
+            type: "tailscale",
+            tag: dns_tag,
+            endpoint: ep_tag,
+            accept_default_resolvers: src_or_section != null ? bool_option(src_or_section, "tailscale_accept_default_resolvers", true) : true
+        });
+    }
+
+    let has_ts_net_rule = false;
+    let ts_dns_tags = {};
+    for (let srv in config.dns.servers) {
+        if (type(srv) == "object" && srv.type == "tailscale" && as_string(srv.tag || "") != "")
+            ts_dns_tags[as_string(srv.tag)] = true;
+    }
+    for (let r in config.dns.rules) {
+        if (type(r) != "object" || !ts_dns_tags[as_string(r.server || "")])
+            continue;
+        if (r.domain_suffix == "ts.net" || (type(r.domain_suffix) == "array" && index(r.domain_suffix, "ts.net") >= 0)) {
+            has_ts_net_rule = true;
+            break;
+        }
+    }
+    if (!has_ts_net_rule) {
+        push(config.dns.rules, {
+            action: "route",
+            server: dns_tag,
+            domain_suffix: [ "ts.net" ],
+            __service_tag: "tailscale-client-dns-" + safe_ep
+        });
+    }
+    if (ctx.is_tachyon_core != null && ctx.is_tachyon_core(null)) {
+        let pref_rule_tag = "tailscale-client-pref-dns-" + safe_ep;
+        let has_pref_rule = false;
+        for (let r in config.dns.rules) {
+            if (type(r) == "object" && r.__service_tag == pref_rule_tag) {
+                has_pref_rule = true;
+                break;
+            }
+        }
+        if (!has_pref_rule) {
+            push(config.dns.rules, {
+                action: "route",
+                server: dns_tag,
+                preferred_by: ep_tag,
+                __service_tag: pref_rule_tag
+            });
+        }
+    }
+}
+
+function add_imported_tailscale_endpoint(config, endpoint) {
+    if (!config.endpoints)
+        config.endpoints = [];
+    if (type(endpoint) == "object") {
+        let ep_tag = as_string(endpoint.tag || "tailscale");
+        let accept_dns = endpoint.accept_dns !== false;
+        delete endpoint.accept_dns;
+        if (as_string(endpoint.auth_key || "") == "")
+            delete endpoint.auth_key;
+        if (as_string(endpoint.state_directory || "") == "") {
+            let base_dir = endpoint.ephemeral === true ? "/var/run/tachyon/tailscale/" : "/etc/tachyon/tailscale/";
+            endpoint.state_directory = base_dir + safe_tailscale_id(ep_tag);
+        }
+        push(config.endpoints, endpoint);
+        if (accept_dns)
+            ensure_tailscale_client_dns(config, null, ep_tag);
+        return;
     }
     push(config.endpoints, endpoint);
 }
@@ -1047,7 +1349,7 @@ function fptn_token_payload(payload) {
 // (`tachyon-core fptn decode <token>`). Returns null when the binary is
 // missing or refuses, and the caller falls back to the raw-token form.
 function fptn_token_decode_via_core(token) {
-    let binary = getenv("SB_PREFLIGHT_BINARY") || getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/tachyon-core";
+    let binary = getenv("TACHYON_CORE_PREFLIGHT_BINARY") || getenv("TACHYON_CORE_BIN") || "/usr/bin/tachyon-core";
     if (fs.stat(binary) == null)
         return null;
     let result = exec.run({ argv: [ binary, "fptn", "decode", token ], timeout: 15 });
@@ -1114,8 +1416,10 @@ function manual_link_outbound(link, tag_name, display_info) {
     let scheme = url_scheme(link);
     // Preserve the base64 payload; do not URL-decode the complete link first.
     if (scheme == "vpn") {
-        ensure_imported_vpn_lx();
+        ensure_imported_vpn_supported();
         let endpoint = subscription_wireguard.from_vpn(link);
+        if (endpoint == null)
+            endpoint = subscription_parser.parse_share_link(link);
         if (endpoint == null)
             ctx.runtime_generate_unsupported("invalid vpn:// export: expected a valid WG/AWG .conf or Amnezia WG/AWG container");
         if (type(display_info) == "object")
@@ -1128,11 +1432,26 @@ function manual_link_outbound(link, tag_name, display_info) {
         return {
             type: "fptn",
             tag: tag_name,
-            token: link
+            token: url_strip_fragment_value(link)
         };
     }
     if (scheme == "vmess")
         return manual_vmess_outbound(link, tag_name);
+
+    if (scheme == "anytls" || scheme == "naive+https" || scheme == "naive+quic" ||
+        scheme == "snell" || scheme == "mieru" || scheme == "mierus" ||
+        scheme == "tg" || scheme == "mtproto" || scheme == "shadowtls" ||
+        scheme == "tewfai" || scheme == "trusttunnel" || scheme == "masque" ||
+        scheme == "openconnect" || scheme == "anyconnect" ||
+        scheme == "csqtt" || scheme == "wdtt" || scheme == "qwdtt" ||
+        ((scheme == "http" || scheme == "https") && (index(link, "://t.me/proxy?") >= 0 || index(link, "://telegram.me/proxy?") >= 0))) {
+        let parsed = subscription_parser.parse_share_link(link);
+        if (parsed == null)
+            ctx.runtime_generate_unsupported("invalid manual proxy link for scheme " + scheme);
+        if (type(display_info) == "object")
+            display_info.name = subscription_outbound_display_name(parsed);
+        return copy_subscription_outbound(parsed, tag_name);
+    }
 
     // Strip the fragment, nothing else. Decoding the whole link up front used
     // to run before the query was split, so a percent-encoded `&` (extra=...,
@@ -1155,7 +1474,7 @@ function manual_link_outbound(link, tag_name, display_info) {
         return manual_hysteria2_outbound(link, tag_name);
     if (scheme == "tuic")
         return manual_tuic_outbound(link, tag_name);
-    ctx.runtime_generate_unsupported("manual proxy link scheme is not supported by sing-box config generation yet");
+    ctx.runtime_generate_unsupported("manual proxy link scheme is not supported by tachyon-core config generation yet");
 }
 
 // fptn:// is a share link whose scheme is not a standard URI scheme the
@@ -1172,7 +1491,7 @@ function is_fptn_link(link) {
 // does, so the dashboard lists the servers instead of one opaque card. Falls
 // back to false for anything undecodable, and the caller then keeps the raw
 // token for the core to expand itself.
-function add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags) {
+function add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags, source_id) {
     if (!is_fptn_link(link))
         return false;
     ensure_fptn_outbound_supported();
@@ -1180,7 +1499,26 @@ function add_fptn_manual_members(config, state, section_name, tag_name, link, ta
     if (decoded == null)
         return false;
 
-    for (let server in decoded.servers) {
+    let src_tag = as_string(source_id || "") != "" ? as_string(source_id) : "manual";
+    let src_obj = (connections && connections.outbound_source_section && src_tag != "manual")
+        ? connections.outbound_source_section(src_tag)
+        : null;
+    let node_prefix = (src_obj != null && bool_option(src_obj, "prefix_nodes", true))
+        ? trim(option(src_obj, "node_prefix", ""))
+        : "";
+    let fptn_sni = src_obj != null ? trim(option(src_obj, "sni", "")) : "";
+    let fptn_bypass = src_obj != null ? trim(option(src_obj, "bypass_method", "")) : "";
+    let fptn_pref = src_obj != null ? lc(trim(option(src_obj, "preferred_server", ""))) : "";
+    let ordered_servers = [];
+    for (let s in decoded.servers) {
+        if (fptn_pref != "" && (lc(as_string(s.name || "")) == fptn_pref || lc(as_string(s.host || "")) == fptn_pref))
+            push(ordered_servers, s);
+    }
+    for (let s in decoded.servers) {
+        if (fptn_pref == "" || (lc(as_string(s.name || "")) != fptn_pref && lc(as_string(s.host || "")) != fptn_pref))
+            push(ordered_servers, s);
+    }
+    for (let server in ordered_servers) {
         let member_tag = tag_name + "/" + server.name;
         if (taken[member_tag])
             member_tag = unique_tag(member_tag, taken);
@@ -1196,126 +1534,35 @@ function add_fptn_manual_members(config, state, section_name, tag_name, link, ta
         };
         if (server.md5_fingerprint != "")
             member.md5_fingerprint = server.md5_fingerprint;
+        if (fptn_sni != "")
+            member.sni = fptn_sni;
+        if (fptn_bypass != "")
+            member.bypass_method = fptn_bypass;
 
         push(config.outbounds, member);
         push(selector_tags, member_tag);
         push(urltest_candidate_tags, member_tag);
         state.links[member_tag] = as_string(link);
-        runtime_subscription.remember_outbound_metadata(state, member_tag, server.name, member);
+        runtime_subscription.remember_outbound_metadata(state, member_tag, server.name, member, node_prefix);
+        state.outboundMetadata.sources[member_tag] = src_tag;
+        if (src_tag != "manual") {
+            if (!state.outboundMetadata.source_ids)
+                state.outboundMetadata.source_ids = {};
+            state.outboundMetadata.source_ids[member_tag] = src_tag;
+            let src_sec = (connections && type(connections.outbound_source_section) == "function")
+                ? connections.outbound_source_section(src_tag)
+                : null;
+            if (src_sec != null) {
+                let src_nm = trim(option(src_sec, "name", option(src_sec, "label", "")));
+                if (src_nm != "") {
+                    if (!state.outboundMetadata.source_names)
+                        state.outboundMetadata.source_names = {};
+                    state.outboundMetadata.source_names[member_tag] = src_nm;
+                }
+            }
+        }
     }
     return true;
-}
-
-function add_manual_proxy_link(config, state, section_name, manual_index, link, taken, selector_tags, urltest_candidate_tags) {
-    let tag_name = outbound_tag(section_name + "-" + manual_index);
-    if (taken[tag_name])
-        tag_name = unique_tag(tag_name, taken);
-    taken[tag_name] = true;
-
-    if (add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags))
-        return tag_name;
-
-    let display_info = {};
-    let outbound = manual_link_outbound(link, tag_name, display_info);
-    let display_name = url_fragment(link);
-    if (display_name == "")
-        display_name = as_string(display_info.name || tag_name);
-    ensure_explicit_outbound_supported(outbound, "manual outbound", display_name);
-    if (outbound.type == "wireguard")
-        add_imported_wireguard_endpoint(config, outbound);
-    else
-        push(config.outbounds, outbound);
-    push(selector_tags, tag_name);
-    push(urltest_candidate_tags, tag_name);
-
-    state.links[tag_name] = as_string(link);
-    runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, outbound);
-    return tag_name;
-}
-
-function connection_item_tag(section_name, kind, item_index) {
-    return outbound_tag(section_name + "-" + as_string(kind) + "-" + item_index);
-}
-
-function add_connection_manual_links(config, state, section, taken, selector_tags, urltest_candidate_tags) {
-    let section_name = section[".name"];
-    let manual_links = connections.connection_urls(section);
-    for (let i = 0; i < length(manual_links); i++) {
-        let link = manual_links[i];
-        add_manual_proxy_link(
-            config,
-            state,
-            section_name,
-            i + 1,
-            link,
-            taken,
-            selector_tags,
-            urltest_candidate_tags
-        );
-    }
-}
-
-function is_extended_variant_detected() {
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
-    if (sb_variant_val == "extended" || sb_variant_val == "extended-compressed")
-        return true;
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
-    let sb_version_val = trim(fs.readfile(sb_version_file) || "");
-    return index(sb_version_val, "extended") >= 0;
-}
-
-function add_connection_text_urltest(config, state, section, taken, selector_tags, urltest_candidate_tags, index_offset) {
-    let section_name = section[".name"];
-    if (index(connections.urltests(section), "urltest") >= 0)
-        return "";
-
-    let text_links = connections.urltest_text_links(section);
-    if (length(text_links) == 0)
-        return "";
-
-    let text_tags = [];
-    for (let i = 0; i < length(text_links); i++)
-        add_manual_proxy_link(
-            config,
-            state,
-            section_name,
-            int(index_offset || 0) + i + 1,
-            text_links[i],
-            taken,
-            selector_tags,
-            text_tags
-        );
-
-    if (length(text_tags) == 0)
-        return "";
-
-    let urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
-    let url = connections.urltest_testing_url(section, "urltest");
-    let interval = connections.urltest_check_interval(section, "urltest");
-    let tolerance = int(connections.urltest_tolerance(section, "urltest"), 10);
-    let interrupt = connections.urltest_interrupt_exist_connections(section, "urltest");
-    let outbound = {
-        type: "urltest",
-        tag: urltest_tag,
-        outbounds: text_tags,
-        url,
-        interval,
-        tolerance,
-        interrupt_exist_connections: interrupt
-    };
-    runtime_subscription.remember_outbound_metadata(state, urltest_tag, "Fastest", outbound);
-    runtime_subscription.remember_urltest_group_config(state, urltest_tag, {
-        displayName: "Fastest",
-        outbounds: text_tags,
-        url,
-        interval,
-        tolerance,
-        idle_timeout: "",
-        interrupt_exist_connections: interrupt
-    });
-    push(config.outbounds, outbound);
-    return urltest_tag;
 }
 
 function subscription_keyword_fold(value) {
@@ -1352,9 +1599,285 @@ function subscription_keyword_fold(value) {
     return result;
 }
 
-function subscription_keyword_filter(section) {
-    let include = list_option(section, "subscription_filter_include_keywords");
-    let exclude = list_option(section, "subscription_filter_exclude_keywords");
+function parse_server_interface_overrides(obj_list) {
+    let exact = {};
+    let substr_rules = [];
+    for (let obj in array_or_empty(obj_list)) {
+        if (type(obj) != "object") continue;
+        let raw_list = obj.server_interfaces;
+        let entries = type(raw_list) == "array" ? raw_list : (raw_list != null && as_string(raw_list) != "" ? split(as_string(raw_list), "\n") : []);
+        for (let entry in entries) {
+            entry = trim(as_string(entry));
+            if (entry == "" || substr(entry, 0, 1) == "#") continue;
+            let eq = rindex(entry, "=");
+            if (eq <= 0) eq = rindex(entry, ":");
+            if (eq <= 0) continue;
+            let pat = trim(substr(entry, 0, eq));
+            let iface = trim(substr(entry, eq + 1));
+            if (substr(pat, 0, 4) == "srv:") pat = trim(substr(pat, 4));
+            if (pat == "" || iface == "") continue;
+            exact[lc(pat)] = iface;
+            push(substr_rules, { pattern: subscription_keyword_fold(pat), iface: iface });
+        }
+    }
+    return { exact, substr_rules };
+}
+
+function match_server_interface_override(overrides, candidates) {
+    if (type(overrides) != "object") return "";
+    let exact = object_or_empty(overrides.exact);
+    let substr_rules = array_or_empty(overrides.substr_rules);
+    if (length(keys(exact)) == 0 && length(substr_rules) == 0) return "";
+    for (let c in array_or_empty(candidates)) {
+        let k = lc(trim(as_string(c)));
+        if (k != "" && exact[k] != null)
+            return exact[k];
+    }
+    for (let c in array_or_empty(candidates)) {
+        let folded = subscription_keyword_fold(as_string(c));
+        if (folded == "") continue;
+        for (let rule in substr_rules) {
+            if (rule.pattern != "" && index(folded, rule.pattern) >= 0)
+                return rule.iface;
+        }
+    }
+    return "";
+}
+
+function apply_source_fragment_overrides(outbound, tls_fp, frag_mode, frag_len, frag_delay) {
+    if (type(outbound) != "object")
+        return;
+    let otype = lc(as_string(outbound.type || ""));
+    if (otype == "" || index([
+        "urltest", "selector", "direct", "block", "dns",
+        "hysteria2", "hysteria", "tuic", "masque",
+        "wireguard", "tailscale", "desync", "wdtt", "csqtt"
+    ], otype) >= 0)
+        return;
+
+    if (type(outbound.tls) == "object") {
+        let tls_copy = {};
+        for (let k, v in outbound.tls)
+            tls_copy[k] = v;
+        outbound.tls = tls_copy;
+    }
+
+    if (tls_fp != "" && type(outbound.tls) == "object" && outbound.tls.enabled === true)
+        outbound.tls.utls = { enabled: true, fingerprint: tls_fp };
+
+    if (frag_mode == "tls_record") {
+        if (type(outbound.tls) == "object" && outbound.tls.enabled === true)
+            outbound.tls.record_fragment = true;
+    } else if (frag_mode == "tls_fragment") {
+        if (type(outbound.tls) == "object" && outbound.tls.enabled === true)
+            outbound.tls.fragment = true;
+    } else if (frag_mode == "tcp_fragment") {
+        let eff_len = frag_len != "" ? frag_len : "20-60";
+        let eff_delay = "0-2ms";
+        if (frag_delay != "")
+            eff_delay = match(frag_delay, /(ms|s)$/) != null ? frag_delay : (frag_delay + "ms");
+        outbound.tcp_fragment = {
+            enabled: true,
+            packets: "tlshello",
+            length: eff_len,
+            delay: eff_delay
+        };
+    }
+}
+
+function add_manual_proxy_link(config, state, section_name, manual_index, link, taken, selector_tags, urltest_candidate_tags, source_id) {
+    let tag_name = outbound_tag(section_name + "-" + manual_index);
+    if (taken[tag_name])
+        tag_name = unique_tag(tag_name, taken);
+    taken[tag_name] = true;
+
+    let src_tag = as_string(source_id || "") != "" ? as_string(source_id) : "manual";
+    if (add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags, src_tag))
+        return tag_name;
+
+    let src_obj = (connections && connections.outbound_source_section && src_tag != "manual")
+        ? connections.outbound_source_section(src_tag)
+        : null;
+    let node_prefix = (src_obj != null && bool_option(src_obj, "prefix_nodes", true))
+        ? trim(option(src_obj, "node_prefix", ""))
+        : "";
+    let src_bind_iface = src_obj != null ? trim(option(src_obj, "bind_interface", "")) : "";
+    let src_srv_overrides = parse_server_interface_overrides([ src_obj ]);
+    let src_tls_fp = src_obj != null ? lc(trim(option(src_obj, "tls_fingerprint", ""))) : "";
+    if (src_tls_fp == "default")
+        src_tls_fp = "";
+    let src_frag_mode = src_obj != null ? connections.source_tls_fragment_mode(src_obj, "") : "";
+    let src_frag_len = src_obj != null ? connections.source_tcp_fragment_length(src_obj, "") : "";
+    let src_frag_delay = src_obj != null ? connections.source_tcp_fragment_delay(src_obj, "") : "";
+
+    let display_info = {};
+    let outbound = manual_link_outbound(link, tag_name, display_info);
+    let display_name = url_fragment(link);
+    let info_name = trim(as_string(display_info.name || ""));
+    let src_fallback_name = src_obj != null ? trim(option(src_obj, "name", section_name)) : "";
+    if (display_name == "" || (info_name != "" && info_name != "AmneziaWG" && info_name != "WireGuard" && display_name == src_fallback_name))
+        display_name = info_name != "" ? info_name : tag_name;
+    ensure_explicit_outbound_supported(outbound, "manual outbound", display_name);
+    let manual_override_iface = match_server_interface_override(src_srv_overrides, [
+        tag_name,
+        display_name,
+        as_string(outbound.server || "")
+    ]);
+    if (manual_override_iface != "") {
+        outbound.bind_interface = manual_override_iface;
+        outbound.__tachyon_explicit_bind_interface = true;
+        delete outbound.detour;
+    } else if (src_bind_iface != "" && as_string(outbound.detour || "") == "" && as_string(outbound.bind_interface || "") == "") {
+        outbound.bind_interface = src_bind_iface;
+    }
+    apply_source_fragment_overrides(outbound, src_tls_fp, src_frag_mode, src_frag_len, src_frag_delay);
+    if (outbound.type == "wireguard")
+        add_imported_wireguard_endpoint(config, outbound);
+    else if (outbound.type == "tailscale")
+        add_imported_tailscale_endpoint(config, outbound);
+    else if (outbound.type == "shadowtls") {
+        let stls_tag = unique_tag(tag_name + "-stls", taken);
+        taken[stls_tag] = true;
+        let stls_outbound = {};
+        for (let k, v in outbound)
+            stls_outbound[k] = v;
+        stls_outbound.tag = stls_tag;
+        push(config.outbounds, stls_outbound);
+        outbound = {
+            type: "shadowsocks",
+            tag: tag_name,
+            server: stls_outbound.server,
+            server_port: stls_outbound.server_port,
+            method: "aes-128-gcm",
+            password: as_string(stls_outbound.password || ""),
+            detour: stls_tag
+        };
+        push(config.outbounds, outbound);
+    } else
+        push(config.outbounds, outbound);
+    push(selector_tags, tag_name);
+    push(urltest_candidate_tags, tag_name);
+
+    state.links[tag_name] = as_string(link);
+    runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, outbound, node_prefix);
+    state.outboundMetadata.sources[tag_name] = src_tag;
+    if (src_tag != "manual") {
+        if (!state.outboundMetadata.source_ids)
+            state.outboundMetadata.source_ids = {};
+        state.outboundMetadata.source_ids[tag_name] = src_tag;
+        let src_sec = (connections && type(connections.outbound_source_section) == "function")
+            ? connections.outbound_source_section(src_tag)
+            : null;
+        if (src_sec != null) {
+            let src_nm = trim(option(src_sec, "name", option(src_sec, "label", "")));
+            if (src_nm != "") {
+                if (!state.outboundMetadata.source_names)
+                    state.outboundMetadata.source_names = {};
+                state.outboundMetadata.source_names[tag_name] = src_nm;
+            }
+        }
+    }
+    return tag_name;
+}
+
+function connection_item_tag(section_name, kind, item_index) {
+    return outbound_tag(section_name + "-" + as_string(kind) + "-" + item_index);
+}
+
+function add_connection_manual_links(config, state, section, taken, selector_tags, urltest_candidate_tags) {
+    let section_name = section[".name"];
+    let manual_links = connections.connection_urls(section);
+    for (let i = 0; i < length(manual_links); i++) {
+        let link = manual_links[i];
+        let src_id = (connections && connections.source_id_for_manual_item)
+            ? connections.source_id_for_manual_item(section, link)
+            : "";
+        add_manual_proxy_link(
+            config,
+            state,
+            section_name,
+            i + 1,
+            link,
+            taken,
+            selector_tags,
+            urltest_candidate_tags,
+            src_id
+        );
+    }
+}
+
+function add_connection_text_urltest(config, state, section, taken, selector_tags, urltest_candidate_tags, index_offset) {
+    let section_name = section[".name"];
+    if (index(connections.urltests(section), "urltest") >= 0)
+        return "";
+
+    let text_links = connections.urltest_text_links(section);
+    if (length(text_links) == 0)
+        return "";
+
+    let text_tags = [];
+    for (let i = 0; i < length(text_links); i++)
+        add_manual_proxy_link(
+            config,
+            state,
+            section_name,
+            int(index_offset || 0) + i + 1,
+            text_links[i],
+            taken,
+            selector_tags,
+            text_tags
+        );
+
+    if (length(text_tags) == 0)
+        return "";
+
+    let urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
+    let url = connections.urltest_testing_url(section, "urltest");
+    let interval = connections.urltest_check_interval(section, "urltest");
+    let tolerance = int(connections.urltest_tolerance(section, "urltest"), 10);
+    let idle_timeout = ctx.routes.urltest_idle_timeout(section, "urltest");
+    let interrupt = connections.urltest_interrupt_exist_connections(section, "urltest");
+    let outbound = {
+        type: "urltest",
+        tag: urltest_tag,
+        outbounds: text_tags,
+        url,
+        interval,
+        tolerance,
+        interrupt_exist_connections: interrupt
+    };
+    if (idle_timeout != "")
+        outbound.idle_timeout = idle_timeout;
+    runtime_subscription.remember_outbound_metadata(state, urltest_tag, "Fastest", outbound);
+    runtime_subscription.remember_urltest_group_config(state, urltest_tag, {
+        displayName: "Fastest",
+        outbounds: text_tags,
+        url,
+        interval,
+        tolerance,
+        idle_timeout: outbound.idle_timeout || "",
+        interrupt_exist_connections: interrupt
+    });
+    push(config.outbounds, outbound);
+    return urltest_tag;
+}
+
+function subscription_keyword_filter(section, source_entry) {
+    let include = [];
+    let exclude = [];
+    for (let kw in list_option(section, "subscription_filter_include_keywords"))
+        push(include, kw);
+    for (let kw in list_option(section, "subscription_filter_exclude_keywords"))
+        push(exclude, kw);
+    if (source_entry != null && source_entry != "" && connections && connections.subscription_url_settings) {
+        let src_settings = connections.subscription_url_settings(section, source_entry);
+        if (src_settings != null && type(src_settings) == "object") {
+            for (let kw in list_option(src_settings, "subscription_filter_include_keywords"))
+                push(include, kw);
+            for (let kw in list_option(src_settings, "subscription_filter_exclude_keywords"))
+                push(exclude, kw);
+        }
+    }
     if (length(include) == 0 && length(exclude) == 0)
         return null;
 
@@ -1395,14 +1918,38 @@ function subscription_keyword_name_passes(filter, name) {
 function add_subscription_source_with_state(config, section, source_index, source_entry, taken, selector_tags, urltest_candidate_tags, state, show_metadata, include_urltest_groups, hide_urltest_group_outbounds, hide_detour_outbounds, node_prefix) {
     let section_name = section[".name"];
     let source_section = runtime_subscription.source_id(section_name, source_index);
-    if (!runtime_subscription.source_cache_is_current(
-        source_section,
-        source_entry,
-        connections.subscription_user_agent(section, source_entry),
-        connections.subscription_hwid(section, source_entry),
-        connections.subscription_device_headers_signature(section, source_entry)
-    ))
-        return 0;
+    let ua = connections.subscription_user_agent(section, source_entry);
+    let hwid = connections.subscription_hwid(section, source_entry);
+    let hdr_sig = connections.subscription_device_headers_signature(section, source_entry);
+    if (!runtime_subscription.source_cache_is_current(source_section, source_entry, ua, hwid, hdr_sig)) {
+        let resolved_source_section = "";
+        for (let src in connections.outbound_source_sections()) {
+            let sname = as_string(src[".name"] || "");
+            if (sname == "" || connections.outbound_source_subscription_url(src) != source_entry)
+                continue;
+            for (let cand in [ runtime_subscription.source_id("Pool_" + sname, 1), "Pool_" + sname, runtime_subscription.source_id(sname, 1), sname ]) {
+                if (runtime_subscription.source_cache_is_current(cand, source_entry, ua, hwid, hdr_sig)) {
+                    resolved_source_section = cand;
+                    break;
+                }
+            }
+            if (resolved_source_section != "")
+                break;
+        }
+        if (resolved_source_section == "") {
+            let sub_folder = getenv("TMP_SUBSCRIPTION_FOLDER") || "/tmp/tachyon-core/subscriptions";
+            for (let upath in (fs.glob(sub_folder + "/*.url") || [])) {
+                let base_name = replace(replace(upath, /^.*\//, ""), /\.url$/, "");
+                if (base_name != "" && runtime_subscription.source_cache_is_current(base_name, source_entry, ua, hwid, hdr_sig)) {
+                    resolved_source_section = base_name;
+                    break;
+                }
+            }
+        }
+        if (resolved_source_section == "")
+            return 0;
+        source_section = resolved_source_section;
+    }
 
     let source_outbounds = runtime_subscription.read_source_outbounds(source_section);
     if (length(source_outbounds) == 0)
@@ -1418,53 +1965,144 @@ function add_subscription_source_with_state(config, section, source_index, sourc
     }
     let outbounds = compatible_subscription_outbounds(source_outbounds, section_name);
 
-    if (show_metadata !== false)
-        runtime_subscription.merge_source_metadata(state, section_name, source_section, source_index, source_entry);
+    if (show_metadata !== false) {
+        let src_cfg = connections.subscription_url_settings(section, source_entry);
+        let raw_src_name = trim(option(src_cfg, "name", option(src_cfg, "label", "")));
+        if (raw_src_name != "" && (raw_src_name == source_entry || match(lc(raw_src_name), /^https?:\/\//) != null || match(lc(raw_src_name), /^(happ:\/\/)?crypt[2-5]?\//) != null))
+            raw_src_name = "";
+        let src_fallback_title = raw_src_name != "" ? raw_src_name : trim(as_string(node_prefix || option(src_cfg, "node_prefix", "")));
+        runtime_subscription.merge_source_metadata(state, section_name, source_section, source_index, source_entry, src_fallback_title);
+    }
     let visibility_refs = subscription_visibility_refs(outbounds);
     if (include_urltest_groups === false)
         hide_urltest_group_outbounds = false;
     // Decide before the loop whether the members can be dropped at all: only
     // when at least one outbound that is neither a group nor a member of one
-    // survives. This keeps a section whose rules name the members working, and
-    // still declutters large subscriptions.
+    // survives. Never drop leaf servers that came from Xray balancer/multi-config
+    // conversion (those carry a share_link and represent the subscription's real
+    // proxy servers rather than internal tachyon-core urltest helper outbounds).
     let urltest_member_tags = include_urltest_groups === false
         ? (visibility_refs.urltest || {})
         : {};
     let survivors = 0;
+    let survivor_endpoints = {};
+    let outbounds_by_tag = {};
     for (let candidate in array_or_empty(outbounds)) {
         if (type(candidate) != "object")
             continue;
+        let candidate_tag = as_string(candidate.tag || "");
+        if (candidate_tag != "")
+            outbounds_by_tag[candidate_tag] = candidate;
         if (subscription_urltest_group_outbound(candidate))
             continue;
-        let candidate_tag = as_string(candidate.tag || "");
-        if (candidate_tag == "" || !(candidate_tag in urltest_member_tags))
+        if (candidate_tag == "" || !(candidate_tag in (visibility_refs.urltest || {}))) {
             survivors++;
+            let ep_key = lc(as_string(candidate.type || "")) + "|" + lc(as_string(candidate.server || "")) + "|" + as_string(candidate.server_port || "");
+            if (as_string(candidate.server || "") != "")
+                survivor_endpoints[ep_key] = true;
+        }
+    }
+    let aux_balancer_members = {};
+    let covered_group_hidden_members = {};
+    let fallback_group_remarks = {};
+    for (let candidate in array_or_empty(outbounds)) {
+        if (!subscription_urltest_group_outbound(candidate))
+            continue;
+        let group_label = trim(as_string(candidate.remark || candidate.tag || ""));
+        let has_survivor_member = false;
+        let group_hidden_tags = [];
+        let candidate_aux_tags = [];
+        let non_aux_members = [];
+        for (let m in array_or_empty(candidate.outbounds)) {
+            let m_tag = as_string(m);
+            let m_obj = outbounds_by_tag[m_tag];
+            if (type(m_obj) != "object")
+                continue;
+            let ep_key = lc(as_string(m_obj.type || "")) + "|" + lc(as_string(m_obj.server || "")) + "|" + as_string(m_obj.server_port || "");
+            let m_hidden = internal_flag(m_obj.__tachyon_hidden);
+            let m_remark_lc = lc(trim(as_string(m_obj.remark || m_tag)));
+            let is_dup_ep = as_string(m_obj.server || "") != "" && survivor_endpoints[ep_key] === true;
+            if (m_hidden && is_dup_ep)
+                has_survivor_member = true;
+            let is_aux_tag = m_hidden && (
+                match(lc(m_tag), /^bal-[0-9]+-/) != null ||
+                match(m_remark_lc, /^(reserve|backup|fallback)([-_ ]?[0-9]+)?(-[0-9]+)?$/) != null ||
+                is_dup_ep
+            );
+            if (m_hidden)
+                push(group_hidden_tags, m_tag);
+            if (is_aux_tag)
+                push(candidate_aux_tags, m_tag);
+            else
+                push(non_aux_members, m_tag);
+        }
+        if (has_survivor_member || length(non_aux_members) > 0) {
+            for (let m_tag in candidate_aux_tags)
+                aux_balancer_members[m_tag] = true;
+        }
+        if (has_survivor_member) {
+            for (let m_tag in group_hidden_tags)
+                covered_group_hidden_members[m_tag] = true;
+        } else if (group_label != "" && length(non_aux_members) == 1) {
+            fallback_group_remarks[non_aux_members[0]] = group_label;
+        }
     }
     let drop_urltest_members = include_urltest_groups === false && survivors > 0;
     node_prefix = trim(as_string(node_prefix));
-    let keyword_filter = subscription_keyword_filter(section);
+    let keyword_filter = subscription_keyword_filter(section, source_entry);
+    let sub_tls_fp = connections.subscription_tls_fingerprint(section, source_entry);
+    let sub_frag_mode = connections.source_tls_fragment_mode(section, source_entry);
+    let sub_frag_len = connections.source_tcp_fragment_length(section, source_entry);
+    let sub_frag_delay = connections.source_tcp_fragment_delay(section, source_entry);
+    let sub_src_id_for_bind = (connections && connections.source_id_for_manual_item)
+        ? connections.source_id_for_manual_item(section, source_entry)
+        : "";
+    let sub_src_obj = (connections && connections.outbound_source_section && sub_src_id_for_bind != "")
+        ? connections.outbound_source_section(sub_src_id_for_bind)
+        : null;
+    let sub_src_name = sub_src_obj != null ? trim(option(sub_src_obj, "name", option(sub_src_obj, "label", ""))) : "";
+    let sub_bind_iface = sub_src_obj != null ? trim(option(sub_src_obj, "bind_interface", "")) : "";
+    let sub_idle_timeout = connections.subscription_urltest_idle_timeout(section, source_entry);
+    let sec_idle_timeout = sub_idle_timeout == "" ? ctx.routes.urltest_idle_timeout(section, "urltest") : "";
+    let sub_url_cfg = (connections && connections.subscription_url_settings)
+        ? connections.subscription_url_settings(section, source_entry)
+        : null;
+    let srv_iface_overrides = parse_server_interface_overrides([ section, sub_url_cfg, sub_src_obj ]);
     let prepared = [];
     let display_names = [];
     let source_links = [];
     let group_flags = [];
     let hidden_flags = [];
+    let internal_member_flags = [];
     let tag_map = {};
     for (let i = 0; i < length(outbounds); i++) {
         let outbound = outbounds[i];
-        if (include_urltest_groups === false && subscription_urltest_group_outbound(outbound))
+        let orig_tag = as_string(outbound.tag || "");
+        if (include_urltest_groups === false &&
+            subscription_urltest_group_outbound(outbound))
             continue;
-        // A node that only a disabled urltest group pointed at is unreachable
-        // and only clutters the selector, so it is dropped. But "unreachable
-        // through a group" is not "unused": a section whose rules name these
-        // nodes has them as its only outbounds, and dropping them leaves the
-        // section with none, which generation reports as a terminal error. The
-        // filter is therefore applied only while something else survives.
-        if (drop_urltest_members && (as_string(outbound.tag || "") in urltest_member_tags))
-            continue;
+        // When subscription URLTest groups are disabled, drop internal Xray balancer
+        // helper/reserve/duplicate members while keeping unique leaf servers visible.
+        if (include_urltest_groups === false && (orig_tag in urltest_member_tags)) {
+            let member_remark = as_string(outbound.remark || "");
+            if (aux_balancer_members[orig_tag] === true || covered_group_hidden_members[orig_tag] === true)
+                continue;
+            if (drop_urltest_members && member_remark == "")
+                continue;
+        }
+        let raw_remark = trim(as_string(outbound.remark || ""));
         let display_name = as_string(outbound.remark || outbound.tag || ("server-" + (i + 1)));
+        let base = as_string(outbound.tag || outbound.remark || ("server-" + (i + 1)));
+        if (include_urltest_groups === false &&
+            fallback_group_remarks[orig_tag] != null &&
+            (raw_remark == "" || match(lc(raw_remark), /^(proxy|main|out|vless|vmess|trojan|shadowsocks|ss|hysteria2?|tuic|server)([-_ ]?[0-9]+)?$/) != null)) {
+            display_name = fallback_group_remarks[orig_tag];
+            base = display_name;
+        }
+        if (keyword_filter != null && subscription_group_outbound(outbound) && !subscription_keyword_name_passes({ include: [], exclude: keyword_filter.exclude }, display_name))
+            continue;
         if (keyword_filter != null && !subscription_group_outbound(outbound) && !subscription_keyword_name_passes(keyword_filter, display_name))
             continue;
-        let base = as_string(outbound.tag || outbound.remark || ("server-" + (i + 1)));
         if (node_prefix != "") {
             display_name = node_prefix + " " + display_name;
             base = display_name;
@@ -1476,23 +2114,63 @@ function add_subscription_source_with_state(config, section, source_index, sourc
             tag_map[as_string(outbound.tag)] = new_tag;
         if (as_string(outbound.remark || "") != "")
             tag_map[as_string(outbound.remark)] = new_tag;
-        push(prepared, copy_subscription_outbound(outbound, new_tag));
+        let copied_outbound = copy_subscription_outbound(outbound, new_tag);
+        let node_bind_iface = !subscription_group_outbound(outbound)
+            ? match_server_interface_override(srv_iface_overrides, [
+                new_tag,
+                display_name,
+                as_string(outbound.remark || ""),
+                as_string(outbound.tag || ""),
+                as_string(outbound.server || "")
+            ])
+            : "";
+        if (node_bind_iface != "") {
+            copied_outbound.bind_interface = node_bind_iface;
+            copied_outbound.__tachyon_explicit_bind_interface = true;
+            delete copied_outbound.detour;
+        } else if (sub_bind_iface != "" && !subscription_group_outbound(outbound) &&
+            as_string(copied_outbound.detour || "") == "" && as_string(copied_outbound.bind_interface || "") == "") {
+            copied_outbound.bind_interface = sub_bind_iface;
+        }
+        if (!subscription_group_outbound(outbound))
+            apply_source_fragment_overrides(copied_outbound, sub_tls_fp, sub_frag_mode, sub_frag_len, sub_frag_delay);
+        push(prepared, copied_outbound);
         push(display_names, display_name);
         let source_link = as_string(outbound.share_link || "");
-        if (!subscription_share_link.is_copyable_link(source_link))
+        if (!subscription_share_link.is_copyable_link(source_link)) {
             source_link = subscription_share_link.serialize_outbound_link(outbound);
+            if (source_link != "")
+                outbound.share_link = source_link;
+        }
         push(source_links, source_link);
         push(group_flags, subscription_group_outbound(outbound));
-        push(hidden_flags, subscription_hidden_outbound(outbound, visibility_refs, hide_urltest_group_outbounds, hide_detour_outbounds));
+        let is_internal_member = aux_balancer_members[orig_tag] === true;
+        push(internal_member_flags, is_internal_member);
+        push(hidden_flags, is_internal_member || subscription_hidden_outbound(outbound, visibility_refs, hide_urltest_group_outbounds, hide_detour_outbounds));
     }
 
     if (keyword_filter != null && length(prepared) == 0)
-        ctx.runtime_generate_unsupported("subscription keyword filter removed all nodes for rule '" + section_name + "'");
+        return 0;
 
     if (length(keys(skipped)) > 0)
         warn("skipped unsupported subscription outbounds for rule '", section_name, "': ", subscription_skip_summary(skipped), "\n");
 
     rewrite_subscription_outbound_references(prepared, tag_map, subscription_reference_set(source_outbounds));
+    let active_hidden_refs = {};
+    for (let i = 0; i < length(prepared); i++) {
+        let outbound = prepared[i];
+        if (group_flags[i]) {
+            for (let member_tag in array_or_empty(outbound.outbounds)) {
+                let mt = as_string(member_tag);
+                if (mt != "")
+                    active_hidden_refs[mt] = true;
+            }
+        }
+        let detour_tag = as_string(outbound.detour || "");
+        if (detour_tag != "")
+            active_hidden_refs[detour_tag] = true;
+    }
+
     let added = 0;
     for (let i = 0; i < length(prepared); i++) {
         let outbound = prepared[i];
@@ -1501,23 +2179,62 @@ function add_subscription_source_with_state(config, section, source_index, sourc
             warn("skipped empty subscription group for rule '", section_name, "': ", as_string(display_names[i] || outbound.tag || "unknown"), "\n");
             continue;
         }
+        if (hidden_flags[i] === true && !(as_string(outbound.tag || "") in active_hidden_refs))
+            continue;
 
+        if (outbound.type == "urltest") {
+            if (sub_idle_timeout != "")
+                outbound.idle_timeout = sub_idle_timeout;
+            else if (as_string(outbound.idle_timeout || "") == "" && sec_idle_timeout != "")
+                outbound.idle_timeout = sec_idle_timeout;
+        }
         if (outbound.type == "wireguard") {
             add_imported_wireguard_endpoint(config, outbound);
+        } else if (outbound.type == "tailscale") {
+            add_imported_tailscale_endpoint(config, outbound);
+        } else if (outbound.type == "shadowtls" && !(as_string(outbound.tag || "") in active_hidden_refs)) {
+            let stls_tag = unique_tag(outbound.tag + "-stls", taken);
+            taken[stls_tag] = true;
+            let stls_outbound = {};
+            for (let k, v in outbound)
+                stls_outbound[k] = v;
+            stls_outbound.tag = stls_tag;
+            push(config.outbounds, stls_outbound);
+            outbound = {
+                type: "shadowsocks",
+                tag: outbound.tag,
+                server: stls_outbound.server,
+                server_port: stls_outbound.server_port,
+                method: "aes-128-gcm",
+                password: as_string(stls_outbound.password || ""),
+                detour: stls_tag
+            };
+            push(config.outbounds, outbound);
         } else {
             push(config.outbounds, outbound);
         }
         added++;
-        if (!is_group)
+        if (!is_group && !internal_member_flags[i])
             push(urltest_candidate_tags, outbound.tag);
         runtime_subscription.remember_source_outbound(
             state,
             outbound.tag,
             display_names[i],
             outbound,
-            source_links[i],
-            node_prefix
+            internal_member_flags[i] ? "" : source_links[i],
+            node_prefix,
+            "sub:" + source_index
         );
+        if (sub_src_id_for_bind != "") {
+            if (!state.outboundMetadata.source_ids)
+                state.outboundMetadata.source_ids = {};
+            state.outboundMetadata.source_ids[outbound.tag] = sub_src_id_for_bind;
+            if (sub_src_name != "") {
+                if (!state.outboundMetadata.source_names)
+                    state.outboundMetadata.source_names = {};
+                state.outboundMetadata.source_names[outbound.tag] = sub_src_name;
+            }
+        }
         if (hidden_flags[i] !== true) {
             push(selector_tags, outbound.tag);
             runtime_subscription.remember_urltest_group(state, outbound.tag, display_names[i], outbound);
@@ -1525,6 +2242,8 @@ function add_subscription_source_with_state(config, section, source_index, sourc
             state.hiddenOutboundTags[outbound.tag] = true;
         }
     }
+    // One source may have no keyword matches. The connection section checks the
+    // combined selector after all subscriptions and manual nodes are processed.
     return added;
 }
 
@@ -1573,12 +2292,15 @@ function add_interface_connection_outbound(config, state, section, interface_ind
         push(config.dns.servers, dns_server);
     }
 
+    let eff_mark = (type(config) == "object" && type(config.route) == "object" && int(config.route.default_mark || 0) > 0)
+        ? int(config.route.default_mark)
+        : runtime_constants.OUTBOUND_MARK;
     let outbound = {
         type: "direct",
         tag: tag_name,
         bind_interface: interface_name,
         domain_resolver,
-        routing_mark: runtime_constants.OUTBOUND_MARK
+        routing_mark: eff_mark
     };
     if (domain_resolver == "")
         delete outbound.domain_resolver;
@@ -1586,7 +2308,33 @@ function add_interface_connection_outbound(config, state, section, interface_ind
     push(config.outbounds, outbound);
     push(selector_tags, tag_name);
     push(urltest_candidate_tags, tag_name);
-    runtime_subscription.remember_outbound_metadata(state, tag_name, interface_name, outbound);
+    let src_id = (connections && connections.source_id_for_manual_item)
+        ? connections.source_id_for_manual_item(section, interface_name)
+        : "";
+    let display_name = interface_name;
+    let node_prefix = "";
+    if (src_id != "" && connections && type(connections.outbound_source_section) == "function") {
+        let src_sec = connections.outbound_source_section(src_id);
+        if (src_sec != null) {
+            let src_label = trim(option(src_sec, "name", option(src_sec, "label", "")));
+            if (src_label != "" && src_label != src_id)
+                display_name = src_label;
+            if (bool_option(src_sec, "prefix_nodes", true))
+                node_prefix = trim(option(src_sec, "node_prefix", ""));
+        }
+    }
+    runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, outbound, node_prefix);
+    state.outboundMetadata.sources[tag_name] = src_id != "" ? src_id : "manual";
+    if (src_id != "") {
+        if (!state.outboundMetadata.source_ids)
+            state.outboundMetadata.source_ids = {};
+        state.outboundMetadata.source_ids[tag_name] = src_id;
+        if (display_name != "") {
+            if (!state.outboundMetadata.source_names)
+                state.outboundMetadata.source_names = {};
+            state.outboundMetadata.source_names[tag_name] = display_name;
+        }
+    }
 }
 
 function add_connection_interfaces(config, state, section, taken, selector_tags, urltest_candidate_tags) {
@@ -1603,7 +2351,7 @@ function parse_outbound_json(value) {
         return null;
     }
 
-    return type(value) == "object" ? value : null;
+    return type(value) == "object" ? sanitize_wdtt_outbound(value) : null;
 }
 
 function rewrite_json_outbound_references(outbounds, tag_map) {
@@ -1629,12 +2377,63 @@ function rewrite_json_outbound_references(outbounds, tag_map) {
     }
 }
 
-function prepare_json_connection_outbounds(section, taken) {
+function desync_outbound_signature(outbound) {
+    if (type(outbound) != "object" || lc(trim(as_string(outbound.type || ""))) != "desync")
+        return "";
+    let copy = {};
+    let k_list = keys(outbound);
+    sort(k_list);
+    for (let k in k_list) {
+        if (k == "tag")
+            continue;
+        copy[k] = outbound[k];
+    }
+    return sprintf("%J", copy);
+}
+
+function find_existing_desync_outbound(existing_list, sig) {
+    if (sig == "")
+        return null;
+    for (let existing in array_or_empty(existing_list)) {
+        if (desync_outbound_signature(existing) == sig)
+            return existing;
+    }
+    return null;
+}
+
+function outbound_detour_tag_for_section(section) {
+    if (!bool_option(section, "outbound_detour_enabled", false))
+        return "";
+
+    let detour_section = option(section, "outbound_detour_section", "");
+    if (detour_section == "")
+        return "";
+    // A deferred or quarantined detour target contributes no outbound at all;
+    // emitting its tag anyway would leave a dangling detour and take the whole
+    // config down at tachyon-core check time.
+    if (ctx.deferred_sections && ctx.deferred_sections[detour_section])
+        return "";
+    if (ctx.routes && type(ctx.routes.enabled_sections) == "function") {
+        for (let s in ctx.routes.enabled_sections()) {
+            if (as_string(s[".name"]) == detour_section && option(s, "action", "") == "group")
+                return ctx.routes.urltest_outbound_tag(detour_section, "urltest");
+        }
+    }
+    return outbound_tag(detour_section);
+}
+
+function prepare_json_connection_outbounds(section, taken, existing_outbounds) {
     let items = connections.outbound_jsons(section);
     let prepared = [];
     let outbounds = [];
     let tag_map = {};
     let legacy_tags = [];
+    let desync_by_sig = {};
+    for (let existing in array_or_empty(existing_outbounds)) {
+        let sig = desync_outbound_signature(existing);
+        if (sig != "" && desync_by_sig[sig] == null)
+            desync_by_sig[sig] = existing;
+    }
 
     for (let i = 0; i < length(items); i++) {
         let outbound = parse_outbound_json(items[i]);
@@ -1644,18 +2443,68 @@ function prepare_json_connection_outbounds(section, taken) {
         let display_name = trim(as_string(outbound.tag || ""));
         let legacy_tag = connection_item_tag(section[".name"], "json", i + 1);
         let base = display_name != "" ? display_name : legacy_tag;
-        let tag_name = unique_tag(base, taken);
         ensure_explicit_outbound_supported(outbound, "JSON outbound", display_name != "" ? display_name : legacy_tag);
+
+        let desync_sig = desync_outbound_signature(outbound);
+        let existing_desync = desync_sig != "" ? desync_by_sig[desync_sig] : null;
+        let src_id = (connections && connections.source_id_for_manual_item)
+            ? connections.source_id_for_manual_item(section, items[i])
+            : "";
+
+        if (existing_desync != null && as_string(existing_desync.tag || "") != "") {
+            let shared_tag = as_string(existing_desync.tag);
+            if (display_name != "" && !tag_map[display_name])
+                tag_map[display_name] = shared_tag;
+            push(legacy_tags, [ legacy_tag, shared_tag ]);
+            push(prepared, {
+                outbound: existing_desync,
+                displayName: display_name != "" ? display_name : shared_tag,
+                sourceId: src_id != "" ? src_id : "manual",
+                reused: true
+            });
+            continue;
+        }
+
+        let tag_name = unique_tag(base, taken);
         taken[tag_name] = true;
         if (display_name != "" && !tag_map[display_name])
             tag_map[display_name] = tag_name;
         push(legacy_tags, [ legacy_tag, tag_name ]);
 
         outbound.tag = tag_name;
+        if (src_id != "" && src_id != "manual" && connections && connections.outbound_source_section) {
+            let json_src_obj = connections.outbound_source_section(src_id);
+            if (json_src_obj != null) {
+                let json_detour = outbound_detour_tag_for_section(json_src_obj);
+                if (json_detour != "" && as_string(outbound.detour || "") == "") {
+                    outbound.detour = json_detour;
+                    delete outbound.bind_interface;
+                }
+                let json_bind_iface = trim(option(json_src_obj, "bind_interface", ""));
+                if (json_bind_iface != "" && lc(as_string(outbound.type || "")) != "desync" &&
+                    !subscription_group_outbound(outbound) &&
+                    as_string(outbound.detour || "") == "" && as_string(outbound.bind_interface || "") == "") {
+                    outbound.bind_interface = json_bind_iface;
+                }
+            }
+            let out_type = lc(as_string(outbound.type || ""));
+            if (out_type != "" && out_type != "selector" && out_type != "urltest" &&
+                out_type != "dns" && out_type != "block" && out_type != "direct" &&
+                out_type != "desync" && !subscription_group_outbound(outbound) &&
+                as_string(outbound.detour || "") == "" && as_string(outbound.bind_interface || "") == "") {
+                let sec_detour = outbound_detour_tag_for_section(section);
+                if (sec_detour != "")
+                    outbound.detour = sec_detour;
+            }
+        }
         push(outbounds, outbound);
+        if (desync_sig != "" && desync_by_sig[desync_sig] == null)
+            desync_by_sig[desync_sig] = outbound;
         push(prepared, {
             outbound,
-            displayName: display_name != "" ? display_name : "JSON outbound " + (i + 1)
+            displayName: display_name != "" ? display_name : "JSON outbound " + (i + 1),
+            sourceId: src_id != "" ? src_id : "manual",
+            reused: false
         });
     }
 
@@ -1668,53 +2517,222 @@ function prepare_json_connection_outbounds(section, taken) {
 }
 
 function add_connection_json_outbounds(config, state, section, taken, selector_tags, urltest_candidate_tags) {
-    for (let item in prepare_json_connection_outbounds(section, taken)) {
+    for (let item in prepare_json_connection_outbounds(section, taken, config.outbounds)) {
         let outbound = item.outbound;
         let tag_name = outbound.tag;
-        push(config.outbounds, outbound);
-        push(selector_tags, tag_name);
-        if (urltest_leaf_candidate_outbound(outbound))
+        if (!item.reused) {
+            if (outbound.type == "wireguard")
+                add_imported_wireguard_endpoint(config, outbound);
+            else if (outbound.type == "tailscale")
+                add_imported_tailscale_endpoint(config, outbound);
+            else
+                push(config.outbounds, lc(as_string(outbound.type || "")) == "wdtt" ? sanitize_wdtt_outbound(outbound) : outbound);
+        }
+        if (index(selector_tags, tag_name) < 0)
+            push(selector_tags, tag_name);
+        if (urltest_leaf_candidate_outbound(outbound) && index(urltest_candidate_tags, tag_name) < 0)
             push(urltest_candidate_tags, tag_name);
-        runtime_subscription.remember_outbound_metadata(state, tag_name, item.displayName, outbound);
+        let src_id = as_string(item.sourceId || "");
+        let src_obj = (connections && connections.outbound_source_section && src_id != "" && src_id != "manual")
+            ? connections.outbound_source_section(src_id)
+            : null;
+        let node_prefix = (src_obj != null && bool_option(src_obj, "prefix_nodes", true))
+            ? trim(option(src_obj, "node_prefix", ""))
+            : "";
+        runtime_subscription.remember_outbound_metadata(state, tag_name, item.displayName, outbound, node_prefix);
         runtime_subscription.remember_urltest_group(state, tag_name, item.displayName, outbound);
+        state.outboundMetadata.sources[tag_name] = src_id != "" ? src_id : "manual";
+        if (src_id != "" && src_id != "manual") {
+            if (!state.outboundMetadata.source_ids)
+                state.outboundMetadata.source_ids = {};
+            state.outboundMetadata.source_ids[tag_name] = src_id;
+            let src_name = src_obj != null ? trim(option(src_obj, "name", option(src_obj, "label", ""))) : "";
+            if (src_name != "") {
+                if (!state.outboundMetadata.source_names)
+                    state.outboundMetadata.source_names = {};
+                state.outboundMetadata.source_names[tag_name] = src_name;
+            }
+        }
     }
 }
 
-function outbound_detour_tag_for_section(section) {
-    if (!bool_option(section, "outbound_detour_enabled", false))
-        return "";
+function add_connection_inline_uci_outbound(config, state, section, taken, selector_tags, urltest_candidate_tags) {
+    let raw_type = lc(trim(option(section, "type", "")));
+    if (raw_type == "")
+        raw_type = lc(trim(option(section, "protocol", "")));
+    if (raw_type == "") {
+        let act = lc(trim(option(section, "action", "")));
+        if (act == "socks" || act == "socks5" || act == "socks4" || act == "http" ||
+            act == "shadowsocks" || act == "ss" || act == "vless" || act == "vmess" ||
+            act == "trojan" || act == "hysteria2" || act == "hy2" || act == "tuic")
+            raw_type = act;
+    }
+    if (raw_type == "socks5" || raw_type == "socks4" || raw_type == "socks4a")
+        raw_type = "socks";
+    else if (raw_type == "ss")
+        raw_type = "shadowsocks";
+    else if (raw_type == "hy2")
+        raw_type = "hysteria2";
 
-    let detour_section = option(section, "outbound_detour_section", "");
-    if (detour_section == "")
-        return "";
-    // A deferred or quarantined detour target contributes no outbound at all;
-    // emitting its tag anyway would leave a dangling detour and take the whole
-    // config down at sing-box check time.
-    if (ctx.deferred_sections && ctx.deferred_sections[detour_section])
-        return "";
-    return outbound_tag(detour_section);
-}
+    let server = trim(option(section, "server", option(section, "address", option(section, "host", option(section, "socks_server", "")))));
+    let port_raw = trim(option(section, "server_port", option(section, "port", option(section, "socks_port", ""))));
 
-function apply_section_detour_to_connection_outbounds(config, start_index, detour_tag) {
-    if (detour_tag == "")
+    if (raw_type == "socks" && server == "" && port_raw != "")
+        server = "127.0.0.1";
+    if (raw_type == "socks" && server != "" && port_raw == "")
+        port_raw = "1080";
+
+    if (raw_type == "" || server == "" || port_raw == "")
         return;
 
-    let outbounds = array_or_empty(config.outbounds);
-    for (let i = int(start_index || 0); i < length(outbounds); i++) {
-        let outbound = outbounds[i];
+    let port = parse_port(port_raw);
+    if (port == null)
+        return;
+
+    let section_name = section[".name"];
+    let base_tag = connection_item_tag(section_name, raw_type, 1);
+    let tag_name = unique_tag(base_tag, taken);
+    taken[tag_name] = true;
+
+    let outbound = {
+        type: raw_type,
+        tag: tag_name,
+        server: server,
+        server_port: port
+    };
+
+    if (raw_type == "socks") {
+        let ver = trim(option(section, "version", "5"));
+        outbound.version = (ver == "4" || ver == "4a") ? ver : "5";
+        let username = option(section, "username", option(section, "user", ""));
+        let password = option(section, "password", option(section, "pass", ""));
+        if (username != "")
+            outbound.username = username;
+        if (password != "")
+            outbound.password = password;
+    }
+    else if (raw_type == "http") {
+        let username = option(section, "username", option(section, "user", ""));
+        let password = option(section, "password", option(section, "pass", ""));
+        if (username != "")
+            outbound.username = username;
+        if (password != "")
+            outbound.password = password;
+    }
+    else if (raw_type == "shadowsocks") {
+        outbound.method = option(section, "method", option(section, "cipher", "aes-256-gcm"));
+        outbound.password = option(section, "password", "");
+        let plugin = option(section, "plugin", "");
+        let plugin_opts = option(section, "plugin_opts", option(section, "plugin-opts", ""));
+        if (plugin != "")
+            outbound.plugin = plugin;
+        if (plugin_opts != "")
+            outbound.plugin_opts = plugin_opts;
+    }
+    else if (raw_type == "vless" || raw_type == "vmess") {
+        outbound.uuid = option(section, "uuid", option(section, "id", ""));
+        let flow = normalize_vless_flow_value(option(section, "flow", ""));
+        if (flow != null && flow != "" && raw_type == "vless")
+            outbound.flow = flow;
+    }
+    else if (raw_type == "trojan" || raw_type == "hysteria2" || raw_type == "tuic") {
+        outbound.password = option(section, "password", "");
+        if (raw_type == "tuic")
+            outbound.uuid = option(section, "uuid", "");
+    }
+
+    let display_name = trim(option(section, "label", option(section, "name", "")));
+    if (display_name == "")
+        display_name = server + ":" + port;
+
+    push(config.outbounds, outbound);
+    push(selector_tags, tag_name);
+    if (urltest_leaf_candidate_outbound(outbound))
+        push(urltest_candidate_tags, tag_name);
+    runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, outbound);
+}
+
+function apply_section_detour_to_outbound_slice(items, start_index, detour_tag) {
+    let list = array_or_empty(items);
+    for (let i = int(start_index || 0); i < length(list); i++) {
+        let outbound = list[i];
         if (type(outbound) != "object")
+            continue;
+        if (outbound.__tachyon_explicit_bind_interface) {
+            delete outbound.__tachyon_explicit_bind_interface;
+            continue;
+        }
+        if (detour_tag == "")
             continue;
 
         let outbound_type = lc(as_string(outbound.type || ""));
         if (outbound_type == "" ||
             outbound_type == "selector" ||
             outbound_type == "urltest" || outbound_type == "dns" ||
-            outbound_type == "block")
+            outbound_type == "block" || outbound_type == "direct" ||
+            outbound_type == "desync")
             continue;
 
-        if (as_string(outbound.detour || "") == "")
+        if (as_string(outbound.detour || "") == "") {
             outbound.detour = detour_tag;
+            delete outbound.bind_interface;
+        }
     }
+}
+
+function apply_section_detour_to_connection_outbounds(config, start_index, detour_tag, endpoints_start_index) {
+    apply_section_detour_to_outbound_slice(config.outbounds, start_index, detour_tag);
+    if (endpoints_start_index != null)
+        apply_section_detour_to_outbound_slice(config.endpoints, endpoints_start_index, detour_tag);
+}
+
+function apply_section_bind_interface_to_outbound_slice(items, start_index, bind_iface, sec_overrides, has_sec_overrides) {
+    let list = array_or_empty(items);
+    for (let i = int(start_index || 0); i < length(list); i++) {
+        let outbound = list[i];
+        if (type(outbound) != "object")
+            continue;
+        delete outbound.__tachyon_explicit_bind_interface;
+
+        let outbound_type = lc(as_string(outbound.type || ""));
+        if (outbound_type == "" ||
+            outbound_type == "selector" ||
+            outbound_type == "urltest" || outbound_type == "dns" ||
+            outbound_type == "block" || outbound_type == "direct" ||
+            outbound_type == "desync")
+            continue;
+
+        if (has_sec_overrides) {
+            let peer_addr = "";
+            if (type(outbound.peers) == "array" && type(outbound.peers[0]) == "object")
+                peer_addr = as_string(outbound.peers[0].address || "");
+            let override_iface = match_server_interface_override(sec_overrides, [
+                as_string(outbound.tag || ""),
+                as_string(outbound.server || peer_addr)
+            ]);
+            if (override_iface != "") {
+                outbound.bind_interface = override_iface;
+                delete outbound.detour;
+                continue;
+            }
+        }
+
+        if (bind_iface != "" && as_string(outbound.detour || "") == "" && as_string(outbound.bind_interface || "") == "")
+            outbound.bind_interface = bind_iface;
+    }
+}
+
+function apply_section_bind_interface_to_connection_outbounds(config, start_index, bind_iface, section, endpoints_start_index) {
+    bind_iface = trim(as_string(bind_iface || ""));
+    let sec_overrides = section != null ? parse_server_interface_overrides([ section ]) : null;
+    let has_sec_overrides = sec_overrides != null &&
+        (length(keys(object_or_empty(sec_overrides.exact))) > 0 || length(array_or_empty(sec_overrides.substr_rules)) > 0);
+    if (bind_iface == "" && !has_sec_overrides)
+        return;
+
+    apply_section_bind_interface_to_outbound_slice(config.outbounds, start_index, bind_iface, sec_overrides, has_sec_overrides);
+    if (endpoints_start_index != null)
+        apply_section_bind_interface_to_outbound_slice(config.endpoints, endpoints_start_index, bind_iface, sec_overrides, has_sec_overrides);
 }
 
 function apply_section_packet_encoding_to_connection_outbounds(config, start_index, encoding) {
@@ -1735,8 +2753,8 @@ function apply_section_packet_encoding_to_connection_outbounds(config, start_ind
             } else if (encoding == "xudp" || encoding == "packetaddr") {
                 outbound.packet_encoding = encoding;
             }
-        } else if (outbound_type == "shadowsocks") {
-            if (encoding == "xudp" || encoding == "packetaddr" || encoding == "1" || encoding == "true") {
+        } else if (outbound_type == "shadowsocks" || outbound_type == "naive") {
+            if (encoding == "xudp" || encoding == "packetaddr" || encoding == "uot" || encoding == "udp_over_tcp" || encoding == "1" || encoding == "true") {
                 outbound.udp_over_tcp = true;
             } else if (encoding == "disabled" || encoding == "none" || encoding == "off" || encoding == "0") {
                 delete outbound.udp_over_tcp;
@@ -1745,502 +2763,104 @@ function apply_section_packet_encoding_to_connection_outbounds(config, start_ind
     }
 }
 
-function add_connections_outbound(config, section, taken) {
-    let section_name = section[".name"];
-    let selector_tags = [];
-    let urltest_candidate_tags = [];
-    let state = runtime_subscription.new_section_state(section_name);
-    let cascade_start = length(array_or_empty(config.outbounds));
+function build_and_push_tailscale_client_endpoint(config, src, tag_name, parent_section) {
+    let safe_id = safe_tailscale_id(tag_name);
+    let ephemeral = bool_option(src, "tailscale_ephemeral", false);
+    let state_dir = (ephemeral ? "/var/run/tachyon/tailscale/" : "/etc/tachyon/tailscale/") + safe_id;
+    let control_url = trim(option(src, "tailscale_control_url", ""));
+    if (control_url == "")
+        control_url = "https://controlplane.tailscale.com";
+    let hostname = trim(option(src, "tailscale_hostname", ""));
+    if (hostname == "")
+        hostname = "tachyon-" + safe_id;
 
-    let manual_count = length(connections.connection_urls(section));
-    add_connection_manual_links(config, state, section, taken, selector_tags, urltest_candidate_tags);
-    let text_urltest_tag = add_connection_text_urltest(config, state, section, taken, selector_tags, urltest_candidate_tags, manual_count);
-    add_connection_subscriptions(config, state, section, taken, selector_tags, urltest_candidate_tags);
-    
-    apply_section_detour_to_connection_outbounds(
-        config,
-        cascade_start,
-        outbound_detour_tag_for_section(section)
-    );
-    add_connection_interfaces(config, state, section, taken, selector_tags, urltest_candidate_tags);
-    add_connection_json_outbounds(config, state, section, taken, selector_tags, urltest_candidate_tags);
-    apply_section_packet_encoding_to_connection_outbounds(
-        config,
-        cascade_start,
-        connections.packet_encoding(section)
-    );
-
-    if (length(selector_tags) == 0) {
-        if (ctx.deferred_sections && ctx.deferred_sections[section_name])
-            return;
-        if (getenv("SB_PREFLIGHT_BINARY")) {
-            let dummy_tag = unique_tag("preflight-dummy-" + section_name, taken);
-            taken[dummy_tag] = true;
-            push(config.outbounds, {
-                type: "direct",
-                tag: dummy_tag
-            });
-            push(selector_tags, dummy_tag);
-            push(urltest_candidate_tags, dummy_tag);
-            runtime_subscription.remember_outbound_metadata(state, dummy_tag, dummy_tag, { type: "direct", tag: dummy_tag });
-        } else {
-            ctx.runtime_generate_unsupported("connection section has no usable outbounds");
-        }
-    }
-
-    if (ctx.routes.section_needs_country_is(section)) {
-        let previous_state = read_json_file(runtime_subscription.section_cache_path(section_name));
-        state.outboundMetadata.countries = runtime_country.detect(
-            state.servers,
-            previous_state,
-            option(ctx.runtime_settings(), "bootstrap_dns_server", "77.88.8.8")
-        );
-    }
-    if (ctx.routes.section_has_direct_priority_level(section))
-        state.outboundMetadata.names[runtime_constants.DIRECT_OUTBOUND_TAG] = "Direct";
-
-    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
-    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
-    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
-        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
-}
-
-// An AmneziaWG section carrying imported .conf files is shaped the way an FPTN
-// token is: one endpoint per config, an auto urltest group over them, and the
-// section selector on top — so several configs behave like several servers and
-// the urltest/priority children have something to group. A bare endpoint
-// cannot carry those children, and the Clash API rejects a non-selector as the
-// section tag on every dashboard group switch.
-function add_awg_config_members(config, section) {
-    let section_name = section[".name"];
-    let tag = outbound_tag(section_name);
-    let state = runtime_subscription.new_section_state(section_name);
-    let selector_tags = [];
-    let urltest_candidate_tags = [];
-    let taken = { };
-    taken[tag] = true;
-    let detour = outbound_detour_tag_for_section(section);
-
-    for (let value in connections.amnezia_configs(section)) {
-        let item = subscription_amnezia.parse(value);
-        if (item == null)
-            ctx.runtime_generate_unsupported("Invalid imported Amnezia configuration");
-        let endpoints = subscription_wireguard.from_vpn_endpoints(item.link);
-        if (endpoints == null)
-            ctx.runtime_generate_unsupported("invalid imported Amnezia configuration: " + as_string(item.name));
-        // Every peer of the .conf is its own member: a multi-peer file behaves
-        // like several configs, and each server joins the urltest pool.
-        for (let i = 0; i < length(endpoints); i++) {
-            let display_name = as_string(endpoints[i].tag || item.name);
-            let member_tag = unique_tag(tag + "/" + display_name, taken);
-            taken[member_tag] = true;
-            let member = copy_subscription_outbound(endpoints[i], member_tag);
-            if (detour != "")
-                member.detour = detour;
-            add_imported_wireguard_endpoint(config, member);
-            push(selector_tags, member_tag);
-            push(urltest_candidate_tags, member_tag);
-            runtime_subscription.remember_outbound_metadata(state, member_tag, display_name, member);
-        }
-    }
-
-    // The group the selector defaults to. Same shape as the FPTN expansion;
-    // a section urltest child called "urltest" owns this very tag, and then it
-    // is the group and nothing is emitted here.
-    let text_urltest_tag = "";
-    if (index(connections.urltests(section), "urltest") < 0) {
-        text_urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
-        let group_members = [];
-        for (let member_tag in selector_tags)
-            push(group_members, member_tag);
-        let auto_group = {
-            type: "urltest",
-            tag: text_urltest_tag,
-            outbounds: group_members
-        };
-        push(config.outbounds, auto_group);
-        let group_name = option(section, "label", "");
-        if (group_name == "") group_name = text_urltest_tag;
-        runtime_subscription.remember_outbound_metadata(state, text_urltest_tag, group_name, auto_group);
-        runtime_subscription.remember_urltest_group_config(state, text_urltest_tag, {
-            displayName: group_name,
-            outbounds: group_members
-        });
-    }
-
-    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
-    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
-    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
-        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
-}
-
-function add_awg_endpoint(config, section) {
-    if (length(connections.amnezia_configs(section)) > 0) {
-        add_awg_config_members(config, section);
-        return;
-    }
-    let tag = outbound_tag(section[".name"]);
     let endpoint = {
-        type: "wireguard",
-        tag: tag,
-        name: tag,
-        address: core_ip.normalize_to_cidrs(list_option(section, "awg_local_address")),
-        private_key: option(section, "awg_private_key", ""),
-        peers: [{
-            address: option(section, "awg_server_address", ""),
-            port: int_option(section, "awg_server_port", "0"),
-            public_key: option(section, "awg_peer_public_key", ""),
-            allowed_ips: ["0.0.0.0/0", "::/0"]
-        }]
+        type: "tailscale",
+        tag: tag_name,
+        state_directory: state_dir,
+        control_url,
+        hostname,
+        ephemeral,
+        accept_routes: bool_option(src, "tailscale_accept_routes", true)
     };
 
-    let preshared_key = option(section, "awg_preshared_key", "");
-    if (preshared_key != "")
-        endpoint.peers[0].pre_shared_key = preshared_key;
+    let auth_key = trim(option(src, "tailscale_auth_key", ""));
+    if (auth_key != "")
+        endpoint.auth_key = auth_key;
 
-    let mtu = int_option(section, "awg_mtu", "1280");
-    endpoint.mtu = mtu > 0 ? mtu : 1280;
+    let exit_node = trim(option(src, "tailscale_exit_node", ""));
+    if (exit_node != "")
+        endpoint.exit_node = exit_node;
+    if (bool_option(src, "tailscale_exit_node_allow_lan_access", false))
+        endpoint.exit_node_allow_lan_access = true;
 
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
-    let sb_version_val = trim(fs.readfile(sb_version_file) || "");
-    let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
-    let is_lx = sb_variant_val == "lx" || index(sb_version_val, "-lx") >= 0;
-    // tachyon-core reads the AmneziaWG params flat off the wireguard endpoint -
-    // the same layout sing-box-lx uses. Its KNOWN_ENDPOINT_FIELDS has no
-    // "amnezia" wrapper, so a config carrying one is rejected outright.
-    let is_core = ctx.is_tachyon_core != null ? ctx.is_tachyon_core(sb_version_val) : false;
-    let flat_awg = is_lx || is_core;
-
-    let keepalive = int_or_range_option(section, "awg_keepalive", 25);
-    if (is_lx) {
-        endpoint.peers[0].persistent_keepalive_interval = keepalive;
-    } else {
-        if (type(keepalive) == "string") {
-            let m = match(keepalive, /^([0-9]+)/);
-            endpoint.peers[0].persistent_keepalive_interval = m ? int(m[1], 10) : 25;
-        } else {
-            endpoint.peers[0].persistent_keepalive_interval = keepalive > 0 ? keepalive : 25;
+    let advertise_routes = [];
+    for (let item in list_option(src, "tailscale_advertise_routes")) {
+        for (let part in split(as_string(item), ",")) {
+            part = trim(part);
+            if (part != "")
+                push(advertise_routes, part);
         }
     }
+    if (length(advertise_routes) > 0)
+        endpoint.advertise_routes = advertise_routes;
+    if (bool_option(src, "tailscale_advertise_exit_node", false))
+        endpoint.advertise_exit_node = true;
 
-    let jc = int_option(section, "awg_jc", "4");
-    if (jc > 10) jc = 10;
+    let relay_port = int_option(src, "tailscale_relay_server_port", 0);
+    if (relay_port > 0)
+        endpoint.relay_server_port = relay_port;
 
-    let jmin = int_option(section, "awg_jmin", "40");
-
-    let jmax = int_option(section, "awg_jmax", "70");
-    if (jmax > 1200) jmax = 1200;
-
-    // AmneziaWG obfuscation parameters. H1-H4 use badoption.Range on both
-    // sing-box-extended and sing-box-lx, so a "min-max" string passes through.
-    let amnezia = {
-        jc: jc,
-        jmin: jmin,
-        jmax: jmax,
-        s1: int_option(section, "awg_s1", "0"),
-        s2: int_option(section, "awg_s2", "0"),
-        h1: int_or_range_option(section, "awg_h1", 1),
-        h2: int_or_range_option(section, "awg_h2", 2),
-        h3: int_or_range_option(section, "awg_h3", 3),
-        h4: int_or_range_option(section, "awg_h4", 4),
-        s3: int_option(section, "awg_s3", "0"),
-        s4: int_option(section, "awg_s4", "0")
-    };
-    let i1 = awg_cps_option(section, "awg_i1");
-    let i2 = awg_cps_option(section, "awg_i2");
-    let i3 = awg_cps_option(section, "awg_i3");
-    let i4 = awg_cps_option(section, "awg_i4");
-    let i5 = awg_cps_option(section, "awg_i5");
-    let j1 = awg_cps_option(section, "awg_j1");
-    let j2 = awg_cps_option(section, "awg_j2");
-    let j3 = awg_cps_option(section, "awg_j3");
-    let itime = int_option(section, "awg_itime", "0");
-
-    if (flat_awg) {
-        // sing-box-lx and tachyon-core expect AWG fields at the endpoint root
-        // (AWG 2.0 schema). Magic headers accept a single value or an AWG 2.0
-        // "min-max" range; junk-packet fields are plain integers.
-        endpoint.jc = amnezia.jc;
-        endpoint.jmin = amnezia.jmin;
-        endpoint.jmax = amnezia.jmax;
-        endpoint.s1 = amnezia.s1;
-        endpoint.s2 = amnezia.s2;
-        endpoint.h1 = amnezia.h1;
-        endpoint.h2 = amnezia.h2;
-        endpoint.h3 = amnezia.h3;
-        endpoint.h4 = amnezia.h4;
-        endpoint.s3 = amnezia.s3;
-        endpoint.s4 = amnezia.s4;
-        if (i1 != "") endpoint.i1 = i1;
-        if (i2 != "") endpoint.i2 = i2;
-        if (i3 != "" && i3 != "0") endpoint.i3 = i3;
-        if (i4 != "" && i4 != "0") endpoint.i4 = i4;
-        if (i5 != "" && i5 != "0") endpoint.i5 = i5;
-    } else {
-        if (i1 != "") amnezia.i1 = i1;
-        if (i2 != "") amnezia.i2 = i2;
-        if (i3 != "" && i3 != "0") amnezia.i3 = i3;
-        if (i4 != "" && i4 != "0") amnezia.i4 = i4;
-        if (i5 != "" && i5 != "0") amnezia.i5 = i5;
-        // j1-j3/itime were removed from the extended schema in 2.6.1 and
-        // sing-box fatals on unknown fields, so emit them only for builds
-        // whose schema still accepts them.
-        let sb_version_state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
-        let sb_version = trim(fs.readfile(sb_version_state_file) || "");
-        if (common.extended_awg_schema_has_junk_signatures(sb_version)) {
-            if (j1 != "") amnezia.j1 = j1;
-            if (j2 != "") amnezia.j2 = j2;
-            if (j3 != "") amnezia.j3 = j3;
-            if (itime > 0) amnezia.itime = itime;
-        }
-
-        endpoint.amnezia = amnezia;
-    }
-
-    // AmneziaWG version handling: 2.0, 3.0, and 3.1 (sing-box-lx & sing-box-extended 2.7.0+)
-    let awg_ver = option(section, "awg_version", "");
-    if (awg_ver == "") {
-        if (option(section, "awg_rekey_after_time", "") != "" || option(section, "awg_rekey_timeout", "") != "" ||
-            option(section, "awg_reject_after_time", "") != "" || option(section, "awg_keepalive_timeout", "") != "" ||
-            option(section, "awg_max_handshake_attempts", "") != "" ||
-            bool_option(section, "awg_random_trailers", false) || bool_option(section, "awg_disable_cookies", false)) {
-            awg_ver = "3.1";
-        } else if (option(section, "awg_header_protection_key", "") != "" || option(section, "awg_content_padding_addition", "") != "") {
-            awg_ver = "3.0";
-        } else {
-            awg_ver = "2.0";
+    let relay_endpoints = [];
+    for (let item in list_option(src, "tailscale_relay_server_static_endpoints")) {
+        for (let part in split(as_string(item), ",")) {
+            part = trim(part);
+            if (part != "")
+                push(relay_endpoints, part);
         }
     }
+    if (length(relay_endpoints) > 0)
+        endpoint.relay_server_static_endpoints = relay_endpoints;
 
-    if (awg_ver == "3.0" || awg_ver == "3.1") {
-        let hpk = option(section, "awg_header_protection_key", "");
-        if (hpk != "") {
-            if (flat_awg) {
-                if (endpoint.s1 < 12) endpoint.s1 = 20;
-                if (endpoint.s2 < 12) endpoint.s2 = 20;
-                if (endpoint.s3 < 12) endpoint.s3 = 20;
-                if (endpoint.s4 < 12) endpoint.s4 = 20;
-                endpoint.header_protection_key = hpk;
-            } else {
-                if (endpoint.amnezia.s1 < 12) endpoint.amnezia.s1 = 20;
-                if (endpoint.amnezia.s2 < 12) endpoint.amnezia.s2 = 20;
-                if (endpoint.amnezia.s3 < 12) endpoint.amnezia.s3 = 20;
-                if (endpoint.amnezia.s4 < 12) endpoint.amnezia.s4 = 20;
-                endpoint.amnezia.header_protection_key = hpk;
-            }
-        }
-
-        let cpa = option(section, "awg_content_padding_addition", "");
-        if (cpa != "") {
-            if (flat_awg) endpoint.content_padding_addition = cpa;
-            else endpoint.amnezia.content_padding_addition = cpa;
-        }
+    if (bool_option(src, "tailscale_system_interface", false)) {
+        endpoint.system_interface = true;
+        let sys_iface_name = trim(option(src, "tailscale_system_interface_name", ""));
+        if (sys_iface_name != "")
+            endpoint.system_interface_name = sys_iface_name;
+        let sys_iface_mtu = int_option(src, "tailscale_system_interface_mtu", 0);
+        if (sys_iface_mtu > 0)
+            endpoint.system_interface_mtu = sys_iface_mtu;
     }
 
-    if (awg_ver == "3.1") {
-        let rka = option(section, "awg_rekey_after_time", "");
-        if (rka != "") {
-            if (flat_awg) endpoint.rekey_after_time = rka;
-            else endpoint.amnezia.rekey_after_time = rka;
-        }
+    let udp_timeout = trim(option(src, "tailscale_udp_timeout", ""));
+    if (udp_timeout != "")
+        endpoint.udp_timeout = udp_timeout;
 
-        let rkt = option(section, "awg_rekey_timeout", "");
-        if (rkt != "") {
-            if (flat_awg) endpoint.rekey_timeout = rkt;
-            else endpoint.amnezia.rekey_timeout = rkt;
-        }
-
-        let rja = option(section, "awg_reject_after_time", "");
-        if (rja != "") {
-            if (flat_awg) endpoint.reject_after_time = rja;
-            else endpoint.amnezia.reject_after_time = rja;
-        }
-
-        let kpt = option(section, "awg_keepalive_timeout", "");
-        if (kpt != "") {
-            if (flat_awg) endpoint.keepalive_timeout = kpt;
-            else endpoint.amnezia.keepalive_timeout = kpt;
-        }
-
-        let mha = option(section, "awg_max_handshake_attempts", "");
-        if (mha != "") {
-            if (flat_awg) endpoint.max_handshake_attempts = mha;
-            else endpoint.amnezia.max_handshake_attempts = mha;
-        }
-
-        if (flat_awg) {
-            if (bool_option(section, "awg_random_trailers", false))
-                endpoint.random_trailers = true;
-            if (bool_option(section, "awg_disable_cookies", false))
-                endpoint.disable_cookies = true;
-        }
-    }
-
-    let detour = outbound_detour_tag_for_section(section);
-    if (detour == "") {
-        let legacy_detour = option(section, "awg_detour", "");
-        if (legacy_detour != "")
-            detour = outbound_tag(legacy_detour);
-    }
+    let detour_owner = parent_section || src;
+    let detour = outbound_detour_tag_for_section(detour_owner);
+    if (detour == "" && parent_section != null && src != parent_section)
+        detour = outbound_detour_tag_for_section(src);
     if (detour != "") {
         endpoint.detour = detour;
+    } else {
+        let bind_iface = trim(option(src, "bind_interface", ""));
+        if (bind_iface == "")
+            bind_iface = trim(option(src, "interface", ""));
+        if (bind_iface == "" && parent_section != null && parent_section != src)
+            bind_iface = trim(option(parent_section, "bind_interface", ""));
+        if (bind_iface != "")
+            endpoint.bind_interface = bind_iface;
     }
 
+    if (!config.endpoints)
+        config.endpoints = [];
     push(config.endpoints, endpoint);
-}
-
-function add_warp_endpoint(config, section) {
-    let tag = outbound_tag(section[".name"]);
-    let account_id = option(section, "warp_account_id", "");
-    let access_token = replace(option(section, "warp_access_token", ""), /^ +| +$/g, "");
-    let private_key = option(section, "warp_private_key", "");
-
-    if (private_key == "")
-        ctx.runtime_generate_unsupported("WARP section '" + section[".name"] + "' missing warp_private_key");
-    if (account_id == "")
-        ctx.runtime_generate_unsupported("WARP section '" + section[".name"] + "' missing warp_account_id");
-
-    let profile = { id: account_id, private_key };
-    if (access_token != "") {
-        profile.auth_token = access_token;
-    }
-
-    let detour = option(section, "warp_detour", "");
-    // NB: was ctx.sing_box_tachyon_core, which nothing ever set - the branch was
-    // dead and tachyon-core got the sing-box-extended masque shape instead.
-    if (ctx.is_tachyon_core != null && ctx.is_tachyon_core(null)) {
-        let masque_out = {
-            type: "masque",
-            tag,
-            server: "162.159.198.2",
-            server_port: 443,
-            profile: "cloudflare",
-            private_key,
-            ip: "172.16.0.2/32"
-        };
-        if (access_token != "")
-            masque_out.auth_token = access_token;
-        if (detour != "")
-            masque_out.detour = outbound_tag(detour);
-        push(config.outbounds, masque_out);
-        return;
-    }
-
-    // NB: no "mtu" here. sing-box-extended 2.7.x rejects it on the warp
-    // endpoint ("endpoints[0].mtu: json: unknown field \"mtu\"") and aborts the
-    // whole config. warp_mtu stays readable for backwards compatibility.
-    let endpoint = {
-        type: "warp",
-        tag,
-        name: tag,
-        profile
-    };
-
-    if (detour != "") {
-        endpoint.detour = outbound_tag(detour);
-    }
-
-    push(config.endpoints, endpoint);
-}
-
-function add_anytls_outbound(config, section) {
-    let tag = outbound_tag(section[".name"]);
-    let server = option(section, "anytls_server", "");
-    if (server == "")
-        ctx.runtime_generate_unsupported("AnyTLS section '" + section[".name"] + "' missing anytls_server");
-    let outbound = {
-        type: "anytls",
-        tag,
-        server,
-        server_port: int_option(section, "anytls_server_port", "0"),
-        password: option(section, "anytls_password", "")
-    };
-    let sni = option(section, "anytls_sni", "");
-    let insecure = internal_flag(option(section, "anytls_insecure", "0"));
-    outbound.tls = { enabled: true };
-    // Fall back to server hostname when no explicit SNI is configured
-    outbound.tls.server_name = sni != "" ? sni : server;
-    if (insecure) outbound.tls.insecure = true;
-    push(config.outbounds, outbound);
-}
-
-function add_snell_outbound(config, section) {
-    push(config.outbounds, {
-        type: "snell",
-        tag: outbound_tag(section[".name"]),
-        server: option(section, "snell_server", ""),
-        server_port: int_option(section, "snell_server_port", "0"),
-        psk: option(section, "snell_psk", ""),
-        version: int_option(section, "snell_version", "4")
-    });
-}
-
-function add_mieru_outbound(config, section) {
-    push(config.outbounds, {
-        type: "mieru",
-        tag: outbound_tag(section[".name"]),
-        server: option(section, "mieru_server", ""),
-        server_port: int_option(section, "mieru_server_port", "0"),
-        transport: option(section, "mieru_transport", "TCP"),
-        username: option(section, "mieru_username", ""),
-        password: option(section, "mieru_password", "")
-    });
-}
-
-function add_naive_outbound(config, section) {
-    let tls = { enabled: true };
-    let sni = option(section, "naive_sni", "");
-    if (sni != "")
-        tls.server_name = sni;
-    push(config.outbounds, {
-        type: "naive",
-        tag: outbound_tag(section[".name"]),
-        server: option(section, "naive_server", ""),
-        server_port: int_option(section, "naive_server_port", "0"),
-        username: option(section, "naive_username", ""),
-        password: option(section, "naive_password", ""),
-        // NaiveProxy is HTTPS-only: tachyon-core refuses a naive outbound with
-        // no tls block, and tls.insecure is rejected by it outright.
-        tls: tls
-    });
-}
-
-function add_sudoku_outbound(config, section) {
-    let outbound = {
-        type: "sudoku",
-        tag: outbound_tag(section[".name"]),
-        server: option(section, "sudoku_server", ""),
-        server_port: int_option(section, "sudoku_server_port", "0"),
-        key: option(section, "sudoku_key", "")
-    };
-    let method = option(section, "sudoku_aead_method", "");
-    if (method != "") outbound.aead_method = method;
-    push(config.outbounds, outbound);
-}
-
-function add_masque_outbound(config, section) {
-    let tag = outbound_tag(section[".name"]);
-    let account_id  = option(section, "masque_account_id", "");
-    let access_token = option(section, "masque_access_token", "");
-    if (account_id == "")
-        ctx.runtime_generate_unsupported("MASQUE section '" + section[".name"] + "' missing masque_account_id");
-    if (access_token == "")
-        ctx.runtime_generate_unsupported("MASQUE section '" + section[".name"] + "' missing masque_access_token");
-    // sing-box-extended 2.7.x models MASQUE as an outbound with a single
-    // "profile" object; the endpoint + profiles[] form we used to emit is not
-    // known to it ("unknown endpoint type: masque") and aborts the config.
-    // masque_private_key is not part of that profile, so it is not emitted.
-    push(config.outbounds, {
-        type: "masque",
-        tag,
-        name: tag,
-        profile: { id: account_id, auth_token: access_token }
-    });
+    ensure_tailscale_client_dns(config, src, tag_name);
+    return endpoint;
 }
 
 function add_openvpn_endpoint(config, section) {
-    let tag = outbound_tag(section[".name"]);
+    let tag = option(section, ".tag", "") || outbound_tag(section[".name"]);
     let server = option(section, "openvpn_server", "");
     if (server == "")
         ctx.runtime_generate_unsupported("OpenVPN section '" + section[".name"] + "' missing openvpn_server");
@@ -2337,122 +2957,1332 @@ function add_openvpn_endpoint(config, section) {
     push(config.endpoints, endpoint);
 }
 
-function enabled_action_index(sections, target_section, action_name) {
-    if (connections && connections.active_provider_section_index)
-        return connections.active_provider_section_index(action_name, sections, target_section);
-    let index = 0;
-    for (let section in sections) {
-        if (option(section, "action", "") != action_name)
-            continue;
-        index++;
-        if (section[".name"] == target_section[".name"])
-            return index;
+function add_connection_dpi_sources(config, state, section, taken, selector_tags, urltest_candidate_tags) {
+    if (!connections || !connections.section_effective_outbound_sources)
+        return;
+    let section_name = section[".name"];
+    for (let src in connections.section_effective_outbound_sources(section)) {
+        let stype = lc(trim(option(src, "source_type", "")));
+        let src_id = as_string(src[".name"] || "");
+        let display_name = trim(option(src, "name", src_id)) || src_id;
+        if (!state.outboundMetadata.source_ids)
+            state.outboundMetadata.source_ids = {};
+        if (stype == "openvpn") {
+            let server = trim(option(src, "openvpn_server", ""));
+            if (server == "")
+                continue;
+            let tag_name = unique_tag(outbound_tag(section_name + "-openvpn-" + src_id), taken);
+            taken[tag_name] = true;
+            let ovpn_sec = {};
+            for (let k, v in src)
+                ovpn_sec[k] = v;
+            ovpn_sec[".name"] = tag_name;
+            ovpn_sec[".tag"] = tag_name;
+            add_openvpn_endpoint(config, ovpn_sec);
+            push(selector_tags, tag_name);
+            push(urltest_candidate_tags, tag_name);
+            runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, {
+                type: "openvpn-client",
+                tag: tag_name,
+                server,
+                server_port: int_option(src, "openvpn_server_port", "1194")
+            });
+            state.outboundMetadata.sources[tag_name] = src_id;
+        } else if (stype == "tailscale") {
+            let tag_name = unique_tag(outbound_tag(section_name + "-tailscale-" + src_id), taken);
+            taken[tag_name] = true;
+            let ep = build_and_push_tailscale_client_endpoint(config, src, tag_name, section);
+            push(selector_tags, tag_name);
+            push(urltest_candidate_tags, tag_name);
+            runtime_subscription.remember_outbound_metadata(state, tag_name, display_name, ep);
+            state.outboundMetadata.sources[tag_name] = src_id;
+            state.outboundMetadata.source_ids[tag_name] = src_id;
+        }
     }
-    return 0;
 }
 
-function add_zapret_outbound(config, section, sections) {
-    if (connections && !connections.section_is_active_provider(section, "zapret"))
-        return;
-    let index = enabled_action_index(sections, section, "zapret");
-    if (index <= 0)
-        ctx.runtime_generate_unsupported("unable to resolve Zapret index for " + section[".name"]);
-    push(config.outbounds, {
-        type: "direct",
-        tag: outbound_tag(section[".name"]),
-        routing_mark: runtime_constants.ZAPRET_ROUTE_MARK_BASE + index
-    });
+function format_amnezia_diagnosis(diag) {
+    if (type(diag) != "object")
+        return "";
+    let reason = as_string(diag.reason || "");
+    let detail = as_string(diag.detail || "");
+    if (reason == "cloud_api_key")
+        return "Amnezia Cloud API key vpn:// link requires gateway exchange; export a WireGuard/AmneziaWG .conf file instead";
+    if (reason == "unsupported_container")
+        return "unsupported Amnezia container" + (detail != "" ? (": " + detail) : "");
+    if (reason == "incomplete_container")
+        return "incomplete Amnezia container" + (detail != "" ? (": " + detail) : "");
+    if (reason == "invalid_vpn_link")
+        return "invalid vpn:// link" + (detail != "" ? (": " + detail) : "");
+    return "";
 }
 
-function add_zapret2_outbound(config, section, sections) {
-    if (connections && !connections.section_is_active_provider(section, "zapret2"))
-        return;
-    let index = enabled_action_index(sections, section, "zapret2");
-    if (index <= 0)
-        ctx.runtime_generate_unsupported("unable to resolve Zapret2 index for " + section[".name"]);
-    push(config.outbounds, {
-        type: "direct",
-        tag: outbound_tag(section[".name"]),
-        routing_mark: runtime_constants.ZAPRET2_ROUTE_MARK_BASE + index
-    });
+function diagnose_amnezia_entry(raw_entry) {
+    if (!amnezia_decoder || type(amnezia_decoder.diagnose) != "function")
+        return "";
+    let val = trim(as_string(raw_entry));
+    if (val == "")
+        return "";
+    if (substr(val, 0, 1) == "{") {
+        let parsed = null;
+        try { parsed = json(val); } catch (e) {}
+        if (type(parsed) == "object" && type(parsed.config) == "string" && substr(trim(parsed.config), 0, 6) == "vpn://")
+            val = trim(parsed.config);
+    }
+    if (substr(val, 0, 6) != "vpn://")
+        return "";
+    return format_amnezia_diagnosis(amnezia_decoder.diagnose(val));
 }
 
-function add_byedpi_outbound(config, section, sections) {
-    if (connections && !connections.section_is_active_provider(section, "byedpi"))
-        return;
-    let index = enabled_action_index(sections, section, "byedpi");
-    if (index <= 0)
-        ctx.runtime_generate_unsupported("unable to resolve ByeDPI index for " + section[".name"]);
-    push(config.outbounds, {
-        type: "socks",
-        tag: outbound_tag(section[".name"]),
-        server: runtime_constants.BYEDPI_LISTEN_ADDRESS,
-        server_port: runtime_constants.BYEDPI_PORT_BASE + index - 1,
-        version: "5"
-    });
+function amnezia_config_failure_detail(section) {
+    let cfgs = connections.amnezia_configs(section);
+    if (length(cfgs) == 0)
+        return "";
+    for (let entry in cfgs) {
+        let msg = diagnose_amnezia_entry(entry);
+        if (msg != "")
+            return msg;
+    }
+    return "";
 }
 
-function qwdtt_available() {
-    let binary = as_string(getenv("TACHYON_QWDTT_BIN")) || "/usr/bin/qwdtt-client";
-    return fs.stat(binary) != null;
+function add_connections_outbound(config, section, taken) {
+    let section_name = section[".name"];
+    let selector_tags = [];
+    let urltest_candidate_tags = [];
+    let state = runtime_subscription.new_section_state(section_name);
+    let cascade_start = length(array_or_empty(config.outbounds));
+    let endpoints_start = length(array_or_empty(config.endpoints));
+
+    add_connection_dpi_sources(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    let manual_count = length(connections.connection_urls(section));
+    add_connection_manual_links(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    let text_urltest_tag = add_connection_text_urltest(config, state, section, taken, selector_tags, urltest_candidate_tags, manual_count);
+    add_connection_subscriptions(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    
+    apply_section_detour_to_connection_outbounds(
+        config,
+        cascade_start,
+        outbound_detour_tag_for_section(section),
+        endpoints_start
+    );
+    add_connection_interfaces(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    add_connection_json_outbounds(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    add_connection_inline_uci_outbound(config, state, section, taken, selector_tags, urltest_candidate_tags);
+    apply_section_bind_interface_to_connection_outbounds(
+        config,
+        cascade_start,
+        option(section, "bind_interface", ""),
+        section,
+        endpoints_start
+    );
+    apply_section_packet_encoding_to_connection_outbounds(
+        config,
+        cascade_start,
+        connections.packet_encoding(section)
+    );
+
+    if (length(selector_tags) == 0) {
+        if (ctx.deferred_sections && ctx.deferred_sections[section_name])
+            return;
+        if (getenv("TACHYON_CORE_PREFLIGHT_BINARY")) {
+            let dummy_tag = unique_tag("preflight-dummy-" + section_name, taken);
+            taken[dummy_tag] = true;
+            push(config.outbounds, {
+                type: "direct",
+                tag: dummy_tag
+            });
+            push(selector_tags, dummy_tag);
+            push(urltest_candidate_tags, dummy_tag);
+            runtime_subscription.remember_outbound_metadata(state, dummy_tag, dummy_tag, { type: "direct", tag: dummy_tag });
+        } else {
+            let amn_detail = amnezia_config_failure_detail(section);
+            let msg = "connection section has no usable outbounds";
+            if (amn_detail != "")
+                msg += " (" + amn_detail + ")";
+            ctx.runtime_generate_unsupported(msg);
+        }
+    }
+
+    if (ctx.routes.section_needs_country_is(section)) {
+        let previous_state = read_json_file(runtime_subscription.section_cache_path(section_name));
+        state.outboundMetadata.countries = runtime_country.detect(
+            state.servers,
+            previous_state,
+            option(ctx.runtime_settings(), "bootstrap_dns_server", "77.88.8.8")
+        );
+    }
+    if (ctx.routes.section_has_direct_priority_level(section))
+        state.outboundMetadata.names[runtime_constants.DIRECT_OUTBOUND_TAG] = "Direct";
+
+    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
+    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
+    if (!getenv("TACHYON_CORE_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
 }
 
-function add_wdtt_outbound(config, section, sections) {
-    if (connections && !connections.section_is_active_provider(section, "wdtt"))
-        return;
-    let index = enabled_action_index(sections, section, "wdtt");
-    if (index <= 0)
-        ctx.runtime_generate_unsupported("unable to resolve WDTT index for " + section[".name"]);
-    if (qwdtt_available()) {
-        push(config.outbounds, {
-            type: "direct",
-            tag: outbound_tag(section[".name"]),
-            bind_interface: option(section, "tun_name", "qwdtt0"),
-            domain_resolver: {
-                server: as_string(ctx.default_domain_resolver) || runtime_constants.DNS_SERVER_TAG,
-                strategy: "ipv4_only"
+// An AmneziaWG section carrying imported .conf files is shaped the way an FPTN
+// token is: one endpoint per config, an auto urltest group over them, and the
+// section selector on top — so several configs behave like several servers and
+// the urltest/priority children have something to group. A bare endpoint
+// cannot carry those children, and the Clash API rejects a non-selector as the
+// section tag on every dashboard group switch.
+function add_awg_config_members(config, section) {
+    let section_name = section[".name"];
+    let tag = outbound_tag(section_name);
+    let state = runtime_subscription.new_section_state(section_name);
+    let selector_tags = [];
+    let urltest_candidate_tags = [];
+    let taken = { };
+    taken[tag] = true;
+    let detour = outbound_detour_tag_for_section(section);
+
+    let all_awg_cfgs = connections.amnezia_configs(section);
+    for (let value in all_awg_cfgs) {
+        let trimmed_val = trim(as_string(value));
+        let item = substr(trimmed_val, 0, 6) == "vpn://"
+            ? { name: url_fragment(trimmed_val) || option(section, "label", section_name) || "AmneziaWG", link: trimmed_val }
+            : subscription_amnezia.parse(value);
+        if (item == null) {
+            if (length(all_awg_cfgs) > 1)
+                continue;
+            let amn_detail = diagnose_amnezia_entry(value);
+            ctx.runtime_generate_unsupported(amn_detail != "" ? ("Invalid imported Amnezia configuration (" + amn_detail + ")") : "Invalid imported Amnezia configuration");
+        }
+        let endpoints = subscription_wireguard.from_vpn_endpoints(item.link);
+        if (endpoints == null) {
+            let alt_outbound = subscription_parser.parse_share_link(item.link);
+            if (alt_outbound != null) {
+                let display_name = as_string(alt_outbound.remark || alt_outbound.tag || item.name);
+                let member_tag = unique_tag(tag + "/" + display_name, taken);
+                taken[member_tag] = true;
+                let member = copy_subscription_outbound(alt_outbound, member_tag);
+                if (detour != "")
+                    member.detour = detour;
+                push(config.outbounds, member);
+                push(selector_tags, member_tag);
+                push(urltest_candidate_tags, member_tag);
+                state.links[member_tag] = as_string(item.link || "");
+                runtime_subscription.remember_outbound_metadata(state, member_tag, display_name, member);
+                let src_id = (connections && connections.source_id_for_manual_item)
+                    ? connections.source_id_for_manual_item(section, value)
+                    : "";
+                state.outboundMetadata.sources[member_tag] = src_id != "" ? src_id : "manual";
+                continue;
             }
+            if (length(all_awg_cfgs) > 1)
+                continue;
+            let amn_detail = diagnose_amnezia_entry(value) || diagnose_amnezia_entry(item.link);
+            let msg = "invalid imported Amnezia configuration: " + as_string(item.name);
+            if (amn_detail != "")
+                msg += " (" + amn_detail + ")";
+            ctx.runtime_generate_unsupported(msg);
+        }
+        // Every peer of the .conf is its own member: a multi-peer file behaves
+        // like several configs, and each server joins the urltest pool.
+        for (let i = 0; i < length(endpoints); i++) {
+            let display_name = as_string(endpoints[i].tag || item.name);
+            let member_tag = unique_tag(tag + "/" + display_name, taken);
+            taken[member_tag] = true;
+            let member = copy_subscription_outbound(endpoints[i], member_tag);
+            if (detour != "")
+                member.detour = detour;
+            add_imported_wireguard_endpoint(config, member);
+            push(selector_tags, member_tag);
+            push(urltest_candidate_tags, member_tag);
+            state.links[member_tag] = as_string(item.link || "");
+            runtime_subscription.remember_outbound_metadata(state, member_tag, display_name, member);
+            let src_id = (connections && connections.source_id_for_manual_item)
+                ? connections.source_id_for_manual_item(section, value)
+                : "";
+            state.outboundMetadata.sources[member_tag] = src_id != "" ? src_id : "manual";
+        }
+    }
+    if (length(selector_tags) == 0) {
+        let amn_detail = amnezia_config_failure_detail(section);
+        ctx.runtime_generate_unsupported(amn_detail != "" ? ("Invalid imported Amnezia configuration (" + amn_detail + ")") : "Invalid imported Amnezia configuration");
+    }
+
+    // The group the selector defaults to. Same shape as the FPTN expansion;
+    // a section urltest child called "urltest" owns this very tag, and then it
+    // is the group and nothing is emitted here.
+    let text_urltest_tag = "";
+    if (index(connections.urltests(section), "urltest") < 0) {
+        text_urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
+        let group_members = [];
+        for (let member_tag in selector_tags)
+            push(group_members, member_tag);
+        let auto_group = {
+            type: "urltest",
+            tag: text_urltest_tag,
+            outbounds: group_members
+        };
+        push(config.outbounds, auto_group);
+        let group_name = option(section, "label", "");
+        if (group_name == "") group_name = text_urltest_tag;
+        runtime_subscription.remember_outbound_metadata(state, text_urltest_tag, group_name, auto_group);
+        runtime_subscription.remember_urltest_group_config(state, text_urltest_tag, {
+            displayName: group_name,
+            outbounds: group_members
         });
+    }
+
+    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
+    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
+    if (!getenv("TACHYON_CORE_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
+}
+
+function add_awg_endpoint(config, section) {
+    if (length(connections.amnezia_configs(section)) > 0) {
+        add_awg_config_members(config, section);
         return;
     }
-    let listen = runtime_constants.WDTT_LISTEN_ADDRESS || "127.0.0.1";
-    let port_base = int(runtime_constants.WDTT_PORT_BASE || 1081);
-    push(config.outbounds, {
-        type: "socks",
+    let tag = outbound_tag(section[".name"]);
+    let local_addrs = core_ip.normalize_to_cidrs(list_option(section, "awg_local_address"));
+    let has_v6_local = false;
+    for (let addr in local_addrs) {
+        if (index(addr, ":") >= 0) {
+            has_v6_local = true;
+            break;
+        }
+    }
+    let endpoint = {
+        type: "wireguard",
+        tag: tag,
+        name: tag,
+        address: local_addrs,
+        private_key: option(section, "awg_private_key", ""),
+        peers: [{
+            address: option(section, "awg_server_address", ""),
+            port: int_option(section, "awg_server_port", "0"),
+            public_key: option(section, "awg_peer_public_key", ""),
+            allowed_ips: has_v6_local ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"]
+        }]
+    };
+
+    let preshared_key = option(section, "awg_preshared_key", "");
+    if (preshared_key != "")
+        endpoint.peers[0].pre_shared_key = preshared_key;
+
+    let mtu = int_option(section, "awg_mtu", "1280");
+    endpoint.mtu = mtu > 0 ? mtu : 1280;
+
+    let keepalive = int_or_range_option(section, "awg_keepalive", 25);
+    if (type(keepalive) == "string") {
+        let m = match(keepalive, /^([0-9]+)/);
+        endpoint.peers[0].persistent_keepalive_interval = m ? int(m[1], 10) : 25;
+    } else {
+        endpoint.peers[0].persistent_keepalive_interval = keepalive > 0 ? keepalive : 25;
+    }
+
+    let jc = int_option(section, "awg_jc", "4");
+    if (jc > 10) jc = 10;
+
+    let jmin = int_option(section, "awg_jmin", "40");
+
+    let jmax = int_option(section, "awg_jmax", "70");
+    if (jmax > 1200) jmax = 1200;
+
+    // AmneziaWG obfuscation parameters placed at the endpoint root for tachyon-core.
+    endpoint.jc = jc;
+    endpoint.jmin = jmin;
+    endpoint.jmax = jmax;
+    endpoint.s1 = int_option(section, "awg_s1", "0");
+    endpoint.s2 = int_option(section, "awg_s2", "0");
+    endpoint.h1 = int_or_range_option(section, "awg_h1", 1);
+    endpoint.h2 = int_or_range_option(section, "awg_h2", 2);
+    endpoint.h3 = int_or_range_option(section, "awg_h3", 3);
+    endpoint.h4 = int_or_range_option(section, "awg_h4", 4);
+    endpoint.s3 = int_option(section, "awg_s3", "0");
+    endpoint.s4 = int_option(section, "awg_s4", "0");
+
+    let i1 = awg_cps_option(section, "awg_i1");
+    let i2 = awg_cps_option(section, "awg_i2");
+    let i3 = awg_cps_option(section, "awg_i3");
+    let i4 = awg_cps_option(section, "awg_i4");
+    let i5 = awg_cps_option(section, "awg_i5");
+    if (i1 != "") endpoint.i1 = i1;
+    if (i2 != "") endpoint.i2 = i2;
+    if (i3 != "" && i3 != "0") endpoint.i3 = i3;
+    if (i4 != "" && i4 != "0") endpoint.i4 = i4;
+    if (i5 != "" && i5 != "0") endpoint.i5 = i5;
+
+    // AmneziaWG version handling: 2.0, 3.0, and 3.1
+    let awg_ver = option(section, "awg_version", "");
+    if (awg_ver == "") {
+        if (option(section, "awg_rekey_after_time", "") != "" || option(section, "awg_rekey_timeout", "") != "" ||
+            option(section, "awg_reject_after_time", "") != "" || option(section, "awg_keepalive_timeout", "") != "" ||
+            option(section, "awg_max_handshake_attempts", "") != "" ||
+            bool_option(section, "awg_random_trailers", false) || bool_option(section, "awg_disable_cookies", false)) {
+            awg_ver = "3.1";
+        } else if (option(section, "awg_header_protection_key", "") != "" || option(section, "awg_content_padding_addition", "") != "") {
+            awg_ver = "3.0";
+        } else {
+            awg_ver = "2.0";
+        }
+    }
+
+    if (awg_ver == "3.0" || awg_ver == "3.1") {
+        let hpk = option(section, "awg_header_protection_key", "");
+        if (hpk != "") {
+            if (endpoint.s1 < 12) endpoint.s1 = 20;
+            if (endpoint.s2 < 12) endpoint.s2 = 20;
+            if (endpoint.s3 < 12) endpoint.s3 = 20;
+            if (endpoint.s4 < 12) endpoint.s4 = 20;
+            endpoint.header_protection_key = hpk;
+        }
+
+        let cpa = option(section, "awg_content_padding_addition", "");
+        if (cpa != "") endpoint.content_padding_addition = cpa;
+    }
+
+    if (awg_ver == "3.1") {
+        let rka = option(section, "awg_rekey_after_time", "");
+        if (rka != "") endpoint.rekey_after_time = rka;
+
+        let rkt = option(section, "awg_rekey_timeout", "");
+        if (rkt != "") endpoint.rekey_timeout = rkt;
+
+        let rja = option(section, "awg_reject_after_time", "");
+        if (rja != "") endpoint.reject_after_time = rja;
+
+        let kpt = option(section, "awg_keepalive_timeout", "");
+        if (kpt != "") endpoint.keepalive_timeout = kpt;
+
+        let mha = option(section, "awg_max_handshake_attempts", "");
+        if (mha != "") endpoint.max_handshake_attempts = mha;
+
+        if (bool_option(section, "awg_random_trailers", false))
+            endpoint.random_trailers = true;
+        if (bool_option(section, "awg_disable_cookies", false))
+            endpoint.disable_cookies = true;
+    }
+
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour == "") {
+        let legacy_detour = option(section, "awg_detour", "");
+        if (legacy_detour != "")
+            detour = outbound_tag(legacy_detour);
+    }
+    if (detour != "") {
+        endpoint.detour = detour;
+    }
+
+    endpoint.__wireguard_client = true;
+    push(config.endpoints, endpoint);
+}
+
+function add_warp_endpoint(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let account_id = option(section, "warp_account_id", "");
+    let access_token = replace(option(section, "warp_access_token", ""), /^ +| +$/g, "");
+    let private_key = option(section, "warp_private_key", "");
+
+    if (private_key == "")
+        ctx.runtime_generate_unsupported("WARP section '" + section[".name"] + "' missing warp_private_key");
+    if (account_id == "")
+        ctx.runtime_generate_unsupported("WARP section '" + section[".name"] + "' missing warp_account_id");
+
+    let detour = option(section, "warp_detour", "");
+    let masque_out = {
+        type: "masque",
+        tag,
+        server: "162.159.198.2",
+        server_port: 443,
+        profile: "cloudflare",
+        private_key,
+        ip: "172.16.0.2/32"
+    };
+    if (access_token != "")
+        masque_out.auth_token = access_token;
+    if (detour != "")
+        masque_out.detour = outbound_tag(detour);
+    push(config.outbounds, masque_out);
+}
+
+function add_anytls_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "anytls_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("AnyTLS section '" + section[".name"] + "' missing anytls_server");
+    let outbound = {
+        type: "anytls",
+        tag,
+        server,
+        server_port: int_option(section, "anytls_server_port", "0"),
+        password: option(section, "anytls_password", "")
+    };
+    let sni = option(section, "anytls_sni", "");
+    let insecure = internal_flag(option(section, "anytls_insecure", "0"));
+    outbound.tls = { enabled: true };
+    // Fall back to server hostname when no explicit SNI is configured
+    outbound.tls.server_name = sni != "" ? sni : server;
+    if (insecure) outbound.tls.insecure = true;
+    let min_idle = int_option(section, "anytls_min_idle_session", "0");
+    if (min_idle > 0) outbound.min_idle_session = min_idle;
+    let check_interval = option(section, "anytls_idle_session_check_interval", "");
+    if (check_interval != "") outbound.idle_session_check_interval = check_interval;
+    let idle_timeout = option(section, "anytls_idle_session_timeout", "");
+    if (idle_timeout != "") outbound.idle_session_timeout = idle_timeout;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_snell_outbound(config, section) {
+    let outbound = {
+        type: "snell",
         tag: outbound_tag(section[".name"]),
-        server: listen,
-        server_port: port_base + index - 1,
-        version: "5"
-    });
+        server: option(section, "snell_server", ""),
+        server_port: int_option(section, "snell_server_port", "0"),
+        psk: option(section, "snell_psk", ""),
+        version: int_option(section, "snell_version", "4")
+    };
+    let obfs = option(section, "snell_obfs", "");
+    if (obfs != "" && obfs != "none") {
+        let obfs_obj = { mode: obfs };
+        let obfs_host = option(section, "snell_obfs_host", "");
+        if (obfs_host != "") obfs_obj.host = obfs_host;
+        outbound.obfs = obfs_obj;
+    }
+    if (bool_option(section, "snell_uot", false))
+        outbound.udp_over_tcp = true;
+    if (bool_option(section, "snell_reuse", false))
+        outbound.reuse = true;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
 }
 
-function olcrtc_host(section) {
-    return option_or_legacy(section, "socks_host", "olcrtc_socks_host",
-        runtime_constants.OLCRTC_LISTEN_ADDRESS || "127.0.0.1");
+function add_mieru_outbound(config, section) {
+    let raw_port = trim(as_string(option(section, "mieru_server_port", "")));
+    let server_ports = [];
+    for (let p in list_option(section, "mieru_server_ports"))
+        push(server_ports, replace(trim(as_string(p)), ":", "-"));
+    let single_port = 0;
+    if (raw_port != "") {
+        if (match(raw_port, /^[0-9]+$/) != null && int(raw_port) >= 1 && int(raw_port) <= 65535) {
+            single_port = int(raw_port);
+        } else {
+            for (let token in split(replace(raw_port, /[, \t\r\n]+/g, " "), " ")) {
+                token = trim(replace(token, ":", "-"));
+                if (token != "")
+                    push(server_ports, token);
+            }
+        }
+    }
+    let outbound = {
+        type: "mieru",
+        tag: outbound_tag(section[".name"]),
+        server: option(section, "mieru_server", ""),
+        transport: uc(option(section, "mieru_transport", "TCP")),
+        username: option(section, "mieru_username", ""),
+        password: option(section, "mieru_password", "")
+    };
+    if (single_port > 0)
+        outbound.server_port = single_port;
+    if (length(server_ports) > 0)
+        outbound.server_ports = server_ports;
+    if (outbound.server_port == null && outbound.server_ports == null)
+        outbound.server_port = 1080;
+    let multiplexing = option(section, "mieru_multiplexing", "");
+    if (multiplexing != "")
+        outbound.multiplexing = multiplexing;
+    let handshake_mode = trim(option(section, "mieru_handshake_mode", ""));
+    if (handshake_mode != "")
+        outbound.handshake_mode = handshake_mode;
+    let traffic_pattern = trim(option(section, "mieru_traffic_pattern", ""));
+    if (traffic_pattern != "")
+        outbound.traffic_pattern = traffic_pattern;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
 }
 
-function olcrtc_port(section, index) {
-    let port_base = int(runtime_constants.OLCRTC_PORT_BASE || 1082);
-    let fallback = as_string(port_base + index - 1);
-    let value = option_or_legacy(section, "socks_port", "olcrtc_socks_port", fallback);
-    if (match(value, /^[0-9]+$/))
-        return int(value, 10);
-    return int(fallback, 10);
+function add_naive_outbound(config, section) {
+    let tls = { enabled: true };
+    let sni = option(section, "naive_sni", "");
+    if (sni != "")
+        tls.server_name = sni;
+    let outbound = {
+        type: "naive",
+        tag: outbound_tag(section[".name"]),
+        server: option(section, "naive_server", ""),
+        server_port: int_option(section, "naive_server_port", "0"),
+        username: option(section, "naive_username", ""),
+        password: option(section, "naive_password", ""),
+        // NaiveProxy is HTTPS-only: tachyon-core refuses a naive outbound with
+        // no tls block, and tls.insecure is rejected by it outright.
+        tls: tls
+    };
+    if (bool_option(section, "naive_quic", false))
+        outbound.quic = true;
+    let cc = option(section, "naive_quic_congestion_control", "");
+    if (cc != "")
+        outbound.quic_congestion_control = cc;
+    let conc = int_option(section, "naive_insecure_concurrency", "0");
+    if (conc > 0)
+        outbound.insecure_concurrency = conc;
+    if (bool_option(section, "naive_udp_over_tcp", bool_option(section, "naive_uot", false)))
+        outbound.udp_over_tcp = true;
+    let raw_headers = trim(option(section, "naive_extra_headers", ""));
+    if (raw_headers != "") {
+        let parsed_headers = null;
+        if (substr(raw_headers, 0, 1) == "{") {
+            try { parsed_headers = json(raw_headers); } catch (e) { parsed_headers = null; }
+        }
+        if (type(parsed_headers) == "object") {
+            outbound.extra_headers = parsed_headers;
+        } else {
+            let hdrs = {};
+            for (let line in split(raw_headers, /\r?\n/)) {
+                let colon = index(line, ":");
+                if (colon > 0) {
+                    let hk = trim(substr(line, 0, colon));
+                    let hv = trim(substr(line, colon + 1));
+                    if (hk != "") hdrs[hk] = hv;
+                }
+            }
+            if (length(keys(hdrs)) > 0)
+                outbound.extra_headers = hdrs;
+        }
+    }
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
 }
 
-function add_olcrtc_outbound(config, section, sections) {
-    if (connections && !connections.section_is_active_provider(section, "olcrtc"))
+function add_sudoku_outbound(config, section) {
+    let outbound = {
+        type: "sudoku",
+        tag: outbound_tag(section[".name"]),
+        server: option(section, "sudoku_server", ""),
+        server_port: int_option(section, "sudoku_server_port", "0"),
+        key: option(section, "sudoku_key", "")
+    };
+    let method = option(section, "sudoku_aead_method", "");
+    if (method != "") outbound.aead_method = method;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_masque_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let access_token = option(section, "masque_access_token", "");
+    let masque_server = option(section, "masque_server", "");
+    let masque_priv = option(section, "masque_private_key", "");
+
+    let profile = option(section, "masque_profile", "cloudflare");
+    let server = masque_server != "" ? masque_server : "162.159.198.2";
+    let server_port = int_option(section, "masque_server_port", "443");
+    let outbound = {
+        type: "masque",
+        tag,
+        server,
+        server_port,
+        profile
+    };
+    let vhttp = option(section, "masque_vhttp", "");
+    if (vhttp != "") outbound.vhttp = vhttp;
+    if (masque_priv != "") outbound.private_key = masque_priv;
+    let pub = option(section, "masque_public_key", "");
+    if (pub != "") outbound.public_key = pub;
+    let ip = option(section, "masque_ip", profile == "cloudflare" ? "172.16.0.2/32" : "");
+    if (ip != "") outbound.ip = ip;
+    let ipv6 = option(section, "masque_ipv6", "");
+    if (ipv6 != "") outbound.ipv6 = ipv6;
+    let uri = option(section, "masque_uri", "");
+    if (uri != "") outbound.uri = uri;
+    let mtu = int_option(section, "masque_mtu", "0");
+    if (mtu > 0) outbound.mtu = mtu;
+    if (access_token != "") outbound.auth_token = access_token;
+    let sni = option(section, "masque_sni", "");
+    let insecure = bool_option(section, "masque_insecure", false);
+    let fragment = bool_option(section, "masque_fragment", false);
+    let record_fragment = bool_option(section, "masque_record_fragment", false);
+    if (sni != "" || insecure || fragment || record_fragment) {
+        let tls = { enabled: true };
+        if (sni != "") tls.server_name = sni;
+        if (insecure) tls.insecure = true;
+        if (fragment) tls.fragment = true;
+        if (record_fragment) tls.record_fragment = true;
+        outbound.tls = tls;
+    }
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function normalize_desync_preset_value(val) {
+    val = lc(trim(as_string(val)));
+    if (val == "" || val == "none" || val == "custom")
+        return "";
+    if (val == "auto" || val == "adaptive" || val == "smart")
+        return "auto";
+    if (val == "fake_split" || val == "fakesplit" || val == "fake+split" || val == "fakedsplit" || val == "faked_split")
+        return "fake_split";
+    if (val == "fake_disorder" || val == "fakedisorder" || val == "fake+disorder")
+        return "fake_disorder";
+    if (val == "multi_disorder" || val == "multidisorder" || val == "multi+disorder" || val == "fakeddisorder" || val == "faked_disorder")
+        return "multi_disorder";
+    if (val == "multi_split" || val == "multisplit" || val == "multi+split")
+        return "multi_split";
+    if (val == "tlsrec" || val == "tls_rec")
+        return "tlsrec";
+    if (val in ["split", "disorder", "fake", "oob"])
+        return val;
+    if (val == "youtube" || val == "google_youtube" || val == "discord" || val == "general" || val == "general_fake_tls")
+        return "fake_split";
+    if (val == "general_alt")
+        return "tlsrec";
+    if (val == "aggressive" || val == "general_alt2")
+        return "fake_disorder";
+    if (val == "general_multisplit")
+        return "multi_split";
+    if (val == "light" || val == "general_simple_fake")
+        return "split";
+    return "auto";
+}
+
+function normalize_desync_mode_value(val) {
+    val = lc(trim(as_string(val)));
+    if (val == "")
+        return "";
+    if (val == "auto" || val == "adaptive" || val == "smart")
+        return "auto";
+    if (val == "fake_split" || val == "fakesplit" || val == "fake+split" || val == "fakedsplit" || val == "faked_split")
+        return "fake_split";
+    if (val == "fake_disorder" || val == "fakedisorder" || val == "fake+disorder")
+        return "fake_disorder";
+    if (val == "multi_disorder" || val == "multidisorder" || val == "multi+disorder" || val == "fakeddisorder" || val == "faked_disorder")
+        return "multi_disorder";
+    if (val == "multi_split" || val == "multisplit" || val == "multi+split")
+        return "multi_split";
+    if (val == "tlsrec" || val == "tls_rec")
+        return "tlsrec";
+    if (val in ["split", "disorder", "fake", "oob", "none"])
+        return val;
+    return "fake_split";
+}
+
+function normalize_desync_fooling_value(val) {
+    val = lc(trim(as_string(val)));
+    if (val == "")
+        return "";
+    if (val == "md5" || val == "tcp_md5" || val == "wrong-md5" || val == "wrong_md5")
+        return "md5";
+    if (val == "ts" || val == "tcp_ts" || val == "timestamp" || val == "wrong-timestamp" || val == "wrong_timestamp")
+        return "timestamp";
+    if (val == "badseq" || val == "seq" || val == "wrong-sequence" || val == "wrong_sequence")
+        return "badseq";
+    if (val == "badack" || val == "ack" || val == "tcp_ack" || val == "wrong-ack" || val == "wrong_ack")
+        return "badack";
+    if (val == "badsum" || val == "sum" || val == "wrong-checksum" || val == "wrong_checksum")
+        return "badsum";
+    if (val == "autottl" || val == "auto_ttl" || val == "ttl" || val == "low-ttl" || val == "low_ttl")
+        return "autottl";
+    if (val == "hopbyhop" || val == "ip6_hopbyhop" || val == "hopbyhop2" || val == "ip6_hopbyhop2" || val == "destopt" || val == "ip6_destopt")
+        return "hopbyhop";
+    if (val == "badseq_badack_badsum" || val == "combo" || val == "badsum_combo")
+        return "badseq_badack_badsum";
+    if (val == "md5_badack" || val == "tcp_md5_badack" || val == "md5+badack")
+        return "md5_badack";
+    if (val == "datanoack" || val == "data_no_ack" || val == "noack")
+        return "datanoack";
+    return "";
+}
+
+function normalize_desync_single_split_pos_value(val) {
+    val = lc(trim(as_string(val)));
+    if (val == "midsld" || val == "sld" || val == "host")
+        return "midsld";
+    if (val == "midsld-2" || val == "sld-2")
+        return "midsld-2";
+    if (val == "midsld+2" || val == "sld+2")
+        return "midsld+2";
+    if (val == "sni" || val == "sniext")
+        return "sni";
+    if (val == "sniext+1" || val == "sni+1")
+        return "sniext+1";
+    if (val == "host+1")
+        return "host+1";
+    if (val == "endhost-1" || val == "endsld-1" || val == "endhost")
+        return "endhost-1";
+    if (val == "extlen")
+        return "extlen";
+    if (val != "" && match(val, /^[0-9]+$/)) {
+        let n = int(val, 10);
+        if (n >= 1 && n <= 1400)
+            return n;
+    }
+    return null;
+}
+
+function normalize_desync_split_pos_value(val) {
+    val = trim(as_string(val));
+    if (val == "")
+        return null;
+    if (index(val, ",") >= 0) {
+        let arr = [];
+        for (let part in split(val, ",")) {
+            let item = normalize_desync_single_split_pos_value(part);
+            if (item != null)
+                push(arr, item);
+        }
+        if (length(arr) == 1)
+            return arr[0];
+        if (length(arr) > 1)
+            return arr;
+        return null;
+    }
+    return normalize_desync_single_split_pos_value(val);
+}
+
+function apply_desync_opts_string(outbound, opts_str) {
+    opts_str = trim(as_string(opts_str));
+    if (opts_str == "")
         return;
-    let index = enabled_action_index(sections, section, "olcrtc");
-    if (index <= 0)
-        ctx.runtime_generate_unsupported("unable to resolve OlcRTC index for " + section[".name"]);
-    push(config.outbounds, {
-        type: "socks",
-        tag: outbound_tag(section[".name"]),
-        server: olcrtc_host(section),
-        server_port: olcrtc_port(section, index),
-        version: "5"
-    });
+    for (let token in split(opts_str, /\s+/)) {
+        let eq = index(token, "=");
+        if (eq <= 0)
+            continue;
+        let k = lc(trim(substr(token, 0, eq)));
+        if (substr(k, 0, 2) == "--")
+            k = replace(substr(k, 2), /-/g, "_");
+        if (substr(k, 0, 11) == "dpi_desync_")
+            k = substr(k, 11);
+        else if (k == "dpi_desync")
+            k = "mode";
+        let v = trim(substr(token, eq + 1));
+        if (v == "")
+            continue;
+        if (k == "preset") {
+            let np = normalize_desync_preset_value(v);
+            if (np != "")
+                outbound.preset = np;
+        } else if (k == "mode") {
+            let nm = normalize_desync_mode_value(v);
+            if (nm != "")
+                outbound.mode = nm;
+        } else if (k == "fooling") {
+            let nf = normalize_desync_fooling_value(v);
+            if (nf != "")
+                outbound.fooling = nf;
+        } else if (k == "auto_tune") {
+            outbound.auto_tune = is_true(v);
+        } else if (k == "tlsrec_first") {
+            outbound.tlsrec_first = is_true(v);
+        } else if (k == "split_pos") {
+            let nsp = normalize_desync_split_pos_value(v);
+            if (nsp != null)
+                outbound.split_pos = nsp;
+        } else if (k == "seqovl" || k == "split_seqovl") {
+            if (match(v, /^[0-9]+$/))
+                outbound.seqovl = int(v, 10);
+        } else if (k == "syndata") {
+            outbound.syndata = is_true(v);
+        } else if (k == "wsize") {
+            if (match(v, /^[0-9]+$/))
+                outbound.wsize = int(v, 10);
+        } else if (k == "ipfrag") {
+            outbound.ipfrag = is_true(v);
+        } else if (k == "udplen") {
+            if (match(v, /^[0-9]+$/))
+                outbound.udplen = int(v, 10);
+        } else if (k == "fake_ttl" || k == "ttl") {
+            if (match(v, /^[0-9]+$/))
+                outbound.fake_ttl = int(v, 10);
+        } else if (k == "fake_sni") {
+            outbound.fake_sni = v;
+        } else if (k == "repeats") {
+            if (match(v, /^[0-9]+$/))
+                outbound.repeats = int(v, 10);
+        } else if (k == "split_delay_ms") {
+            if (match(v, /^[0-9]+$/))
+                outbound.split_delay_ms = int(v, 10);
+        } else if (k == "udp_fake") {
+            outbound.udp_fake = is_true(v);
+        } else if (k == "udp_repeats") {
+            if (match(v, /^[0-9]+$/))
+                outbound.udp_repeats = int(v, 10);
+        } else if (k == "udp_fake_ttl") {
+            if (match(v, /^[0-9]+$/))
+                outbound.udp_fake_ttl = int(v, 10);
+        }
+    }
+}
+
+function add_desync_outbound(config, section) {
+    ensure_desync_outbound_supported();
+    let outbound = {
+        type: "desync",
+        tag: outbound_tag(section[".name"])
+    };
+    let raw_preset = trim(option(section, "desync_preset", ""));
+    let is_custom = lc(raw_preset) == "custom" || raw_preset == "";
+    let preset = normalize_desync_preset_value(raw_preset);
+    let mode = is_custom ? normalize_desync_mode_value(option(section, "desync_mode", "")) : "";
+    let fooling = normalize_desync_fooling_value(option(section, "desync_fooling", ""));
+    if (preset != "")
+        outbound.preset = preset;
+    if (mode != "")
+        outbound.mode = mode;
+    if (fooling != "")
+        outbound.fooling = fooling;
+    let auto_tune_raw = trim(option(section, "desync_auto_tune", ""));
+    if (auto_tune_raw != "")
+        outbound.auto_tune = bool_option(section, "desync_auto_tune", false);
+    else if (lc(raw_preset) in ["discord", "youtube", "google_youtube", "general"])
+        outbound.auto_tune = true;
+    if (bool_option(section, "desync_tlsrec_first", false))
+        outbound.tlsrec_first = true;
+    let has_discord_list = false;
+    for (let cl in list_option(section, "community_lists")) {
+        if (lc(trim(as_string(cl))) == "discord") {
+            has_discord_list = true;
+            break;
+        }
+    }
+    let udp_fake_raw = trim(option(section, "desync_udp_fake", ""));
+    if ((lc(raw_preset) == "discord" || has_discord_list) && udp_fake_raw == "")
+        outbound.udp_fake = true;
+    let split_pos = normalize_desync_split_pos_value(option(section, "desync_split_pos", ""));
+    if (split_pos != null)
+        outbound.split_pos = split_pos;
+    let seqovl = int_option(section, "desync_seqovl", "0");
+    if (seqovl > 0)
+        outbound.seqovl = seqovl;
+    if (bool_option(section, "desync_syndata", false))
+        outbound.syndata = true;
+    let wsize = int_option(section, "desync_wsize", "0");
+    if (wsize > 0)
+        outbound.wsize = wsize;
+    if (bool_option(section, "desync_ipfrag", false))
+        outbound.ipfrag = true;
+    let udplen = int_option(section, "desync_udplen", "0");
+    if (udplen > 0)
+        outbound.udplen = udplen;
+    let fake_ttl = int_option(section, "desync_fake_ttl", "0");
+    if (fake_ttl > 0)
+        outbound.fake_ttl = fake_ttl;
+    let fake_sni = trim(option(section, "desync_fake_sni", ""));
+    if (fake_sni != "")
+        outbound.fake_sni = fake_sni;
+    let repeats = int_option(section, "desync_repeats", "0");
+    if (repeats > 0)
+        outbound.repeats = repeats;
+    let delay_raw = option(section, "desync_split_delay_ms", "");
+    if (delay_raw != "" && match(delay_raw, /^[0-9]+$/))
+        outbound.split_delay_ms = int(delay_raw, 10);
+    if (udp_fake_raw != "")
+        outbound.udp_fake = bool_option(section, "desync_udp_fake", false);
+    let udp_repeats = int_option(section, "desync_udp_repeats", "0");
+    if (udp_repeats > 0)
+        outbound.udp_repeats = udp_repeats;
+    let udp_fake_ttl = int_option(section, "desync_udp_fake_ttl", "0");
+    if (udp_fake_ttl > 0)
+        outbound.udp_fake_ttl = udp_fake_ttl;
+
+    if (is_custom)
+        apply_desync_opts_string(outbound, option(section, "desync_opts", ""));
+    desync_udp.apply(outbound, section, is_custom);
+    ensure_desync_udp_options_supported(outbound, section[".name"]);
+
+    if (outbound.preset == null && outbound.mode == null)
+        outbound.preset = "auto";
+
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "")
+        outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_tewfai_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "tewfai_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("Tewfai section '" + section[".name"] + "' missing tewfai_server");
+    let outbound = {
+        type: "tewfai",
+        tag,
+        server,
+        server_port: int_option(section, "tewfai_server_port", "443"),
+        uuid: option(section, "tewfai_uuid", "")
+    };
+    let password = option(section, "tewfai_password", "");
+    if (password != "") outbound.password = password;
+    let raw_tr = list_option(section, "tewfai_transport");
+    if (length(raw_tr) == 0) {
+        let tr_str = option(section, "tewfai_transport", "");
+        if (tr_str != "")
+            raw_tr = split(tr_str, ",");
+    }
+    let tr_list = [];
+    for (let item in raw_tr) {
+        item = lc(trim(as_string(item)));
+        if (item == "raw_tls" || item == "h2" || item == "ws") item = "tcp";
+        else if (item == "h3_stream" || item == "h3_datagram") item = "quic";
+        if (item == "tcp" || item == "quic") {
+            if (index(tr_list, item) < 0)
+                push(tr_list, item);
+        }
+    }
+    if (length(tr_list) > 0)
+        outbound.transport = tr_list;
+    let cipher = option(section, "tewfai_inner_cipher", "");
+    if (cipher == "aes-256-gcm" || cipher == "none" || cipher == "null")
+        outbound.inner_cipher = cipher;
+    let morph = option(section, "tewfai_morph_profile", "");
+    if (morph == "auto" || morph == "adaptive" || morph == "transformer" ||
+        morph == "browsing" || morph == "video" || morph == "webrtc" || morph == "bulk")
+        outbound.morph_profile = morph;
+    let max_streams = int_option(section, "tewfai_max_streams", "0");
+    if (max_streams > 0) outbound.max_streams = max_streams;
+    let mtu = int_option(section, "tewfai_mtu", "0");
+    if (mtu > 0) outbound.mtu = mtu;
+    if (bool_option(section, "tewfai_pqc_enabled", false))
+        outbound.pqc = true;
+    let rotate_secs = int_option(section, "tewfai_rotate_secs", "0");
+    let rotate_mb = int_option(section, "tewfai_rotate_mb", "0");
+    if (bool_option(section, "tewfai_handover_enabled", false) || rotate_secs > 0 || rotate_mb > 0) {
+        let ho = { enabled: bool_option(section, "tewfai_handover_enabled", true) };
+        if (rotate_secs > 0) ho.rotate_secs = rotate_secs;
+        if (rotate_mb > 0) ho.rotate_mb = rotate_mb;
+        outbound.handover = ho;
+    }
+    if (bool_option(section, "tewfai_fec_enabled", false))
+        outbound.fec = true;
+    if (bool_option(section, "tewfai_desync_enabled", false))
+        outbound.desync = true;
+    if (bool_option(section, "tewfai_shaper_enabled", false)) {
+        let sp = option(section, "tewfai_shaper_profile", "adaptive");
+        let mode = (sp == "fixed" || sp == "off") ? sp : "adaptive";
+        outbound.shaper = { mode };
+    }
+    let sni = option(section, "tewfai_sni", "");
+    let tls = {
+        enabled: true,
+        server_name: sni != "" ? sni : server
+    };
+    if (bool_option(section, "tewfai_insecure", false))
+        tls.insecure = true;
+    let alpn = list_option(section, "tewfai_alpn");
+    if (length(alpn) > 0) tls.alpn = alpn;
+    let fp = option(section, "tewfai_fingerprint", "");
+    if (fp != "") tls.utls = { enabled: true, fingerprint: fp };
+    let r_pbk = option(section, "tewfai_reality_public_key", "");
+    if (r_pbk != "") {
+        let reality = { enabled: true, public_key: r_pbk };
+        let r_sid = option(section, "tewfai_reality_short_id", "");
+        if (r_sid != "") reality.short_id = r_sid;
+        tls.reality = reality;
+        if (tls.utls == null)
+            tls.utls = { enabled: true, fingerprint: "chrome" };
+    }
+    outbound.tls = tls;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_trusttunnel_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "trusttunnel_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("TrustTunnel section '" + section[".name"] + "' missing trusttunnel_server");
+    let outbound = {
+        type: "trusttunnel",
+        tag,
+        server,
+        server_port: int_option(section, "trusttunnel_server_port", "443")
+    };
+    let username = option(section, "trusttunnel_username", "");
+    if (username != "") outbound.username = username;
+    let password = option(section, "trusttunnel_password", "");
+    if (password != "") outbound.password = password;
+    if (bool_option(section, "trusttunnel_quic", false))
+        outbound.quic = true;
+    let cc = option(section, "trusttunnel_congestion_control", "");
+    if (cc != "") outbound.quic_congestion_control = cc;
+    let sni = option(section, "trusttunnel_sni", "");
+    let tls = {
+        enabled: true,
+        server_name: sni != "" ? sni : server
+    };
+    if (bool_option(section, "trusttunnel_insecure", false))
+        tls.insecure = true;
+    let alpn = list_option(section, "trusttunnel_alpn");
+    if (length(alpn) > 0) tls.alpn = alpn;
+    outbound.tls = tls;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_openconnect_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "openconnect_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("OpenConnect section '" + section[".name"] + "' missing openconnect_server");
+    let outbound = {
+        type: "openconnect",
+        tag,
+        server,
+        server_port: int_option(section, "openconnect_server_port", "443"),
+        flavor: option(section, "openconnect_flavor", "anyconnect")
+    };
+    let username = option(section, "openconnect_username", "");
+    if (username != "") outbound.username = username;
+    let password = option(section, "openconnect_password", "");
+    if (password != "") outbound.password = password;
+    let cookie = option(section, "openconnect_cookie", "");
+    if (cookie != "") outbound.cookie = cookie;
+    let urlpath = option(section, "openconnect_urlpath", "");
+    if (urlpath != "") outbound.urlpath = urlpath;
+    let realm = option(section, "openconnect_realm", "");
+    if (realm != "") outbound.realm = realm;
+    let region = option(section, "openconnect_region", "");
+    if (region != "") outbound.region = region;
+    let ua = option(section, "openconnect_user_agent", "");
+    if (ua != "") outbound.user_agent = ua;
+    let lhost = option(section, "openconnect_local_hostname", "");
+    if (lhost != "") outbound.local_hostname = lhost;
+    if (bool_option(section, "openconnect_ip", false))
+        outbound.ip = true;
+    if (bool_option(section, "openconnect_esp", false))
+        outbound.esp = true;
+    if (bool_option(section, "openconnect_dtls", false))
+        outbound.dtls = true;
+    if (bool_option(section, "openconnect_hip_report", false))
+        outbound.hip_report = true;
+    let pin = option(section, "openconnect_server_cert_pin", "");
+    if (pin != "") outbound.server_cert_pin = pin;
+    let addr = option(section, "openconnect_address", "");
+    if (addr != "") outbound.address = split(addr, "/")[0];
+    let addrv6 = option(section, "openconnect_address_v6", "");
+    if (addrv6 != "") outbound.address_v6 = split(addrv6, "/")[0];
+    let mtu = int_option(section, "openconnect_mtu", "0");
+    if (mtu > 0) outbound.mtu = as_string(mtu);
+    let sni = option(section, "openconnect_sni", "");
+    let tls = {
+        enabled: true,
+        server_name: sni != "" ? sni : server
+    };
+    if (bool_option(section, "openconnect_insecure", false))
+        tls.insecure = true;
+    outbound.tls = tls;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_mtproto_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "mtproto_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("MTProto section '" + section[".name"] + "' missing mtproto_server");
+    let raw_secret = option(section, "mtproto_secret", "");
+    let norm_secret = lc(trim(as_string(raw_secret)));
+    let padded_prefix = false;
+    if (length(norm_secret) >= 34 && match(norm_secret, /^(ee|dd)[0-9a-f]{32}/)) {
+        padded_prefix = substr(norm_secret, 0, 2) == "dd";
+        raw_secret = substr(norm_secret, 2, 32);
+    } else if (length(norm_secret) == 32 && match(norm_secret, /^[0-9a-f]{32}$/)) {
+        raw_secret = norm_secret;
+    }
+    let outbound = {
+        type: "mtproto",
+        tag,
+        server,
+        server_port: int_option(section, "mtproto_server_port", "443"),
+        secret: raw_secret
+    };
+    let transport = option(section, "mtproto_transport", "");
+    if (transport != "") outbound.transport = transport;
+    else if (padded_prefix) outbound.transport = "padded_intermediate";
+    let mode = option(section, "mtproto_mode", "");
+    if (mode != "") outbound.mode = mode;
+    let sni = option(section, "mtproto_sni", "");
+    if (sni != "")
+        outbound.tls = { enabled: true, server_name: sni };
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_shadowtls_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let server = option(section, "shadowtls_server", "");
+    if (server == "")
+        ctx.runtime_generate_unsupported("ShadowTLS section '" + section[".name"] + "' missing shadowtls_server");
+    let sni = option(section, "shadowtls_sni", "");
+    let outbound = {
+        type: "shadowtls",
+        tag,
+        server,
+        server_port: int_option(section, "shadowtls_server_port", "443"),
+        version: int_option(section, "shadowtls_version", "3"),
+        password: option(section, "shadowtls_password", ""),
+        tls: {
+            enabled: true,
+            server_name: sni != "" ? sni : server
+        }
+    };
+    if (bool_option(section, "shadowtls_insecure", false))
+        outbound.tls.insecure = true;
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "") outbound.detour = detour;
+    push(config.outbounds, outbound);
+}
+
+function add_chain_outbound(config, section) {
+    let tag = outbound_tag(section[".name"]);
+    let hops = [];
+    for (let s in list_option(section, "chain_sections")) {
+        s = trim(as_string(s));
+        if (s != "")
+            push(hops, outbound_tag(s));
+    }
+    for (let o in list_option(section, "chain_outbounds")) {
+        o = trim(as_string(o));
+        if (o != "")
+            push(hops, o);
+    }
+    let outbound = {
+        type: "chain",
+        tag,
+        outbounds: unique_string_array(hops)
+    };
+    if (bool_option(section, "chain_strip", false))
+        outbound.strip = true;
+    if (bool_option(section, "chain_interrupt", false))
+        outbound.interrupt_exist_connections = true;
+    push(config.outbounds, outbound);
+}
+
+function add_tailscale_client_endpoint(config, section) {
+    return build_and_push_tailscale_client_endpoint(config, section, outbound_tag(section[".name"]), section);
+}
+
+function add_csqtt_outbound(config, section) {
+    let tag_name = outbound_tag(section[".name"]);
+    // qwdtt/wdtt sections written by older Tachyon builds kept the URI in the
+    // generic `uri` option; keep honouring it next to the native csqtt_* keys.
+    let uri = trim(as_string(option(section, "csqtt_uri", option(section, "uri", option(section, "warp_flow_uri", "")))));
+    let server = trim(as_string(option(section, "csqtt_server", option(section, "server", ""))));
+    if (server == "" && uri != "") {
+        let parsed = subscription_parser.parse_share_link(uri);
+        if (type(parsed) == "object" && lc(as_string(parsed.type || "")) == "wdtt") {
+            let outbound = copy_subscription_outbound(parsed, tag_name);
+            let workers = int_option(section, "csqtt_workers", option(section, "wdtt_workers", option(section, "workers", "0")));
+            if (workers >= 1 && workers <= 126 && outbound.workers == null) outbound.workers = workers;
+            let mtu = int_option(section, "csqtt_mtu", option(section, "wdtt_mtu", option(section, "mtu", "0")));
+            if (mtu >= 576 && mtu <= 1500 && outbound.mtu == null) outbound.mtu = mtu;
+            let did = trim(as_string(option(section, "csqtt_device_id", option(section, "warp_flow_device_id", option(section, "wdtt_device_id", option(section, "device_id", ""))))));
+            if (did != "" && outbound.device_id == null) outbound.device_id = did;
+            let detour = outbound_detour_tag_for_section(section);
+            if (detour != "")
+                outbound.detour = detour;
+            push(config.outbounds, sanitize_wdtt_outbound(outbound));
+            return;
+        }
+    }
+    if (server == "")
+        ctx.runtime_generate_unsupported("CSQTT section '" + section[".name"] + "' missing csqtt_server");
+
+    let mode = trim(lc(as_string(option(section, "csqtt_mode", "csqtt"))));
+    if (mode != "wg" && mode != "raw" && mode != "csqtt" && mode != "csqtt_v1")
+        mode = "csqtt";
+    let default_port = (mode == "wg" || mode == "raw") ? "56000" : "46000";
+    let port = int_option(section, "csqtt_server_port", default_port);
+    if (port < 1 || port > 65535)
+        port = int(default_port, 10);
+    let password = as_string(option(section, "csqtt_password", option(section, "password", "")));
+    if (password == "")
+        ctx.runtime_generate_unsupported("CSQTT section '" + section[".name"] + "' missing csqtt_password");
+
+    let outbound = {
+        type: "wdtt",
+        tag: tag_name,
+        server: server,
+        server_port: port,
+        password: password,
+        mode: mode
+    };
+    let raw_port = int_option(section, "csqtt_raw_port", "0");
+    if (raw_port > 0 && raw_port <= 65535) outbound.raw_port = raw_port;
+    let wg_port = int_option(section, "csqtt_wg_port", "0");
+    if (wg_port > 0 && wg_port <= 65535) outbound.wg_port = wg_port;
+    let local_port = int_option(section, "csqtt_local_port", "0");
+    if (local_port > 0 && local_port <= 65535) outbound.local_port = local_port;
+
+    let obfs = trim(lc(as_string(option(section, "csqtt_obfs", ""))));
+    if (obfs == "audio" || obfs == "video" || obfs == "unified")
+        outbound.obfs = obfs;
+
+    let hashes_list = list_option(section, "csqtt_hashes");
+    let hashes = [];
+    for (let item in hashes_list) {
+        for (let part in split(as_string(item), /[,;+ \t\r\n]+/)) {
+            part = trim(part);
+            if (part != "") push(hashes, part);
+        }
+    }
+    if (length(hashes) == 0) {
+        let h_str = trim(as_string(option(section, "csqtt_hashes", "")));
+        if (h_str != "") {
+            for (let part in split(h_str, /[,;+ \t\r\n]+/)) {
+                part = trim(part);
+                if (part != "") push(hashes, part);
+            }
+        }
+    }
+    if (length(hashes) > 0) outbound.hashes = hashes;
+
+    let vk_auth = trim(lc(as_string(option(section, "csqtt_vk_auth_mode", ""))));
+    if (vk_auth != "") outbound.vk_auth_mode = vk_auth;
+    let vk_cookie = as_string(option(section, "csqtt_vk_cookie", ""));
+    if (vk_cookie != "") outbound.vk_cookie = vk_cookie;
+    let vk_cids = list_option(section, "csqtt_vk_client_ids");
+    if (length(vk_cids) > 0) outbound.vk_client_ids = vk_cids;
+
+    let turn_srv = trim(as_string(option(section, "csqtt_turn_server", "")));
+    if (turn_srv != "") outbound.turn_server = turn_srv;
+    let turn_urls = list_option(section, "csqtt_turn_urls");
+    if (length(turn_urls) > 0) outbound.turn_urls = turn_urls;
+    let turn_user = as_string(option(section, "csqtt_turn_username", ""));
+    if (turn_user != "") outbound.turn_username = turn_user;
+    let turn_pass = as_string(option(section, "csqtt_turn_password", ""));
+    if (turn_pass != "") outbound.turn_password = turn_pass;
+    let turn_tr = trim(lc(as_string(option(section, "csqtt_turn_transport", ""))));
+    if (turn_tr == "auto" || turn_tr == "tcp" || turn_tr == "udp" || turn_tr == "tcp_tls" || turn_tr == "tls")
+        outbound.turn_transport = turn_tr;
+
+    let workers = int_option(section, "csqtt_workers", option(section, "wdtt_workers", "0"));
+    if (workers >= 1 && workers <= 126) outbound.workers = workers;
+    let did = trim(as_string(option(section, "csqtt_device_id", option(section, "warp_flow_device_id", option(section, "wdtt_device_id", "")))));
+    if (did != "") outbound.device_id = did;
+    let mtu = int_option(section, "csqtt_mtu", option(section, "wdtt_mtu", "0"));
+    if (mtu >= 576 && mtu <= 1500) outbound.mtu = mtu;
+    if (bool_option(section, "csqtt_chunk1", false)) outbound.chunk1 = true;
+
+    let wg_priv = trim(as_string(option(section, "csqtt_wg_private_key", "")));
+    if (wg_priv != "") outbound.wg_private_key = wg_priv;
+    let wg_pub = trim(as_string(option(section, "csqtt_wg_peer_public_key", "")));
+    if (wg_pub != "") outbound.wg_peer_public_key = wg_pub;
+    let wg_addr = trim(as_string(option(section, "csqtt_wg_address", "")));
+    if (wg_addr != "") outbound.wg_address = wg_addr;
+
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "")
+        outbound.detour = detour;
+    push(config.outbounds, sanitize_wdtt_outbound(outbound));
+}
+
+function add_wdtt_outbound(config, section) {
+    return add_csqtt_outbound(config, section);
 }
 
 // Emit the section the way a connection section is shaped: one outbound per
@@ -2472,7 +4302,20 @@ function add_fptn_token_members(config, section, token) {
     let urltest_candidate_tags = [];
     let detour = outbound_detour_tag_for_section(section);
 
-    for (let server in decoded.servers) {
+    let fptn_sni = trim(option(section, "sni", option(section, "fptn_sni", "")));
+    let fptn_bypass = trim(option(section, "bypass_method", option(section, "fptn_bypass_method", "")));
+    let fptn_pref = lc(trim(option(section, "preferred_server", option(section, "fptn_server_host", ""))));
+    let ordered_servers = [];
+    for (let s in decoded.servers) {
+        if (fptn_pref != "" && (lc(as_string(s.name || "")) == fptn_pref || lc(as_string(s.host || "")) == fptn_pref))
+            push(ordered_servers, s);
+    }
+    for (let s in decoded.servers) {
+        if (fptn_pref == "" || (lc(as_string(s.name || "")) != fptn_pref && lc(as_string(s.host || "")) != fptn_pref))
+            push(ordered_servers, s);
+    }
+
+    for (let server in ordered_servers) {
         let member = {
             type: "fptn",
             tag: tag + "/" + server.name,
@@ -2483,6 +4326,10 @@ function add_fptn_token_members(config, section, token) {
         };
         if (server.md5_fingerprint != "")
             member.md5_fingerprint = server.md5_fingerprint;
+        if (fptn_sni != "")
+            member.sni = fptn_sni;
+        if (fptn_bypass != "")
+            member.bypass_method = fptn_bypass;
         if (detour != "")
             member.detour = detour;
         push(config.outbounds, member);
@@ -2528,53 +4375,33 @@ function add_fptn_token_members(config, section, token) {
 
     state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
     ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
-    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+    if (!getenv("TACHYON_CORE_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
         ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
     return true;
 }
 
-// FPTN routes traffic through its TUN interface (tun-fptn) via kernel routing.
-// fwmark 0x00300000 (3145728) → ip rule → routing table 4249 → dev tun-fptn.
-//
-// tachyon-core speaks FPTN itself: in native mode the section expands into
-// per-server outbounds plus a selector — the same shape a connection section
-// gets — instead of a single outbound carrying the access token. The mode
-// comes from the single resolver in config.connections so the generator and
-// the provider runtime can never disagree.
+// tachyon-core speaks FPTN natively: the section expands into per-server
+// outbounds plus a selector — the same shape a connection section gets — or
+// falls back to a raw-token outbound when the token cannot be decoded locally.
 function add_fptn_outbound(config, section, sections) {
     if (connections && !connections.section_is_active_provider(section, "fptn"))
         return;
+    ensure_fptn_outbound_supported();
     let tag = outbound_tag(section[".name"]);
-
-    if (connections && connections.fptn_transport_mode() == "native") {
-        // access_token is the canonical field; an fptn:// link pasted into the
-        // section URL list feeds the same resolver, so a pasted token works
-        // everywhere the section is read.
-        let token = connections.fptn_section_token(section);
-        if (token == "")
-            return;
-        if (add_fptn_token_members(config, section, token))
-            return;
-        // Undecodable on this box (brotli without the core binary, malformed
-        // token): hand the raw token to the core, which expands it into the
-        // same members itself.
-        let fptn_out = {
-            type: "fptn",
-            tag,
-            token
-        };
-        let detour = outbound_detour_tag_for_section(section);
-        if (detour != "")
-            fptn_out.detour = detour;
-        push(config.outbounds, fptn_out);
+    let token = connections ? connections.fptn_section_token(section) : "";
+    if (token == "")
         return;
-    }
-
-    push(config.outbounds, {
-        type: "direct",
+    if (add_fptn_token_members(config, section, token))
+        return;
+    let fptn_out = {
+        type: "fptn",
         tag,
-        routing_mark: 3145728
-    });
+        token: url_strip_fragment_value(token)
+    };
+    let detour = outbound_detour_tag_for_section(section);
+    if (detour != "")
+        fptn_out.detour = detour;
+    push(config.outbounds, fptn_out);
 }
 
 return {
@@ -2609,12 +4436,17 @@ return {
     add_naive_outbound,
     add_sudoku_outbound,
     add_masque_outbound,
+    add_desync_outbound,
+    add_tewfai_outbound,
+    add_trusttunnel_outbound,
+    add_openconnect_outbound,
+    add_mtproto_outbound,
+    add_shadowtls_outbound,
+    add_chain_outbound,
+    add_tailscale_client_endpoint,
     add_openvpn_endpoint,
-    add_zapret_outbound,
-    add_zapret2_outbound,
-    add_byedpi_outbound,
+    add_csqtt_outbound,
     add_wdtt_outbound,
-    add_olcrtc_outbound,
     add_fptn_outbound,
     fptn_token_decode,
     urltest_leaf_candidate_outbound,

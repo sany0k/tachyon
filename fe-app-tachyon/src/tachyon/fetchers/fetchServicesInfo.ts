@@ -34,56 +34,50 @@ export async function fetchServicesInfo() {
     return uiState;
   }
 
-  const [tachyonResult, singboxResult, watchdogResult, engineResult] =
-    await Promise.allSettled([
-      TachyonShellMethods.getStatus(),
-      TachyonShellMethods.getSingBoxStatus(),
-      TachyonShellMethods.getWatchdogStatus(),
-      TachyonShellMethods.getEngineStatus(),
-    ]);
+  const [tachyonResult, coreResult, watchdogResult] = await Promise.allSettled([
+    TachyonShellMethods.getStatus(),
+    TachyonShellMethods.getTachyonCoreStatus(),
+    TachyonShellMethods.getWatchdogStatus(),
+  ]);
 
   if (requestId !== latestServicesInfoRequestId) {
     return;
   }
 
   const tachyon = getSettledMethodResponse('getStatus', tachyonResult);
-  const singbox = getSettledMethodResponse('getSingBoxStatus', singboxResult);
+  const core = getSettledMethodResponse('getTachyonCoreStatus', coreResult);
   const watchdog = getSettledMethodResponse(
     'getWatchdogStatus',
     watchdogResult,
   );
-  const engineStatus = getSettledMethodResponse(
-    'getEngineStatus',
-    engineResult,
-  );
 
-  // On steer the sing-box service is intentionally stopped. Don't mark the
-  // dashboard as failed just because S99sing-box is absent, and report the
-  // active engine's own liveness in the singbox slot so the widget shows the
-  // routing engine that actually runs.
-  const activeEngine =
-    engineStatus.success &&
-    (engineStatus.data as Tachyon.GetEngineStatus).engine
-      ? (engineStatus.data as Tachyon.GetEngineStatus).engine
-      : 'sing-box';
-  const isSteer = activeEngine === 'steer' || activeEngine === 'steer-extended';
-  const singboxFailed = !singbox.success && !isSteer;
+  const coreFailed = !core.success;
 
   const previousData = store.get().servicesInfoWidget.data;
 
   store.set({
     servicesInfoWidget: {
       loading: false,
-      failed: !tachyon.success || singboxFailed,
+      failed: !tachyon.success || coreFailed,
       data: {
-        singbox: singbox.success
-          ? singbox.data.running
-          : isSteer && engineStatus.success
-            ? 1
-            : previousData.singbox,
-        singboxMemoryMb: singbox.success
-          ? singbox.data.memory_rss_mb
-          : previousData.singboxMemoryMb,
+        tachyonCore: core.success
+          ? core.data.running
+          : previousData.tachyonCore,
+        tachyonCoreMemoryMb: core.success
+          ? core.data.memory_rss_mb
+          : previousData.tachyonCoreMemoryMb,
+        tachyonCorePid: core.success
+          ? core.data.pid
+          : previousData.tachyonCorePid,
+        tachyonCoreUptimeSeconds: core.success
+          ? core.data.uptime_seconds
+          : previousData.tachyonCoreUptimeSeconds,
+        tachyonCoreUptimePretty: core.success
+          ? core.data.uptime_pretty
+          : previousData.tachyonCoreUptimePretty,
+        engineVersion: core.success
+          ? core.data.engine_version
+          : previousData.engineVersion,
         tachyonRunning: tachyon.success
           ? tachyon.data.running
           : previousData.tachyonRunning,
@@ -93,21 +87,34 @@ export async function fetchServicesInfo() {
         tachyonStatus: tachyon.success
           ? tachyon.data.status
           : previousData.tachyonStatus,
+        liteMode:
+          tachyon.success && tachyon.data.lite_mode != null
+            ? tachyon.data.lite_mode
+            : previousData.liteMode,
         tachyonMemoryMb: tachyon.success
           ? tachyon.data.memory_rss_mb
           : previousData.tachyonMemoryMb,
+        tachyonPid: tachyon.success
+          ? tachyon.data.pid
+          : previousData.tachyonPid,
+        tachyonUptimeSeconds: tachyon.success
+          ? tachyon.data.uptime_seconds
+          : previousData.tachyonUptimeSeconds,
+        tachyonUptimePretty: tachyon.success
+          ? tachyon.data.uptime_pretty
+          : previousData.tachyonUptimePretty,
         watchdogRunning: watchdog.success
           ? Number((watchdog.data as { running: boolean }).running)
           : previousData.watchdogRunning,
-        zapret2Running: previousData.zapret2Running,
-        zapret2MemoryMb: previousData.zapret2MemoryMb,
         dnsmasqRunning: previousData.dnsmasqRunning,
         dnsmasqMemoryMb: previousData.dnsmasqMemoryMb,
         dnsmasqLocalCacheEnabled: previousData.dnsmasqLocalCacheEnabled,
         dnsmasqCacheSize: previousData.dnsmasqCacheSize,
+        dnsmasqPid: previousData.dnsmasqPid,
+        dnsmasqUptimeSeconds: previousData.dnsmasqUptimeSeconds,
+        dnsmasqUptimePretty: previousData.dnsmasqUptimePretty,
       },
     },
-    activeEngine,
   });
 
   return undefined;

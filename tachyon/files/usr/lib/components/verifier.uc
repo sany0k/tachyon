@@ -1,7 +1,7 @@
 #!/usr/bin/env ucode
 //
 // Post-install verification for components: binary presence, version reads,
-// sing-box extended binary validation and human-readable fingerprints.
+// tachyon-core binary validation and human-readable fingerprints.
 //
 
 let fs = require("fs");
@@ -14,29 +14,13 @@ let core_profile_module = null;
 let as_string = common.as_string;
 
 // Lazy on purpose: components_updater_job.sh stages this module into a partial
-// -L tree whose singbox/ directory is created but left empty, to pin that
+// -L tree whose tachyon_core/ directory is created but left empty, to pin that
 // component verification carries the profile lookup itself rather than
 // inheriting it from a require graph.
 function core_profile() {
     if (core_profile_module == null)
         core_profile_module = require("tachyon_core.core_profile");
     return core_profile_module;
-}
-
-// Lazy for the same reason as core_profile(), and additionally guarded: the
-// partial -L tree that components_updater_job stages has no core/gomemlimit.uc,
-// and a hard require here would break that update path outright. There the
-// ceiling is simply skipped - exactly as it was before - while a full install,
-// which is where a second Go runtime competes with the running daemon, gets it.
-let gomemlimit_module = false;
-function gomemlimit_env_map() {
-    if (gomemlimit_module === false) {
-        try { gomemlimit_module = require("core.gomemlimit"); }
-        catch (e) { gomemlimit_module = null; }
-    }
-    if (gomemlimit_module == null) return {};
-    try { return gomemlimit_module.gomemlimit_env_map(); }
-    catch (e) { return {}; }
 }
 
 // ============================================================================
@@ -100,7 +84,7 @@ function verify_binary_post_install(binary_path, expected_version, version_cmd_a
         return false;
     }
     if (type(version_cmd_args) == "array" && length(version_cmd_args) > 0) {
-        let actual = versions.read_sing_box_binary_version(binary_path, "");
+        let actual = versions.read_core_binary_version(binary_path, "");
         if (actual == "") {
             helpers.updates_log("Post-install verification: cannot read version from " + binary_path, "warn");
         } else if (as_string(expected_version) != "" && actual != as_string(expected_version)) {
@@ -110,31 +94,7 @@ function verify_binary_post_install(binary_path, expected_version, version_cmd_a
     return true;
 }
 
-function validate_sing_box_extended_binary(binary, library_dir, compressed) {
-    let version = versions.read_sing_box_binary_version(binary, library_dir || "");
-    if (version != "")
-        return version;
-    if (compressed && binary && binary != "") {
-        let is_elf = false;
-        try {
-            let f = fs.open(binary, "r");
-            if (f) {
-                let header = f.read("4");
-                f.close();
-                is_elf = (header == "\x7fELF");
-            }
-        }
-        catch (e) {}
-        if (is_elf) {
-            helpers.updates_log("Compressed binary validated via ELF header check: " + binary, "info");
-            return "compressed";
-        }
-        helpers.updates_log("Compressed binary is not a valid ELF executable: " + binary, "warn");
-    }
-    return "";
-}
-
-// Drops the field sing-box named from the outbound it named, and reports whether
+// Drops the field tachyon-core named from the outbound it named, and reports whether
 // anything changed.
 //
 // The apply path in tachyon_core/runtime.uc calls this same function now, because its
@@ -143,12 +103,19 @@ function validate_sing_box_extended_binary(binary, library_dir, compressed) {
 // It is the reason a build that rejects one field can still run: only the offending
 // outbound loses it, because deleting it everywhere threw away settings that were
 // working. The pre-flight needs the same repair, or a binary that rejects a single
-// field is refused outright and the user is told the variant is "incompatible" when
+// field is refused outright and the user is told the core build is "incompatible" when
 // the truth is that one key could have been dropped.
 //
 // Reports false once no further repair applies, so the caller stops instead of
 // rewriting the same file until it gives up.
+function normalize_unknown_field_reason(reason) {
+    let s = replace(as_string(reason), /: (json: )*unknown field /g, ": json: unknown field ");
+    s = replace(s, /(^|: )(log|ntp|route|dns): ([A-Za-z0-9_.]+): json: unknown field /g, "$1$2.$3: json: unknown field ");
+    return s;
+}
+
 function repair_unknown_outbound_field(config_file, reason) {
+    let norm_reason = normalize_unknown_field_reason(reason);
     if (index(as_string(reason), "unknown log level: panic") >= 0) {
         let cfg_text = as_string(fs.readfile(config_file) || "");
         if (length(cfg_text) == 0) return false;
@@ -160,9 +127,86 @@ function repair_unknown_outbound_field(config_file, reason) {
         }
     }
 
-    let out_m = match(as_string(reason), /outbounds\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
-    let ep_m = match(as_string(reason), /endpoints\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
-    let inb_m = match(as_string(reason), /inbounds\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let ep_peer_m = match(norm_reason, /endpoints\[(\d+)\]\.peers\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    if (ep_peer_m && ep_peer_m[1] && ep_peer_m[2] && ep_peer_m[3]) {
+        let ep_idx = int(ep_peer_m[1]);
+        let peer_idx = int(ep_peer_m[2]);
+        let field = ep_peer_m[3];
+        if (ep_idx < 0 || peer_idx < 0) return false;
+        let cfg_text = as_string(fs.readfile(config_file) || "");
+        if (length(cfg_text) == 0) return false;
+        let cfg = json(cfg_text);
+        if (type(cfg) != "object" || type(cfg.endpoints) != "array" || ep_idx >= length(cfg.endpoints))
+            return false;
+        let ep = cfg.endpoints[ep_idx];
+        if (type(ep) != "object" || type(ep.peers) != "array" || peer_idx >= length(ep.peers))
+            return false;
+        let target = ep.peers[peer_idx];
+        if (type(target) != "object" || target[field] == null)
+            return false;
+        delete target[field];
+        fs.writefile(config_file, sprintf("%J", cfg));
+        return true;
+    }
+
+    let rrule_m = match(norm_reason, /route\.rules\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let drule_m = match(norm_reason, /dns\.rules\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let dsrv_m = match(norm_reason, /dns\.servers\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let sub_m = rrule_m || drule_m || dsrv_m;
+    if (sub_m && sub_m[1] && sub_m[2]) {
+        let idx = int(sub_m[1]);
+        let field = sub_m[2];
+        if (idx < 0) return false;
+        let cfg_text = as_string(fs.readfile(config_file) || "");
+        if (length(cfg_text) == 0) return false;
+        let cfg = json(cfg_text);
+        if (type(cfg) != "object") return false;
+        let arr = null;
+        if (rrule_m) {
+            if (type(cfg.route) != "object" || type(cfg.route.rules) != "array" || idx >= length(cfg.route.rules))
+                return false;
+            arr = cfg.route.rules;
+        } else if (drule_m) {
+            if (type(cfg.dns) != "object" || type(cfg.dns.rules) != "array" || idx >= length(cfg.dns.rules))
+                return false;
+            arr = cfg.dns.rules;
+        } else if (dsrv_m) {
+            if (type(cfg.dns) != "object" || type(cfg.dns.servers) != "array" || idx >= length(cfg.dns.servers))
+                return false;
+            arr = cfg.dns.servers;
+        }
+        let target = arr[idx];
+        if (type(target) != "object") return false;
+        let parts = split(field, ".");
+        let leaf = parts[length(parts) - 1];
+        for (let step = 0; step < length(parts) - 1; step++) {
+            if (type(target) != "object") return false;
+            target = target[parts[step]];
+        }
+        if (type(target) != "object" || target[leaf] == null) return false;
+        delete target[leaf];
+        if (rrule_m || drule_m) {
+            let rule_obj = arr[idx];
+            let non_matcher = rrule_m
+                ? { action: true, outbound: true, server: true, strategy: true, override_address: true, override_port: true, method: true, no_drop: true, sniffer: true, timeout: true, inbound: true }
+                : { action: true, server: true, strategy: true, rewrite_ttl: true, client_subnet: true, disable_cache: true, rcode: true, answer: true, ns: true, extra: true, method: true, no_drop: true };
+            let has_matcher = false;
+            for (let k in keys(rule_obj)) {
+                if (!non_matcher[k]) {
+                    has_matcher = true;
+                    break;
+                }
+            }
+            if (!has_matcher)
+                splice(arr, idx, 1);
+        }
+        fs.writefile(config_file, sprintf("%J", cfg));
+        return true;
+    }
+
+    let out_m = match(norm_reason, /outbounds\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let ep_m = match(norm_reason, /endpoints\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
+    let inb_m = match(norm_reason, /inbounds\[(\d+)\]\.([A-Za-z0-9_.]+): json: unknown field/);
 
     let m = out_m || ep_m || inb_m;
     if (m && m[1] && m[2]) {
@@ -210,7 +254,7 @@ function repair_unknown_outbound_field(config_file, reason) {
         return true;
     }
 
-    let gen_m = match(as_string(reason), /([A-Za-z0-9_.]+): json: unknown field/);
+    let gen_m = match(norm_reason, /([A-Za-z0-9_.]+): json: unknown field/);
     if (gen_m && gen_m[1]) {
         let field = gen_m[1];
         let cfg_text = as_string(fs.readfile(config_file) || "");
@@ -235,25 +279,17 @@ function repair_unknown_outbound_field(config_file, reason) {
     return false;
 }
 
-function check_sing_box_config_with_binary(binary, config_path, library_dir, target_variant) {
+function check_core_config_with_binary(binary, config_path, library_dir) {
     binary = as_string(binary);
     if (binary == "" || !helpers.file_exists(binary))
-        return { ok: false, reason: "sing-box binary not found at " + binary };
+        return { ok: false, reason: "tachyon-core binary not found at " + binary };
 
     helpers.init_tmp_dir();
-    let err_file = helpers.make_tmp_file("sb-chk");
+    let err_file = helpers.make_tmp_file("core-chk");
     if (err_file == "")
         return { ok: true };
 
-    let env_map = {
-        GODEBUG: "madvdontneed=1",
-        GOGC: "30"
-    };
-    // A config check loads every .srs the config references while the daemon
-    // already holds its own copy. Without a ceiling here the second Go runtime
-    // balloons by 40-80 MB of RSS and the OOM killer lands on the daemon.
-    for (let name, value in gomemlimit_env_map())
-        env_map[name] = value;
+    let env_map = {};
     let lib_path = as_string(library_dir || "");
     if (lib_path != "") {
         if (lib_path == "/usr/lib")
@@ -262,47 +298,26 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
             lib_path = lib_path + ":/usr/lib:/lib";
         env_map.LD_LIBRARY_PATH = lib_path;
     }
+    let env_prefix = helpers.command_env(env_map);
+    let env_space = env_prefix != "" ? env_prefix + " " : "";
 
     let ver_out = trim(common.command_output_from_args([ binary, "version" ]));
-    let ver_str = common.parse_sing_box_version(ver_out);
+    let ver_str = common.parse_core_version(ver_out);
     if (ver_str == "") {
         helpers.remove_file(err_file);
         helpers.updates_log("Pre-flight check failed: binary " + binary + " is invalid or unable to report version", "error");
         return { ok: false, reason: "binary unable to report version" };
     }
 
-    let active_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let active_variant = trim(fs.readfile(active_variant_file) || "");
-    let target_var = as_string(target_variant || "");
-    if (target_var == "") {
-        if (index(ver_out, "tachyon-core") >= 0 || index(ver_str, "-tachyon.") >= 0)
-            target_var = "tachyon-core";
-        else if (index(ver_str, "-lx") >= 0)
-            target_var = "lx";
-        else if (index(ver_str, "extended") >= 0)
-            target_var = "extended";
-        else
-            target_var = active_variant != "" ? active_variant : "stable";
-    }
-
-    let is_variant_switch = (target_var != "" && active_variant != "" && target_var != active_variant);
-
     config_path = as_string(config_path || "/etc/tachyon-core/config.json");
 
-    // When changing core/variant, the existing config on disk was built for the
-    // old variant/core and may contain incompatible options (e.g. endpoints[0].amnezia).
-    // Configs must be regenerated for the target variant and checked only after regeneration.
-    if (!is_variant_switch && helpers.file_exists(config_path) && helpers.file_nonempty(config_path)) {
-        let check_cmd = helpers.command_env(env_map) + " " +
+    if (helpers.file_exists(config_path) && helpers.file_nonempty(config_path)) {
+        let check_cmd = env_space +
             common.command_from_args([ binary, "-c", config_path, "check" ]) +
             " >" + common.shell_quote(err_file) + " 2>&1";
         let status = common.command_status(check_cmd);
         if ((status == 247 || status == 137) && fs.stat("/proc/sys/vm/drop_caches") != null) {
             system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
-            env_map.GOGC = "15";
-            check_cmd = helpers.command_env(env_map) + " " +
-                common.command_from_args([ binary, "-c", config_path, "check" ]) +
-                " >" + common.shell_quote(err_file) + " 2>&1";
             status = common.command_status(check_cmd);
         }
 
@@ -312,28 +327,20 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
         }
     }
 
-    let candidate_cfg = helpers.make_tmp_file("sb-cand");
-    let version_file = helpers.make_tmp_file("sb-cand-ver");
-    let variant_file = helpers.make_tmp_file("sb-cand-var");
+    let candidate_cfg = helpers.make_tmp_file("core-cand");
+    let version_file = helpers.make_tmp_file("core-cand-ver");
     let cand_status = -1;
     if (candidate_cfg != "" && version_file != "") {
         fs.writefile(version_file, ver_str + "\n");
-        if (variant_file != "")
-            fs.writefile(variant_file, target_var + "\n");
         let gen_env = {
-            SB_PREFLIGHT_BINARY: binary,
-            SB_VERSION_OVERRIDE: ver_str,
-            SB_VERSION_STATE_FILE: version_file,
+            TACHYON_CORE_PREFLIGHT_BINARY: binary,
+            TACHYON_CORE_VERSION_OVERRIDE: ver_str,
+            TACHYON_CORE_VERSION_FILE: version_file,
             RECORD_FLASH_WEAR: "0"
         };
-        if (variant_file != "")
-            gen_env.SB_VARIANT_STATE_FILE = variant_file;
         if (lib_path != "")
             gen_env.LD_LIBRARY_PATH = lib_path;
-        // The banner itself may still be the only thing naming our core - the
-        // variant file can lag behind it - so the name wins over target_var.
-        let xhttp_marker = index(ver_out, "tachyon-core") >= 0 ? "tachyon-core" : target_var;
-        let target_supports_xhttp = core_profile().supports_xhttp(ver_str, xhttp_marker, ver_out) === true;
+        let target_supports_xhttp = core_profile().supports_xhttp(ver_str, "tachyon-core", ver_out) === true;
         let gen_cmd = helpers.command_env(gen_env) + " " +
             common.command_from_args([
                 "ucode", "-L", helpers.LIB_DIR, helpers.LIB_DIR + "/tachyon_core/generator.uc",
@@ -344,7 +351,7 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
             helpers.remove_file(err_file);
             let repaired = false;
             for (let attempt = 0; attempt < 16; attempt++) {
-                let cand_check_cmd = helpers.command_env(env_map) + " " +
+                let cand_check_cmd = env_space +
                     common.command_from_args([ binary, "-c", candidate_cfg, "check" ]) +
                     " >" + common.shell_quote(err_file) + " 2>&1";
                 cand_status = common.command_status(cand_check_cmd);
@@ -361,11 +368,10 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
                     repaired = false;
                     break;
                 }
-                helpers.updates_log("Pre-flight: the candidate sing-box rejected a field, retrying without it", "warn");
+                helpers.updates_log("Pre-flight: the candidate tachyon-core rejected a field, retrying without it", "warn");
             }
             helpers.remove_file(candidate_cfg);
             helpers.remove_file(version_file);
-            if (variant_file != "") helpers.remove_file(variant_file);
             if (repaired) {
                 helpers.remove_file(err_file);
                 return { ok: true };
@@ -373,7 +379,6 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
         } else {
             helpers.remove_file(candidate_cfg);
             helpers.remove_file(version_file);
-            if (variant_file != "") helpers.remove_file(variant_file);
         }
     }
 
@@ -403,10 +408,10 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
             helpers.updates_log("Pre-flight: no enabled sections yet in configuration, skipping pre-flight check", "info");
             return { ok: true };
         }
-        helpers.updates_log("Pre-flight check failed: unable to generate configuration for " + target_var + ": " + reason, "error");
+        helpers.updates_log("Pre-flight check failed: unable to generate configuration for tachyon-core: " + reason, "error");
     }
     else {
-        helpers.updates_log("Pre-flight check failed: binary " + binary + " rejected config for " + target_var + ": " + reason, "error");
+        helpers.updates_log("Pre-flight check failed: binary " + binary + " rejected config for tachyon-core: " + reason, "error");
     }
     return { ok: false, reason: reason };
 }
@@ -416,11 +421,11 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
 function module_exports() {
     return {
         format_fingerprint_human,
+        normalize_unknown_field_reason,
         repair_unknown_outbound_field,
         verify_package_post_install,
         verify_binary_post_install,
-        validate_sing_box_extended_binary,
-        check_sing_box_config_with_binary
+        check_core_config_with_binary
     };
 }
 

@@ -2,40 +2,194 @@
 
 let common = require("core.common");
 let fs = require("fs");
-let gomemlimit = require("core.gomemlimit");
 let command_from_args = common.command_from_args;
+const MEMINFO_PATH = getenv("TACHYON_MEMINFO_PATH") || "/proc/meminfo";
+
+function mem_total_kb() {
+    let data = fs.readfile(MEMINFO_PATH);
+    if (data == null)
+        return 0;
+    for (let line in split(data, "\n")) {
+        let m = match(line, /^MemTotal:\s+(\d+)\s+kB/);
+        if (m != null)
+            return int(m[1]);
+    }
+    return 0;
+}
 
 const EMPTY_SRS_B64 = "U1JTAXjaYgAEAAD//wABAAE=";
 const EMPTY_SRS_PATH = "/usr/share/tachyon/rulesets/empty.srs";
 // Decoded length of the placeholder above. Derived so the two cannot drift.
 const EMPTY_SRS_SIZE = 17;
 
-const SRS_MAIN_URL = "https://github.com/itdoginfo/allow-domains/releases/latest/download";
 const SRS_ADS_HAGEZI_PRO_URL = "https://github.com/zxc-rv/ad-filter/releases/latest/download/adlist.srs";
-const SRS_SUPERCELL_URL = "https://raw.githubusercontent.com/ushan0v/sing-box-supercell-ruleset/main/supercell.srs";
-const SRS_GITHUB_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/github.srs";
-const SRS_TWITCH_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/twitch.srs";
-const SRS_GEOIP_RU_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/ru.srs";
-const SRS_GEOSITE_RU_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ru.srs";
-const SRS_GEOIP_US_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/us.srs";
-const SRS_GEOIP_CN_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs";
+const SRS_GEOBLOCK_URL = "https://raw.githubusercontent.com/legiz-ru/sb-rule-sets/main/no-russia-hosts.srs";
+const SRS_TACHYON_LISTS_BASE = "https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release/sing-box";
+const TRS_TACHYON_LISTS_BASE = "https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main/release/tachyon";
+const SRS_TACHYON_LISTS_RELEASE_BASE = "https://github.com/Dushnilin/tachyon-lists/releases/latest/download";
+const SRS_ROSCOMVPN_GEOSITE_BASE = "https://raw.githubusercontent.com/hydraponique/roscomvpn-geosite/master/release/sing-box";
+const SRS_RUNETFREEDOM_GEOSITE_BASE = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geosite";
+const SRS_RUNETFREEDOM_GEOIP_BASE = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geoip";
+const SRS_METACUBEX_GEOSITE_BASE = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite";
+const SRS_METACUBEX_GEOIP_BASE = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip";
+
+const ROSCOMVPN_GEOSITE_MAP = {
+    ru_whitelist: "whitelist",
+    push: "push",
+    torrent: "torrent",
+    twitch_ads: "twitch-ads"
+};
+
+const METACUBEX_GEOSITE_MAP = {
+    ukraine_inside: "category-ru",
+    ru_domains: "category-ru",
+    geosite_ru: "category-ru",
+    steam_cdn: "category-game-platforms-download",
+    captive_ntp_stun: "category-ntp",
+    google_ai: "google-gemini",
+    youtube: "youtube",
+    twitch: "twitch",
+    kick: "kick",
+    tiktok: "tiktok",
+    hdrezka: "hdrezka",
+    anime: "anime",
+    pinterest: "pinterest",
+    tmdb_metadata: "tmdb",
+    streaming_west: "disney",
+    books_archives: "archive",
+    podcasts_radio: "pocketcasts",
+    discord: "discord",
+    meta: "facebook",
+    twitter: "twitter",
+    steam: "steam",
+    epicgames: "epicgames",
+    callofduty: "activision-blizzard",
+    riot: "riot",
+    roblox: "roblox",
+    supercell: "supercell",
+    escapefromtarkov: "escapefromtarkov",
+    faceit: "faceit",
+    netease_tencent_games: "netease",
+    japanese_publishers: "konami",
+    fighting_racing: "wbgames",
+    strategy_sim: "category-flight-simulator",
+    meta_quest: "oculus",
+    chess_boardgames: "chesscom",
+    gaming_mods_stats: "category-enhance-gaming",
+    apple: "apple",
+    microsoft: "microsoft",
+    google_play: "google-play",
+    github: "github",
+    hodca: "digicert",
+    paas_db: "vercel",
+    google_services: "google",
+    cloud_gaming_remote: "category-remote-control",
+    cloud_storage: "category-netdisk-!cn",
+    gamedev_3d: "unity",
+    security_passwords: "category-password-management",
+    smarthome_iot: "xiaomi-iot",
+    smarttv_apps: "samsung",
+    smart_cars: "category-automobile-cn",
+    linux_repos: "ubuntu",
+    doh_dot_dns: "category-doh",
+    news: "category-media-ru-blocked",
+    tor: "torproject",
+    porn: "category-porn",
+    travel_booking: "booking",
+    shopping_global: "amazon",
+    edtech_learning: "coursera",
+    win_spy: "win-spy"
+};
+
+const METACUBEX_GEOIP_MAP = {
+    cloudfront: "cloudfront"
+};
+
+const RUNETFREEDOM_GEOSITE_MAP = {
+    russia_inside: "geosite-ru-blocked",
+    block: "geosite-antifilter-download-community",
+    ru_blocked: "geosite-ru-blocked",
+    ru_blocked_all: "geosite-ru-blocked-all",
+    antifilter: "geosite-antifilter-download-community",
+    refilter: "geosite-refilter",
+    russia_outside: "geosite-ru-available-only-inside",
+    ru_only_inside: "geosite-ru-available-only-inside",
+    ai_all: "geosite-category-ai-!cn",
+    openai: "geosite-openai",
+    anthropic: "geosite-anthropic",
+    xai: "geosite-xai",
+    openrouter: "geosite-poe",
+    cursor: "geosite-cursor",
+    perplexity: "geosite-perplexity",
+    copilot: "geosite-github-copilot",
+    deepseek: "geosite-deepseek",
+    midjourney: "geosite-comfy",
+    elevenlabs: "geosite-elevenlabs",
+    huggingface: "geosite-huggingface",
+    spotify: "geosite-spotify",
+    netflix: "geosite-netflix",
+    soundcloud_music: "geosite-soundcloud",
+    rutracker_lampa: "geosite-rutracker",
+    patreon_creators: "geosite-patreon",
+    whatsapp: "geosite-whatsapp",
+    messengers: "geosite-signal",
+    reddit: "geosite-reddit",
+    zoom_teams: "geosite-zoom",
+    linkedin: "geosite-linkedin",
+    games_all: "geosite-category-games-!cn",
+    ubisoft: "geosite-ubisoft",
+    warthunder: "geosite-gaijin",
+    blizzard: "geosite-blizzard",
+    origin: "geosite-ea",
+    xbox: "geosite-xbox",
+    playstation: "geosite-playstation",
+    nintendo: "geosite-nintendo",
+    gog: "geosite-gog",
+    wargaming: "geosite-wargaming",
+    hoyoverse: "geosite-hoyoverse",
+    minecraft: "geosite-mojang",
+    rockstar: "geosite-rockstar",
+    pubg: "geosite-pubg",
+    docker: "geosite-docker",
+    fastly: "geosite-fastly",
+    jetbrains: "geosite-jetbrains",
+    gitlab_notion: "geosite-notion",
+    figma_adobe: "geosite-figma",
+    pkg_registries: "geosite-hashicorp",
+    speedtest: "geosite-ookla-speedtest",
+    crypto: "geosite-category-cryptocurrency",
+    paypal_fintech: "geosite-paypal",
+    xiaomi_smarttv_ads: "geosite-xiaomi@ads"
+};
+
+const RUNETFREEDOM_GEOIP_MAP = {
+    telegram: "geoip-telegram"
+};
 
 const COMMUNITY_SERVICES = {
     russia_inside: true,
     russia_outside: true,
     ukraine_inside: true,
+    belarus_inside: true,
     geoblock: true,
     block: true,
     porn: true,
     news: true,
     anime: true,
     youtube: true,
+    youtube_images: true,
+    tmdb_metadata: true,
+    streaming_west: true,
+    books_archives: true,
+    podcasts_radio: true,
     hdrezka: true,
     tiktok: true,
     google_ai: true,
     google_play: true,
+    google_services: true,
     hodca: true,
     discord: true,
+    discord_voice: true,
     meta: true,
     twitter: true,
     cloudflare: true,
@@ -43,6 +197,8 @@ const COMMUNITY_SERVICES = {
     digitalocean: true,
     hetzner: true,
     ovh: true,
+    vps_clouds: true,
+    doh_dot_dns: true,
     telegram: true,
     roblox: true,
     ads_hagezi_pro: true,
@@ -53,32 +209,158 @@ const COMMUNITY_SERVICES = {
     geosite_ru: true,
     geoip_us: true,
     geoip_cn: true,
-    google_meet: true
+    google_meet: true,
+    ru_whitelist: true,
+    ru_domains: true,
+    ru_only_inside: true,
+    push: true,
+    steam_cdn: true,
+    captive_ntp_stun: true,
+    ru_blocked: true,
+    ru_blocked_all: true,
+    antifilter: true,
+    refilter: true,
+    roscomvpn_whitelist: true,
+    roscomvpn_geoblock: true,
+    roscomvpn_ru: true,
+    roscomvpn_push: true,
+    apple: true,
+    microsoft: true,
+    win_spy: true,
+    steam: true,
+    epicgames: true,
+    riot: true,
+    origin: true,
+    escapefromtarkov: true,
+    faceit: true,
+    callofduty: true,
+    game_backends: true,
+    cs2_dota2: true,
+    survival_coop: true,
+    mmorpg: true,
+    netease_tencent_games: true,
+    japanese_publishers: true,
+    fighting_racing: true,
+    strategy_sim: true,
+    meta_quest: true,
+    chess_boardgames: true,
+    gaming_mods_stats: true,
+    pinterest: true,
+    torrent: true,
+    twitch_ads: true,
+    kick: true,
+    runetfreedom_blocked: true,
+    runetfreedom_blocked_all: true,
+    antifilter_community: true,
+    ru_available_only_inside: true,
+    ai_all: true,
+    openai: true,
+    anthropic: true,
+    xai: true,
+    openrouter: true,
+    cursor: true,
+    perplexity: true,
+    copilot: true,
+    deepseek: true,
+    qwen: true,
+    kimi: true,
+    midjourney: true,
+    elevenlabs: true,
+    huggingface: true,
+    ai_video: true,
+    ai_cloud_gpu: true,
+    spotify: true,
+    netflix: true,
+    soundcloud_music: true,
+    rutracker_lampa: true,
+    patreon_creators: true,
+    whatsapp: true,
+    messengers: true,
+    reddit: true,
+    zoom_teams: true,
+    linkedin: true,
+    games_all: true,
+    ubisoft: true,
+    warthunder: true,
+    blizzard: true,
+    xbox: true,
+    playstation: true,
+    nintendo: true,
+    gog: true,
+    wargaming: true,
+    hoyoverse: true,
+    minecraft: true,
+    rockstar: true,
+    pubg: true,
+    docker: true,
+    tor: true,
+    fastly: true,
+    jetbrains: true,
+    gitlab_notion: true,
+    figma_adobe: true,
+    pkg_registries: true,
+    paas_db: true,
+    captcha_auth: true,
+    cloud_gaming_remote: true,
+    cloud_storage: true,
+    gamedev_3d: true,
+    security_passwords: true,
+    smarthome_iot: true,
+    smarttv_apps: true,
+    smart_cars: true,
+    linux_repos: true,
+    speedtest: true,
+    crypto: true,
+    paypal_fintech: true,
+    travel_booking: true,
+    shopping_global: true,
+    edtech_learning: true,
+    freelance_remote: true,
+    sports_fitness: true,
+    xiaomi_smarttv_ads: true,
+    android_ads_block: true,
+    gambling_block: true,
+    phishing_malware_block: true,
+    telemetry_mobile_block: true,
+    et_spamhaus_block: true,
+    hagezi_tif_ip_block: true,
+    botnet_attackers_ip_block: true
 };
 
 // Classification of community rule-sets based on upstream rule-set generation.
 // Upstream allow-domains (itdoginfo/allow-domains convert.py) compiles:
-// - general lists (russia_inside, russia_outside, ukraine_inside) and category lists as domain-only ("domains");
-// - SUBNET_SERVICES (meta, twitter, telegram, roblox, google_meet)
+// - general lists (russia_inside, russia_outside) and category lists as domain-only ("domains");
+// - SUBNET_SERVICES (meta, twitter, telegram, roblox, google_meet, zoom_teams, discord_voice, callofduty, game_backends, cs2_dota2, doh_dot_dns)
 //   as mixed containing both domain_suffix and ip_cidr ("mixed");
-// - infrastructure / CDN provider lists (cloudflare, cloudfront, hetzner, ovh, digitalocean) as IP subnets ("subnets").
-//   In sing-box 1.14+, these must NOT be placed into DNS response rules (match_response: true) because doing so
+// - infrastructure / CDN provider lists (cloudflare, cloudfront, hetzner, ovh, digitalocean, vps_clouds) as IP subnets ("subnets").
+//   In tachyon-core, these must NOT be placed into DNS response rules (match_response: true) because doing so
 //   causes arbitrary third-party domains hosted behind these CDNs/providers (e.g. mtpro.xyz) to be issued a FakeIP,
 //   discarding the real IP and breaking routing to direct. They are routed purely by destination IP in route.rules.
 // - discord is also treated as subnets: its voice endpoints use Cloudflare Anycast with UDP QUIC (port 443).
-//   FakeIP-ing Discord IP-in-DNS-response causes sing-box to dial tcp for UDP QUIC sessions → i/o timeout.
+//   FakeIP-ing Discord IP-in-DNS-response causes tachyon-core to dial tcp for UDP QUIC sessions → i/o timeout.
 // - geoip_* lists from MetaCubeX/meta-rules-dat contain only ip_cidr ("subnets");
 // - geosite_* lists from MetaCubeX/meta-rules-dat contain only domains ("domains");
-// - external lists (github, twitch, ads_hagezi_pro, supercell) are domain-only ("domains").
+// - external lists (github, twitch, ads_hagezi_pro, supercell) are domain-only ("domains");
+// - lists with kind == "domains" that publish companion IPv4/IPv6 CIDR files
+//   (refilter, antifilter, ru_blocked, ru_blocked_all, ru_domains, ru_whitelist,
+//   fastly, games_all, netflix, origin, pubg, tor) stay classified as "domains"
+//   so DNS rules remain domain-only, while route.rules attach their companion
+//   subnets as a separate `builtin-<id>-subnets-ruleset` when community_subnets is enabled.
 //
-// In sing-box 1.14+, referencing a rule-set with ip_cidr in a DNS rule without match_response: true
+// Referencing a rule-set with ip_cidr in a DNS rule without match_response: true
 // is treated as a deprecated legacy address filter and rejected if query_type is present in DNS configuration.
 const COMMUNITY_SUBNET_SERVICES = {
     meta: true,
     twitter: true,
     telegram: true,
     roblox: true,
-    google_meet: true
+    google_meet: true,
+    zoom_teams: true,
+    discord_voice: true,
+    callofduty: true,
+    game_backends: true,
+    cs2_dota2: true,
+    doh_dot_dns: true
 };
 
 const COMMUNITY_INFRASTRUCTURE_SERVICES = {
@@ -87,28 +369,153 @@ const COMMUNITY_INFRASTRUCTURE_SERVICES = {
     cloudfront: true,
     hetzner: true,
     ovh: true,
-    digitalocean: true
+    digitalocean: true,
+    vps_clouds: true,
+    et_spamhaus_block: true,
+    hagezi_tif_ip_block: true,
+    botnet_attackers_ip_block: true
+};
+
+const TACHYON_LISTS_RELEASE_FALLBACK_SERVICES = {
+    et_spamhaus_block: true,
+    hagezi_tif_ip_block: true,
+    botnet_attackers_ip_block: true
 };
 
 const COMMUNITY_DOMAIN_SERVICES = {
     russia_inside: true,
     russia_outside: true,
     ukraine_inside: true,
+    belarus_inside: true,
     geoblock: true,
     block: true,
     porn: true,
     news: true,
     anime: true,
     youtube: true,
+    youtube_images: true,
+    tmdb_metadata: true,
+    streaming_west: true,
+    books_archives: true,
+    podcasts_radio: true,
     hdrezka: true,
     tiktok: true,
     google_ai: true,
     google_play: true,
+    google_services: true,
     hodca: true,
     ads_hagezi_pro: true,
     supercell: true,
     github: true,
-    twitch: true
+    twitch: true,
+    ru_whitelist: true,
+    ru_domains: true,
+    ru_only_inside: true,
+    push: true,
+    steam_cdn: true,
+    captive_ntp_stun: true,
+    ru_blocked: true,
+    ru_blocked_all: true,
+    antifilter: true,
+    refilter: true,
+    roscomvpn_whitelist: true,
+    roscomvpn_geoblock: true,
+    roscomvpn_ru: true,
+    roscomvpn_push: true,
+    apple: true,
+    microsoft: true,
+    win_spy: true,
+    steam: true,
+    epicgames: true,
+    riot: true,
+    origin: true,
+    escapefromtarkov: true,
+    faceit: true,
+    survival_coop: true,
+    mmorpg: true,
+    netease_tencent_games: true,
+    japanese_publishers: true,
+    fighting_racing: true,
+    strategy_sim: true,
+    meta_quest: true,
+    chess_boardgames: true,
+    gaming_mods_stats: true,
+    pinterest: true,
+    torrent: true,
+    twitch_ads: true,
+    kick: true,
+    runetfreedom_blocked: true,
+    runetfreedom_blocked_all: true,
+    antifilter_community: true,
+    ru_available_only_inside: true,
+    ai_all: true,
+    openai: true,
+    anthropic: true,
+    xai: true,
+    openrouter: true,
+    cursor: true,
+    perplexity: true,
+    copilot: true,
+    deepseek: true,
+    qwen: true,
+    kimi: true,
+    midjourney: true,
+    elevenlabs: true,
+    huggingface: true,
+    ai_video: true,
+    ai_cloud_gpu: true,
+    spotify: true,
+    netflix: true,
+    soundcloud_music: true,
+    rutracker_lampa: true,
+    patreon_creators: true,
+    whatsapp: true,
+    messengers: true,
+    reddit: true,
+    linkedin: true,
+    games_all: true,
+    ubisoft: true,
+    warthunder: true,
+    blizzard: true,
+    xbox: true,
+    playstation: true,
+    nintendo: true,
+    gog: true,
+    wargaming: true,
+    hoyoverse: true,
+    minecraft: true,
+    rockstar: true,
+    pubg: true,
+    docker: true,
+    tor: true,
+    fastly: true,
+    jetbrains: true,
+    gitlab_notion: true,
+    figma_adobe: true,
+    pkg_registries: true,
+    paas_db: true,
+    captcha_auth: true,
+    cloud_gaming_remote: true,
+    cloud_storage: true,
+    gamedev_3d: true,
+    security_passwords: true,
+    smarthome_iot: true,
+    smarttv_apps: true,
+    smart_cars: true,
+    linux_repos: true,
+    speedtest: true,
+    crypto: true,
+    paypal_fintech: true,
+    travel_booking: true,
+    shopping_global: true,
+    edtech_learning: true,
+    freelance_remote: true,
+    sports_fitness: true,
+    xiaomi_smarttv_ads: true,
+    android_ads_block: true,
+    gambling_block: true,
+    phishing_malware_block: true,
+    telemetry_mobile_block: true
 };
 
 let as_string = common.as_string;
@@ -137,37 +544,144 @@ function community_kind(name) {
     return "unknown";
 }
 
-function community_url(name) {
+const TACHYON_LISTS_ALIAS_MAP = {
+    geosite_ru: "ru_domains",
+    roscomvpn_whitelist: "ru_whitelist",
+    roscomvpn_geoblock: "geoblock",
+    roscomvpn_ru: "ru_domains",
+    roscomvpn_push: "push",
+    runetfreedom_blocked: "ru_blocked",
+    runetfreedom_blocked_all: "ru_blocked_all",
+    antifilter_community: "antifilter",
+    ru_available_only_inside: "ru_only_inside"
+};
+
+function is_non_ru_geoip_community(name) {
     name = as_string(name);
+    return match(name, /^geoip_[a-z]{2}$/) != null && name != "geoip_ru";
+}
+
+function should_compact_huge_ruleset(name) {
+    name = as_string(name);
+    if (name != "ru_blocked_all" && name != "runetfreedom_blocked_all")
+        return false;
+    if (getenv("TACHYON_FORCE_FULL_RULESETS") == "1")
+        return false;
+    if (getenv("TACHYON_COMPACT_HUGE_RULESETS") == "1")
+        return true;
+    let total_kb = mem_total_kb();
+    if (total_kb > 0 && total_kb < 786432)
+        return true;
+    return false;
+}
+
+function tachyon_lists_srs_url(name) {
+    name = as_string(name);
+    if (should_compact_huge_ruleset(name))
+        name = "ru_blocked";
+    let canonical = TACHYON_LISTS_ALIAS_MAP[name] || name;
+    let custom_base = as_string(getenv("TACHYON_LISTS_SRS_URL") || "");
+    if (custom_base != "")
+        return replace(custom_base, /\/+$/, "") + "/" + canonical + ".srs";
+    return SRS_TACHYON_LISTS_BASE + "/" + canonical + ".srs";
+}
+
+function tachyon_lists_trs_url(name) {
+    name = as_string(name);
+    if (should_compact_huge_ruleset(name))
+        name = "ru_blocked";
+    let canonical = TACHYON_LISTS_ALIAS_MAP[name] || name;
+    let custom_base = as_string(getenv("TACHYON_LISTS_TRS_URL") || "");
+    if (custom_base != "")
+        return replace(custom_base, /\/+$/, "") + "/" + canonical + ".trs";
+    let custom_srs_base = as_string(getenv("TACHYON_LISTS_SRS_URL") || "");
+    if (custom_srs_base != "")
+        return replace(custom_srs_base, /\/+$/, "") + "/" + canonical + ".trs";
+    return TRS_TACHYON_LISTS_BASE + "/" + canonical + ".trs";
+}
+
+function community_trs_url(name) {
+    name = as_string(name);
+    if (is_non_ru_geoip_community(name))
+        return "";
+    if (COMMUNITY_SERVICES[name] === true)
+        return tachyon_lists_trs_url(name);
+    return "";
+}
+
+function community_trs_urls(name) {
+    name = as_string(name);
+    if (is_non_ru_geoip_community(name) || COMMUNITY_SERVICES[name] !== true)
+        return [];
+    if (should_compact_huge_ruleset(name))
+        name = "ru_blocked";
+    let canonical = TACHYON_LISTS_ALIAS_MAP[name] || name;
+    let custom_trs = as_string(getenv("TACHYON_LISTS_TRS_URL") || "");
+    if (custom_trs != "")
+        return [ replace(custom_trs, /\/+$/, "") + "/" + canonical + ".trs" ];
+    let custom_srs = as_string(getenv("TACHYON_LISTS_SRS_URL") || "");
+    if (custom_srs != "")
+        return [ replace(custom_srs, /\/+$/, "") + "/" + canonical + ".trs" ];
+    return [
+        TRS_TACHYON_LISTS_BASE + "/" + canonical + ".trs"
+    ];
+}
+
+function supports_trs() {
+    if (getenv("TACHYON_DISABLE_TRS") == "1")
+        return false;
+    return true;
+}
+
+function fallback_community_url(name) {
+    name = as_string(name);
+    if (should_compact_huge_ruleset(name))
+        name = "ru_blocked";
+    name = TACHYON_LISTS_ALIAS_MAP[name] || name;
     if (name == "ads_hagezi_pro")
         return SRS_ADS_HAGEZI_PRO_URL;
-    if (name == "supercell")
-        return SRS_SUPERCELL_URL;
-    if (name == "github")
-        return SRS_GITHUB_URL;
-    if (name == "twitch")
-        return SRS_TWITCH_URL;
-    if (name == "geosite_ru")
-        return SRS_GEOSITE_RU_URL;
+    if (name == "geoblock")
+        return SRS_GEOBLOCK_URL;
+    if (ROSCOMVPN_GEOSITE_MAP[name] != null)
+        return SRS_ROSCOMVPN_GEOSITE_BASE + "/" + ROSCOMVPN_GEOSITE_MAP[name] + ".srs";
+    if (METACUBEX_GEOSITE_MAP[name] != null)
+        return SRS_METACUBEX_GEOSITE_BASE + "/" + METACUBEX_GEOSITE_MAP[name] + ".srs";
+    if (METACUBEX_GEOIP_MAP[name] != null)
+        return SRS_METACUBEX_GEOIP_BASE + "/" + METACUBEX_GEOIP_MAP[name] + ".srs";
+    if (RUNETFREEDOM_GEOSITE_MAP[name] != null)
+        return SRS_RUNETFREEDOM_GEOSITE_BASE + "/" + RUNETFREEDOM_GEOSITE_MAP[name] + ".srs";
+    if (RUNETFREEDOM_GEOIP_MAP[name] != null)
+        return SRS_RUNETFREEDOM_GEOIP_BASE + "/" + RUNETFREEDOM_GEOIP_MAP[name] + ".srs";
+    if (TACHYON_LISTS_RELEASE_FALLBACK_SERVICES[name] === true)
+        return SRS_TACHYON_LISTS_RELEASE_BASE + "/" + name + ".srs";
 
     let geoip_match = match(name, /^geoip_([a-z]{2})$/);
     if (geoip_match)
-        return "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + geoip_match[1] + ".srs";
+        return SRS_METACUBEX_GEOIP_BASE + "/" + geoip_match[1] + ".srs";
 
     let geosite_match = match(name, /^geosite_([a-z]{2})$/);
     if (geosite_match)
-        return "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/" + geosite_match[1] + ".srs";
+        return SRS_METACUBEX_GEOSITE_BASE + "/" + geosite_match[1] + ".srs";
 
-    return SRS_MAIN_URL + "/" + name + ".srs";
+    return SRS_TACHYON_LISTS_RELEASE_BASE + "/" + name + ".srs";
+}
+
+function community_url(name) {
+    name = as_string(name);
+    if (!is_non_ru_geoip_community(name) && COMMUNITY_SERVICES[name] === true)
+        return tachyon_lists_srs_url(name);
+
+    return fallback_community_url(name);
 }
 
 function hash12(value) {
     value = as_string(value);
     let first = 2166136261;
     let second = 16777619;
+    let len = length(value);
 
-    for (let i = 0; i < length(value); i++) {
-        let code = ord(substr(value, i, 1));
+    for (let i = 0; i < len; i++) {
+        let code = ord(value, i);
         first = (first * 33 + code) % 4294967296;
         second = (second * 131 + code) % 4294967296;
     }
@@ -240,11 +754,39 @@ function is_valid_srs_file(path) {
     return magic == "SRS";
 }
 
+function is_valid_trs_file(path) {
+    let p = as_string(path);
+    let st = fs.stat(p);
+    if (!st || st.size < 8)
+        return false;
+    let f = fs.open(p, "r");
+    if (!f)
+        return false;
+    let magic = f.read(4);
+    f.close();
+    if (!magic || length(magic) < 3)
+        return false;
+    let m3 = substr(magic, 0, 3);
+    return m3 == "TRS" || magic == "TSRS" || magic == "TCRS";
+}
+
+function is_usable_trs_file(path) {
+    let p = as_string(path);
+    let st = fs.stat(p);
+    if (!st || st.size < 16)
+        return false;
+    return is_valid_trs_file(p);
+}
+
+function is_referenceable_trs_file(path) {
+    return supports_trs() && is_usable_trs_file(path);
+}
+
 // The placeholder this module writes when a list cannot be fetched is itself a
 // syntactically valid SRS of exactly 17 bytes, so is_valid_srs_file() accepts
 // it. Callers that mean "a real list is present locally" therefore treat the
 // placeholder as downloaded: the generator emits `type: local` with no url, so
-// sing-box can never fetch the real list again and the rule silently matches
+// tachyon-core can never fetch the real list again and the rule silently matches
 // nothing. A block rule over an empty list is indistinguishable from no rule at
 // all (TCH-1043), and the only recovery was a manual list update.
 //
@@ -252,29 +794,34 @@ function is_valid_srs_file(path) {
 // magic bytes say. Callers that only need "not corrupt" keep using
 // is_valid_srs_file; callers that need "actually populated" use this.
 // Every cheap measure of an .srs passes on a truncated one: the magic sits at the
-// front and a partial file is still larger than the placeholder. sing-box then dies
+// front and a partial file is still larger than the placeholder. tachyon-core then dies
 // with "parse rule-set: read rule: unexpected EOF" and takes the whole generated
 // config down with it, which leaves the router unapplyable - a red check that no
 // list update can clear, reported on 1.4.9.
 //
 // The payload is a zlib stream, so its real length cannot be read off the header
 // and a size comparison cannot tell a whole file from a prefix of one. Ask
-// sing-box, which is already a dependency, to parse it. One process per list, only
+// tachyon-core, which is already a dependency, to parse it. One process per list, only
 // on the paths that adopt a file, never per generate.
 function srs_file_parses(path) {
     let p = as_string(path);
     if (!is_valid_srs_file(p))
         return false;
 
-    let bin = getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/tachyon-core";
+    let st = fs.stat(p);
+    if (st && int(st.size || 0) > 2097152) {
+        let total_kb = mem_total_kb();
+        if (total_kb > 0 && total_kb < 786432)
+            return true;
+    }
+
+    let bin = getenv("TACHYON_CORE_BIN") || "/usr/bin/tachyon-core";
     if (fs.stat(bin) == null)
         return true;
 
-    // rule-set match is a second Go runtime next to the running daemon; without
-    // a ceiling it is free to balloon exactly like `check` does.
     return common.command_status(
-        gomemlimit.gomemlimit_env() +
-        command_from_args([ bin, "rule-set", "match", "--format", "binary", p, "tachyon-validation.invalid" ])
+        command_from_args([ bin, "rule-set", "match", "--format", "binary", p, "tachyon-validation.invalid" ]) +
+        " >/dev/null"
     ) == 0;
 }
 
@@ -293,7 +840,7 @@ function is_usable_srs_file(path) {
     return is_populated_srs_file(path) && srs_file_parses(path);
 }
 
-// Verifying means spawning sing-box, so remember what has already been verified
+// Verifying means spawning tachyon-core, so remember what has already been verified
 // and skip the spawn while the file is the same one we checked. The marker sits in
 // tmpfs next to the files it describes, so it cannot outlive them and no verdict
 // survives the file changing underneath it - which is also why the stamp carries
@@ -331,7 +878,7 @@ function remember_srs_file_verified(path) {
 
 // The check for a file we are about to keep but have maybe already checked. The
 // /tmp copy used to be trusted outright, which left a file downloaded by an older
-// Tachyon in place forever: it passed the cheap test, sing-box died on it, and no
+// Tachyon in place forever: it passed the cheap test, tachyon-core died on it, and no
 // apply could recover because the copy that was broken was the one believed.
 function is_adoptable_srs_file(path) {
     if (!is_populated_srs_file(path))
@@ -344,17 +891,17 @@ function is_adoptable_srs_file(path) {
     return true;
 }
 
-// Whether a generated config may point at this file. That needs sing-box to be
+// Whether a generated config may point at this file. That needs tachyon-core to be
 // able to read it, and it is not the same question as "is a real list here": the
 // placeholder is a valid, parseable SRS that simply matches nothing, and it exists
 // so a cold boot without a network still applies. Referencing it locally is right;
-// emitting a remote rule-set instead puts the fetch back into sing-box's startup,
+// emitting a remote rule-set instead puts the fetch back into tachyon-core's startup,
 // and a GitHub hiccup then kills the core with "initialize rule-set: context
 // deadline exceeded" - the failure prepare_community_rulesets() exists to avoid.
 //
 // A truncated list is the opposite case: valid magic, larger than the placeholder,
 // and unreadable. It must never be referenced, so the generator falls through to
-// the remote branch and sing-box fetches a whole list itself.
+// the remote branch and tachyon-core fetches a whole list itself.
 function is_referenceable_srs_file(path) {
     let p = as_string(path);
     if (!is_valid_srs_file(p))
@@ -396,6 +943,13 @@ function module_exports() {
         COMMUNITY_DOMAIN_SERVICES,
         COMMUNITY_INFRASTRUCTURE_SERVICES,
         is_community,
+        should_compact_huge_ruleset,
+        tachyon_lists_srs_url,
+        tachyon_lists_trs_url,
+        community_trs_url,
+        community_trs_urls,
+        supports_trs,
+        fallback_community_url,
         community_url,
         community_kind,
         hash12,
@@ -404,6 +958,9 @@ function module_exports() {
         remote_format,
         is_plain_list_reference,
         is_valid_srs_file,
+        is_valid_trs_file,
+        is_usable_trs_file,
+        is_referenceable_trs_file,
         is_populated_srs_file,
         srs_file_parses,
         srs_file_already_verified,
@@ -443,6 +1000,6 @@ else if (mode == "is-referenceable-srs-file")
 else if (mode == "ensure-empty-srs-stub")
     exit(ensure_empty_srs_stub(ARGV[1]) ? 0 : 1);
 else {
-    warn("Usage: singbox/rulesets.uc <file-extension|is-community|community-kind|kind-from-reference-hint|remote-format|is-valid-srs-file|is-usable-srs-file|is-adoptable-srs-file|is-referenceable-srs-file|ensure-empty-srs-stub> ...\n");
+    warn("Usage: tachyon_core/rulesets.uc <file-extension|is-community|community-kind|kind-from-reference-hint|remote-format|is-valid-srs-file|is-usable-srs-file|is-adoptable-srs-file|is-referenceable-srs-file|ensure-empty-srs-stub> ...\n");
     exit(1);
 }

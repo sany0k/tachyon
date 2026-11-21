@@ -5,11 +5,6 @@ let helpers = require("core.helpers");
 let uci_core = require("core.uci");
 let fixture_uci_data = null;
 let subscription_parser_module = null;
-let zapret_validator_module = null;
-let zapret2_validator_module = null;
-let byedpi_validator_module = null;
-let wdtt_validator_module = null;
-let olcrtc_validator_module = null;
 let constants_module = null;
 let core_url = require("core.url");
 let core_ip = require("core.ip");
@@ -32,6 +27,12 @@ let bool_flag = bool_value;
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const DEFAULT_LATENCY_TEST_URL = "https://www.gstatic.com/generate_204";
 const TAILSCALE_FWMARK_MASK = 0x00ff0000;
+const VALIDATOR_QUARANTINED_FILE = getenv("TACHYON_VALIDATOR_QUARANTINED_FILE") || "/var/run/tachyon/validator-quarantined.json";
+const SECTION_ERRORS_FILE = getenv("TACHYON_SECTION_ERRORS_FILE") || "/var/run/tachyon/section-errors.json";
+
+let runtime_quarantine_mode = false;
+let current_validating_section = "";
+let runtime_quarantined_sections = {};
 
 function read_stdin() {
     let input = fs.open("/dev/stdin", "r");
@@ -133,7 +134,8 @@ function bool_option(section, key, fallback) {
     if (fallback == null)
         fallback = false;
 
-    let value = option(section, key, fallback ? "1" : "0");
+    let raw = trim(option(section, key, ""));
+    let value = raw == "" ? (fallback ? "1" : "0") : lc(raw);
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
@@ -166,7 +168,114 @@ function log_message(message, level) {
     run_args([ "logger", "-t", "tachyon", "[" + level + "] " + as_string(message) ]);
 }
 
+function expand_validation_error(message) {
+    let raw = trim(as_string(message || ""));
+    let clean = replace(raw, /[ \t]*Aborted\.?$/i, "");
+    if (index(clean, "Причина:") >= 0)
+        return clean;
+
+    let hint = "";
+    if (index(clean, "has no routing conditions") >= 0 || index(clean, "must contain at least one domain condition") >= 0)
+        hint = "Причина: у секции не заданы условия маршрутизации (домены, списки сервисов, IP/подсети или устройства). Решение: привяжите условие во вкладке «Секции», укажите домены или включите «Весь трафик» / Mixed Proxy.";
+    else if (index(clean, "references missing condition") >= 0)
+        hint = "Причина: секция ссылается на удалённое условие. Решение: откройте секцию и обновите список привязанных условий.";
+    else if (index(clean, "references missing outbound source") >= 0 || index(clean, "references missing outbound group") >= 0)
+        hint = "Причина: секция или группа ссылается на удалённый источник серверов. Решение: проверьте привязку во вкладке «Пул серверов» и в настройках секции.";
+    else if (index(clean, "references missing balancer") >= 0)
+        hint = "Причина: секция ссылается на удалённый шаблон автовыбора. Решение: выберите существующий шаблон автовыбора или создайте новый.";
+    else if (index(clean, "Duplicate JSON outbound tag") >= 0)
+        hint = "Причина: обнаружены дублирующиеся теги (\"tag\") среди JSON-объектов outbound в одной секции. Решение: убедитесь, что у каждого JSON-объекта указан уникальный \"tag\", или удалите дублирующуюся привязку источника.";
+    else if (index(clean, "JSON outbound") >= 0 || index(clean, "outbound_json") >= 0)
+        hint = "Причина: пустой или синтаксически некорректный JSON-объект outbound. Решение: проверьте JSON-конфигурацию прокси и наличие обязательного поля \"type\" и уникального \"tag\".";
+    else if (index(clean, "Outbound cascade") >= 0)
+        hint = "Причина: цепочка каскадирования (detour) ссылается на отключённую/несуществующую секцию или образует замкнутый цикл. Решение: выберите активную прокси/VPN секцию для каскада или отключите каскадирование.";
+    else if (index(clean, "Section group") >= 0)
+        hint = "Причина: группа секций не содержит активных прокси/VPN секций или ссылается на удалённую секцию. Решение: добавьте хотя бы одну включённую секцию в группу.";
+    else if (index(clean, "reserved internal Tachyon port") >= 0)
+        hint = "Причина: входящий сервер использует зарезервированный системный порт Tachyon (1602, 1053 или 5354). Решение: измените порт прослушивания (например, на 8443 или 443) во вкладке «Входящие серверы».";
+    else if (index(clean, "routing section") >= 0 || index(clean, "routing mode") >= 0)
+        hint = "Причина: входящий сервер настроен на маршрутизацию через секцию, которая отключена, удалена или не поддерживает исходящий прокси. Решение: выберите активную секцию маршрутизации в настройках входящего сервера.";
+    else if (index(clean, "MTProto") >= 0)
+        hint = "Причина: некорректный секрет MTProto или выбранное ядро не поддерживает протокол MTProto. Решение: проверьте формат секрета или переключите вариант ядра.";
+    else if (index(clean, "Tailscale") >= 0 || index(clean, "tailscale") >= 0)
+        hint = "Причина: ошибка конфигурации Tailscale (отсутствует Auth Key или некорректные параметры сети). Решение: укажите ключ авторизации и проверьте параметры Tailscale.";
+    else if (index(clean, "AmneziaWG") >= 0 || index(clean, "awg_") >= 0)
+        hint = "Причина: параметры AmneziaWG несовместимы с установленным вариантом ядра или заполнены некорректно. Решение: проверьте ключи и параметры обфускации AWG.";
+    else if (index(clean, "FPTN") >= 0 || index(clean, "fptn") >= 0)
+        hint = "Причина: отсутствует или повреждён токен доступа FPTN (fptn://...). Решение: вставьте корректный токен FPTN в пуле серверов или настройках секции.";
+    else if (index(clean, "Desync") >= 0 || index(clean, "desync") >= 0)
+        hint = "Причина: некорректные параметры секции desync. Решение: проверьте пресет и параметры фрагментации в настройках секции.";
+    else if (index(clean, "DNS") >= 0 || index(clean, "dns") >= 0)
+        hint = "Причина: некорректный адрес DNS-сервера, неподдерживаемый протокол или отсутствуют доменные условия для маршрутизируемого DNS. Решение: проверьте настройки DNS в секции.";
+    else if (index(clean, "Subscription") >= 0 || index(clean, "subscription") >= 0 || index(clean, "proxy link") >= 0)
+        hint = "Причина: некорректный URL подписки, прокси-ссылка или параметры обновления. Решение: проверьте адрес подписки/ссылки во вкладке «Пул серверов».";
+    else if (index(clean, "does not support") >= 0 || index(clean, "only supported by") >= 0 || index(clean, "not installed") >= 0)
+        hint = "Причина: выбранный протокол или функция не поддерживается установленным ядром. Решение: установите подходящий компонент во вкладке «Компоненты» или измените тип секции.";
+    else
+        hint = "Причина: ошибка в параметрах секции. Решение: проверьте выделенные поля в настройках этой секции.";
+
+    return clean + " — " + hint;
+}
+
+function extract_quarantine_target(message) {
+    if (current_validating_section != "")
+        return current_validating_section;
+    let text = as_string(message || "");
+    let m = match(text, /(Rule|Section|Server|Section group|rule|section|server) '([A-Za-z0-9_]+)'/);
+    if (m && m[2] != "settings")
+        return m[2];
+    let m2 = match(text, /rule\.([A-Za-z0-9_]+)\./);
+    if (m2 && m2[1] != "settings")
+        return m2[1];
+    return "";
+}
+
+function record_runtime_quarantine(target, message) {
+    target = as_string(target || "");
+    if (target == "")
+        return false;
+    let expanded = expand_validation_error(message);
+    if (runtime_quarantined_sections[target] == null)
+        runtime_quarantined_sections[target] = expanded;
+    log_message("Section/server '" + target + "' quarantined during validation: " + expanded, "warn");
+    return true;
+}
+
+function persist_validator_quarantine() {
+    if (!runtime_quarantine_mode)
+        return;
+    let prev_quarantined = object_or_empty(read_json_file(VALIDATOR_QUARANTINED_FILE));
+    let existing_errors = object_or_empty(read_json_file(SECTION_ERRORS_FILE));
+    let changed_existing = false;
+    for (let k in keys(prev_quarantined)) {
+        if (runtime_quarantined_sections[k] == null && existing_errors[k] != null) {
+            delete existing_errors[k];
+            changed_existing = true;
+        }
+    }
+    let has_any = false;
+    for (let k in keys(runtime_quarantined_sections)) {
+        has_any = true;
+        existing_errors[k] = runtime_quarantined_sections[k];
+    }
+    if (has_any) {
+        common.write_json_file(VALIDATOR_QUARANTINED_FILE, runtime_quarantined_sections);
+        common.write_json_file(SECTION_ERRORS_FILE, existing_errors);
+    } else {
+        common.remove_file(VALIDATOR_QUARANTINED_FILE);
+        if (length(keys(existing_errors)) == 0)
+            common.remove_file(SECTION_ERRORS_FILE);
+        else if (changed_existing)
+            common.write_json_file(SECTION_ERRORS_FILE, existing_errors);
+    }
+}
+
 function fail_requirement(message, level) {
+    if (runtime_quarantine_mode) {
+        let target = extract_quarantine_target(message);
+        if (target != "" && record_runtime_quarantine(target, message))
+            die("__TACHYON_QUARANTINE__");
+    }
     log_message(message, level || "error");
     exit(1);
 }
@@ -382,7 +491,8 @@ function ruleset_reference_valid(reference, community_services) {
     return reference == "" ||
         community_service_valid(reference, community_services) ||
         remote_reference(reference) ||
-        absolute_reference_with_extension(reference, ".srs", ".json") ||
+        absolute_reference_with_extension(reference, ".trs", ".srs") ||
+        absolute_reference_with_extension(reference, ".json", null) ||
         absolute_reference_with_extension(reference, ".lst", ".txt");
 }
 
@@ -406,12 +516,21 @@ function valid_inbound() {
 
 function outbound_detour_source_action(action) {
     action = as_string(action);
-    return connections.is_connections_action(action) || action == "awg" || action == "fptn";
+    return connections.is_connections_action(action) || action == "awg" || action == "fptn" ||
+        action == "warp" || action == "anytls" || action == "snell" || action == "mieru" ||
+        action == "naive" || action == "sudoku" || action == "masque" || action == "openvpn" ||
+        action == "openconnect" || action == "tewfai" || action == "csqtt" || action == "trusttunnel" ||
+        action == "mtproto" || action == "shadowtls" || action == "desync" || action == "tailscale";
 }
 
 function outbound_detour_target_action(action) {
     action = as_string(action);
-    return connections.is_connections_action(action) || action == "awg" || action == "fptn";
+    return connections.is_connections_action(action) || action == "awg" || action == "fptn" ||
+        action == "warp" || action == "anytls" || action == "snell" || action == "mieru" ||
+        action == "naive" || action == "sudoku" || action == "masque" || action == "openvpn" ||
+        action == "openconnect" || action == "tewfai" || action == "csqtt" || action == "trusttunnel" ||
+        action == "mtproto" || action == "shadowtls" || action == "desync" ||
+        action == "chain" || action == "tailscale";
 }
 
 function outbound_detour_rows() {
@@ -475,11 +594,21 @@ function outbound_detour_chain_reaches_source(by_section, source_section, curren
 }
 
 function fail_outbound_detour(message) {
+    if (runtime_quarantine_mode) {
+        let target = extract_quarantine_target(message);
+        if (target != "" && record_runtime_quarantine(target, message))
+            die("__TACHYON_QUARANTINE__");
+    }
     print(message, "\n");
     exit(1);
 }
 
 function fail_validation(message) {
+    if (runtime_quarantine_mode) {
+        let target = extract_quarantine_target(message);
+        if (target != "" && record_runtime_quarantine(target, message))
+            die("__TACHYON_QUARANTINE__");
+    }
     print(message, "\n");
     // A start that aborts on an invalid config has to leave a trace. The user runs
     // it from a console, watches the message scroll by, and then logread shows
@@ -496,35 +625,44 @@ function validate_outbound_detours_rows(rows) {
     for (let row in parsed.rows) {
         if (!row.enabled || !row.detour_enabled)
             continue;
+        if (runtime_quarantine_mode && runtime_quarantined_sections[row.section] != null)
+            continue;
 
-        if (!outbound_detour_source_action(row.action))
-            fail_outbound_detour("Outbound cascade is supported only for Connection and AmneziaWG rules, but rule '" +
-                row.section + "' uses action '" + row.action + "'. Aborted.");
+        current_validating_section = row.section;
+        try {
+            if (!outbound_detour_source_action(row.action))
+                fail_outbound_detour("Outbound cascade is supported only for Connection and AmneziaWG rules, but rule '" +
+                    row.section + "' uses action '" + row.action + "'. Aborted.");
 
-        if (row.detour_section == "")
-            fail_outbound_detour("Outbound cascade is enabled for rule '" + row.section +
-                "', but no intermediate rule is selected. Aborted.");
+            if (row.detour_section == "")
+                fail_outbound_detour("Outbound cascade is enabled for rule '" + row.section +
+                    "', but no intermediate rule is selected. Aborted.");
 
-        if (row.detour_section == row.section)
-            fail_outbound_detour("Outbound cascade for rule '" + row.section + "' cannot point to itself. Aborted.");
+            if (row.detour_section == row.section)
+                fail_outbound_detour("Outbound cascade for rule '" + row.section + "' cannot point to itself. Aborted.");
 
-        let target = parsed.by_section[row.detour_section];
-        if (type(target) != "object")
-            fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references missing rule '" +
-                row.detour_section + "'. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
+            let target = parsed.by_section[row.detour_section];
+            if (type(target) != "object")
+                fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references missing rule '" +
+                    row.detour_section + "'. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
 
-        if (!target.enabled)
-            fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references disabled rule '" +
-                row.detour_section + "'. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
+            if (!target.enabled || (runtime_quarantine_mode && runtime_quarantined_sections[row.detour_section] != null))
+                fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references disabled rule '" +
+                    row.detour_section + "'. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
 
-        if (!outbound_detour_target_action(target.action))
-            fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references rule '" +
-                row.detour_section + "', but it is not a Connection or AmneziaWG rule. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
+            if (!outbound_detour_target_action(target.action))
+                fail_outbound_detour("Outbound cascade for rule '" + row.section + "' references rule '" +
+                    row.detour_section + "', but it is not a Connection or AmneziaWG rule. Select an enabled Connection or AmneziaWG rule or disable cascade connection. Aborted.");
 
-        if (outbound_detour_chain_reaches_source(parsed.by_section, row.section, row.detour_section))
-            fail_outbound_detour("Outbound cascade for rule '" + row.section + "' creates a cycle through '" +
-                row.detour_section + "'. Aborted.");
-
+            if (outbound_detour_chain_reaches_source(parsed.by_section, row.section, row.detour_section))
+                fail_outbound_detour("Outbound cascade for rule '" + row.section + "' creates a cycle through '" +
+                    row.detour_section + "'. Aborted.");
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
     }
 }
 
@@ -551,25 +689,22 @@ function basic_rule_rows() {
     return rows;
 }
 
-function download_section_action_available(action, byedpi_installed, zapret_installed, zapret2_installed) {
+function download_section_action_available(action) {
     action = as_string(action);
     if (connections.is_connections_action(action))
         return true;
     if (action == "fptn" || action == "awg" || action == "warp" ||
-        action == "anytls" || action == "snell" || action == "mieru" ||
-        action == "sudoku" || action == "masque" || action == "openvpn")
+        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" ||
+        action == "sudoku" || action == "masque" || action == "openvpn" || action == "openconnect" ||
+        action == "tewfai" || action == "csqtt" || action == "wdtt" || action == "trusttunnel" ||
+        action == "mtproto" || action == "shadowtls" ||
+        action == "desync" || action == "chain" || action == "tailscale" || action == "group")
         return true;
-    if (action == "byedpi")
-        return bool_flag(byedpi_installed);
-    if (action == "zapret")
-        return bool_flag(zapret_installed);
-    if (action == "zapret2")
-        return bool_flag(zapret2_installed);
 
     return false;
 }
 
-function validate_download_section_rows(target_section, byedpi_installed, zapret_installed, zapret2_installed, rows) {
+function validate_download_section_rows(target_section, rows) {
     target_section = as_string(target_section);
 
     if (target_section == "")
@@ -588,7 +723,7 @@ function validate_download_section_rows(target_section, byedpi_installed, zapret
             continue;
 
         enabled = true;
-        if (download_section_action_available(row.action, byedpi_installed, zapret_installed, zapret2_installed))
+        if (download_section_action_available(row.action))
             outbound = true;
     }
 
@@ -602,11 +737,11 @@ function validate_download_section_rows(target_section, byedpi_installed, zapret
 
     if (!outbound)
         fail_validation("Downloading external resources through a section references rule '" + target_section +
-            "', but it cannot provide an outbound. Select an enabled Connection, Zapret, Zapret2, or ByeDPI rule with its provider installed, or disable the option. Aborted.");
+            "', but it cannot provide an outbound. Select an enabled Connection, Desync, or VPN rule, or disable the option. Aborted.");
 }
 
-function validate_download_section(target_section, byedpi_installed, zapret_installed, zapret2_installed) {
-    validate_download_section_rows(target_section, byedpi_installed, zapret_installed, zapret2_installed, basic_rule_rows());
+function validate_download_section(target_section) {
+    validate_download_section_rows(target_section, basic_rule_rows());
 }
 
 function dhcp_has_https_dns_proxy_options(path) {
@@ -626,8 +761,11 @@ function dhcp_has_https_dns_proxy_options_exit(path) {
 
 function mwan3_has_enabled_interface_text(data) {
     let prefix = "mwan3.";
+    let kmwan_prefix = "kmwan.";
     let sections = {};
     let enabled = {};
+    let kmwan_members = {};
+    let kmwan_disabled = {};
 
     for (let line in split(as_string(data), "\n")) {
         let equals = index(as_string(line), "=");
@@ -636,25 +774,46 @@ function mwan3_has_enabled_interface_text(data) {
 
         let key = substr(line, 0, equals);
         let value = uci_show_list_value(substr(line, equals + 1));
-        if (!string_starts_with(key, prefix))
-            continue;
+        if (string_starts_with(key, prefix)) {
+            let rest = substr(key, length(prefix));
+            if (index(rest, ".") < 0) {
+                if (value == "interface")
+                    sections[key] = true;
+                continue;
+            }
 
-        let rest = substr(key, length(prefix));
-        if (index(rest, ".") < 0) {
-            if (value == "interface")
-                sections[key] = true;
+            let option_dot = rindex(key, ".");
+            let section = substr(key, 0, option_dot);
+            let option = substr(key, option_dot + 1);
+            if (option == "enabled")
+                enabled[section] = value;
             continue;
         }
 
-        let option_dot = rindex(key, ".");
-        let section = substr(key, 0, option_dot);
-        let option = substr(key, option_dot + 1);
-        if (option == "enabled")
-            enabled[section] = value;
+        if (string_starts_with(key, kmwan_prefix)) {
+            let rest = substr(key, length(kmwan_prefix));
+            if (index(rest, ".") < 0) {
+                if (value == "member")
+                    kmwan_members[key] = true;
+                continue;
+            }
+
+            let option_dot = rindex(key, ".");
+            let section = substr(key, 0, option_dot);
+            let option = substr(key, option_dot + 1);
+            if (option == "disabled")
+                kmwan_disabled[section] = value;
+            else if (option == "enabled" && value == "0")
+                kmwan_disabled[section] = "1";
+        }
     }
 
     for (let section, _ in sections)
         if (enabled[section] == "1")
+            return true;
+
+    for (let section, _ in kmwan_members)
+        if (kmwan_disabled[section] != "1")
             return true;
 
     return false;
@@ -671,15 +830,53 @@ function mwan3_has_enabled_interface_from_sections() {
     return false;
 }
 
+function kmwan_has_enabled_member_from_sections() {
+    for (let section in uci_core.section_objects("kmwan", "member"))
+        if (option(section, "disabled", "0") != "1" && option(section, "enabled", "1") != "0")
+            return true;
+    return false;
+}
+
+function kmwan_is_active() {
+    if (!file_nonempty("/etc/config/kmwan"))
+        return false;
+    if (!file_executable("/etc/init.d/kmwan") && !file_nonempty("/proc/gl-kmwan/config"))
+        return false;
+    if (!kmwan_has_enabled_member_from_sections())
+        return false;
+    return file_nonempty("/proc/gl-kmwan/config") ||
+        command_success_from_args([ "/etc/init.d/kmwan", "status" ]) ||
+        command_success_from_args([ "/etc/init.d/kmwan", "enabled" ]);
+}
+
+function multiwan_network_interfaces_active() {
+    let wan_count = 0;
+    for (let section in uci_core.section_objects("network", "interface")) {
+        let name = lc(trim(as_string(section[".name"] || "")));
+        if (name == "" || substr(name, -1) == "6")
+            continue;
+        if (match(name, /^(wan|wan[0-9]+|wanb|secondwan|wwan[0-9]*|lte[0-9]*|modem[0-9]*|tethering[0-9]*)$/) == null)
+            continue;
+        if (option(section, "proto", "") == "")
+            continue;
+        if (option(section, "disabled", "0") == "1" || option(section, "auto", "1") == "0")
+            continue;
+        wan_count++;
+        if (wan_count >= 2)
+            return true;
+    }
+    return false;
+}
+
 function mwan3_is_active() {
-    if (!file_executable("/etc/init.d/mwan3") || !file_nonempty("/etc/config/mwan3"))
-        return false;
-
-    if (!mwan3_has_enabled_interface_from_sections())
-        return false;
-
-    return command_success_from_args([ "/etc/init.d/mwan3", "status" ]) ||
-        command_success_from_args([ "/etc/init.d/mwan3", "enabled" ]);
+    if (file_executable("/etc/init.d/mwan3") && file_nonempty("/etc/config/mwan3") && mwan3_has_enabled_interface_from_sections()) {
+        if (command_success_from_args([ "/etc/init.d/mwan3", "status" ]) ||
+            command_success_from_args([ "/etc/init.d/mwan3", "enabled" ]))
+            return true;
+    }
+    if (kmwan_is_active())
+        return true;
+    return multiwan_network_interfaces_active();
 }
 
 let parse_number = common.parse_number;
@@ -690,15 +887,9 @@ function subscription_parser() {
     return subscription_parser_module;
 }
 
-function zapret_validator() {
-    if (zapret_validator_module == null)
-        zapret_validator_module = require("providers.zapret.validator");
-    return zapret_validator_module;
-}
-
 // Lazy on purpose: config_validator_runtime.sh runs this module against a
 // deliberately partial -L tree (core, config, subscription, providers) to pin
-// that validating a config never needs the singbox module tree loaded. A
+// that validating a config never needs the tachyon_core module tree loaded. A
 // top-level require put that contract back in reach of any future edit.
 function core_profile() {
     if (core_profile_module == null)
@@ -706,28 +897,65 @@ function core_profile() {
     return core_profile_module;
 }
 
-function zapret2_validator() {
-    if (zapret2_validator_module == null)
-        zapret2_validator_module = require("providers.zapret2.validator");
-    return zapret2_validator_module;
+function parse_wdtt_query_string(query) {
+    let params = {};
+    if (query == "" || query == null)
+        return params;
+    for (let pair in split(query, "&")) {
+        let kv = split(pair, "=", 2);
+        if (length(kv) == 2)
+            params[kv[0]] = core_url.decode(kv[1]);
+        else if (length(kv) == 1)
+            params[kv[0]] = "";
+    }
+    return params;
 }
 
-function byedpi_validator() {
-    if (byedpi_validator_module == null)
-        byedpi_validator_module = require("providers.byedpi.validator");
-    return byedpi_validator_module;
-}
+function parse_wdtt_uri(value) {
+    value = trim(as_string(value));
+    let lower = lc(value);
+    if (substr(lower, 0, 7) != "wdtt://" && substr(lower, 0, 8) != "csqtt://" && substr(lower, 0, 8) != "qwdtt://")
+        return { valid: false, reason: "URI must start with wdtt://, csqtt://, or qwdtt://" };
 
-function wdtt_validator() {
-    if (wdtt_validator_module == null)
-        wdtt_validator_module = require("providers.wdtt.validator");
-    return wdtt_validator_module;
-}
+    let sep = index(value, "://");
+    let rest = substr(value, sep + 3);
+    let hash_idx = index(rest, "#");
+    let label = "";
+    if (hash_idx >= 0) {
+        label = substr(rest, hash_idx + 1);
+        rest = substr(rest, 0, hash_idx);
+    }
 
-function olcrtc_validator() {
-    if (olcrtc_validator_module == null)
-        olcrtc_validator_module = require("providers.olcrtc.validator");
-    return olcrtc_validator_module;
+    if (substr(lower, 0, 8) == "csqtt://" && index(rest, ":") < 0 && index(rest, "?") < 0 && index(rest, "@") < 0 && length(rest) >= 16)
+        return { valid: true, peer: "", hashes: "", pass: "", workers: "", port: "", label: label };
+
+    let qpos = index(rest, "?");
+    let query_part = qpos >= 0 ? substr(rest, qpos + 1) : rest;
+    let params = parse_wdtt_query_string(query_part);
+    let peer = params.peer || params.host || params.ip || params.server || "";
+    let hashes = params.hashes || params.hash || "";
+    let pass = params.pass || params.password || "";
+    let workers = params.workers || params.streams || "";
+    let port = params.port || params.dtls || "";
+
+    if (peer == "" && substr(lower, 0, 7) == "wdtt://" && index(rest, ":") < 0 && index(rest, "?") < 0)
+        return { valid: true, peer: "", hashes: hashes, pass: pass, workers: workers, port: port, label: label };
+
+    if (peer == "" && index(rest, ":") >= 0 && index(rest, "?") < 0)
+        peer = split(rest, ":")[0] || "";
+
+    if (peer == "")
+        return { valid: false, reason: "wdtt/csqtt URI must contain peer or host parameter" };
+
+    return {
+        valid: true,
+        peer: peer,
+        hashes: hashes,
+        pass: pass,
+        workers: workers,
+        port: port,
+        label: label
+    };
 }
 
 function runtime_constants() {
@@ -754,7 +982,7 @@ function fixture_get_section(section_name) {
     if (section_name == "settings" && type(fixture.settings) == "object")
         return fixture.settings;
 
-    for (let type_name in [ "settings", "server", "section", "subscription_url", "section_interface", "urltest", "priority_group", "priority_level" ]) {
+    for (let type_name in [ "settings", "server", "section", "subscription_url", "section_interface", "urltest", "priority_group", "priority_level", "condition", "outbound_source", "outbound_group", "balancer" ]) {
         for (let section in fixture_section_list(type_name)) {
             if (as_string(section[".name"]) == section_name)
                 return section;
@@ -820,18 +1048,22 @@ function rule_action(section) {
 function rule_action_supported(action) {
     return contains([ "connection", "proxy", "outbound", "vpn", "awg", "warp",
         "anytls", "snell", "mieru", "naive", "sudoku", "masque", "openvpn",
-        "bypass", "block", "dns", "zapret", "zapret2", "byedpi", "hosts",
-        "wdtt", "olcrtc", "fptn", "group" ], as_string(action));
+        "openconnect", "tewfai", "csqtt", "trusttunnel", "mtproto", "shadowtls",
+        "desync", "chain", "tailscale",
+        "bypass", "block", "dns", "hosts",
+        "wdtt", "fptn", "group" ], as_string(action));
 }
 
 function server_routing_section_action_supported(action) {
     return contains([ "connection", "proxy", "outbound", "vpn", "awg", "warp",
         "anytls", "snell", "mieru", "naive", "sudoku", "masque", "openvpn",
-        "zapret", "zapret2", "byedpi", "wdtt", "olcrtc", "fptn" ], as_string(action));
+        "openconnect", "tewfai", "csqtt", "trusttunnel", "mtproto", "shadowtls",
+        "desync", "chain", "tailscale",
+        "wdtt", "fptn", "group" ], as_string(action));
 }
 
 // A group member must be a section that actually produces proxy outbounds:
-// no nested groups, no DPI engines, no markers, no route-only sections.
+// no nested groups, no desync-only sections, no markers, no route-only sections.
 function group_member_action_supported(action) {
     action = as_string(action);
     if (action == "group")
@@ -839,7 +1071,10 @@ function group_member_action_supported(action) {
     return connections.is_connections_action(action) ||
         action == "awg" || action == "warp" ||
         action == "anytls" || action == "snell" || action == "mieru" || action == "naive" ||
-        action == "sudoku" || action == "masque" || action == "openvpn" || action == "fptn";
+        action == "sudoku" || action == "masque" || action == "openvpn" || action == "openconnect" ||
+        action == "tewfai" || action == "csqtt" || action == "wdtt" || action == "trusttunnel" ||
+        action == "mtproto" || action == "shadowtls" ||
+        action == "chain" || action == "tailscale" || action == "fptn";
 }
 
 function validate_group_members(section, sections) {
@@ -850,6 +1085,8 @@ function validate_group_members(section, sections) {
             "' has no members. Add at least one Connection, VPN or AmneziaWG rule. Aborted.");
 
     let seen = {};
+    let enabled_count = 0;
+    let first_disabled = "";
     for (let member_value in members) {
         let member_name = trim(as_string(member_value));
         if (member_name == "")
@@ -871,15 +1108,24 @@ function validate_group_members(section, sections) {
         if (member == null)
             fail_validation("Section group '" + group_name +
                 "' references missing rule '" + member_name + "'. Aborted.");
-        if (!section_enabled(member))
-            fail_validation("Section group '" + group_name +
-                "' references disabled rule '" + member_name +
-                "'. Enable it or remove it from the group. Aborted.");
         if (!group_member_action_supported(rule_action(member)))
             fail_validation("Section group '" + group_name + "' cannot include rule '" + member_name +
                 "' with action '" + rule_action(member) +
                 "'. DPI, marker, route-only and group rules produce no proxy servers. Aborted.");
+        if (!section_enabled(member)) {
+            if (first_disabled == "")
+                first_disabled = member_name;
+            log_message("Section group '" + group_name +
+                "' skips disabled rule '" + member_name + "'", "warn");
+            continue;
+        }
+        enabled_count++;
     }
+
+    if (enabled_count == 0 && first_disabled != "")
+        fail_validation("Section group '" + group_name +
+            "' references disabled rule '" + first_disabled +
+            "'. Enable it or remove it from the group. Aborted.");
 }
 
 function duration_to_seconds_value(value) {
@@ -920,12 +1166,12 @@ function validate_duration_option(value, label) {
     if (duration_to_seconds_value(value) != null)
         return;
 
-    fail_validation("Invalid duration value for " + label + ": " + value + ". Use sing-box duration format like 1d, 12h or 30m. Aborted.");
+    fail_validation("Invalid duration value for " + label + ": " + value + ". Use core duration format like 1d, 12h or 30m. Aborted.");
 }
 
 function validate_required_duration_option(value, label) {
     if (as_string(value) == "")
-        fail_validation("Missing duration value for " + label + ". Use sing-box duration format like 1d, 12h or 30m. Aborted.");
+        fail_validation("Missing duration value for " + label + ". Use core duration format like 1d, 12h or 30m. Aborted.");
 
     validate_duration_option(value, label);
 }
@@ -943,7 +1189,7 @@ function dns_server_value_valid(value) {
     if (port != "" && (match(port, /^[0-9]+$/) == null || int(port) < 1 || int(port) > 65535))
         return false;
 
-    if (core_ip.valid_ip(host))
+    if (core_ip.valid_ip_with_zone(host))
         return true;
 
     return length(host) <= 253 &&
@@ -986,7 +1232,7 @@ function validate_dns_settings(settings, sections, context) {
             fail_validation("Invalid Bootstrap DNS server '" + value + "'. Aborted.");
 
     if (length(main_servers) > 1 || length(bootstrap_servers) > 1) {
-        validate_required_duration_option(option(settings, "dns_check_interval", "10s"), "settings.dns_check_interval");
+        validate_required_duration_option(option(settings, "dns_check_interval", "30s"), "settings.dns_check_interval");
         validate_required_duration_option(option(settings, "dns_recovery_check_interval", "60s"), "settings.dns_recovery_check_interval");
         validate_required_duration_option(option(settings, "dns_check_timeout", "2s"), "settings.dns_check_timeout");
         for (let name in [ "dns_failure_threshold", "dns_recovery_threshold", "dns_failover_failure_threshold" ]) {
@@ -1032,8 +1278,85 @@ function validate_dns_settings(settings, sections, context) {
         fail_validation("DNS through a section references missing rule '" + target_name + "'. Aborted.");
     if (!target.enabled)
         fail_validation("DNS through a section references disabled rule '" + target_name + "'. Aborted.");
-    if (!download_section_action_available(target.action, context.byedpi_installed, context.zapret_installed, context.zapret2_installed))
-        fail_validation("DNS through a section references rule '" + target_name + "' with unsupported action '" + target.action + "'. Select an enabled Connection, VPN, Zapret, Zapret2, or ByeDPI section. Aborted.");
+    if (!download_section_action_available(target.action))
+        fail_validation("DNS through a section references rule '" + target_name + "' with unsupported action '" + target.action + "'. Select an enabled Connection, Desync, or VPN section. Aborted.");
+}
+
+function valid_bool_setting_text(value) {
+    let v = lc(trim(as_string(value)));
+    return v == "0" || v == "1" || v == "true" || v == "false" || v == "yes" || v == "no" || v == "on" || v == "off";
+}
+
+function validate_ipv6_and_fakeip_settings(settings, sections) {
+    let raw_ipv6_mode = lc(trim(option(settings, "ipv6_mode", "")));
+    if (raw_ipv6_mode != "" && !contains([
+        "off", "ipv4_only", "ipv4-only", "ipv4", "disabled", "none",
+        "auto",
+        "dual_stack", "dual-stack", "ipv4_ipv6", "ipv4-ipv6", "on", "full", "always",
+        "tunnel_over_v4", "tunnel-over-v4", "v6_over_v4", "v6-over-v4", "tunnel"
+    ], raw_ipv6_mode))
+        fail_validation("Unsupported IPv6 mode '" + raw_ipv6_mode + "'. Use off, auto, dual_stack, or tunnel_over_v4. Aborted.");
+
+    for (let bool_key in [ "ipv6_leak_guard", "fakeip_enabled", "tcp_bbr", "tun_kill_switch" ]) {
+        let raw_bool = trim(option(settings, bool_key, ""));
+        if (raw_bool != "" && !valid_bool_setting_text(raw_bool))
+            fail_validation("Invalid boolean value '" + raw_bool + "' for settings." + bool_key + " (expected 0 or 1). Aborted.");
+    }
+    // "auto" = on while a section is Fail-Closed (service/kill_switch.uc).
+    let raw_webrtc = trim(option(settings, "webrtc_leak_protect", ""));
+    if (raw_webrtc != "" && lc(raw_webrtc) != "auto" && !valid_bool_setting_text(raw_webrtc))
+        fail_validation("Invalid value '" + raw_webrtc + "' for settings.webrtc_leak_protect (expected auto, 0 or 1). Aborted.");
+
+    let raw_ui_mode = lc(trim(option(settings, "ui_mode", "")));
+    if (raw_ui_mode != "" && !contains([ "simple", "advanced", "basic" ], raw_ui_mode))
+        fail_validation("Unsupported UI mode '" + raw_ui_mode + "'. Use simple or advanced. Aborted.");
+
+    let fakeip4 = trim(option(settings, "fakeip_inet4_range", ""));
+    if (fakeip4 != "" && !core_ip.valid_ipv4_cidr(fakeip4, false))
+        fail_validation("Invalid FakeIPv4 CIDR range '" + fakeip4 + "'. Aborted.");
+
+    let fakeip6 = trim(option(settings, "fakeip_inet6_range", ""));
+    if (fakeip6 != "" && !core_ip.valid_ipv6_cidr(fakeip6))
+        fail_validation("Invalid FakeIPv6 CIDR range '" + fakeip6 + "'. Aborted.");
+
+    let tun4 = trim(option(settings, "tun_inet4", ""));
+    if (tun4 != "" && !core_ip.valid_ipv4_cidr(tun4, false))
+        fail_validation("Invalid TUN IPv4 CIDR '" + tun4 + "'. Aborted.");
+
+    let tun6 = trim(option(settings, "tun_inet6", ""));
+    if (tun6 != "" && !core_ip.valid_ipv6_cidr(tun6))
+        fail_validation("Invalid TUN IPv6 CIDR '" + tun6 + "'. Aborted.");
+
+    let eff_fakeip4 = fakeip4 != "" ? fakeip4 : "198.18.0.0/15";
+    let eff_fakeip6 = fakeip6 != "" ? fakeip6 : "fc00::/18";
+    if (tun4 != "" && core_ip.cidrs_overlap(tun4, eff_fakeip4))
+        fail_validation("TUN IPv4 CIDR '" + tun4 + "' overlaps FakeIPv4 range '" + eff_fakeip4 + "'. Aborted.");
+    if (tun6 != "" && core_ip.cidrs_overlap(tun6, eff_fakeip6))
+        fail_validation("TUN IPv6 CIDR '" + tun6 + "' overlaps FakeIPv6 range '" + eff_fakeip6 + "'. Aborted.");
+
+    for (let raw_ex in option_list_values(settings, "fakeip_exclude")) {
+        let ex = trim(as_string(raw_ex));
+        if (ex == "" || substr(ex, 0, 1) == "#")
+            continue;
+        if (!combined_domain_valid(ex))
+            fail_validation("Invalid settings.fakeip_exclude entry '" + ex + "'. Aborted.");
+    }
+
+    for (let sec in (sections || [])) {
+        let raw_v6_sup = lc(trim(option(sec, "ipv6_support", "")));
+        if (raw_v6_sup != "" && raw_v6_sup != "auto" && !valid_bool_setting_text(raw_v6_sup))
+            fail_validation("Invalid section." + section_name(sec) + ".ipv6_support '" + raw_v6_sup + "' (expected auto, 0, or 1). Aborted.");
+        let raw_hidden = lc(trim(option(sec, "hidden", "")));
+        if (raw_hidden != "" && !valid_bool_setting_text(raw_hidden))
+            fail_validation("Invalid section." + section_name(sec) + ".hidden '" + raw_hidden + "' (expected 0 or 1). Aborted.");
+    }
+    for (let type_name in [ "outbound_source", "subscription_url" ]) {
+        for (let item in sections_by_type(type_name)) {
+            let raw_hidden = lc(trim(option(item, "hidden", "")));
+            if (raw_hidden != "" && !valid_bool_setting_text(raw_hidden))
+                fail_validation("Invalid " + type_name + "." + section_name(item) + ".hidden '" + raw_hidden + "' (expected 0 or 1). Aborted.");
+        }
+    }
 }
 
 function normalize_port_number_value(value) {
@@ -1043,6 +1366,23 @@ function normalize_port_number_value(value) {
 
     let number = int(value);
     return number >= 1 && number <= 65535 ? number : null;
+}
+
+function validate_tailscale_network_options(entity, label) {
+    let relay_port_raw = trim(as_string(option(entity, "tailscale_relay_server_port", "")));
+    if (relay_port_raw != "") {
+        if (normalize_port_number_value(relay_port_raw) == null)
+            fail_validation(label + " has invalid tailscale_relay_server_port '" + relay_port_raw + "' (expected integer 1..65535). Aborted.");
+    }
+
+    let mtu_raw = trim(as_string(option(entity, "tailscale_system_interface_mtu", "")));
+    if (mtu_raw != "") {
+        if (match(mtu_raw, /^[0-9]+$/) == null)
+            fail_validation(label + " has invalid tailscale_system_interface_mtu '" + mtu_raw + "' (expected integer 576..65535). Aborted.");
+        let mtu = int(mtu_raw);
+        if (mtu < 576 || mtu > 65535)
+            fail_validation(label + " has out-of-range tailscale_system_interface_mtu '" + mtu_raw + "' (expected 576..65535). Aborted.");
+    }
 }
 
 function normalize_port_condition_value(value) {
@@ -1145,11 +1485,12 @@ function validate_proxy_parameter_value(value, allowed, parameter, section) {
 function validate_proxy_parameter_filters(protocols, transports, securities, ports, section) {
     for (let value in protocols)
         validate_proxy_parameter_value(value,
-            [ "awg", "direct", "http", "hysteria2", "shadowsocks", "socks", "trojan", "tuic", "vless", "vmess" ],
+            [ "awg", "amneziawg", "direct", "http", "hysteria2", "shadowsocks", "socks", "trojan", "tuic", "vless", "vmess",
+              "anytls", "naive", "mieru", "snell", "masque", "sudoku", "openvpn", "openconnect", "tewfai", "csqtt", "wdtt", "trusttunnel", "mtproto", "shadowtls", "fptn" ],
             "protocol", section);
     for (let value in transports)
         validate_proxy_parameter_value(value,
-            [ "tcp", "ws", "grpc", "http", "httpupgrade", "xhttp" ],
+            [ "tcp", "udp", "quic", "ws", "grpc", "http", "httpupgrade", "xhttp" ],
             "transport", section);
     for (let value in securities)
         validate_proxy_parameter_value(value, [ "none", "tls", "reality" ], "security", section);
@@ -1213,44 +1554,44 @@ function validate_priority_group(section, group_id) {
     if (connections.priority_group_switch_to_faster_same_priority(section, group_id))
         validate_required_duration_option(connections.priority_group_fastest_check_interval(section, group_id), "rule." + name + ".priority." + group_id + ".fastest_check_interval");
 
-    for (let level_id in connections.priority_levels(group_id)) {
+    for (let level_id in connections.priority_levels(group_id, section)) {
         validate_priority_identifier_value(level_id, name);
-        if (trim(connections.priority_level_display_name(group_id, level_id)) == "")
+        if (trim(connections.priority_level_display_name(group_id, level_id, section)) == "")
             fail_validation("Priority level '" + level_id + "' in rule '" + name + "', priority '" + group_id + "' has no display name. Aborted.");
 
-        validate_priority_level_order(connections.priority_level_order(group_id, level_id), name, group_id, level_id);
-        if (connections.priority_level_direct(group_id, level_id))
+        validate_priority_level_order(connections.priority_level_order(group_id, level_id, section), name, group_id, level_id);
+        if (connections.priority_level_direct(group_id, level_id, section))
             continue;
 
-        let filter_mode = connections.priority_level_filter_mode(group_id, level_id);
+        let filter_mode = connections.priority_level_filter_mode(group_id, level_id, section);
         validate_priority_filter_mode_value(filter_mode, name, group_id, level_id);
         if (filter_mode != "disabled")
-            validate_detect_server_country_value(connections.priority_level_detect_server_country(group_id, level_id), name);
+            validate_detect_server_country_value(connections.priority_level_detect_server_country(group_id, level_id, section), name);
         if (filter_mode == "include" || filter_mode == "mixed") {
-            for (let value in connections.priority_level_include_countries(group_id, level_id))
+            for (let value in connections.priority_level_include_countries(group_id, level_id, section))
                 validate_country_code_value(value, name);
-            for (let value in connections.priority_level_include_regex(group_id, level_id))
+            for (let value in connections.priority_level_include_regex(group_id, level_id, section))
                 validate_urltest_regex_value(value, name);
-            if (connections.priority_level_include_proxy_parameters(group_id, level_id))
+            if (connections.priority_level_include_proxy_parameters(group_id, level_id, section))
                 validate_proxy_parameter_filters(
-                    connections.priority_level_include_protocols(group_id, level_id),
-                    connections.priority_level_include_transports(group_id, level_id),
-                    connections.priority_level_include_securities(group_id, level_id),
-                    connections.priority_level_include_ports(group_id, level_id),
+                    connections.priority_level_include_protocols(group_id, level_id, section),
+                    connections.priority_level_include_transports(group_id, level_id, section),
+                    connections.priority_level_include_securities(group_id, level_id, section),
+                    connections.priority_level_include_ports(group_id, level_id, section),
                     name
                 );
         }
         if (filter_mode == "exclude" || filter_mode == "mixed") {
-            for (let value in connections.priority_level_exclude_countries(group_id, level_id))
+            for (let value in connections.priority_level_exclude_countries(group_id, level_id, section))
                 validate_country_code_value(value, name);
-            for (let value in connections.priority_level_exclude_regex(group_id, level_id))
+            for (let value in connections.priority_level_exclude_regex(group_id, level_id, section))
                 validate_urltest_regex_value(value, name);
-            if (connections.priority_level_exclude_proxy_parameters(group_id, level_id))
+            if (connections.priority_level_exclude_proxy_parameters(group_id, level_id, section))
                 validate_proxy_parameter_filters(
-                    connections.priority_level_exclude_protocols(group_id, level_id),
-                    connections.priority_level_exclude_transports(group_id, level_id),
-                    connections.priority_level_exclude_securities(group_id, level_id),
-                    connections.priority_level_exclude_ports(group_id, level_id),
+                    connections.priority_level_exclude_protocols(group_id, level_id, section),
+                    connections.priority_level_exclude_transports(group_id, level_id, section),
+                    connections.priority_level_exclude_securities(group_id, level_id, section),
+                    connections.priority_level_exclude_ports(group_id, level_id, section),
                     name
                 );
         }
@@ -1367,6 +1708,36 @@ function validate_geoip_country_values(section) {
     }
 }
 
+function validate_interface_address_values(section) {
+    let name = section_name(section);
+    for (let raw_item in list_option(section, "default_interface_address")) {
+        let item = trim(as_string(raw_item));
+        if (item != "" && !core_ip.valid_ip_or_cidr(item))
+            fail_validation("Rule '" + name + "' has invalid default_interface_address '" + item + "'. Expected IP or CIDR subnet. Aborted.");
+    }
+    for (let key in [ "interface_address", "network_interface_address" ]) {
+        for (let raw_item in list_option(section, key)) {
+            let item = trim(as_string(raw_item));
+            if (item == "")
+                continue;
+            let sep = index(item, "=");
+            if (sep < 0)
+                sep = index(item, ":");
+            if (sep <= 0)
+                fail_validation("Rule '" + name + "' has invalid " + key + " '" + item + "'. Expected format 'interface=CIDR' (e.g. wan2=192.168.1.0/24). Aborted.");
+            let iface_name = trim(substr(item, 0, sep));
+            let cidr_str = trim(substr(item, sep + 1));
+            if (iface_name == "" || match(iface_name, /^[A-Za-z0-9_.:-]+$/) == null)
+                fail_validation("Rule '" + name + "' has invalid interface name in " + key + " '" + item + "'. Aborted.");
+            for (let part in split(cidr_str, ",")) {
+                let cidr = trim(as_string(part));
+                if (cidr == "" || !core_ip.valid_ip_or_cidr(cidr))
+                    fail_validation("Rule '" + name + "' has invalid IP or CIDR '" + cidr + "' in " + key + " '" + item + "'. Aborted.");
+            }
+        }
+    }
+}
+
 function validate_common_rule_references(section, context) {
     for (let value in connections.community_lists(section))
         validate_service_value(value, context);
@@ -1378,6 +1749,7 @@ function validate_common_rule_references(section, context) {
         validate_plain_domain_ip_list_reference_value(value);
     validate_dscp_values(section);
     validate_geoip_country_values(section);
+    validate_interface_address_values(section);
 }
 
 function outbound_json_object(value) {
@@ -1404,12 +1776,12 @@ function validate_outbound_json_rule(section) {
         fail_validation("JSON outbound rule '" + name + "' has empty outbound_json. Aborted.");
 
     if (!valid_outbound_json(outbound_json))
-        fail_validation("JSON outbound rule '" + name + "' must contain a valid sing-box outbound JSON object with a type field. Aborted.");
+        fail_validation("JSON outbound rule '" + name + "' must contain a valid outbound JSON object with a type field. Aborted.");
 }
 
 function validate_outbound_json_values(section) {
     let name = section_name(section);
-    let values = connections.outbound_jsons(section);
+    let values = connections.outbound_jsons(section, true);
     let require_user_tag = length(list_option(section, "outbound_jsons")) > 0;
     let tags = {};
 
@@ -1418,7 +1790,7 @@ function validate_outbound_json_values(section) {
             fail_validation("Connection rule '" + name + "' has empty JSON outbound. Aborted.");
 
         if (!valid_outbound_json(value))
-            fail_validation("Connection rule '" + name + "' must contain valid sing-box outbound JSON objects with a type field. Aborted.");
+            fail_validation("Connection rule '" + name + "' must contain valid outbound JSON objects with a type field. Aborted.");
 
         let outbound = outbound_json_object(value);
         let tag_name = trim(as_string(outbound.tag || ""));
@@ -1452,69 +1824,59 @@ function validate_subscription_request_profile(section, entry) {
     fail_validation("Subscription source in rule '" + section_name(section) + "' has manual HWID enabled but HWID is empty. Fill HWID or enable auto-generation. Aborted.");
 }
 
-function validate_provider_strategy(kind, section, context) {
-    let name = section_name(section);
-
-    if (kind == "zapret") {
-        let raw = zapret_validator().strategy_or_default(option(section, "nfqws_opt", ""), context.zapret_default_nfqws_opt);
-        let result = zapret_validator().validate_strategy("nfqws", raw, context.zapret_legacy_default_nfqws_opt);
-        if (!result.valid)
-            fail_validation("Zapret rule '" + name + "' uses invalid NFQWS strategy: " + result.message + " Aborted.");
+function validate_fragment_range_value(raw, min_val, suffix_allowed, holder_label, field_name, example) {
+    let val = trim(as_string(raw));
+    if (val == "")
         return;
+
+    let rx = suffix_allowed ? /^[0-9]+(-[0-9]+)?(ms|s)?$/ : /^[0-9]+(-[0-9]+)?$/;
+    if (match(val, rx) == null)
+        fail_validation(holder_label + " has invalid " + field_name + " '" + val + "'. Expected e.g. '" + example + "'. Aborted.");
+
+    let clean = val;
+    if (suffix_allowed) {
+        if (length(clean) >= 2 && substr(clean, length(clean) - 2) == "ms")
+            clean = substr(clean, 0, length(clean) - 2);
+        else if (length(clean) >= 1 && substr(clean, length(clean) - 1) == "s")
+            clean = substr(clean, 0, length(clean) - 1);
     }
 
-    if (kind == "zapret2") {
-        let raw = zapret2_validator().strategy_or_default(option(section, "nfqws2_opt", ""), context.zapret2_default_nfqws2_opt);
-        let result = zapret2_validator().validate_strategy("nfqws2", raw, "");
-        if (!result.valid)
-            fail_validation("Zapret2 rule '" + name + "' uses invalid NFQWS2 strategy: " + result.message + " Aborted.");
-        return;
-    }
-
-    let raw = byedpi_validator().strategy_or_default(option(section, "byedpi_cmd_opts", ""), context.byedpi_default_cmd_opts);
-    let result = byedpi_validator().validate_byedpi_strategy(raw);
-    if (!result.valid)
-        fail_validation("Invalid ByeDPI strategy for rule '" + name + "': " + result.message);
+    let dash = index(clean, "-");
+    let lo = dash >= 0 ? int(substr(clean, 0, dash)) : int(clean);
+    let hi = dash >= 0 ? int(substr(clean, dash + 1)) : lo;
+    if (lo < min_val || hi < lo)
+        fail_validation(holder_label + " has invalid " + field_name + " '" + val + "' (range bounds out of order). Aborted.");
 }
 
-function validate_wdtt_section(section, context) {
-    let name = section_name(section);
-    let uri = option_or_legacy(section, "uri", "warp_flow_uri", "");
-    let links = list_option_or_legacy(section, "subscription_links", "warp_flow_subscription_links");
-
-    if (uri == "" && length(links) == 0 && option(section, "peer", "") == "") {
-        fail_validation("WDTT rule '" + name + "' has no connection URI or subscription link. Aborted.");
+function validate_source_fragment_options(holder, holder_label) {
+    if (type(holder) != "object")
         return;
-    }
-
-    let result = wdtt_validator().validate_section(section);
-    if (length(result) > 0)
-        fail_validation("Invalid WDTT rule '" + name + "': " + join("; ", result) + ". Aborted.");
+    let mode = lc(trim(option(holder, "tls_fragment_mode", "")));
+    if (mode != "" && !contains([ "tls_record", "tls_fragment", "tcp_fragment" ], mode))
+        fail_validation(holder_label + " has invalid tls_fragment_mode '" + mode + "'. Expected tls_record, tls_fragment, or tcp_fragment. Aborted.");
+    validate_fragment_range_value(option(holder, "tcp_fragment_length", ""), 1, false, holder_label, "tcp_fragment_length", "20-60");
+    validate_fragment_range_value(option(holder, "tcp_fragment_delay", ""), 0, true, holder_label, "tcp_fragment_delay", "0-2ms");
 }
 
-function validate_olcrtc_section(section, context) {
+function validate_csqtt_or_wdtt_section(section, label) {
     let name = section_name(section);
-    let provider = option_or_legacy(section, "provider", "olcrtc_provider", "");
-    let room_id = option_or_legacy(section, "room_id", "olcrtc_room_id", "");
-    let links = list_option_or_legacy(section, "subscription_links", "olcrtc_subscription_links");
-
-    if (length(links) == 0 && (provider == "" || room_id == "")) {
-        fail_validation("OlcRTC rule '" + name + "' has no subscription link and no provider with room ID. Aborted.");
-        return;
+    let uri = trim(option_or_legacy(section, "csqtt_uri", "uri", option(section, "warp_flow_uri", "")));
+    let srv = trim(option(section, "csqtt_server", option(section, "server", "")));
+    let has_modular_refs = length(list_option(section, "outbound_source_refs")) > 0 ||
+        length(list_option(section, "outbound_group_refs")) > 0 ||
+        length(list_option(section, "balancer_refs")) > 0;
+    if (uri == "" && srv == "") {
+        if (has_modular_refs)
+            return;
+        fail_validation(label + " rule '" + name + "' requires a server address or link URI. Aborted.");
     }
-
-    let normalized = {
-        provider: provider,
-        transport: option_or_legacy(section, "transport", "olcrtc_transport", ""),
-        room_id: room_id,
-        crypto_key: option_or_legacy(section, "crypto_key", "olcrtc_crypto_key", ""),
-        socks_port: option_or_legacy(section, "socks_port", "olcrtc_socks_port", ""),
-        dns_server: option_or_legacy(section, "dns_server", "olcrtc_dns_server", ""),
-        subscription_links: links
-    };
-    let result = olcrtc_validator().validate_section(normalized);
-    if (length(result) > 0)
-        fail_validation("Invalid OlcRTC rule '" + name + "': " + join("; ", result) + ". Aborted.");
+    if (srv != "" && option(section, "csqtt_password", option(section, "password", "")) == "")
+        fail_validation(label + " rule '" + name + "' requires a password. Aborted.");
+    if (srv == "" && uri != "") {
+        let parsed_uri = parse_wdtt_uri(uri);
+        if (!parsed_uri.valid)
+            fail_validation("Invalid " + label + " URI for rule '" + name + "': " + (parsed_uri.reason || "invalid URI") + ". Aborted.");
+    }
 }
 
 function dns_action_inline_domains(section) {
@@ -1535,7 +1897,7 @@ function dns_action_has_domain_matchers(section) {
 }
 
 // The generator emits every block/bypass rule before all others
-// (tachyon_core/generator.uc), and sing-box DNS rules are first-match-wins, so an
+// (tachyon_core/generator.uc), and tachyon-core DNS rules are first-match-wins, so an
 // action=dns section can never override one. A domain written inline here and
 // also claimed by a block/bypass list is dropped with no other trace.
 function warn_dns_action_precedence(section, sections) {
@@ -1568,7 +1930,8 @@ function validate_dns_action(section, sections, context) {
     if (!contains([ "udp", "dot", "doh", "doq" ], dns_type))
         fail_validation("DNS rule '" + name + "' uses unsupported protocol '" + dns_type + "'. Use udp, dot, doh, or doq. Aborted.");
     let dns_servers = list_option(section, "dns_server");
-    if (length(dns_servers) == 0)
+    let use_wan = bool_option(section, "dns_use_wan", false);
+    if (length(dns_servers) == 0 && !use_wan)
         fail_validation("DNS rule '" + name + "' has no DNS server specified. Aborted.");
     for (let dns_server in dns_servers) {
         if (!dns_server_value_valid(dns_server))
@@ -1608,8 +1971,8 @@ function validate_dns_action(section, sections, context) {
         fail_validation("DNS rule '" + name + "' references missing detour section '" + target_name + "'. Aborted.");
     if (!section_enabled(target))
         fail_validation("DNS rule '" + name + "' references disabled detour section '" + target_name + "'. Aborted.");
-    if (!download_section_action_available(rule_action(target), context.byedpi_installed, context.zapret_installed, context.zapret2_installed))
-        fail_validation("DNS rule '" + name + "' references detour section '" + target_name + "' with unsupported action '" + rule_action(target) + "'. Select an enabled Connection, VPN, Zapret, Zapret2, or ByeDPI section. Aborted.");
+    if (!download_section_action_available(rule_action(target)))
+        fail_validation("DNS rule '" + name + "' references detour section '" + target_name + "' with unsupported action '" + rule_action(target) + "'. Select an enabled Connection, Desync, or VPN section. Aborted.");
 }
 
 // URLTest and Priority groups, shared by every action that emits them: the
@@ -1689,45 +2052,11 @@ function validate_rule(section, sections, context) {
     if (action == "dns")
         validate_dns_action(section, sections, context);
 
-    if (action == "zapret") {
-        if (!context.zapret_installed) {
-            validate_common_rule_references(section, context);
-            return;
-        }
-        validate_provider_strategy("zapret", section, context);
-    }
+    if (action == "wdtt")
+        validate_csqtt_or_wdtt_section(section, "WDTT");
 
-    if (action == "zapret2") {
-        if (!context.zapret2_installed) {
-            validate_common_rule_references(section, context);
-            return;
-        }
-        validate_provider_strategy("zapret2", section, context);
-    }
-
-    if (action == "byedpi") {
-        if (!context.byedpi_installed) {
-            validate_common_rule_references(section, context);
-            return;
-        }
-        validate_provider_strategy("byedpi", section, context);
-    }
-
-    if (action == "wdtt") {
-        if (!context.wdtt_installed) {
-            validate_common_rule_references(section, context);
-            return;
-        }
-        validate_wdtt_section(section, context);
-    }
-
-    if (action == "olcrtc") {
-        if (!context.olcrtc_installed) {
-            validate_common_rule_references(section, context);
-            return;
-        }
-        validate_olcrtc_section(section, context);
-    }
+    if (action == "csqtt")
+        validate_csqtt_or_wdtt_section(section, "CSQTT");
 
     if (action == "fptn") {
         let fptn_validator = require("providers.fptn.validator");
@@ -1740,19 +2069,22 @@ function validate_rule(section, sections, context) {
         validate_group_members(section, sections);
 
     let provider_labels = {
-        zapret: "Zapret",
-        zapret2: "Zapret2",
-        byedpi: "ByeDPI",
         wdtt: "WDTT",
-        olcrtc: "OlcRTC",
+        csqtt: "CSQTT",
         fptn: "FPTN"
     };
     if (provider_labels[action] != null) {
-        if (!connections.section_has_routing_matchers(section) && !bool_option(section, "match_all", false))
-            fail_validation(provider_labels[action] + " rule '" + name + "' has no routing conditions. Add domains, community lists, IP/subnet/port/protocol matchers or enable Match All explicitly. Aborted.");
+        if (!connections.section_has_routing_matchers(section) &&
+            !connections.section_referenced_by_active_inbound_server(section) &&
+            !bool_option(section, "match_all", false) &&
+            !bool_option(section, "mixed_proxy_enabled", false))
+            fail_validation(provider_labels[action] + " rule '" + name + "' has no routing conditions. Add domains, community lists, IP/subnet/port/protocol matchers, enable Mixed Proxy, or enable Match All explicitly. Aborted.");
     }
 
-    if (connections.is_connections_action(action) || action == "fptn") {
+    if (connections.is_connections_action(action))
+        validate_source_fragment_options(section, "Rule '" + name + "'");
+
+    if (connections.is_connections_action(action) || action == "fptn" || action == "csqtt" || action == "wdtt") {
         validate_section_route_groups(section);
 
         if (rule_has_subscription_urls(section)) {
@@ -1768,19 +2100,30 @@ function validate_rule(section, sections, context) {
         validate_outbound_json_values(section);
     }
 
-    // AmneziaWG sections emit the same URLTest/Priority groups a connection
-    // section does, so the groups need the same validation. Their other
-    // connection-only options (subscriptions, JSON outbounds) stay out of it.
-    if (action == "awg")
+    // AmneziaWG and Group sections emit the same URLTest/Priority groups a
+    // connection section does, so the groups need the same validation. Their
+    // other connection-only options (subscriptions, JSON outbounds) stay out of it.
+    if (action == "awg" || action == "group")
         validate_section_route_groups(section);
 
     if (action == "outbound")
         validate_outbound_json_rule(section);
 
+    if (action == "tailscale")
+        validate_tailscale_network_options(section, "Section '" + name + "'");
+
+    for (let src in connections.section_effective_outbound_sources(section)) {
+        if (lc(option(src, "source_type", "")) == "tailscale")
+            validate_tailscale_network_options(src, "Section '" + name + "' Tailscale source");
+    }
+
     validate_combined_domain_text_value(option(section, "domain", ""), name);
     for (let value in list_option(section, "domain_suffix"))
         validate_combined_domain_value(value, name);
     validate_combined_domain_text_value(option(section, "domain_suffix_text", ""), name);
+    for (let value in list_option(section, "excluded_domains"))
+        validate_combined_domain_value(value, name);
+    validate_combined_domain_text_value(option(section, "excluded_domains_text", ""), name);
 
     if (connections.routed_dns_enabled(section)) {
         if (action == "dns" || action == "hosts" || action == "block")
@@ -1872,19 +2215,23 @@ function validate_subscription_download_sections(sections, context) {
             continue;
 
         let name = section_name(section);
-        for (let entry in connections.subscription_urls(section)) {
-            let target = connections.subscription_download_section(section, entry);
-            if (target == "")
-                continue;
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            for (let entry in connections.subscription_urls(section)) {
+                let target = connections.subscription_download_section(section, entry);
+                if (target == "")
+                    continue;
 
-            validate_download_section_rows(
-                target,
-                context.byedpi_installed,
-                context.zapret_installed,
-                context.zapret2_installed,
-                rows
-            );
+                validate_download_section_rows(target, rows);
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
         }
+        current_validating_section = "";
     }
 }
 
@@ -1905,30 +2252,50 @@ function validate_server_routing_sections(sections) {
             continue;
 
         let name = section_name(server);
-        let mode = option(server, "routing_mode", "rules");
-        if (!contains([ "rules", "direct", "section" ], mode))
-            fail_validation("Server '" + name + "' uses unsupported routing mode '" + mode + "'. Aborted.");
-
-        if (option(server, "protocol", "vless") == "mtproto") {
-            let faketls = option(server, "mtproto_faketls", "google.com");
-            if (common.mtproto_secret_canonical(option(server, "mtproto_secret", ""), faketls) == null)
-                fail_validation("Server '" + name + "' has an invalid MTProto secret. Provide the full 'ee' secret or a 16-byte key in hex or base64 form. Aborted.");
-        }
-
-        if (mode != "section")
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
             continue;
+        current_validating_section = name;
+        try {
+            let protocol = option(server, "protocol", "vless");
+            if (protocol != "tailscale" && protocol != "json_inbound") {
+                let port_str = trim(as_string(option(server, "listen_port", "")));
+                if (port_str == "")
+                    port_str = (protocol == "socks" || protocol == "http" || protocol == "shadowsocks") ? "1080" : "443";
+                let port_num = normalize_port_number_value(port_str);
+                if (port_num == 1602 || port_num == 1053 || port_num == 5354)
+                    fail_validation("Server '" + name + "' uses reserved internal Tachyon port " + port_num + " (1602 is tproxy-in, 1053 is dns-block-in, 5354 is dns-source-in). Choose a different listen_port (e.g. 8443 or 443). Aborted.");
+            } else if (protocol == "tailscale") {
+                validate_tailscale_network_options(server, "Server '" + name + "'");
+            }
+            let mode = option(server, "routing_mode", "rules");
+            if (!contains([ "rules", "direct", "section" ], mode))
+                fail_validation("Server '" + name + "' uses unsupported routing mode '" + mode + "'. Aborted.");
 
-        let target_name = option(server, "routing_section", "");
-        if (target_name == "")
-            fail_validation("Server '" + name + "' uses selected-section routing, but no routing section is selected. Aborted.");
+            if (option(server, "protocol", "vless") == "mtproto") {
+                let faketls = option(server, "mtproto_faketls", "google.com");
+                if (common.mtproto_secret_canonical(option(server, "mtproto_secret", ""), faketls) == null)
+                    fail_validation("Server '" + name + "' has an invalid MTProto secret. Provide the full 'ee' secret or a 16-byte key in hex or base64 form. Aborted.");
+            }
 
-        let target = by_section[target_name];
-        if (type(target) != "object")
-            fail_validation("Server '" + name + "' references missing routing section '" + target_name + "'. Aborted.");
-        if (!target.enabled)
-            fail_validation("Server '" + name + "' references disabled routing section '" + target_name + "'. Aborted.");
-        if (!server_routing_section_action_supported(target.action))
-            fail_validation("Server '" + name + "' references routing section '" + target_name + "' with unsupported action '" + target.action + "'. Select a Connection, proxy, JSON outbound, VPN, AWG, Zapret, Zapret2, or ByeDPI section. Aborted.");
+            if (mode == "section") {
+                let target_name = option(server, "routing_section", "");
+                if (target_name == "")
+                    fail_validation("Server '" + name + "' uses selected-section routing, but no routing section is selected. Aborted.");
+
+                let target = by_section[target_name];
+                if (type(target) != "object")
+                    fail_validation("Server '" + name + "' references missing routing section '" + target_name + "'. Aborted.");
+                if (!target.enabled || (runtime_quarantine_mode && runtime_quarantined_sections[target_name] != null))
+                    fail_validation("Server '" + name + "' references disabled routing section '" + target_name + "'. Aborted.");
+                if (!server_routing_section_action_supported(target.action))
+                    fail_validation("Server '" + name + "' references routing section '" + target_name + "' with unsupported action '" + target.action + "'. Select a Connection, proxy, JSON outbound, VPN, AWG, or Desync section. Aborted.");
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
     }
 }
 
@@ -1942,6 +2309,34 @@ function validate_list_update_settings(settings) {
     validate_required_duration_option(update_interval, "settings.update_interval");
 }
 
+function validate_wan_failover_settings(settings) {
+    if (!bool_option(settings, "wan_failover_enabled", false))
+        return;
+
+    let primary = trim(option(settings, "wan_failover_primary", "wan"));
+    let backup = trim(option(settings, "wan_failover_backup", ""));
+    if (primary == "" || match(primary, /^[A-Za-z0-9_.:-]+$/) == null)
+        fail_validation("WAN failover primary interface '" + primary + "' is invalid. Aborted.");
+    if (backup != "" && match(backup, /^[A-Za-z0-9_.:-]+$/) == null)
+        fail_validation("WAN failover backup interface '" + backup + "' is invalid. Aborted.");
+    if (backup != "" && primary == backup)
+        fail_validation("WAN failover primary and backup interfaces cannot be identical ('" + primary + "'). Aborted.");
+
+    let fail_thresh = parse_number(option(settings, "wan_failover_failure_threshold", "3"));
+    if (fail_thresh == null || fail_thresh < 1 || fail_thresh > 30)
+        fail_validation("WAN failover failure threshold must be an integer between 1 and 30. Aborted.");
+
+    let rec_thresh = parse_number(option(settings, "wan_failover_recovery_threshold", "3"));
+    if (rec_thresh == null || rec_thresh < 1 || rec_thresh > 30)
+        fail_validation("WAN failover recovery threshold must be an integer between 1 and 30. Aborted.");
+
+    for (let host in list_option(settings, "wan_failover_probe_hosts")) {
+        let h = trim(as_string(host));
+        if (h == "" || match(h, /^[A-Za-z0-9_.:-]+$/) == null)
+            fail_validation("WAN failover probe host '" + h + "' is invalid. Expected IP address or hostname. Aborted.");
+    }
+}
+
 function validate_runtime_mark_ranges_context(context) {
     let fakeip_mark = parse_number(context.nft_fakeip_mark);
     let outbound_mark = parse_number(context.nft_outbound_mark);
@@ -1952,32 +2347,6 @@ function validate_runtime_mark_ranges_context(context) {
         fail_validation("FakeIP mark overlaps Tailscale fwmark mask 0x00ff0000. Aborted.");
     if ((outbound_mark & TAILSCALE_FWMARK_MASK) != 0)
         fail_validation("Outbound mark overlaps Tailscale fwmark mask 0x00ff0000. Aborted.");
-
-    let ranges = [
-        [ "Zapret", context.zapret_route_mark_base, context.zapret_queue_range_size, fakeip_mark, "FakeIP mark " + context.nft_fakeip_mark ],
-        [ "Zapret", context.zapret_route_mark_base, context.zapret_queue_range_size, outbound_mark, "outbound mark " + context.nft_outbound_mark ],
-        [ "Zapret2", context.zapret2_route_mark_base, context.zapret2_queue_range_size, fakeip_mark, "FakeIP mark " + context.nft_fakeip_mark ],
-        [ "Zapret2", context.zapret2_route_mark_base, context.zapret2_queue_range_size, outbound_mark, "outbound mark " + context.nft_outbound_mark ],
-        [ "Zapret", context.zapret_route_mark_base, context.zapret_queue_range_size, TAILSCALE_FWMARK_MASK, "Tailscale fwmark mask 0x00ff0000" ],
-        [ "Zapret2", context.zapret2_route_mark_base, context.zapret2_queue_range_size, TAILSCALE_FWMARK_MASK, "Tailscale fwmark mask 0x00ff0000" ]
-    ];
-
-    for (let range in ranges) {
-        let label = as_string(range[0]);
-        let base = parse_number(range[1]);
-        let range_size = parse_number(range[2]);
-        let mark_mask = range[3];
-        let mark_mask_label = as_string(range[4]);
-
-        if (base == null || range_size == null || mark_mask == null)
-            fail_validation(label + " route mark range contains invalid numeric constants. Aborted.");
-
-        for (let index_value = 1; index_value <= range_size; index_value++) {
-            let mark_value = base + index_value;
-            if ((mark_value & mark_mask) != 0)
-                fail_validation(label + " route mark range overlaps " + mark_mask_label + ". Aborted.");
-        }
-    }
 }
 
 function validate_time_format(val, label) {
@@ -2169,6 +2538,10 @@ function validate_guest_mode(guest_mode) {
     let end_time = option(guest_mode, "end_time", "");
     validate_time_format(start_time, "guest_mode." + name + ".start_time");
     validate_time_format(end_time, "guest_mode." + name + ".end_time");
+
+    let allow_proxy = lc(trim(as_string(option(guest_mode, "allow_proxy", ""))));
+    if (allow_proxy != "" && allow_proxy != "0" && allow_proxy != "1" && allow_proxy != "true" && allow_proxy != "false")
+        fail_validation("Guest mode '" + name + "' has invalid allow_proxy '" + allow_proxy + "'. Expected 0 or 1. Aborted.");
 }
 
 // A section may claim one of its own condition values as global: the value is
@@ -2184,20 +2557,29 @@ function validate_global_rules(sections) {
 
     for (let section in sections) {
         let name = section_name(section);
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            for (let entry in connections.global_rules(section)) {
+                claim_count++;
+                let claim = connections.global_rule_claim(entry);
+                if (claim == null)
+                    fail_validation("Rule '" + name + "' has a malformed global rule '" + entry +
+                        "'. Expected '<option>:<value>' with a supported option. Aborted.");
 
-        for (let entry in connections.global_rules(section)) {
-            claim_count++;
-            let claim = connections.global_rule_claim(entry);
-            if (claim == null)
-                fail_validation("Rule '" + name + "' has a malformed global rule '" + entry +
-                    "'. Expected '<option>:<value>' with a supported option. Aborted.");
-
-            // A claim that no longer matches the owner's own conditions is inert
-            // and reserves nothing, so it neither blocks others nor collides here.
-            let values = connections.condition_values(section, claim.kind);
-            if (values != null && values[claim.value] == true)
-                owners[claim.kind + ":" + claim.value] = name;
+                // A claim that no longer matches the owner's own conditions is inert
+                // and reserves nothing, so it neither blocks others nor collides here.
+                let values = connections.condition_values(section, claim.kind);
+                if (values != null && values[claim.value] == true)
+                    owners[claim.kind + ":" + claim.value] = name;
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
         }
+        current_validating_section = "";
     }
 
     if (!claim_count)
@@ -2205,21 +2587,235 @@ function validate_global_rules(sections) {
 
     for (let section in sections) {
         let name = section_name(section);
-
-        for (let kind in connections.GLOBAL_RULE_OPTIONS) {
-            let values = connections.condition_values(section, kind);
-            if (values == null)
-                continue;
-
-            for (let value in keys(values)) {
-                let owner = owners[kind + ":" + value];
-                if (owner == null || owner == name)
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            for (let kind in connections.GLOBAL_RULE_OPTIONS) {
+                let values = connections.condition_values(section, kind);
+                if (values == null)
                     continue;
-                fail_validation("Rule '" + name + "' uses '" + value + "' (" + kind +
-                    "), which rule '" + owner + "' has claimed as a global rule. Remove it from '" +
-                    name + "' or drop the global claim in '" + owner + "'. Aborted.");
+
+                for (let value in keys(values)) {
+                    let owner = owners[kind + ":" + value];
+                    if (owner == null || owner == name)
+                        continue;
+                    fail_validation("Rule '" + name + "' uses '" + value + "' (" + kind +
+                        "), which rule '" + owner + "' has claimed as a global rule. Remove it from '" +
+                        name + "' or drop the global claim in '" + owner + "'. Aborted.");
+                }
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
+    }
+}
+
+function find_core_binary() {
+    if (command_exists("tachyon-core"))
+        return "tachyon-core";
+    return "";
+}
+
+function core_exists() {
+    return command_exists("tachyon-core");
+}
+
+function tachyon_core_version_state(ctx) {
+    let path = as_string(ctx.core_version_state_file);
+    if (path == "")
+        path = "/etc/tachyon/tachyon-core-version";
+
+    let data = fs.readfile(path);
+    if (data == null)
+        return "";
+
+    let newline = index(data, "\n");
+    return newline >= 0 ? substr(data, 0, newline) : as_string(data);
+}
+
+function get_tachyon_core_version(ctx) {
+    let state_ver = tachyon_core_version_state(ctx);
+    if (state_ver != "")
+        return state_ver;
+
+    let bin = find_core_binary();
+    if (bin == "")
+        return "";
+
+    return common.parse_core_version(command_output_from_args([ bin, "version" ]));
+}
+
+function validate_routing_strategy(settings, sections) {
+    let mode = lc(trim(option(settings, "routing_strategy", option(settings, "global_routing_mode", "split"))));
+    if (mode != "" && mode != "split" && mode != "full_tunnel")
+        fail_validation("Unsupported routing strategy '" + mode + "'. Expected split or full_tunnel. Aborted.");
+    if (mode == "full_tunnel") {
+        let def_tunnel = trim(option(settings, "default_tunnel_section", ""));
+        let has_tunnel_candidate = false;
+        let found_def = false;
+        for (let s in sections) {
+            if (!bool_option(s, "enabled", true))
+                continue;
+            let action = option(s, "action", "");
+            if (connections.is_connections_action(action) || action == "awg" || action == "fptn" || action == "group") {
+                has_tunnel_candidate = true;
+                if (s[".name"] == def_tunnel)
+                    found_def = true;
             }
         }
+        if (!has_tunnel_candidate)
+            fail_validation("Full tunnel strategy requires at least one enabled proxy/VPN/group section. Aborted.");
+        if (def_tunnel != "" && !found_def)
+            fail_validation("Full tunnel default section '" + def_tunnel + "' was not found or is not an active proxy/VPN/group section. Aborted.");
+    }
+}
+
+function validate_modular_entities(sections, context) {
+    let graph_check = connections.validate_condition_graph();
+    if (!graph_check.valid) {
+        if (runtime_quarantine_mode)
+            log_message("Condition graph warning: " + graph_check.message, "warn");
+        else
+            fail_validation(graph_check.message + ". Aborted.");
+    }
+
+    let broken_conditions = {};
+    for (let cond in sections_by_type("condition")) {
+        let cname = section_name(cond);
+        current_validating_section = runtime_quarantine_mode ? cname : "";
+        try {
+            for (let value in list_option(cond, "community_lists"))
+                validate_service_value(value, context);
+            for (let value in list_option(cond, "rule_set"))
+                validate_ruleset_reference_value(value, context);
+            for (let value in list_option(cond, "rule_set_with_subnets"))
+                validate_ruleset_reference_value(value, context);
+            for (let value in list_option(cond, "domain_ip_lists"))
+                validate_plain_domain_ip_list_reference_value(value);
+            for (let value in list_option(cond, "ports"))
+                validate_port_condition_value(value, cname);
+            validate_dscp_values(cond);
+            validate_geoip_country_values(cond);
+            validate_interface_address_values(cond);
+            for (let value in list_option(cond, "excluded_domains"))
+                validate_combined_domain_value(value, cname);
+            validate_combined_domain_text_value(option(cond, "excluded_domains_text", ""), cname);
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+            broken_conditions[cname] = runtime_quarantined_sections[cname] || ("Condition '" + cname + "' is invalid");
+            delete runtime_quarantined_sections[cname];
+        }
+        current_validating_section = "";
+    }
+
+    let broken_sources = {};
+    for (let src in sections_by_type("outbound_source")) {
+        if (!bool_option(src, "enabled", true))
+            continue;
+        let sname = section_name(src);
+        let stype = lc(trim(option(src, "source_type", "")));
+        if (stype == "subscription" || stype == "proxy_links") {
+            current_validating_section = runtime_quarantine_mode ? sname : "";
+            try {
+                validate_source_fragment_options(src, "Outbound source '" + sname + "'");
+            } catch (e) {
+                current_validating_section = "";
+                if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                    die(e);
+                broken_sources[sname] = runtime_quarantined_sections[sname] || ("Outbound source '" + sname + "' is invalid");
+                delete runtime_quarantined_sections[sname];
+            }
+            current_validating_section = "";
+            continue;
+        }
+        if (stype != "csqtt" && stype != "wdtt")
+            continue;
+        current_validating_section = runtime_quarantine_mode ? sname : "";
+        try {
+            let uri = trim(option(src, "csqtt_uri", option(src, "uri", option(src, "warp_flow_uri", ""))));
+            let srv = trim(option(src, "csqtt_server", option(src, "server", "")));
+            let label = stype == "csqtt" ? "CSQTT" : "WDTT";
+            if (uri == "" && srv == "")
+                fail_validation(label + " outbound source '" + sname + "' requires a server address or link URI. Aborted.");
+            if (srv != "" && option(src, "csqtt_password", option(src, "password", "")) == "")
+                fail_validation(label + " outbound source '" + sname + "' requires a password. Aborted.");
+            if (srv == "" && uri != "") {
+                let parsed_uri = parse_wdtt_uri(uri);
+                if (!parsed_uri.valid)
+                    fail_validation("Invalid " + label + " URI in outbound source '" + sname + "': " + (parsed_uri.reason || "invalid URI") + ". Aborted.");
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+            broken_sources[sname] = runtime_quarantined_sections[sname] || ("Outbound source '" + sname + "' is invalid");
+            delete runtime_quarantined_sections[sname];
+        }
+        current_validating_section = "";
+    }
+
+    let broken_groups = {};
+    for (let group in sections_by_type("outbound_group")) {
+        let gname = section_name(group);
+        for (let sref in connections.whitespace_list_value(group, "source_refs")) {
+            if (connections.outbound_source_section(sref) == null) {
+                if (runtime_quarantine_mode) {
+                    broken_groups[gname] = "Outbound group '" + gname + "' references missing outbound source '" + sref + "'.";
+                } else {
+                    fail_validation("Outbound group '" + gname + "' references missing outbound source '" + sref + "'. Aborted.");
+                }
+            } else if (broken_sources[sref] != null) {
+                if (runtime_quarantine_mode) {
+                    broken_groups[gname] = "Outbound group '" + gname + "' uses invalid outbound source '" + sref + "': " + broken_sources[sref];
+                } else {
+                    fail_validation("Outbound group '" + gname + "' uses invalid outbound source '" + sref + "': " + broken_sources[sref] + " Aborted.");
+                }
+            }
+        }
+    }
+
+    for (let section in sections) {
+        if (!section_enabled(section))
+            continue;
+        let name = section_name(section);
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            for (let cref in connections.section_condition_refs(section)) {
+                if (connections.condition_section(cref) == null)
+                    fail_validation("Rule '" + name + "' references missing condition '" + cref + "'. Aborted.");
+                if (broken_conditions[cref] != null)
+                    fail_validation("Rule '" + name + "' uses invalid condition '" + cref + "': " + broken_conditions[cref] + " Aborted.");
+            }
+            for (let sref in connections.section_outbound_source_refs(section)) {
+                if (connections.outbound_source_section(sref) == null)
+                    fail_validation("Rule '" + name + "' references missing outbound source '" + sref + "'. Aborted.");
+                if (broken_sources[sref] != null)
+                    fail_validation("Rule '" + name + "' uses invalid outbound source '" + sref + "': " + broken_sources[sref] + " Aborted.");
+            }
+            for (let gref in connections.section_outbound_group_refs(section)) {
+                if (connections.outbound_group_section(gref) == null)
+                    fail_validation("Rule '" + name + "' references missing outbound group '" + gref + "'. Aborted.");
+                if (broken_groups[gref] != null)
+                    fail_validation("Rule '" + name + "' uses invalid outbound group '" + gref + "': " + broken_groups[gref] + " Aborted.");
+            }
+            for (let bref in connections.section_balancer_refs(section)) {
+                if (connections.balancer_section(bref) == null)
+                    fail_validation("Rule '" + name + "' references missing balancer '" + bref + "'. Aborted.");
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
     }
 }
 
@@ -2231,57 +2827,97 @@ function validate_runtime_config(context) {
     let guest_modes = sections_by_type("guest_mode");
 
     validate_runtime_mark_ranges_context(context);
-
-    // Native-mode Tailscale servers need the system tailscaled binary; the
-    // check lives here so every validation entry point (including fixtures)
-    // enforces it.
-    for (let ts_server in sections_by_type("server")) {
-        if (!server_enabled(ts_server))
-            continue;
-        if (option(ts_server, "protocol", "vless") != "tailscale")
-            continue;
-        if (option(ts_server, "tailscale_mode", "singbox") != "native")
-            continue;
-        // Without a key `tailscale up` falls back to interactive login and
-        // would block the runtime forever on a headless router.
-        if (trim(as_string(option(ts_server, "tailscale_auth_key", "") || "")) == "")
-            fail_requirement("Server '" + section_name(ts_server) + "' uses native Tailscale mode without an auth key. Generate one in the Tailscale admin console and fill in 'Tailscale auth key', or switch this server back to sing-box mode. Aborted.", "fatal");
-        if (!command_exists("tailscaled"))
-            fail_requirement("Server '" + section_name(ts_server) + "' uses native Tailscale mode, but tailscaled is not installed. Install the Tailscale component on the Updates tab, or switch this server back to sing-box mode. Aborted.", "fatal");
-    }
+    validate_modular_entities(sections, context);
 
     validate_dns_settings(settings, sections, context);
+    validate_ipv6_and_fakeip_settings(settings, sections);
     validate_list_update_settings(settings);
+    validate_wan_failover_settings(settings);
     validate_http_url_option(option(settings, "latency_test_url", DEFAULT_LATENCY_TEST_URL) || DEFAULT_LATENCY_TEST_URL, "settings.latency_test_url");
     let bt_policy = lc(trim(option(settings, "bittorrent_policy", "")));
     if (bt_policy != "" && !contains([ "off", "direct", "block" ], bt_policy))
         fail_validation("Unsupported BitTorrent policy '" + bt_policy + "'. Use off, direct, or block. Aborted.");
+    if (runtime_quarantine_mode) {
+        try {
+            current_validating_section = "__settings_routing__";
+            validate_routing_strategy(settings, sections);
+            delete runtime_quarantined_sections["__settings_routing__"];
+        } catch (e) {
+            delete runtime_quarantined_sections["__settings_routing__"];
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
+    } else {
+        validate_routing_strategy(settings, sections);
+    }
 
     if (download_via_proxy_enabled(settings, "lists")) {
-        validate_download_section_rows(
-            download_via_proxy_section(settings, "lists"),
-            context.byedpi_installed,
-            context.zapret_installed,
-            context.zapret2_installed,
-            basic_rows_from_sections(sections)
-        );
+        if (runtime_quarantine_mode) {
+            try {
+                current_validating_section = "__settings_dl_lists__";
+                validate_download_section_rows(
+                    download_via_proxy_section(settings, "lists"),
+                    basic_rows_from_sections(sections)
+                );
+                delete runtime_quarantined_sections["__settings_dl_lists__"];
+            } catch (e) {
+                delete runtime_quarantined_sections["__settings_dl_lists__"];
+                current_validating_section = "";
+                if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                    die(e);
+            }
+            current_validating_section = "";
+        } else {
+            validate_download_section_rows(
+                download_via_proxy_section(settings, "lists"),
+                basic_rows_from_sections(sections)
+            );
+        }
     }
     if (download_via_proxy_enabled(settings, "components")) {
-        validate_download_section_rows(
-            download_via_proxy_section(settings, "components"),
-            context.byedpi_installed,
-            context.zapret_installed,
-            context.zapret2_installed,
-            basic_rows_from_sections(sections)
-        );
+        if (runtime_quarantine_mode) {
+            try {
+                current_validating_section = "__settings_dl_components__";
+                validate_download_section_rows(
+                    download_via_proxy_section(settings, "components"),
+                    basic_rows_from_sections(sections)
+                );
+                delete runtime_quarantined_sections["__settings_dl_components__"];
+            } catch (e) {
+                delete runtime_quarantined_sections["__settings_dl_components__"];
+                current_validating_section = "";
+                if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                    die(e);
+            }
+            current_validating_section = "";
+        } else {
+            validate_download_section_rows(
+                download_via_proxy_section(settings, "components"),
+                basic_rows_from_sections(sections)
+            );
+        }
     }
 
     validate_outbound_detours_rows(detour_rows_from_sections(sections));
     validate_subscription_download_sections(sections, context);
     validate_server_routing_sections(sections);
 
-    for (let section in sections)
-        validate_rule(section, sections, context);
+    for (let section in sections) {
+        let name = section_name(section);
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            validate_rule(section, sections, context);
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
+    }
 
     validate_global_rules(sections);
 
@@ -2293,6 +2929,8 @@ function validate_runtime_config(context) {
 
     for (let guest_mode in guest_modes)
         validate_guest_mode(guest_mode);
+
+    persist_validator_quarantine();
 }
 
 function context_from_runtime() {
@@ -2301,280 +2939,26 @@ function context_from_runtime() {
     return {
         constants,
         community_services: constant_value(constants, "COMMUNITY_SERVICES"),
-        byedpi_default_cmd_opts: constant_value(constants, "BYEDPI_DEFAULT_CMD_OPTS"),
-        zapret_default_nfqws_opt: constant_value(constants, "ZAPRET_DEFAULT_NFQWS_OPT"),
-        zapret_legacy_default_nfqws_opt: constant_value(constants, "ZAPRET_LEGACY_DEFAULT_NFQWS_OPT"),
-        zapret2_default_nfqws2_opt: constant_value(constants, "ZAPRET2_DEFAULT_NFQWS2_OPT"),
-        byedpi_installed: file_executable(constant_value(constants, "BYEDPI_BIN")),
-        zapret_installed: file_executable(constant_value(constants, "ZAPRET_PROVIDER_NFQWS_BIN")),
-        zapret2_installed: file_executable(constant_value(constants, "ZAPRET2_PROVIDER_NFQWS2_BIN")),
-        wdtt_installed: file_executable(constant_value(constants, "WDTT_BIN")),
-        olcrtc_installed: file_executable(constant_value(constants, "OLCRTC_BIN")),
-        fptn_installed: file_executable("/usr/bin/fptn-client-cli") || file_executable("/usr/bin/fptn-client"),
-        fptn_bin: file_executable("/usr/bin/fptn-client-cli") ? "/usr/bin/fptn-client-cli" : "/usr/bin/fptn-client",
-        fptn_state_dir: "/var/run/tachyon/fptn",
-        zapret_provider_nfqws_bin: constant_value(constants, "ZAPRET_PROVIDER_NFQWS_BIN"),
-        zapret2_provider_nfqws2_bin: constant_value(constants, "ZAPRET2_PROVIDER_NFQWS2_BIN"),
-        zapret_route_mark_base: constant_value(constants, "ZAPRET_ROUTE_MARK_BASE"),
-        zapret_queue_range_size: constant_value(constants, "ZAPRET_QUEUE_RANGE_SIZE"),
-        zapret2_route_mark_base: constant_value(constants, "ZAPRET2_ROUTE_MARK_BASE"),
-        zapret2_queue_range_size: constant_value(constants, "ZAPRET2_QUEUE_RANGE_SIZE"),
         nft_fakeip_mark: constant_value(constants, "NFT_FAKEIP_MARK"),
         nft_outbound_mark: constant_value(constants, "NFT_OUTBOUND_MARK"),
         coreutils_base64_required_version: constant_value(constants, "COREUTILS_BASE64_REQUIRED_VERSION"),
-        sing_box_required_version: constant_value(constants, "SB_REQUIRED_VERSION"),
-        sing_box_variant_state_file: constant_value(constants, "SB_VARIANT_STATE_FILE"),
-        sing_box_version_state_file: constant_value(constants, "SB_VERSION_STATE_FILE"),
-        sing_box_managed_service_marker: constant_value(constants, "SB_MANAGED_SERVICE_MARKER"),
-        zapret_legacy_runtime_base_dir: constant_value(constants, "ZAPRET_LEGACY_RUNTIME_BASE_DIR"),
-        zapret_state_dir: constant_value(constants, "ZAPRET_STATE_DIR"),
-        zapret_pid_dir: constant_value(constants, "ZAPRET_PID_DIR"),
-        zapret_child_pid_dir: constant_value(constants, "ZAPRET_CHILD_PID_DIR"),
-        zapret_log_dir: constant_value(constants, "ZAPRET_LOG_DIR"),
-        zapret2_state_dir: constant_value(constants, "ZAPRET2_STATE_DIR"),
-        zapret2_pid_dir: constant_value(constants, "ZAPRET2_PID_DIR"),
-        zapret2_child_pid_dir: constant_value(constants, "ZAPRET2_CHILD_PID_DIR"),
-        zapret2_log_dir: constant_value(constants, "ZAPRET2_LOG_DIR"),
-        byedpi_bin: constant_value(constants, "BYEDPI_BIN"),
-        byedpi_state_dir: constant_value(constants, "BYEDPI_STATE_DIR"),
-        byedpi_pid_dir: constant_value(constants, "BYEDPI_PID_DIR"),
-        byedpi_child_pid_dir: constant_value(constants, "BYEDPI_CHILD_PID_DIR"),
-        byedpi_log_dir: constant_value(constants, "BYEDPI_LOG_DIR")
+        core_version_state_file: constant_value(constants, "CORE_VERSION_STATE_FILE"),
+        core_managed_service_marker: constant_value(constants, "CORE_MANAGED_SERVICE_MARKER")
     };
 }
 
-function find_core_binary() {
-    if (command_exists("tachyon-core"))
-        return "tachyon-core";
-    if (command_exists("sing-box"))
-        return "sing-box";
-    return "";
-}
-
-function core_exists() {
-    return command_exists("tachyon-core") || command_exists("sing-box");
-}
-
-function sing_box_variant_marker(ctx, value) {
-    let path = as_string(ctx.sing_box_variant_state_file);
-    if (path == "")
-        path = fs.stat("/etc/tachyon/tachyon-core-variant") != null ? "/etc/tachyon/tachyon-core-variant" : "/etc/tachyon/sing-box-variant";
-
-    let data = fs.readfile(path);
-    return trim(as_string(data)) == as_string(value);
-}
-
-function sing_box_compressed_marker_set(ctx) {
-    return sing_box_variant_marker(ctx, "extended-compressed");
-}
-
-function sing_box_extended_marker_set(ctx) {
-    return sing_box_variant_marker(ctx, "extended");
-}
-
-function sing_box_lx_marker_set(ctx) {
-    return sing_box_variant_marker(ctx, "lx");
-}
-
-function sing_box_tachyon_core_marker_set(ctx) {
-    return sing_box_variant_marker(ctx, "tachyon-core");
-}
-
-function sing_box_version_state(ctx) {
-    let path = as_string(ctx.sing_box_version_state_file);
-    if (path == "")
-        path = fs.stat("/etc/tachyon/tachyon-core-version") != null ? "/etc/tachyon/tachyon-core-version" : "/etc/tachyon/sing-box-version";
-
-    let data = fs.readfile(path);
-    if (data == null)
-        return "";
-
-    let newline = index(data, "\n");
-    return newline >= 0 ? substr(data, 0, newline) : as_string(data);
-}
-
-function get_sing_box_version(ctx) {
-    let bin = find_core_binary();
-    if (bin == "")
-        return "";
-
-    if (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx))
-        return sing_box_version_state(ctx);
-
-    return common.parse_sing_box_version(command_output_from_args([ bin, "version" ]));
-}
-
-function sing_box_version_is_extended(version) {
-    return index(as_string(version), "extended") >= 0;
-}
-
-function sing_box_version_is_lx(version) {
-    let s = as_string(version);
-    return s == "lx" || s == "sing-box-lx" || index(s, "-lx") >= 0;
-}
-
-// Kept identical to the copy in tachyon_core/runtime.uc, like version_compare above -
-// this module runs before runtime is loaded. Its "-tachyon.<n>" suffix marks a
-// build that implements the schema from scratch rather than being a fork of the
-// Go binary, and whose version number is therefore not comparable with sing-box's.
-function sing_box_version_is_foreign_core(version) {
-    let s = as_string(version);
-    return index(s, "-tachyon.") >= 0 || s == "tachyon-core" || index(s, "tachyon-core") >= 0 || match(s, /^v?0\.0\./) != null;
-}
-
-function sing_box_is_extended(ctx, version) {
-    if (as_string(version) == "" && core_exists() &&
-        (sing_box_compressed_marker_set(ctx) || sing_box_extended_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
-        return true;
-
-    version = version != null ? version : get_sing_box_version(ctx);
-    return sing_box_version_is_extended(version) || sing_box_version_is_lx(version) || sing_box_version_is_foreign_core(version);
-}
-
-function sing_box_is_lx(ctx, version) {
-    if (sing_box_version_is_lx(version) || sing_box_version_is_foreign_core(version))
-        return true;
-    if (as_string(version) == "" && core_exists() && (sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
-        return true;
-
-    return sing_box_version_is_lx(version != null ? version : get_sing_box_version(ctx)) || sing_box_version_is_foreign_core(version != null ? version : get_sing_box_version(ctx));
-}
-
-function sing_box_is_tachyon_core(ctx, version) {
-    if (sing_box_version_is_foreign_core(version))
-        return true;
-    if (as_string(version) == "" && core_exists() && sing_box_tachyon_core_marker_set(ctx))
-        return true;
-
-    return sing_box_version_is_foreign_core(version != null ? version : get_sing_box_version(ctx)) || sing_box_tachyon_core_marker_set(ctx);
-}
-
-// The marker the profile lookup answers from: the state file when there is one,
-// and the identity a bare foreign version carries otherwise. profile() reads a
-// version suffix, so "0.0.1" and "tachyon-core" have none and would be filed
-// under upstream - switching their features off exactly the way the old
-// build-tag probe did.
-function sing_box_capability_marker(ctx, version) {
-    let path = as_string(ctx.sing_box_variant_state_file);
-    if (path == "")
-        path = fs.stat("/etc/tachyon/tachyon-core-variant") != null ? "/etc/tachyon/tachyon-core-variant" : "/etc/tachyon/sing-box-variant";
-
-    let data = fs.readfile(path);
-    let marker = data == null ? "" : trim(as_string(data));
-
-    let v = as_string(version);
-    if (marker == "" && (match(v, /^v?0\.0\./) != null || index(v, "tachyon-core") >= 0))
-        marker = "tachyon-core";
-
-    return marker;
-}
-
-function sing_box_supports_tailscale(ctx, version, version_output) {
-    let answer = core_profile().supports_tailscale(as_string(version),
-        sing_box_capability_marker(ctx, version), as_string(version_output));
-    if (answer == null) {
-        let bin = find_core_binary();
-        answer = bin != "" ? core_profile().output_has_build_tag(command_output_from_args([ bin, "version" ]), "with_tailscale") : false;
-    }
-    return answer;
-}
-
-function sing_box_supports_xhttp(ctx, version, version_output) {
-    let answer = core_profile().supports_xhttp(as_string(version),
-        sing_box_capability_marker(ctx, version), as_string(version_output));
-    if (answer == null) {
-        let bin = find_core_binary();
-        answer = bin != "" ? core_profile().output_has_build_tag(command_output_from_args([ bin, "version" ]), "with_xhttp") : false;
-    }
-    return answer;
-}
-
-function managed_sing_box_service_script(marker) {
+function managed_core_service_script(marker) {
     marker = as_string(marker);
     if (marker == "")
-        marker = "Tachyon managed sing-box service for binary variants";
-
-    return "#!/bin/sh /etc/rc.common\n" +
-        "# " + marker + "\n" +
-        "\n" +
-        "USE_PROCD=1\n" +
-        "START=99\n" +
-        "PROG=\"/usr/bin/tachyon-core\"\n" +
-        "[ -x \"$PROG\" ] || PROG=\"/usr/bin/sing-box\"\n" +
-        "\n" +
-        "start_service() {\n" +
-        "    [ -d /dev/net ] || mkdir -p /dev/net\n" +
-        "    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true\n" +
-        "    modprobe tun 2>/dev/null || true\n" +
-        "    modprobe inet_diag 2>/dev/null || true\n" +
-        "\n" +
-        "    config_load \"tachyon-core\"\n" +
-        "    local enabled config_file working_directory\n" +
-        "    local log_stderr\n" +
-        "\n" +
-        "    config_get_bool enabled \"main\" \"enabled\" \"0\"\n" +
-        "    [ \"$enabled\" -eq \"1\" ] || return 0\n" +
-        "\n" +
-        "    [ -x \"$PROG\" ] || PROG=\"$(command -v tachyon-core 2>/dev/null || command -v sing-box 2>/dev/null || echo /usr/bin/tachyon-core)\"\n" +
-        "    config_get config_file \"main\" \"conffile\" \"/etc/tachyon-core/config.json\"\n" +
-        "    config_get working_directory \"main\" \"workdir\" \"/usr/share/tachyon-core\"\n" +
-        "    [ -d \"$working_directory\" ] || mkdir -p \"$working_directory\"\n" +
-        "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n" +
-        "\n" +
-        "    local mem_limit_mb=\"0\"\n" +
-        "    config_get mem_limit_mb \"main\" \"memory_limit_mb\" \"0\"\n" +
-        "    if [ \"$mem_limit_mb\" = \"0\" ] || [ -z \"$mem_limit_mb\" ]; then\n" +
-        "        mem_limit_mb=\"$(uci get tachyon.settings.memory_limit_mb 2>/dev/null || echo 0)\"\n" +
-        "    fi\n\n" +
-        "    local scale_pct=\"\"\n" +
-        "    if [ -s \"/etc/tachyon/mem_scale\" ]; then\n" +
-        "        scale_pct=\"$(awk -v s=\"$(cat /etc/tachyon/mem_scale 2>/dev/null)\" 'BEGIN { if (!s) exit; pct=int(s*100); if (pct < 20) pct=20; if (pct > 100) pct=100; print pct }')\"\n" +
-        "    fi\n\n" +
-        "    local gomemlimit=\"\"\n" +
-        "    local mem_total_kb=\"$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n" +
-        "    if [ \"$mem_limit_mb\" -gt 0 ] 2>/dev/null; then\n" +
-        "        gomemlimit=\"$mem_limit_mb\"\n" +
-        "    elif [ \"$mem_total_kb\" -gt 0 ]; then\n" +
-        "        if [ \"$mem_total_kb\" -le 524288 ] || { [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; }; then\n" +
-        "            gomemlimit=$(( mem_total_kb / 1024 * 50 / 100 ))\n" +
-        "            [ \"$gomemlimit\" -lt 24 ] && gomemlimit=24\n" +
-        "        fi\n" +
-        "    fi\n\n" +
-        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
-        "        if [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; then\n" +
-        "            gomemlimit=$(( gomemlimit * scale_pct / 100 ))\n" +
-        "            [ \"$gomemlimit\" -lt 16 ] && gomemlimit=16\n" +
-        "        fi\n" +
-        "    fi\n\n" +
-        "    mkdir -p /tmp/tachyon-core 2>/dev/null\n" +
-        "    : > /tmp/tachyon-core/sing-box.log 2>/dev/null\n" +
-        "\n" +
-        "    procd_open_instance\n" +
-        "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
-        "    procd_set_param file \"$config_file\"\n" +
-        "    procd_set_param stderr \"$log_stderr\"\n" +
-        "    procd_set_param limits core=\"0\"\n" +
-        "    procd_set_param limits nofile=\"65535 65535\"\n" +
-        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
-        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\" GOMEMLIMIT=\"${gomemlimit}MiB\"\n" +
-        "    else\n" +
-        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
-        "    fi\n" +
-        "    procd_set_param term_timeout 15\n" +
-        "    procd_set_param respawn\n" +
-        "    procd_close_instance\n" +
-        "}\n" +
-        "\n" +
-        "service_triggers() {\n" +
-        "    procd_add_reload_trigger \"tachyon-core\"\n" +
-        "}\n";
+        marker = "Tachyon managed tachyon-core service";
+    return require("core.process").managed_core_init_script(marker, true);
 }
 
-function install_managed_sing_box_service_script(ctx) {
+function install_managed_core_service_script(ctx) {
     let stamp = clock();
     let tmp_file = sprintf("/etc/init.d/tachyon-core.tachyon.%d.%d", stamp[0], stamp[1]);
 
-    if (!fs.writefile(tmp_file, managed_sing_box_service_script(ctx.sing_box_managed_service_marker)))
+    if (!fs.writefile(tmp_file, managed_core_service_script(ctx.core_managed_service_marker)))
         return false;
 
     if (!run_args([ "chmod", "0755", tmp_file ]) || !run_args([ "mv", "-f", tmp_file, "/etc/init.d/tachyon-core" ])) {
@@ -2589,36 +2973,9 @@ function service_exists(service) {
     return file_executable("/etc/init.d/" + as_string(service));
 }
 
-function validate_extended_server_features(ctx, sing_box_version, sing_box_version_output) {
-    if (sing_box_is_extended(ctx, sing_box_version))
-        return;
-
-    for (let section in sections_by_type("server")) {
-        if (!server_enabled(section))
-            continue;
-
-        let name = section_name(section);
-        let protocol = option(section, "protocol", "vless");
-        let transport = option(section, "transport", "tcp");
-
-        if (protocol == "mtproto")
-            fail_requirement("Server '" + name + "' uses MTProto proxy, but sing-box-extended is not installed. Install sing-box-extended or disable this server. Aborted.", "fatal");
-
-        // Native-mode Tailscale runs tailscaled outside sing-box and does
-        // not need the with_tailscale build.
-        if (protocol == "tailscale" && option(section, "tailscale_mode", "singbox") != "native" &&
-            !sing_box_supports_tailscale(ctx, sing_box_version, sing_box_version_output))
-            fail_requirement("Server '" + name + "' uses Tailscale, but the installed sing-box binary was built without Tailscale support. Install full sing-box or sing-box-extended, switch this server to native Tailscale mode, or disable this server. Aborted.", "fatal");
-
-        if (transport == "xhttp" && !sing_box_supports_xhttp(ctx, sing_box_version, sing_box_version_output))
-            fail_requirement("Server '" + name + "' uses XHTTP transport, but the installed sing-box binary does not support it. Install sing-box-extended or a binary with XHTTP support, or change the transport. Aborted.", "fatal");
-    }
-}
-
-// Runs for every variant (unlike validate_extended_server_features, which
-// early-returns on extended-family binaries): section actions emit
-// outbound/endpoint shapes that differ per sing-box build.
-function validate_section_action_variant_support(ctx, sing_box_version) {
+// Validates section actions and server protocols against the installed
+// tachyon-core build capabilities.
+function validate_section_action_core_support(ctx, core_version) {
     // Returns true when at least one removed junk-signature field is set.
     function removed_junk_sig_set(section) {
         for (let key in [ "awg_j1", "awg_j2", "awg_j3", "awg_itime" ]) {
@@ -2634,88 +2991,90 @@ function validate_section_action_variant_support(ctx, sing_box_version) {
             continue;
 
         let name = section_name(section);
-        let action = rule_action(section);
-        // tachyon-core carries AmneziaWG inside its wireguard endpoint
-        // (AwgParams::from_obj), so it is a supported target like extended/lx.
-        if (action == "awg" && !sing_box_is_extended(ctx, sing_box_version) && !sing_box_is_lx(ctx, sing_box_version) && !sing_box_is_tachyon_core(ctx, sing_box_version))
-            fail_requirement("Section '" + name + "' uses AmneziaWG, but the installed sing-box binary does not support it. Install sing-box-extended, sing-box-lx or tachyon-core, or change the action. Aborted.", "fatal");
-
-        if (action == "awg") {
-            // NB: sing_box_is_lx() is true for tachyon-core as well (it folds in
-            // sing_box_version_is_foreign_core), so the core has to be excluded
-            // explicitly: its AWG_FIELDS has no j1/j2/j3/itime and an unknown
-            // endpoint key is a hard rejection, not a warning.
-            let is_core_awg = sing_box_is_tachyon_core(ctx, sing_box_version);
-            if (removed_junk_sig_set(section) &&
-                !common.extended_awg_schema_has_junk_signatures(sing_box_version) &&
-                !(sing_box_is_lx(ctx, sing_box_version) && !is_core_awg))
-                fail_requirement("Section '" + name + "' sets awg_j1/awg_j2/awg_j3/awg_itime, but the installed core does not accept junk-signature fields: sing-box-extended dropped them in 2.6.1 and tachyon-core never had them. Remove them from the section or use sing-box-extended 2.6.0 or older. Aborted.", "fatal");
-
-            let has_v31_trailers = bool_option(section, "awg_random_trailers", false);
-            let has_v31_cookies = bool_option(section, "awg_disable_cookies", false);
-            if ((has_v31_trailers || has_v31_cookies) && !sing_box_is_lx(ctx, sing_box_version) && !sing_box_is_tachyon_core(ctx, sing_box_version))
-                fail_requirement("Section '" + name + "' enables AmneziaWG 3.1 features (RandomTrailers / DisableCookies), which are only supported by sing-box-lx and tachyon-core. Install one of them in the Updates tab or disable these options. Aborted.", "fatal");
-        }
-
-        // These actions emit outbound/endpoint shapes that only exist in the
-        // sing-box-extended fork: "warp" and the profiles[]-style "masque"/
-        // "openvpn" endpoints are absent from stock sing-box, and sing-box-lx
-        // uses a different masque schema that our UCI options cannot fill.
-        // Gating here keeps an invalid section from failing the whole config.
-        let extended_only_labels = {
-            warp: "WARP",
-            masque: "MASQUE",
-            openvpn: "OpenVPN",
-            snell: "Snell",
-            mieru: "Mieru",
-            sudoku: "Sudoku"
-        };
-        let extended_only_label = extended_only_labels[as_string(action)];
-        // NB: sing_box_is_extended() also matches sing-box-lx, so exclude it here.
-        if (extended_only_label != null) {
-            let is_extended = sing_box_is_extended(ctx, sing_box_version) && !sing_box_is_lx(ctx, sing_box_version);
-            let is_core = sing_box_is_tachyon_core(ctx, sing_box_version);
-            let core_supported = (action == "warp" || action == "masque" || action == "openvpn" || action == "snell" || action == "mieru");
-            if (!is_extended && !(is_core && core_supported)) {
-                let lx_note = (sing_box_is_lx(ctx, sing_box_version) && !is_core)
-                    ? " sing-box-lx " + as_string(sing_box_version) + " does ship this protocol, but Tachyon cannot fill its different configuration schema yet — support is planned."
-                    : (is_core ? " tachyon-core does not implement " + extended_only_label + " yet." : "");
-                fail_requirement("Section '" + name + "' uses " + extended_only_label + ", but Tachyon can only configure it with the sing-box-extended binary" + (core_supported ? " or tachyon-core" : "") + " (stock sing-box lacks the endpoint; sing-box-lx uses a different schema)." + lx_note + " Install sing-box-extended" + (core_supported ? " or tachyon-core" : "") + " or change the action. Aborted.", "fatal");
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            let action = rule_action(section);
+            if (action == "awg" && removed_junk_sig_set(section)) {
+                fail_requirement("Section '" + name + "' sets awg_j1/awg_j2/awg_j3/awg_itime, which tachyon-core does not accept. Remove them from the section. Aborted.", "fatal");
             }
-        }
 
-        // OpenVPN was added in sing-box 1.14.0. Older extended builds (e.g.
-        // 1.13.x-extended-2.x.x) don't know the endpoint type and abort with
-        // "unknown endpoint type: openvpn". Gate on version so the user gets a
-        // clear error instead of a cryptic sing-box fatal.
-        if (action == "openvpn" && !sing_box_is_tachyon_core(ctx, sing_box_version) && !common.sing_box_supports_openvpn(sing_box_version))
-            fail_requirement("Section '" + name + "' uses OpenVPN, but the installed sing-box version (" + as_string(sing_box_version) + ") does not support it. OpenVPN requires sing-box 1.14.0 or newer. Update sing-box-extended in the Updates tab or change the action. Aborted.", "fatal");
+            if (as_string(action) == "sudoku") {
+                fail_requirement("Section '" + name + "' uses Sudoku, which tachyon-core does not implement yet. Change the action. Aborted.", "fatal");
+            }
+
+            // Native desync is a tachyon-core outbound and arrived in 0.1.7.
+            if (action == "desync") {
+                let desync_ok = core_profile().supports_desync(core_version, "tachyon-core") === true;
+                if (!desync_ok) {
+                    fail_requirement("Section '" + name + "' uses Native Desync, which requires tachyon-core 0.1.7 or newer (installed: " + as_string(core_version) + "). Update tachyon-core in the Updates tab or change the action. Aborted.", "fatal");
+                }
+            }
+
+            let uses_native_wdtt = (action == "csqtt" || action == "wdtt");
+            if (!uses_native_wdtt && (connections.is_connections_action(action) || action == "group")) {
+                for (let src in connections.section_effective_outbound_sources(section)) {
+                    let stype = lc(trim(option(src, "source_type", "")));
+                    if (stype == "csqtt" || stype == "wdtt") {
+                        uses_native_wdtt = true;
+                        break;
+                    }
+                }
+                if (!uses_native_wdtt) {
+                    for (let raw_url in connections.connection_urls(section)) {
+                        if (match(lc(trim(as_string(raw_url))), /^(csqtt|wdtt|qwdtt):\/\//) != null) {
+                            uses_native_wdtt = true;
+                            break;
+                        }
+                    }
+                }
+                if (!uses_native_wdtt) {
+                    for (let raw_json in connections.outbound_jsons(section)) {
+                        let parsed_out = outbound_json_object(raw_json);
+                        if (parsed_out != null && lc(as_string(parsed_out.type || "")) == "wdtt") {
+                            uses_native_wdtt = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (uses_native_wdtt &&
+                !core_profile().supports_protocol("wdtt", core_version, "tachyon-core")) {
+                fail_requirement("Section '" + name + "' uses CSQTT / WDTT v3, which is not supported by the installed tachyon-core build. Update tachyon-core or change the action. Aborted.", "fatal");
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
     }
 
     for (let server in sections_by_type("server")) {
         if (!server_enabled(server))
             continue;
 
-        let srv_proto = as_string(option(server, "protocol", "vless"));
-        if (srv_proto == "mtproto" && sing_box_is_tachyon_core(ctx, sing_box_version))
-            fail_requirement("Server '" + section_name(server) + "' uses MTProto, but tachyon-core does not implement MTProto yet. Use sing-box-extended or select another protocol. Aborted.", "fatal");
-
-        if (srv_proto != "awg")
-            continue;
-
         let name = section_name(server);
-        // Same NB as on the section side: sing_box_is_lx() is true for
-        // tachyon-core too, and the core rejects j1/j2/j3/itime outright.
-        let is_core_awg = sing_box_is_tachyon_core(ctx, sing_box_version);
-        if (removed_junk_sig_set(server) &&
-            !common.extended_awg_schema_has_junk_signatures(sing_box_version) &&
-            !(sing_box_is_lx(ctx, sing_box_version) && !is_core_awg))
-            fail_requirement("Server '" + name + "' sets awg_j1/awg_j2/awg_j3/awg_itime, but the installed core does not accept junk-signature fields: sing-box-extended dropped them in 2.6.1 and tachyon-core never had them. Remove them from the server or use sing-box-extended 2.6.0 or older. Aborted.", "fatal");
+        if (runtime_quarantine_mode && runtime_quarantined_sections[name] != null)
+            continue;
+        current_validating_section = name;
+        try {
+            let srv_proto = as_string(option(server, "protocol", "vless"));
+            if (srv_proto == "wdtt" && !core_profile().supports_inbound("wdtt", core_version, "tachyon-core"))
+                fail_requirement("Server '" + name + "' uses CSQTT / WDTT v3, which is not supported by the installed tachyon-core build. Update tachyon-core or select another protocol. Aborted.", "fatal");
+            if (srv_proto == "mtproto" && match(as_string(core_version), /^v?0\.0\./) != null)
+                fail_requirement("Server '" + name + "' uses MTProto, which this older tachyon-core build (" + as_string(core_version) + ") does not support. Update tachyon-core or select another protocol. Aborted.", "fatal");
 
-        let has_srv_trailers = bool_option(server, "awg_random_trailers", false);
-        let has_srv_cookies = bool_option(server, "awg_disable_cookies", false);
-        if ((has_srv_trailers || has_srv_cookies) && !sing_box_is_lx(ctx, sing_box_version))
-            fail_requirement("Server '" + name + "' enables AmneziaWG 3.1 features (RandomTrailers / DisableCookies), which are only supported by sing-box-lx and tachyon-core. Install one of them in the Updates tab or disable these options. Aborted.", "fatal");
+            if (srv_proto == "awg" && removed_junk_sig_set(server)) {
+                fail_requirement("Server '" + name + "' sets awg_j1/awg_j2/awg_j3/awg_itime, which tachyon-core does not accept. Remove them from the server. Aborted.", "fatal");
+            }
+        } catch (e) {
+            current_validating_section = "";
+            if (index(as_string(e), "__TACHYON_QUARANTINE__") < 0)
+                die(e);
+        }
+        current_validating_section = "";
     }
 }
 
@@ -2725,156 +3084,43 @@ function has_outbound_section(ctx) {
             continue;
 
         let action = rule_action(section);
-        if (action == "byedpi" && ctx.byedpi_installed)
-            return true;
-        if (action == "zapret" && ctx.zapret_installed)
-            return true;
-        if (action == "zapret2" && ctx.zapret2_installed)
-            return true;
 
-        // Tunnel-style actions generate real sing-box endpoints/outbounds;
+        // Tunnel-style actions generate real tachyon-core endpoints/outbounds;
         // without this check a lone AWG/WARP/VPN section triggered the
         // misleading "No proxy outbound sections found" warning.
         if (contains([ "awg", "warp", "vpn", "openvpn", "masque",
-            "anytls", "snell", "mieru", "naive", "sudoku", "fptn" ], as_string(action)))
+            "anytls", "snell", "mieru", "naive", "sudoku", "openconnect", "tewfai", "csqtt", "wdtt", "trusttunnel",
+            "mtproto", "shadowtls", "desync", "chain", "tailscale", "fptn" ], as_string(action)))
             return true;
 
         if (length(connections.connection_urls(section)) > 0 ||
             length(connections.subscription_urls(section)) > 0 ||
             length(connections.outbound_jsons(section)) > 0 ||
-            length(connections.interfaces(section)) > 0)
+            length(connections.interfaces(section)) > 0 ||
+            length(connections.embedded_tailscale_sources(section)) > 0)
             return true;
     }
 
     return false;
-}
-
-function has_enabled_rule_action(action) {
-    action = as_string(action);
-
-    for (let section in sections_by_type("section"))
-        if (section_enabled(section) && rule_action(section) == action)
-            return true;
-
-    return false;
-}
-
-function cleanup_legacy_zapret_runtime(ctx) {
-    let base = as_string(ctx.zapret_legacy_runtime_base_dir);
-    if (base == "")
-        return;
-
-    let needle = base + "/nfq/nfqws";
-    for (let line in split(command_output_from_args([ "ps", "w" ]), "\n")) {
-        if (index(as_string(line), needle) < 0)
-            continue;
-
-        let fields = split(trim(as_string(line)), /[ \t]+/);
-        let pid = length(fields) > 0 ? as_string(fields[0]) : "";
-        if (match(pid, /^[0-9]+$/) != null)
-            run_args([ "kill", pid ]);
-    }
-
-    safe_rm_rf(base);
-}
-
-function check_provider_requirement(action, display_name, bin_path, dirs, missing_message, prepare_failure_message) {
-    if (!has_enabled_rule_action(action))
-        return;
-
-    if (!file_executable(bin_path)) {
-        log_message(missing_message, "error");
-        return;
-    }
-
-    if (!mkdir_p(dirs))
-        fail_requirement(prepare_failure_message, "fatal");
-}
-
-function check_provider_requirements(ctx) {
-    cleanup_legacy_zapret_runtime(ctx);
-
-    check_provider_requirement(
-        "zapret",
-        "Zapret",
-        ctx.zapret_provider_nfqws_bin,
-        [ ctx.zapret_state_dir, ctx.zapret_pid_dir, ctx.zapret_child_pid_dir, ctx.zapret_log_dir ],
-        "Zapret provider is not available at " + ctx.zapret_provider_nfqws_bin + ". Rules with action 'zapret' will be skipped until the zapret provider is installed.",
-        "Failed to prepare the Tachyon zapret state directory in " + ctx.zapret_state_dir + ". Aborted."
-    );
-
-    check_provider_requirement(
-        "zapret2",
-        "Zapret2",
-        ctx.zapret2_provider_nfqws2_bin,
-        [ ctx.zapret2_state_dir, ctx.zapret2_pid_dir, ctx.zapret2_child_pid_dir, ctx.zapret2_log_dir ],
-        "Zapret2 provider is not available at " + ctx.zapret2_provider_nfqws2_bin + ". Rules with action 'zapret2' will be skipped until the zapret2 provider is installed.",
-        "Failed to prepare the Tachyon zapret2 state directory in " + ctx.zapret2_state_dir + ". Aborted."
-    );
-
-    check_provider_requirement(
-        "byedpi",
-        "ByeDPI",
-        ctx.byedpi_bin,
-        [ ctx.byedpi_state_dir, ctx.byedpi_pid_dir, ctx.byedpi_child_pid_dir, ctx.byedpi_log_dir ],
-        "ByeDPI provider is not available at " + ctx.byedpi_bin + ". Rules with action 'byedpi' will be skipped until the byedpi package is installed.",
-        "Failed to prepare the Tachyon ByeDPI state directory in " + ctx.byedpi_state_dir + ". Aborted."
-    );
-
-    // FPTN is not always a provider process. With tachyon-core the core dials
-    // FPTN straight from the generated config - generator_outbounds emits an
-    // fptn outbound and there is no external client, no shims, no state dir.
-    // Probing for /usr/bin/fptn-client there produced an error telling the
-    // admin to install a package their setup never uses, and skipped preparing
-    // a directory only the component runtime would have touched. The transport
-    // decision belongs to the single resolver in config.connections, which the
-    // generator and the provider runtime already ask - ask it here too instead
-    // of sniffing a binary behind its back.
-    if (connections.fptn_transport_mode() == "component") {
-        check_provider_requirement(
-            "fptn",
-            "FPTN",
-            ctx.fptn_bin,
-            [ ctx.fptn_state_dir ],
-            "FPTN provider is not available at " + ctx.fptn_bin + ". Rules with action 'fptn' will be skipped until the fptn package is installed.",
-            "Failed to prepare the Tachyon FPTN state directory in " + ctx.fptn_state_dir + ". Aborted."
-        );
-    }
 }
 
 function check_runtime_requirements() {
     log_message("Checking required packages and runtime settings", "info");
 
     let ctx = context_from_runtime();
-    let bin = find_core_binary();
-    let sing_box_version_output = bin != "" ? command_output_from_args([ bin, "version" ]) : "";
-    let sing_box_version = (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)) ? sing_box_version_state(ctx) : common.parse_sing_box_version(sing_box_version_output);
+    let core_version = get_tachyon_core_version(ctx);
     let coreutils_base64_version = first_line_field_from_text(command_output("base64 --version 2>/dev/null"), 4);
 
-    if (sing_box_version == "") {
-        if (!core_exists() || !(sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
-            fail_requirement("Package 'sing-box' is not installed. Aborted.", "error");
-    }
-    else if (!sing_box_version_is_foreign_core(sing_box_version) &&
-        !sing_box_tachyon_core_marker_set(ctx) &&
-        !version_at_least(sing_box_version, ctx.sing_box_required_version)) {
-        // The minimum is sing-box's own release floor, so it only means anything
-        // for a build in sing-box's series. Tachyon's core reports
-        // "0.0.1-tachyon.0": its number is from a different series and was never
-        // comparable, and refusing to start on it was refusing for no reason.
-        // Its schema compatibility is enforced by `sing-box check` on the
-        // generated config, which is the gate that can actually tell.
-        fail_requirement("Package 'sing-box' version (" + sing_box_version + ") is lower than the required minimum (" + ctx.sing_box_required_version + "). Update sing-box: opkg update && opkg remove sing-box && opkg install sing-box. Aborted.", "error");
-    }
+    if (!core_exists())
+        fail_requirement("Package 'tachyon-core' is not installed. Aborted.", "error");
 
-    if (!service_exists("tachyon-core") && !service_exists("sing-box") && (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx) || core_exists()))
-        install_managed_sing_box_service_script(ctx);
+    if (!service_exists("tachyon-core") && core_exists())
+        install_managed_core_service_script(ctx);
 
-    if (!service_exists("tachyon-core") && !service_exists("sing-box"))
-        fail_requirement("Service 'tachyon-core' is missing. Install a sing-box package or reinstall sing-box-lx / sing-box-extended binary variant. Aborted.", "error");
+    if (!service_exists("tachyon-core"))
+        fail_requirement("Service 'tachyon-core' is missing. Reinstall tachyon-core in the Updates tab. Aborted.", "error");
 
-    validate_extended_server_features(ctx, sing_box_version, sing_box_version_output);
-    validate_section_action_variant_support(ctx, sing_box_version);
+    validate_section_action_core_support(ctx, core_version);
 
     if (coreutils_base64_version == "")
         fail_requirement("Package 'coreutils-base64' is not installed. Aborted.", "error");
@@ -2888,8 +3134,6 @@ function check_runtime_requirements() {
         log_message("Proxy outbound configuration found", "debug");
     else
         log_message("No proxy outbound sections found. Tachyon will use direct and/or provider-only routing.", "warn");
-
-    check_provider_requirements(ctx);
 }
 
 function context_override_value(overrides, defaults, key) {
@@ -2919,19 +3163,10 @@ function context_from_json(value, defaults) {
 
     return {
         community_services: context_override_value(value, defaults, "community_services"),
-        byedpi_default_cmd_opts: context_override_value(value, defaults, "byedpi_default_cmd_opts"),
-        zapret_default_nfqws_opt: context_override_value(value, defaults, "zapret_default_nfqws_opt"),
-        zapret_legacy_default_nfqws_opt: context_override_value(value, defaults, "zapret_legacy_default_nfqws_opt"),
-        zapret2_default_nfqws2_opt: context_override_value(value, defaults, "zapret2_default_nfqws2_opt"),
-        byedpi_installed: context_override_bool(value, defaults, "byedpi_installed"),
-        zapret_installed: context_override_bool(value, defaults, "zapret_installed"),
-        zapret2_installed: context_override_bool(value, defaults, "zapret2_installed"),
-        zapret_route_mark_base: context_override_value(value, defaults, "zapret_route_mark_base"),
-        zapret_queue_range_size: context_override_value(value, defaults, "zapret_queue_range_size"),
-        zapret2_route_mark_base: context_override_value(value, defaults, "zapret2_route_mark_base"),
-        zapret2_queue_range_size: context_override_value(value, defaults, "zapret2_queue_range_size"),
         nft_fakeip_mark: context_override_value(value, defaults, "nft_fakeip_mark"),
-        nft_outbound_mark: context_override_value(value, defaults, "nft_outbound_mark")
+        nft_outbound_mark: context_override_value(value, defaults, "nft_outbound_mark"),
+        core_version_state_file: context_override_value(value, defaults, "core_version_state_file"),
+        core_managed_service_marker: context_override_value(value, defaults, "core_managed_service_marker")
     };
 }
 
@@ -2966,33 +3201,47 @@ else if (mode == "valid-inbound")
 else if (mode == "validate-outbound-detours")
     validate_outbound_detours();
 else if (mode == "validate-download-section")
-    validate_download_section(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
+    validate_download_section(ARGV[1]);
 else if (mode == "dhcp-has-https-dns-proxy-options")
     dhcp_has_https_dns_proxy_options_exit(ARGV[1]);
 else if (mode == "mwan3-has-enabled-interface")
     exit(mwan3_has_enabled_interface() ? 0 : 1);
 else if (mode == "mwan3-is-active")
     exit(mwan3_is_active() ? 0 : 1);
-else if (mode == "check-requirements")
+else if (mode == "check-requirements") {
+    runtime_quarantine_mode = true;
     check_runtime_requirements();
-else if (mode == "validate-runtime")
+    persist_validator_quarantine();
+}
+else if (mode == "validate-runtime") {
+    runtime_quarantine_mode = true;
     validate_runtime_config(context_from_runtime());
+}
 // Both start-path validations in one process: the runtime context is expensive to
 // assemble (it shells out for versions and installed-package markers) and each mode
 // built its own copy. check_runtime_requirements() exits non-zero on failure, so
 // reaching the second call already means the requirements passed.
 else if (mode == "check-requirements-and-validate-runtime") {
+    runtime_quarantine_mode = true;
     check_runtime_requirements();
     validate_runtime_config(context_from_runtime());
+}
+else if (mode == "validate-runtime-quarantine-fixture") {
+    runtime_quarantine_mode = true;
+    use_fixture_cursor(ARGV[1]);
+    let ctx = context_from_json(ARGV[2], context_from_runtime());
+    validate_section_action_core_support(ctx, ARGV[3] || "0.0.9");
+    validate_runtime_config(ctx);
+    printf("%J\n", runtime_quarantined_sections);
 }
 else if (mode == "validate-runtime-fixture") {
     use_fixture_cursor(ARGV[1]);
     validate_runtime_config(context_from_json(ARGV[2], context_from_runtime()));
 }
-else if (mode == "validate-section-action-variant-support") {
+else if (mode == "validate-section-action-core-support") {
     use_fixture_cursor(ARGV[1]);
     let ctx = context_from_json(ARGV[2], context_from_runtime());
-    validate_section_action_variant_support(ctx, ARGV[3]);
+    validate_section_action_core_support(ctx, ARGV[3]);
 }
 else {
     warn("Usage: config/validator.uc <operation> ...\n");

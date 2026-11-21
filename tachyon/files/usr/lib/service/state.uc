@@ -2,21 +2,24 @@
 
 let fs = require("fs");
 let uci_core = require("core.uci");
-let rule_config = require("config.rule");
-let connections = require("config.connections");
-let zapret_validator = require("providers.zapret.validator");
-let zapret2_validator = require("providers.zapret2.validator");
-let byedpi_validator = require("providers.byedpi.validator");
+let rule_config = null;
+let connections = null;
 let common = require("core.common");
 let process_identity = require("core.process");
+
+function ensure_signature_deps() {
+    if (rule_config == null) rule_config = require("config.rule");
+    if (connections == null) connections = require("config.connections");
+}
+
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const DEFAULT_PENDING_RELOAD_FILE = getenv("TACHYON_PENDING_RELOAD_FILE") || "/var/run/tachyon/reload.pending";
 const DEFAULT_SERVICE_INIT = getenv("TACHYON_SERVICE_INIT") || "/etc/init.d/tachyon";
-const CORE_LOG_PATH = "/tmp/tachyon-core/sing-box.log";
-const ZAPRET_DEFAULT_NFQWS_OPT = getenv("ZAPRET_DEFAULT_NFQWS_OPT") || "";
-const ZAPRET2_DEFAULT_NFQWS2_OPT = getenv("ZAPRET2_DEFAULT_NFQWS2_OPT") || "";
-const BYEDPI_DEFAULT_CMD_OPTS = getenv("BYEDPI_DEFAULT_CMD_OPTS") || "";
+const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
+const RELOAD_PREVIEW_FILE = getenv("TACHYON_RELOAD_PREVIEW_FILE") || RUNTIME_STATE_DIR + "/reload-preview.json";
+const TACHYON_CORE_PROVENANCE_FILE = getenv("TACHYON_CORE_PROVENANCE_FILE") || "/var/run/tachyon/tachyon-core.provenance";
+const CORE_LOG_PATH = getenv("TACHYON_CORE_LOG_PATH") || "/tmp/tachyon-core/tachyon-core.log";
 
 let as_string = common.as_string;
 
@@ -125,16 +128,8 @@ const RELOAD_STATE_FIELDS = [
     "format",
     "service_trigger_signature",
     "dnsmasq_signature",
-    "sing_box_signature",
+    "tachyon_core_signature",
     "nft_signature",
-    "zapret_queue_signature",
-    "zapret_runtime_signature",
-    "zapret2_queue_signature",
-    "zapret2_runtime_signature",
-    "byedpi_runtime_signature",
-    "wdtt_runtime_signature",
-    "olcrtc_runtime_signature",
-    "fptn_runtime_signature",
     "list_signature",
     "hosts_list_signature",
     "cron_signature",
@@ -219,7 +214,7 @@ function consume_pending_reload(path) {
 }
 
 // Only this one pending reason means "a subscription cache was rewritten",
-// which config.json regeneration plus a SIGHUP into the running sing-box
+// which config.json regeneration plus a SIGHUP into the running tachyon-core
 // settles. Every other reason still means the configuration itself changed and
 // has to go through the real reload (issue #119).
 const PENDING_RELOAD_SOFT_APPLY_REASON = "subscription_deferred_recovery";
@@ -248,15 +243,16 @@ function run_pending_reload_if_requested(path, init_script) {
     // One launch site for both outcomes, so this file does not grow a second
     // background invocation.
     let apply_in_place = reason == PENDING_RELOAD_SOFT_APPLY_REASON;
-    let message = apply_in_place ? "Applying pending subscription recovery in place" : "Applying pending Tachyon reload";
+    let reload_arg = reason == "force" ? "force" : "pending";
     let command = apply_in_place
         ? command_from_args([
             "ucode", "-L", LIB_DIR, LIB_DIR + "/components/updates.uc",
             "subscription-deferred-recovery-apply"
         ])
-        : shell_quote(init_script) + " reload pending";
+        : shell_quote(init_script) + " reload " + reload_arg;
 
-    command_success_from_args([ "logger", "-t", "tachyon", "[info] " + message ]);
+    if (apply_in_place)
+        command_success_from_args([ "logger", "-t", "tachyon", "[info] Applying pending subscription recovery in place" ]);
     system(background_command(command));
 }
 
@@ -431,65 +427,74 @@ function stdin_first_field() {
         print(fields[0], "\n");
 }
 
-function sing_box_service_pid_from_value(value) {
-    // The engine's procd service is `tachyon-core` now; an install that has
-    // not been through the service migration yet still registers as sing-box.
+function tachyon_core_service_pid_from_value(value) {
     value = type(value) == "object" ? value : {};
-    for (let name in [ "tachyon-core", "sing-box" ]) {
-        let service = value[name];
-        let instances = service && type(service.instances) == "object" ? service.instances : {};
+    let service = value["tachyon-core"];
+    let instances = service && type(service.instances) == "object" ? service.instances : {};
 
-        for (let _, instance in instances) {
-            if (type(instance) == "object" && instance.running === true && int(instance.pid || 0) > 0)
-                return int(instance.pid);
-        }
+    for (let _, instance in instances) {
+        if (type(instance) == "object" && instance.running === true && int(instance.pid || 0) > 0)
+            return int(instance.pid);
     }
 
     return 0;
 }
 
-function sing_box_service_pid() {
-    let pid = sing_box_service_pid_from_value(read_stdin_json());
+function tachyon_core_service_pid() {
+    let pid = tachyon_core_service_pid_from_value(read_stdin_json());
     if (pid > 0)
         print(pid, "\n");
 }
 
-function pid_is_sing_box(pid) {
-    return process_identity.is_sing_box(pid);
+function pid_is_tachyon_core_proc(pid) {
+    return process_identity.is_tachyon_core(pid);
 }
 
-function sing_box_service_pid_runtime() {
-    // new procd pid file first, the previous release's paths after it: an
-    // upgraded router can still be running under the old service name until
-    // the managed init script is rewritten
-    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid",
-        "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+function read_json_file_local(path) {
+    let data = fs.readfile(as_string(path));
+    if (data == null)
+        return null;
+    try {
+        return json(as_string(data));
+    }
+    catch (e) {
+        return null;
+    }
+}
+
+function read_provenance_file() {
+    return read_json_file_local(TACHYON_CORE_PROVENANCE_FILE);
+}
+
+function tachyon_core_service_pid_runtime() {
+    for (let path in process_identity.core_contract().pid_files) {
         let pid = int(trim(fs.readfile(path) || "0"));
-        if (pid > 0 && pid_is_sing_box(pid))
+        if (pid > 0 && pid_is_tachyon_core_proc(pid))
             return pid;
     }
 
-    // procd registers the service under its init script name; an install that
-    // has not been migrated yet still answers as sing-box
-    for (let name in [ "tachyon-core", "sing-box" ]) {
-        let data = command_output_from_args([ "ubus", "call", "service", "list", "{\"name\":\"" + name + "\"}" ]);
-        try {
-            let pid = sing_box_service_pid_from_value(json(data));
-            if (pid > 0 && pid_is_sing_box(pid))
-                return pid;
-        }
-        catch (e) {
-            // ubus is unavailable or answered with something that is not the
-            // service list; the fallbacks below handle this case.
-        }
+    if (getenv("TACHYON_CORE_TEST_PID_FILE") == null) {
+        let prov = read_provenance_file();
+        let prov_pid = type(prov) == "object" ? int(prov.pid || 0) : 0;
+        if (prov_pid > 0 && pid_is_tachyon_core_proc(prov_pid))
+            return prov_pid;
+    }
+
+    let data = command_output_from_args([ "ubus", "call", "service", "list", "{\"name\":\"tachyon-core\"}" ]);
+    try {
+        let pid = tachyon_core_service_pid_from_value(json(data));
+        if (pid > 0 && pid_is_tachyon_core_proc(pid))
+            return pid;
+    }
+    catch (e) {
+        // ubus is unavailable or answered with something that is not the
+        // service list; the fallbacks below handle this case.
     }
 
     let pids = split(trim(command_trimmed_output_from_args([ "pidof", "tachyon-core" ])), /[ \t\r\n]+/);
-    if (length(pids) == 0 || pids[0] == "")
-        pids = split(trim(command_trimmed_output_from_args([ "pidof", "sing-box" ])), /[ \t\r\n]+/);
     for (let p in pids) {
         let pid = int(p);
-        if (pid > 0 && pid_is_sing_box(pid))
+        if (pid > 0 && pid_is_tachyon_core_proc(pid))
             return pid;
     }
 
@@ -503,64 +508,123 @@ function has_int(values, needle) {
     return false;
 }
 
-// Mixed-inbound ports the generated config declares. Read from the config
-// rather than hardcoded, so this stays in step with the generator and stands
-// down when no section enables the mixed proxy at all.
-function sing_box_mixed_ports() {
+// Inbound and endpoint ports the generated config declares. Read from the config
+// rather than hardcoded, so this stays in step with the generator and verifies
+// both mixed proxy ports and configured Server Inbounds after SIGHUP.
+function tachyon_core_expected_ports() {
     let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
     let config_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
     let data = fs.readfile(config_path);
     if (data == null)
-        return [];
+        return { tcp: [], udp: [] };
 
     let parsed;
     try {
         parsed = json(data);
     }
     catch (e) {
-        return [];
+        return { tcp: [], udp: [] };
     }
-    if (parsed == null || parsed.inbounds == null)
-        return [];
+    if (parsed == null)
+        return { tcp: [], udp: [] };
 
-    let ports = [];
-    for (let inbound in parsed.inbounds) {
-        if (inbound.type != "mixed" || inbound.listen_port == null)
+    let tcp = [];
+    let udp = [];
+    for (let inbound in (parsed.inbounds || [])) {
+        if (type(inbound) != "object" || inbound.listen_port == null)
             continue;
         let port = int(inbound.listen_port, 10);
-        if (port > 0 && !has_int(ports, port))
-            push(ports, port);
-    }
-    return ports;
-}
-
-// Are the ports the config promises actually in LISTEN? /proc/net/tcp is
-// read directly: this runs inside the SIGHUP poll loop and a netstat fork per
-// iteration is exactly the kind of churn a reload should not add.
-function sing_box_mixed_ports_listening(ports) {
-    if (length(ports) == 0)
-        return true;
-
-    let listening = {};
-    for (let path in [ "/proc/net/tcp", "/proc/net/tcp6" ]) {
-        let content = fs.readfile(path);
-        if (content == null)
+        if (port <= 0)
             continue;
-        for (let line in split(content, "\n")) {
-            let fields = split(trim(line), /[ \t]+/);
-            if (length(fields) < 4 || (fields[3] != "0A" && fields[3] != "0a"))
-                continue;
-            let colon = index(fields[1], ":");
-            if (colon <= 0)
-                continue;
-            listening[int(substr(fields[1], colon + 1), 16)] = true;
+        let t = lc(as_string(inbound.type || ""));
+        if (t == "hysteria2" || t == "tuic" || t == "wireguard" || t == "awg") {
+            if (!has_int(udp, port))
+                push(udp, port);
+        }
+        else if (inbound.type != "mixed" &&
+                 t != "vless" && t != "vmess" && t != "trojan" &&
+                 t != "shadowsocks" && t != "socks" && t != "http" && t != "anytls" &&
+                 t != "naive" && t != "shadowtls" && t != "fptn" && t != "mtproxy") {
+            continue;
+        }
+        else {
+            if (!has_int(tcp, port))
+                push(tcp, port);
         }
     }
+    for (let endpoint in (parsed.endpoints || [])) {
+        if (type(endpoint) != "object" || endpoint.listen_port == null)
+            continue;
+        let port = int(endpoint.listen_port, 10);
+        if (port <= 0)
+            continue;
+        let t = lc(as_string(endpoint.type || ""));
+        if ((t == "wireguard" || t == "awg") && !has_int(udp, port))
+            push(udp, port);
+    }
+    return { tcp, udp };
+}
 
-    for (let port in ports)
-        if (!listening[int(port)])
-            return false;
+function tachyon_core_mixed_ports() {
+    return tachyon_core_expected_ports().tcp;
+}
+
+// Are the ports the config promises actually in LISTEN? /proc/net/tcp and
+// /proc/net/udp are read directly: this runs inside the SIGHUP poll loop and a
+// netstat fork per iteration is exactly the kind of churn a reload should not add.
+function tachyon_core_expected_ports_listening(expected) {
+    let tcp_ports = type(expected) == "array" ? expected : (expected.tcp || []);
+    let udp_ports = type(expected) == "object" ? (expected.udp || []) : [];
+    if (length(tcp_ports) == 0 && length(udp_ports) == 0)
+        return true;
+
+    if (length(tcp_ports) > 0) {
+        let listening_tcp = {};
+        for (let path in [ "/proc/net/tcp", "/proc/net/tcp6" ]) {
+            let content = fs.readfile(path);
+            if (content == null)
+                continue;
+            for (let line in split(content, "\n")) {
+                let fields = split(trim(line), /[ \t]+/);
+                if (length(fields) < 4 || (fields[3] != "0A" && fields[3] != "0a"))
+                    continue;
+                let colon = index(fields[1], ":");
+                if (colon <= 0)
+                    continue;
+                listening_tcp[int(substr(fields[1], colon + 1), 16)] = true;
+            }
+        }
+        for (let port in tcp_ports)
+            if (!listening_tcp[int(port)])
+                return false;
+    }
+
+    if (length(udp_ports) > 0) {
+        let listening_udp = {};
+        for (let path in [ "/proc/net/udp", "/proc/net/udp6" ]) {
+            let content = fs.readfile(path);
+            if (content == null)
+                continue;
+            for (let line in split(content, "\n")) {
+                let fields = split(trim(line), /[ \t]+/);
+                if (length(fields) < 4 || (fields[3] != "07" && fields[3] != "01"))
+                    continue;
+                let colon = index(fields[1], ":");
+                if (colon <= 0)
+                    continue;
+                listening_udp[int(substr(fields[1], colon + 1), 16)] = true;
+            }
+        }
+        for (let port in udp_ports)
+            if (!listening_udp[int(port)])
+                return false;
+        }
+
     return true;
+}
+
+function tachyon_core_mixed_ports_listening(ports) {
+    return tachyon_core_expected_ports_listening(ports);
 }
 
 // Read the core log from a byte offset and report whether the core emitted a
@@ -570,98 +634,233 @@ function sing_box_mixed_ports_listening(ports) {
 // liveness/port probe reads success while none of the new settings applied.
 // The core says so itself in its log ("keeping running configuration"); that
 // is the only reliable signal, so the tail written since the SIGHUP is scanned.
-function core_log_reload_failed(since_offset) {
-    let data = fs.readfile(CORE_LOG_PATH);
-    if (data == null)
-        return false;
-    data = as_string(data);
-    if (length(data) <= since_offset)
-        return false;
-    let tail = substr(data, since_offset);
-    return index(tail, "keeping running configuration") >= 0 ||
-        index(tail, "start error") >= 0 ||
-        index(tail, "reload failed") >= 0;
+function core_logread_tail() {
+    let out = command_output_from_args([ "logread", "-l", "80" ]);
+    if (out == "")
+        return "";
+    let lines = [];
+    for (let line in split(out, "\n")) {
+        if (index(line, "tachyon: [") >= 0)
+            continue;
+        if (index(line, "tachyon-core") >= 0)
+            push(lines, line);
+    }
+    return join("\n", lines);
 }
 
-// Send SIGHUP to the running sing-box process and wait for it to stay alive
-// AND to still be listening.
-// sing-box 1.10+ reloads its configuration in-place on SIGHUP without tearing
-// down the process, so existing TCP sessions are not disrupted.
-// A live pid is not evidence that the reload worked: on tachyon-core a SIGHUP
-// was observed to leave the process running and answering the clash API while
-// the mixed inbound silently never came back - every LAN client proxy and the
-// Telegram bot then dead-ended, and only the watchdog's two-strike mixed-port
-// watch noticed, ten minutes later. So the inbounds the config declares are
-// checked too; if they do not come back the caller escalates to a full restart
-// instead of logging a success that did not happen.
-// Returns true if the process accepted the reload and is still healthy;
-// returns false if the process died, was unreachable, or came back deaf
-// (caller should restart).
-function try_sighup_reload(pid) {
-    pid = int(pid || 0);
-    if (pid <= 0 || !pid_is_sing_box(pid))
-        return false;
+function text_has_reload_failure(text) {
+    text = as_string(text);
+    return index(text, "keeping running configuration") >= 0 ||
+        index(text, "rolled back to the configuration") >= 0 ||
+        index(text, "failed to start box after SIGHUP reload") >= 0 ||
+        index(text, "reload rejected by check") >= 0 ||
+        index(text, "in-place hot reload failed") >= 0 ||
+        index(text, "failed to load configuration on SIGHUP") >= 0 ||
+        index(text, "failed to parse configuration after SIGHUP") >= 0 ||
+        index(text, "start error") >= 0;
+}
 
-    // Send SIGHUP; ignore the kill exit code — the process may have just
-    // finished a reload and the transient exit-code is unreliable.
-    let log_offset = 0;
-    let log_stat = fs.stat(CORE_LOG_PATH);
-    if (log_stat != null)
-        log_offset = int(log_stat.size || 0);
-    command_success_from_args([ "kill", "-HUP", as_string(pid) ]);
+function active_core_log_path() {
+    if (getenv("TACHYON_CORE_LOG_PATH") != null || fs.stat(CORE_LOG_PATH) != null)
+        return CORE_LOG_PATH;
+    if (fs.stat(LEGACY_CORE_LOG_PATH) != null)
+        return LEGACY_CORE_LOG_PATH;
+    return CORE_LOG_PATH;
+}
 
-    // Give sing-box up to 15 s to ingest the new config and bring its inbounds
-    // back. We poll every 500 ms and only call it a success when the process
-    // is alive AND every mixed port the config declares is listening again.
-    let ports = sing_box_mixed_ports();
-    let deadline = 30;
-    while (deadline > 0) {
-        command_success_from_args([ "sleep", "0.5" ]);
-        deadline--;
-        let current_pid = sing_box_service_pid_runtime();
-        if (current_pid <= 0)
-            return false;   // process died — caller must restart
-        // PID unchanged, or procd replaced it (e.g. MTProxy restart path): both
-        // mean "something is running". That alone is not enough - the inbounds
-        // have to be back before this counts as a working reload.
-        let process_ok = current_pid == pid || pid_is_sing_box(current_pid);
-        if (process_ok && sing_box_mixed_ports_listening(ports)) {
-            // The old config also has these ports up, so a still-listening
-            // probe is not proof the new config loaded. The core's own log is.
-            if (core_log_reload_failed(log_offset))
-                return false;
-            common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
-            return true;
+function core_log_reload_failed(since_offset, logread_before, log_path) {
+    let data = fs.readfile(log_path || CORE_LOG_PATH);
+    if (data != null) {
+        data = as_string(data);
+        if (length(data) > since_offset) {
+            let tail = substr(data, since_offset);
+            if (text_has_reload_failure(tail))
+                return true;
         }
     }
-
-    // Timed out: verify at least that a sing-box is still up, and that it is
-    // not running deaf.
-    let final_pid = sing_box_service_pid_runtime();
-    if (final_pid <= 0 || !pid_is_sing_box(final_pid))
-        return false;
-    if (core_log_reload_failed(log_offset))
-        return false;
-    if (sing_box_mixed_ports_listening(ports)) {
-        common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
-        return true;
+    if (logread_before != null) {
+        let current_logread = core_logread_tail();
+        if (current_logread != "" && current_logread != logread_before) {
+            let new_part = current_logread;
+            if (logread_before != "") {
+                let before_lines = split(logread_before, "\n");
+                let last_before = before_lines[length(before_lines) - 1];
+                let idx = last_before != "" ? rindex(current_logread, last_before) : -1;
+                if (idx >= 0)
+                    new_part = substr(current_logread, idx + length(last_before));
+            }
+            if (text_has_reload_failure(new_part))
+                return true;
+        }
     }
     return false;
 }
 
-function hup_sing_box_runtime() {
-    // The name said SIGHUP and the caller's log line said "SIGHUP DNS reload",
-    // but the body was a full /etc/init.d/tachyon-core restart, so every DNS
-    // failover dropped live sessions and the graceful path in
-    // reload_sing_box_runtime() was never the one being taken. Try SIGHUP first
-    // and fall back to a restart only when the process does not survive it.
-    let active_pid = sing_box_service_pid_runtime();
+// In-place hot reload (SIGHUP) is supported on tachyon-core.
+function pid_is_tachyon_core(pid) {
+    return pid_is_tachyon_core_proc(pid);
+}
+
+function consume_reload_preview() {
+    let data = fs.readfile(RELOAD_PREVIEW_FILE);
+    if (data == null)
+        return null;
+    try {
+        let parsed = json(as_string(data));
+        return type(parsed) == "object" ? parsed : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function core_clash_api_info() {
+    let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let config_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
+    let data = fs.readfile(config_path);
+    if (data == null)
+        return null;
+    let parsed;
+    try {
+        parsed = json(as_string(data));
+    } catch (e) {
+        return null;
+    }
+    let clash_api = parsed?.experimental?.clash_api;
+    if (type(clash_api) != "object")
+        return null;
+    let ext = trim(as_string(clash_api.external_controller || ""));
+    if (ext == "")
+        return null;
+    let parts = split(ext, ":");
+    let ip = length(parts) > 1 ? parts[0] : "";
+    let port = length(parts) > 1 ? parts[length(parts) - 1] : "9090";
+    let host = (ip == "0.0.0.0" || ip == "") ? ("127.0.0.1:" + port) : ext;
+    return {
+        base_url: "http://" + host,
+        secret: trim(as_string(clash_api.secret || ""))
+    };
+}
+
+function fetch_tachyon_config_state(clash_info) {
+    if (type(clash_info) != "object" || clash_info.base_url == null)
+        return null;
+    let args = [ "curl", "-s", "-m", "2", "--connect-timeout", "1" ];
+    if (clash_info.secret != "") {
+        push(args, "-H");
+        push(args, "Authorization: Bearer " + clash_info.secret);
+    }
+    push(args, clash_info.base_url + "/tachyon/config-state");
+    let out = trim(command_output_from_args(args));
+    if (out == "")
+        return null;
+    try {
+        let parsed = json(out);
+        if (type(parsed) == "object" && (parsed.ready === true || parsed.ready === false))
+            return parsed;
+    } catch (e) {}
+    return null;
+}
+
+function trigger_tachyon_route_recheck(clash_info) {
+    if (type(clash_info) != "object" || clash_info.base_url == null)
+        return;
+    let args = [ "curl", "-s", "-m", "3", "--connect-timeout", "1", "-X", "POST" ];
+    if (clash_info.secret != "") {
+        push(args, "-H");
+        push(args, "Authorization: Bearer " + clash_info.secret);
+    }
+    push(args, clash_info.base_url + "/tachyon/route-recheck");
+    command_output_from_args(args);
+}
+
+function config_state_reload_confirmed(clash_info, before_state, preview) {
+    if (before_state == null)
+        return true;
+    let after_state = fetch_tachyon_config_state(clash_info);
+    if (after_state == null)
+        return false;
+    if (after_state.ready != true)
+        return false;
+    if (before_state.revision != null && after_state.revision != null &&
+        int(after_state.revision) <= int(before_state.revision))
+        return false;
+    let candidate_digest = type(preview) == "object" ? as_string(preview.candidate_digest || "") : "";
+    if (candidate_digest != "" && as_string(after_state.digest || "") != "")
+        return as_string(after_state.digest) == candidate_digest;
+    return true;
+}
+
+function finalize_sighup_success(clash_info, has_state_probe) {
+    common.write_file(RUNTIME_STATE_DIR + "/tachyon-core-reload.timestamp", as_string(time()) + "\n");
+    if (has_state_probe)
+        trigger_tachyon_route_recheck(clash_info);
+    return true;
+}
+
+// Send SIGHUP to the running tachyon-core process and wait for it to stay alive
+// AND to still be listening.
+// In-place hot reload is only enabled for tachyon-core: reload-preview checks
+// structural compatibility before SIGHUP, /tachyon/config-state confirms the new
+// config revision/digest is ready, and /tachyon/route-recheck re-evaluates live
+// TCP/UDP sessions against the updated routing table.
+function try_sighup_reload(pid, preview) {
+    pid = int(pid || 0);
+    if (preview == null)
+        preview = consume_reload_preview();
+    if (pid <= 0 || !pid_is_tachyon_core(pid))
+        return false;
+    if (type(preview) == "object" && preview.in_place === false)
+        return false;
+
+    let clash_info = core_clash_api_info();
+    let before_state = fetch_tachyon_config_state(clash_info);
+    let log_path = CORE_LOG_PATH;
+    let log_offset = 0;
+    let log_stat = fs.stat(log_path);
+    if (log_stat != null)
+        log_offset = int(log_stat.size || 0);
+    let logread_before = core_logread_tail();
+    command_success_from_args([ "kill", "-HUP", as_string(pid) ]);
+
+    let ports = tachyon_core_expected_ports();
+    let deadline = 30;
+    while (deadline > 0) {
+        command_success_from_args([ "sleep", "0.5" ]);
+        deadline--;
+        let current_pid = tachyon_core_service_pid_runtime();
+        if (current_pid <= 0)
+            return false;   // process died — caller must restart
+        let process_ok = current_pid == pid || pid_is_tachyon_core(current_pid);
+        if (process_ok && tachyon_core_mixed_ports_listening(ports)) {
+            if (core_log_reload_failed(log_offset, logread_before, log_path))
+                return false;
+            if (!config_state_reload_confirmed(clash_info, before_state, preview))
+                continue;
+            return finalize_sighup_success(clash_info, before_state != null);
+        }
+    }
+
+    // Timed out: verify at least that tachyon-core is still up, and that it is
+    // not running deaf.
+    let final_pid = tachyon_core_service_pid_runtime();
+    if (final_pid <= 0 || !pid_is_tachyon_core(final_pid))
+        return false;
+    if (core_log_reload_failed(log_offset, logread_before, log_path))
+        return false;
+    if (tachyon_core_mixed_ports_listening(ports) && config_state_reload_confirmed(clash_info, before_state, preview))
+        return finalize_sighup_success(clash_info, before_state != null);
+    return false;
+}
+
+function hup_tachyon_core_runtime() {
+    // Try SIGHUP first and fall back to a restart only when the process does not survive it.
+    let active_pid = tachyon_core_service_pid_runtime();
     if (active_pid > 0 && try_sighup_reload(active_pid)) {
-        command_success_from_args([ "logger", "-t", "tachyon", "[info] Applying DNS failover via sing-box SIGHUP (graceful)" ]);
+        command_success_from_args([ "logger", "-t", "tachyon", "[info] Applying DNS failover via tachyon-core SIGHUP (graceful)" ]);
         return;
     }
 
-    command_success_from_args([ "logger", "-t", "tachyon", "[warn] sing-box SIGHUP did not take, falling back to a full restart" ]);
+    command_success_from_args([ "logger", "-t", "tachyon", "[warn] tachyon-core SIGHUP did not take, falling back to a full restart" ]);
     if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ]))
         exit(1);
 }
@@ -676,20 +875,6 @@ function process_age_seconds_from_ticks(start_ticks, current_ticks) {
 
 function process_age_seconds(pid) {
     return process_identity.process_age_seconds(pid);
-}
-
-const SING_BOX_PROVENANCE_FILE = getenv("TACHYON_SING_BOX_PROVENANCE_FILE") || "/var/run/tachyon/sing-box.provenance";
-
-function read_json_file_local(path) {
-    let data = fs.readfile(as_string(path));
-    if (data == null)
-        return null;
-    try {
-        return json(as_string(data));
-    }
-    catch (e) {
-        return null;
-    }
 }
 
 function write_provenance_file(pid) {
@@ -707,20 +892,16 @@ function write_provenance_file(pid) {
         launched_at: int(time())
     };
 
-    ensure_parent_dir(SING_BOX_PROVENANCE_FILE);
+    ensure_parent_dir(TACHYON_CORE_PROVENANCE_FILE);
     let stamp = clock();
-    let tmp_path = sprintf("%s.%d.%d.tmp", SING_BOX_PROVENANCE_FILE, stamp[0], stamp[1]);
+    let tmp_path = sprintf("%s.%d.%d.tmp", TACHYON_CORE_PROVENANCE_FILE, stamp[0], stamp[1]);
     let text = sprintf("%J", provenance);
     if (write_text_file(tmp_path, text)) {
-        if (fs.rename(tmp_path, SING_BOX_PROVENANCE_FILE))
+        if (fs.rename(tmp_path, TACHYON_CORE_PROVENANCE_FILE))
             return true;
     }
     try { fs.unlink(tmp_path); } catch(e) {}
     return false;
-}
-
-function read_provenance_file() {
-    return read_json_file_local(SING_BOX_PROVENANCE_FILE);
 }
 
 function verify_provenance() {
@@ -733,15 +914,15 @@ function verify_provenance() {
     if (pid <= 0 || recorded_ticks == "")
         return false;
 
-    if (!pid_is_sing_box(pid))
+    if (!pid_is_tachyon_core_proc(pid))
         return false;
 
     let current_ticks = process_start_ticks(fs.readfile("/proc/" + as_string(pid) + "/stat"));
     return as_string(current_ticks) == recorded_ticks;
 }
 
-function sing_box_is_foreign() {
-    let pid = sing_box_service_pid_runtime();
+function tachyon_core_is_foreign() {
+    let pid = tachyon_core_service_pid_runtime();
     if (pid <= 0)
         return false;
     if (!verify_provenance())
@@ -750,24 +931,24 @@ function sing_box_is_foreign() {
 }
 
 function cleanup_provenance_file() {
-    try { fs.unlink(SING_BOX_PROVENANCE_FILE); } catch(e) {}
+    try { fs.unlink(TACHYON_CORE_PROVENANCE_FILE); } catch(e) {}
 }
 
-function sing_box_pid_replaced(previous_pid, current_pid, current_is_sing_box) {
+function tachyon_core_pid_replaced(previous_pid, current_pid, current_is_core) {
     previous_pid = int(previous_pid || 0);
     current_pid = int(current_pid || 0);
-    current_is_sing_box = lc(as_string(current_is_sing_box));
-    let executable_matches = current_is_sing_box == "1" || current_is_sing_box == "true" ||
-        current_is_sing_box == "yes" || current_is_sing_box == "on";
+    current_is_core = lc(as_string(current_is_core));
+    let executable_matches = current_is_core == "1" || current_is_core == "true" ||
+        current_is_core == "yes" || current_is_core == "on";
     return current_pid > 0 && executable_matches &&
         (previous_pid <= 0 || current_pid != previous_pid);
 }
 
-function wait_sing_box_pid_replacement(previous_pid, timeout) {
+function wait_tachyon_core_pid_replacement(previous_pid, timeout) {
     timeout = int(timeout || 15);
     while (timeout > 0) {
-        let current_pid = sing_box_service_pid_runtime();
-        if (sing_box_pid_replaced(previous_pid, current_pid, pid_is_sing_box(current_pid)))
+        let current_pid = tachyon_core_service_pid_runtime();
+        if (tachyon_core_pid_replaced(previous_pid, current_pid, pid_is_tachyon_core_proc(current_pid)))
             return true;
 
         command_success_from_args([ "sleep", "1" ]);
@@ -776,7 +957,7 @@ function wait_sing_box_pid_replacement(previous_pid, timeout) {
     return false;
 }
 
-function sing_box_reload_previous_pid(previous_pid, config_hash_before, config_hash_after) {
+function tachyon_core_reload_previous_pid(previous_pid, config_hash_before, config_hash_after) {
     previous_pid = as_string(previous_pid);
     if (as_string(config_hash_before) == as_string(config_hash_after) ||
         match(previous_pid, /^[0-9]+$/) == null || int(previous_pid) <= 0)
@@ -789,7 +970,7 @@ function arg_bool(value) {
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
-function sing_box_runtime_reload_needed(config_hash_before, config_hash_after, force) {
+function tachyon_core_runtime_reload_needed(config_hash_before, config_hash_after, force) {
     return as_string(force) == "restart" || arg_bool(force) || as_string(config_hash_before) != as_string(config_hash_after);
 }
 
@@ -806,55 +987,60 @@ function has_active_mtproxy_inbound() {
     return found;
 }
 
-function reload_sing_box_runtime(previous_pid, config_hash_before, config_hash_after, force) {
-    if (!sing_box_runtime_reload_needed(config_hash_before, config_hash_after, force)) {
-        command_success_from_args([ "logger", "-t", "tachyon", "[info] sing-box reload skipped: configuration is unchanged" ]);
+function reload_tachyon_core_runtime(previous_pid, config_hash_before, config_hash_after, force) {
+    if (!tachyon_core_runtime_reload_needed(config_hash_before, config_hash_after, force)) {
+        command_success_from_args([ "logger", "-t", "tachyon", "[info] tachyon-core reload skipped: configuration is unchanged" ]);
         return;
     }
 
+    // Try graceful SIGHUP reload first when tachyon-core is running: it reloads
+    // config in-place without terminating the process, preserving active sessions.
+    let active_pid = tachyon_core_service_pid_runtime();
+    if (active_pid > 0 && as_string(force) != "restart" && pid_is_tachyon_core(active_pid)) {
+        let preview = consume_reload_preview();
+        if (type(preview) == "object" && preview.in_place === false) {
+            command_success_from_args([ "logger", "-t", "tachyon", "[info] In-place reload not applicable for current config change; restarting tachyon-core runtime" ]);
+        } else {
+            command_success_from_args([ "logger", "-t", "tachyon", "[info] Reloading tachyon-core runtime via SIGHUP (graceful)" ]);
+            if (try_sighup_reload(active_pid, preview)) {
+                command_success_from_args([ "logger", "-t", "tachyon", "[info] tachyon-core graceful reload succeeded" ]);
+                return;
+            }
+            command_success_from_args([ "logger", "-t", "tachyon", "[warn] tachyon-core SIGHUP reload failed; falling back to full restart" ]);
+        }
+    }
+
     if (has_active_mtproxy_inbound()) {
-        command_success_from_args([ "logger", "-t", "tachyon", "[info] MTProxy inbound active: terminating sing-box and performing full restart (issue #30)" ]);
-        let active_pid = sing_box_service_pid_runtime();
-        if (active_pid > 0 && pid_is_sing_box(active_pid)) {
-            command_success_from_args([ "kill", "-9", as_string(active_pid) ]);
+        command_success_from_args([ "logger", "-t", "tachyon", "[info] MTProxy inbound active: terminating tachyon-core and performing full restart (issue #30)" ]);
+        let mt_pid = tachyon_core_service_pid_runtime();
+        if (mt_pid > 0 && pid_is_tachyon_core_proc(mt_pid)) {
+            command_success_from_args([ "kill", "-9", as_string(mt_pid) ]);
             command_success_from_args([ "sleep", "0.2" ]);
         }
         if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ])) {
-            command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart sing-box. Aborted." ]);
+            command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart tachyon-core. Aborted." ]);
             exit(1);
         }
         return;
     }
 
-    // Try graceful SIGHUP reload first: sing-box 1.10+ reloads config in-place
-    // without terminating the process, so active TCP sessions are preserved.
-    let active_pid = sing_box_service_pid_runtime();
-    if (active_pid > 0 && as_string(force) != "restart") {
-        command_success_from_args([ "logger", "-t", "tachyon", "[info] Reloading sing-box runtime via SIGHUP (graceful)" ]);
-        if (try_sighup_reload(active_pid)) {
-            command_success_from_args([ "logger", "-t", "tachyon", "[info] sing-box graceful reload succeeded" ]);
-            return;
-        }
-        command_success_from_args([ "logger", "-t", "tachyon", "[warn] sing-box SIGHUP reload failed; falling back to full restart" ]);
-    }
-
-    command_success_from_args([ "logger", "-t", "tachyon", "[info] Restarting sing-box runtime" ]);
+    command_success_from_args([ "logger", "-t", "tachyon", "[info] Restarting tachyon-core runtime" ]);
     if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ])) {
-        command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart sing-box. Aborted." ]);
+        command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart tachyon-core. Aborted." ]);
         exit(1);
     }
 }
 
-function sing_box_service_running() {
-    let pid = sing_box_service_pid_runtime();
-    return pid > 0 && pid_is_sing_box(pid);
+function tachyon_core_service_running() {
+    let pid = tachyon_core_service_pid_runtime();
+    return pid > 0 && pid_is_tachyon_core_proc(pid);
 }
 
-function sing_box_service_stable(min_age) {
+function tachyon_core_service_stable(min_age) {
     min_age = int(min_age || 2);
 
-    let pid = sing_box_service_pid_runtime();
-    if (pid <= 0 || !pid_is_sing_box(pid))
+    let pid = tachyon_core_service_pid_runtime();
+    if (pid <= 0 || !pid_is_tachyon_core_proc(pid))
         return false;
 
     let age = process_age_seconds(pid);
@@ -867,14 +1053,55 @@ let network_check_cache = {
     result: false
 };
 
+function tproxy_route_rule_present_fast(rt_table, mark) {
+    rt_table = as_string(rt_table);
+    let route_out = command_output_from_args([ "ip", "route", "list", "table", rt_table ]);
+    let route_ok = false;
+    for (let line in split(route_out, "\n")) {
+        let trimmed = trim(line);
+        if (trimmed == "local default dev lo" || substr(trimmed, 0, 21) == "local default dev lo ") {
+            route_ok = true;
+            break;
+        }
+    }
+    if (!route_ok)
+        return false;
+
+    let expected_mark = common.parse_number(mark);
+    if (expected_mark == null)
+        return false;
+
+    let rule_out = command_output_from_args([ "ip", "rule", "list" ]);
+    for (let line in split(rule_out, "\n")) {
+        let text = trim(line);
+        if (text == "" || index(text, "lookup " + rt_table) < 0 || index(text, "fwmark ") < 0)
+            continue;
+        let parts = split(text, "fwmark ");
+        if (length(parts) < 2)
+            continue;
+        let mark_part = split(trim(parts[1]), /[ \t\/]/)[0];
+        let parsed = common.parse_number(mark_part);
+        if (parsed != null && parsed == expected_mark)
+            return true;
+    }
+    return false;
+}
+
 function tachyon_runtime_network_configured(rt_table, nft_table, mark) {
-    let key = as_string(rt_table) + ":" + as_string(nft_table) + ":" + as_string(mark);
+    let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let proxy_mode = lc(trim(as_string(settings.proxy_mode || "tproxy")));
+    let key = as_string(rt_table) + ":" + as_string(nft_table) + ":" + as_string(mark) + ":" + proxy_mode;
     let now = int(clock()[0]);
     if (network_check_cache.key == key && network_check_cache.result && (now - network_check_cache.checked_at) < 5)
         return true;
 
-    let result = command_success_from_args([ "nft", "list", "table", "inet", nft_table ]) &&
-        command_success_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/nft/apply.uc", "tproxy-route-rule-present", rt_table, mark ]);
+    let need_tproxy_route = proxy_mode != "tun" && proxy_mode != "socks";
+    let tproxy_ok = !need_tproxy_route || (
+        getenv("TACHYON_CORE_TEST_PID_FILE") != null
+            ? command_success_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/nft/apply.uc", "tproxy-route-rule-present", rt_table, mark ])
+            : tproxy_route_rule_present_fast(rt_table, mark)
+    );
+    let result = command_success_from_args([ "nft", "-t", "list", "table", "inet", nft_table ]) && tproxy_ok;
 
     network_check_cache.key = key;
     network_check_cache.checked_at = now;
@@ -883,11 +1110,11 @@ function tachyon_runtime_network_configured(rt_table, nft_table, mark) {
 }
 
 function tachyon_running(rt_table, nft_table, mark) {
-    return sing_box_service_running() && tachyon_runtime_network_configured(rt_table, nft_table, mark);
+    return tachyon_core_service_running() && tachyon_runtime_network_configured(rt_table, nft_table, mark);
 }
 
 function tachyon_stably_running(rt_table, nft_table, mark, min_age) {
-    return sing_box_service_stable(min_age) && tachyon_runtime_network_configured(rt_table, nft_table, mark);
+    return tachyon_core_service_stable(min_age) && tachyon_runtime_network_configured(rt_table, nft_table, mark);
 }
 
 function wait_tachyon_stable_start(rt_table, nft_table, mark, min_age, timeout) {
@@ -906,14 +1133,14 @@ function wait_tachyon_stable_start(rt_table, nft_table, mark, min_age, timeout) 
 function wait_tachyon_core_service_stable(min_age, timeout) {
     timeout = int(timeout || 30);
     while (timeout > 0) {
-        if (sing_box_service_stable(min_age))
+        if (tachyon_core_service_stable(min_age))
             return true;
 
         command_success_from_args([ "sleep", "1" ]);
         timeout--;
     }
 
-    return sing_box_service_stable(min_age);
+    return tachyon_core_service_stable(min_age);
 }
 
 function whitespace_fields(value) {
@@ -1005,7 +1232,7 @@ function rule_has_list_update_source(enabled, action, community_lists, remote_do
     if (!arg_bool(enabled))
         return false;
     if (as_string(action) == "dns")
-        return list_has_remote_references(domain_ip_lists) || has_remote_plain_ruleset(rule_set);
+        return list_has_remote_references(domain_ip_lists) || has_remote_plain_ruleset(rule_set) || list_has_remote_references(rule_set);
     if (as_string(action) == "hosts")
         return false;
 
@@ -1015,7 +1242,8 @@ function rule_has_list_update_source(enabled, action, community_lists, remote_do
         as_string(remote_subnet_lists) != "" ||
         as_string(rule_set_with_subnets) != "" ||
         list_has_remote_references(domain_ip_lists) ||
-        has_remote_plain_ruleset(rule_set)
+        has_remote_plain_ruleset(rule_set) ||
+        list_has_remote_references(rule_set)
     );
 }
 
@@ -1081,13 +1309,15 @@ function download_via_proxy_enabled(settings, purpose) {
 }
 
 function signature_add_value(body, key, value) {
-    return body + "[" + as_string(key) + "]\n" + as_string(value) + "\n";
+    return body + ("[" + as_string(key) + "]\n" + as_string(value) + "\n");
 }
 
+let _sig_counter = 0;
+
 function signature_hash(body) {
-    let path = trim(command_output_from_args([ "mktemp" ]));
-    if (path == "")
-        return "";
+    let stamp = clock();
+    _sig_counter++;
+    let path = sprintf("/tmp/tachyon-sig.%d.%d.%d.tmp", stamp[0], stamp[1], _sig_counter);
 
     if (!write_text_file(path, body)) {
         unlink_file(path);
@@ -1099,6 +1329,54 @@ function signature_hash(body) {
     hash_line = trim(hash_line);
 
     return length(hash_line) >= 32 ? substr(hash_line, 0, 32) : "";
+}
+
+function signature_hashes_batch(bodies) {
+    let stamp = clock();
+    let keys_list = keys(bodies);
+    let paths = [];
+    let key_by_path = {};
+    let result = {};
+
+    for (let k in keys_list) {
+        _sig_counter++;
+        let p = sprintf("/tmp/tachyon-sig.%d.%d.%d.tmp", stamp[0], stamp[1], _sig_counter);
+        if (!write_text_file(p, bodies[k])) {
+            for (let old_p in paths)
+                unlink_file(old_p);
+            unlink_file(p);
+            for (let k2 in keys_list)
+                result[k2] = signature_hash(bodies[k2]);
+            return result;
+        }
+        push(paths, p);
+        key_by_path[p] = k;
+        result[k] = "";
+    }
+
+    if (length(paths) > 0) {
+        let args = [ "md5sum" ];
+        for (let p in paths)
+            push(args, p);
+        let out = command_output_from_args(args);
+        for (let p in paths)
+            unlink_file(p);
+        let idx = 0;
+        for (let line in split(trim(out), "\n")) {
+            let trimmed = trim(line);
+            if (length(trimmed) >= 32 && idx < length(keys_list)) {
+                let hash = substr(trimmed, 0, 32);
+                let rest = trim(substr(trimmed, 32));
+                if (substr(rest, 0, 1) == "*")
+                    rest = trim(substr(rest, 1));
+                let matched_key = key_by_path[rest] || keys_list[idx];
+                result[matched_key] = hash;
+                idx++;
+            }
+        }
+    }
+
+    return result;
 }
 
 function print_signature_hash(body) {
@@ -1144,6 +1422,13 @@ function dnsmasq_signature_body(settings, dnsmasq, legacy_dnsmasq_present) {
     body = signature_add_value(body, "dhcp.@dnsmasq[0].tachyon_noresolv", option(dnsmasq, "tachyon_noresolv", ""));
     body = signature_add_value(body, "dhcp.@dnsmasq[0].tachyon_cachesize", option(dnsmasq, "tachyon_cachesize", ""));
     body = signature_add_value(body, "dhcp.tachyon.present", arg_bool(legacy_dnsmasq_present) ? "1" : "0");
+    let eff = common.resolve_effective_ipv6_state(settings, null);
+    if (eff.ipv6_mode != "auto")
+        body = signature_add_value(body, "settings.ipv6_mode", eff.ipv6_mode);
+    if (!eff.ipv6_leak_guard)
+        body = signature_add_value(body, "settings.ipv6_leak_guard", "0");
+    if (eff.effective != "leak_guard" && !(eff.ipv6_mode == "off" && !eff.ipv6_leak_guard))
+        body = signature_add_value(body, "runtime.ipv6_effective_state", eff.effective);
 
     return body;
 }
@@ -1168,8 +1453,33 @@ function settings_component_update_check_interval(settings) {
     return value != "" ? value : "1d";
 }
 
+let _rule_ports_csv_cache = {};
+let _rule_cond_csv_cache = {};
+
+function single_rule_ports_csv(section) {
+    let p_val = option(section, "ports", "");
+    let pt_val = option(section, "ports_text", "");
+    if (p_val == "" && pt_val == "")
+        return "";
+    let cache_key = p_val + "\x1f" + pt_val;
+    if (exists(_rule_ports_csv_cache, cache_key))
+        return _rule_ports_csv_cache[cache_key];
+    let res = rule_config.rule_ports_csv_value(p_val, pt_val);
+    _rule_ports_csv_cache[cache_key] = res;
+    return res;
+}
+
 function section_rule_ports_csv(section) {
-    return rule_config.rule_ports_csv_value(option(section, "ports", ""), option(section, "ports_text", ""));
+    let parts = [];
+    let base_ports = single_rule_ports_csv(section);
+    if (base_ports != "")
+        push(parts, base_ports);
+    for (let cond in connections.section_leaf_conditions(section)) {
+        let cond_ports = single_rule_ports_csv(cond);
+        if (cond_ports != "")
+            push(parts, cond_ports);
+    }
+    return join(",", parts);
 }
 
 function combined_domain_condition_text(section) {
@@ -1182,17 +1492,59 @@ function combined_domain_condition_text(section) {
     return option(section, "domain_suffix_text", "");
 }
 
-function section_rule_condition_csv(section, key, kind) {
-    return rule_config.rule_condition_csv_value(
+function single_rule_condition_csv(section, key, kind) {
+    let k_tm = option(section, key + "_text_mode", "0");
+    let c_tm = option(section, "conditions_text_mode", "0");
+    let k_txt = option(section, key + "_text", "");
+    let k_val = option(section, key, "");
+    let comb_txt = combined_domain_condition_text(section);
+    let comb_val = option(section, "domain_suffix", "");
+    if (k_txt == "" && k_val == "" && comb_txt == "" && comb_val == "")
+        return "";
+    let cache_key = key + "\x1f" + kind + "\x1f" + k_tm + "\x1f" + c_tm + "\x1f" + k_txt + "\x1f" + k_val + "\x1f" + comb_txt + "\x1f" + comb_val;
+    if (exists(_rule_cond_csv_cache, cache_key))
+        return _rule_cond_csv_cache[cache_key];
+    let res = rule_config.rule_condition_csv_value(
         key,
         kind,
-        option(section, key + "_text_mode", "0"),
-        option(section, "conditions_text_mode", "0"),
-        option(section, key + "_text", ""),
-        option(section, key, ""),
-        combined_domain_condition_text(section),
-        option(section, "domain_suffix", "")
+        k_tm,
+        c_tm,
+        k_txt,
+        k_val,
+        comb_txt,
+        comb_val
     );
+    _rule_cond_csv_cache[cache_key] = res;
+    return res;
+}
+
+function section_rule_condition_csv(section, key, kind) {
+    let parts = [];
+    let base_csv = single_rule_condition_csv(section, key, kind);
+    if (base_csv != "")
+        push(parts, base_csv);
+    for (let cond in connections.section_leaf_conditions(section)) {
+        let cond_csv = single_rule_condition_csv(cond, key, kind);
+        if (cond_csv != "")
+            push(parts, cond_csv);
+    }
+    return join(",", parts);
+}
+
+function section_leaf_option_text(section, key) {
+    let conds = connections.section_leaf_conditions(section);
+    if (length(conds) == 0)
+        return option(section, key, "");
+    let parts = [];
+    let base = option(section, key, "");
+    if (base != "")
+        push(parts, base);
+    for (let cond in conds) {
+        let val = option(cond, key, "");
+        if (val != "")
+            push(parts, val);
+    }
+    return join(" ", parts);
 }
 
 function nft_schedule_signature_body(body, schedule) {
@@ -1210,6 +1562,7 @@ function nft_schedule_signature_body(body, schedule) {
     body = signature_add_value(body, "schedule." + name + ".days", join(",", list_option(schedule, "days")));
     body = signature_add_value(body, "schedule." + name + ".blocked_domains", join(",", list_option(schedule, "blocked_domains")));
     body = signature_add_value(body, "schedule." + name + ".mode", option(schedule, "mode", "block"));
+    body = signature_add_value(body, "schedule." + name + ".dns_level", option(schedule, "dns_level", "1"));
     return body;
 }
 
@@ -1235,45 +1588,120 @@ function nft_guest_mode_signature_body(body, guest_mode) {
     body = signature_add_value(body, "guest_mode." + name + ".trusted_devices", join(",", list_option(guest_mode, "trusted_devices")));
     body = signature_add_value(body, "guest_mode." + name + ".isolate_lan", bool_option(guest_mode, "isolate_lan", true) ? "1" : "0");
     body = signature_add_value(body, "guest_mode." + name + ".block_router_admin", bool_option(guest_mode, "block_router_admin", true) ? "1" : "0");
+    body = signature_add_value(body, "guest_mode." + name + ".allow_proxy", bool_option(guest_mode, "allow_proxy", true) ? "1" : "0");
     body = signature_add_value(body, "guest_mode." + name + ".start_time", option(guest_mode, "start_time", ""));
     body = signature_add_value(body, "guest_mode." + name + ".end_time", option(guest_mode, "end_time", ""));
     body = signature_add_value(body, "guest_mode." + name + ".days", join(",", list_option(guest_mode, "days")));
     return body;
 }
 
+let _fail_state_cache_stamp = "";
+let _fail_state_cache_obj = null;
+
 function section_runtime_failed(name) {
     let path = getenv("TACHYON_SECTION_FAIL_STATE_FILE") || "/var/run/tachyon/section-fail-state.json";
-    let raw = "";
-    try {
-        raw = trim(as_string(fs.readfile(path)) || "");
-    } catch (e) {
-        raw = "";
-    }
-    if (raw == "")
+    let st = fs.stat(path);
+    if (st == null)
         return false;
-    let parsed = null;
-    try {
-        parsed = json(raw);
-    } catch (e) {
-        parsed = null;
+    let stamp = path + "|" + as_string(st.size || 0) + "|" + as_string(st.mtime || 0);
+    if (_fail_state_cache_stamp != stamp) {
+        _fail_state_cache_stamp = stamp;
+        _fail_state_cache_obj = null;
+        let raw = "";
+        try {
+            raw = trim(as_string(fs.readfile(path)) || "");
+        } catch (e) {
+            raw = "";
+        }
+        if (raw != "") {
+            try {
+                let parsed = json(raw);
+                if (type(parsed) == "object")
+                    _fail_state_cache_obj = parsed;
+            } catch (e) {
+                _fail_state_cache_obj = null;
+            }
+        }
     }
-    if (type(parsed) != "object")
+    if (type(_fail_state_cache_obj) != "object")
         return false;
-    let entry = object_or_empty(parsed[as_string(name)]);
+    let entry = object_or_empty(_fail_state_cache_obj[as_string(name)]);
     return entry.failed == true || as_string(entry.failed || "") == "1";
 }
 
-function nft_runtime_signature_body(settings, sections, schedules, profiles, guest_modes) {
+function tailscale_nft_signature_value(sections, servers) {
+    ensure_signature_deps();
+    let parts = [];
+    for (let srv in (type(servers) == "array" ? servers : [])) {
+        srv = object_or_empty(srv);
+        if (!bool_option(srv, "enabled", true))
+            continue;
+        if (lc(trim(option(srv, "protocol", ""))) != "tailscale")
+            continue;
+        let name = as_string(srv[".name"] || "");
+        push(parts, "srv:" + name + ":tachyon-core");
+    }
+    for (let sec in (type(sections) == "array" ? sections : [])) {
+        sec = object_or_empty(sec);
+        if (!bool_option(sec, "enabled", true))
+            continue;
+        let name = as_string(sec[".name"] || "");
+        let act = lc(trim(option(sec, "action", "")));
+        if (act == "tailscale")
+            push(parts, "sec:" + name + ":embedded");
+        for (let src in connections.embedded_tailscale_sources(sec)) {
+            src = object_or_empty(src);
+            let src_name = as_string(src[".name"] || option(src, "id", ""));
+            push(parts, "src:" + name + ":" + src_name);
+        }
+        for (let uri in list_option(sec, "connection_uris")) {
+            let u = lc(trim(as_string(uri)));
+            if (index(u, "tailscale://") == 0)
+                push(parts, "uri:" + name + ":" + u);
+        }
+        for (let j_str in connections.outbound_jsons(sec)) {
+            try {
+                let parsed = json(as_string(j_str));
+                let items = type(parsed) == "array" ? parsed : [ parsed ];
+                for (let item in items) {
+                    if (type(item) == "object" && lc(trim(as_string(item.type || ""))) == "tailscale")
+                        push(parts, "json:" + name + ":" + as_string(item.tag || ""));
+                }
+            } catch (e) {}
+        }
+    }
+    if (length(parts) == 0)
+        return "";
+    sort(parts);
+    return join("|", parts);
+}
+
+function community_subnets_enabled(section) {
+    let raw = lc(trim(option(section, "community_subnets", "1")));
+    return raw != "0" && raw != "false" && raw != "no" && raw != "off";
+}
+
+function nft_runtime_signature_body(settings, sections, schedules, profiles, guest_modes, servers) {
     let body = "";
 
     body = signature_add_value(body, "settings.source_network_interfaces", option(settings, "source_network_interfaces", "br-lan"));
     body = signature_add_value(body, "settings.exclude_ntp", bool_option(settings, "exclude_ntp", false) ? "1" : "0");
     body = signature_add_value(body, "settings.block_doh", bool_option(settings, "block_doh", false) ? "1" : "0");
+    // The kill-switch gate follows this setting (service/kill_switch.uc).
+    if (option(settings, "emergency_direct_bypass", "1") == "0")
+        body = signature_add_value(body, "settings.emergency_direct_bypass", "0");
+    let dns_intercept_mode = require("service.kill_switch").dns_intercept_mode(settings);
+    if (dns_intercept_mode != "auto")
+        body = signature_add_value(body, "settings.dns_intercept_all", dns_intercept_mode);
     let quic_mode = common.disable_quic_mode(option(settings, "disable_quic", "0"));
     if (quic_mode != "off")
         body = signature_add_value(body, "settings.disable_quic", quic_mode);
-    if (bool_option(settings, "webrtc_leak_protect", false))
-        body = signature_add_value(body, "settings.webrtc_leak_protect", "1");
+    let webrtc_mode = require("service.kill_switch").webrtc_protect_mode(settings);
+    if (webrtc_mode != "auto")
+        body = signature_add_value(body, "settings.webrtc_leak_protect", webrtc_mode);
+    // The TUN kill-switch rules are synced on every nft rebuild.
+    if (!bool_option(settings, "tun_kill_switch", true))
+        body = signature_add_value(body, "settings.tun_kill_switch", "0");
     if (option(settings, "qos_priority_engine", "1") == "0")
         body = signature_add_value(body, "settings.qos_priority_engine", "0");
     let proxy_mode = lc(trim(as_string(option(settings, "proxy_mode", "tproxy"))));
@@ -1289,6 +1717,14 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
     body = signature_add_value(body, "settings.route_router_traffic_section", option(settings, "route_router_traffic_section", ""));
     if (bool_option(settings, "wifi_calling_direct", false))
         body = signature_add_value(body, "settings.wifi_calling_direct", "1");
+    if (bool_option(settings, "lite_mode", false))
+        body = signature_add_value(body, "settings.lite_mode", "1");
+    if (!common.is_tcp_bbr_enabled(settings))
+        body = signature_add_value(body, "settings.tcp_bbr", "0");
+    for (let pair in common.ipv6_signature_pairs(settings, false))
+        body = signature_add_value(body, pair[0], pair[1]);
+
+    let chunks = [ body ];
 
     for (let section in sections) {
         section = object_or_empty(section);
@@ -1296,54 +1732,71 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
         if (name == "" || !bool_option(section, "enabled", true))
             continue;
 
+        let s_body = "";
         let action = option(section, "action", "");
-        body = signature_add_value(body, "rule." + name + ".action", action);
-        if (action == "hosts")
-            continue;
-        if (action == "dns") {
-            body = signature_add_value(body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
-            body = signature_add_value(body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
-            body = signature_add_value(body, "rule." + name + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
+        s_body = signature_add_value(s_body, "rule." + name + ".action", action);
+        if (action == "hosts") {
+            push(chunks, s_body);
             continue;
         }
-        body = signature_add_value(body, "rule." + name + ".ip_cidr", section_rule_condition_csv(section, "ip_cidr", "subnets"));
-        body = signature_add_value(body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
-        body = signature_add_value(body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
-        body = signature_add_value(body, "rule." + name + ".ports", section_rule_ports_csv(section));
-        body = signature_add_value(body, "rule." + name + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
-        body = signature_add_value(body, "rule." + name + ".excluded_ips", option(section, "excluded_ips", ""));
-        body = signature_add_value(body, "rule." + name + ".excluded_protocol", option(section, "excluded_protocol", ""));
-        body = signature_add_value(body, "rule." + name + ".routed_dns_enabled", bool_option(section, "routed_dns_enabled", false) ? "1" : "0");
-        body = signature_add_value(body, "rule." + name + ".routed_dns_type", option(section, "routed_dns_type", ""));
-        body = signature_add_value(body, "rule." + name + ".routed_dns_server", option(section, "routed_dns_server", ""));
-        body = signature_add_value(body, "rule." + name + ".protocol", option(section, "protocol", ""));
-        let comm_subnets = bool_option(section, "community_subnets", true) ? rule_config.filter_community_subnet_lists_value(connections.community_lists_value(section)) : "";
-        body = signature_add_value(body, "rule." + name + ".community_subnet_lists", comm_subnets);
+        if (action == "dns") {
+            s_body = signature_add_value(s_body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
+            s_body = signature_add_value(s_body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
+            s_body = signature_add_value(s_body, "rule." + name + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
+            push(chunks, s_body);
+            continue;
+        }
+        s_body = signature_add_value(s_body, "rule." + name + ".ip_cidr", section_rule_condition_csv(section, "ip_cidr", "subnets"));
+        s_body = signature_add_value(s_body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
+        s_body = signature_add_value(s_body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
+        s_body = signature_add_value(s_body, "rule." + name + ".ports", section_rule_ports_csv(section));
+        s_body = signature_add_value(s_body, "rule." + name + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
+        s_body = signature_add_value(s_body, "rule." + name + ".excluded_ips", section_leaf_option_text(section, "excluded_ips"));
+        let excl_domains = trim(section_leaf_option_text(section, "excluded_domains"));
+        let excl_domains_text = trim(section_leaf_option_text(section, "excluded_domains_text"));
+        if (excl_domains != "" || excl_domains_text != "")
+            s_body = signature_add_value(s_body, "rule." + name + ".excluded_domains", excl_domains + "\n" + excl_domains_text);
+        s_body = signature_add_value(s_body, "rule." + name + ".excluded_protocol", section_leaf_option_text(section, "excluded_protocol"));
+        s_body = signature_add_value(s_body, "rule." + name + ".routed_dns_enabled", bool_option(section, "routed_dns_enabled", false) ? "1" : "0");
+        s_body = signature_add_value(s_body, "rule." + name + ".routed_dns_type", option(section, "routed_dns_type", ""));
+        s_body = signature_add_value(s_body, "rule." + name + ".routed_dns_server", option(section, "routed_dns_server", ""));
+        s_body = signature_add_value(s_body, "rule." + name + ".protocol", section_leaf_option_text(section, "protocol"));
+        let comm_subnets = community_subnets_enabled(section) ? rule_config.filter_community_subnet_lists_value(connections.community_lists_value(section)) : "";
+        s_body = signature_add_value(s_body, "rule." + name + ".community_subnet_lists", comm_subnets);
 
-        body = signature_add_value(body, "rule." + name + ".remote_subnet_lists", option(section, "remote_subnet_lists", ""));
-        body = signature_add_value(body, "rule." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-        body = signature_add_value(body, "rule." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
-        body = signature_add_value(body, "rule." + name + ".dscp", connections.dscp_value(section));
+        s_body = signature_add_value(s_body, "rule." + name + ".remote_subnet_lists", section_leaf_option_text(section, "remote_subnet_lists"));
+        s_body = signature_add_value(s_body, "rule." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
+        s_body = signature_add_value(s_body, "rule." + name + ".domain_ip_lists", section_leaf_option_text(section, "domain_ip_lists"));
+        s_body = signature_add_value(s_body, "rule." + name + ".dscp", connections.dscp_value(section));
+        let geo_val = connections.geoip_country_value(section);
+        if (geo_val != "")
+            s_body = signature_add_value(s_body, "rule." + name + ".geoip_country", connections.geoip_country_mode(section) + ":" + geo_val);
+        if (length(connections.section_condition_refs(section)) > 0 || option(section, "condition_expression", "") != "")
+            s_body = signature_add_value(s_body, "rule." + name + ".condition_clauses", sprintf("%J", connections.section_effective_clauses(section)));
         let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
         if (fail_policy == "block" || fail_policy == "direct") {
-            body = signature_add_value(body, "rule." + name + ".fail_policy", fail_policy);
+            s_body = signature_add_value(s_body, "rule." + name + ".fail_policy", fail_policy);
             if (section_runtime_failed(name))
-                body = signature_add_value(body, "rule." + name + ".runtime_failed", "1");
+                s_body = signature_add_value(s_body, "rule." + name + ".runtime_failed", "1");
         }
+        push(chunks, s_body);
     }
 
     for (let profile in profiles)
-        body = nft_profile_signature_body(body, object_or_empty(profile));
+        push(chunks, nft_profile_signature_body("", object_or_empty(profile)));
 
     for (let schedule in schedules)
-        body = nft_schedule_signature_body(body, object_or_empty(schedule));
+        push(chunks, nft_schedule_signature_body("", object_or_empty(schedule)));
 
     if (guest_modes) {
         for (let gm in guest_modes)
-            body = nft_guest_mode_signature_body(body, object_or_empty(gm));
+            push(chunks, nft_guest_mode_signature_body("", object_or_empty(gm)));
     }
+    let ts_sig = tailscale_nft_signature_value(sections, servers);
+    if (ts_sig != "")
+        push(chunks, signature_add_value("", "tailscale.nft", ts_sig));
 
-    return body;
+    return join("", chunks);
 }
 
 function section_subscription_update_interval(section) {
@@ -1368,13 +1821,36 @@ function section_subscription_update_interval(section) {
 }
 
 function connection_urls_signature(section) {
-    return sprintf("%J", connections.connection_urls(section));
+    let urls = connections.connection_urls(section);
+    let overrides = [];
+    for (let src in connections.section_effective_outbound_sources(section)) {
+        if (lc(trim(option(src, "source_type", ""))) != "proxy_links")
+            continue;
+        let fp = lc(trim(option(src, "tls_fingerprint", "")));
+        if (fp == "default")
+            fp = "";
+        let fm = connections.source_tls_fragment_mode(src, "");
+        let fl = connections.source_tcp_fragment_length(src, "");
+        let fd = connections.source_tcp_fragment_delay(src, "");
+        if (fp != "" || fm != "" || fl != "" || fd != "") {
+            push(overrides, {
+                id: as_string(src[".name"] || ""),
+                tls_fingerprint: fp,
+                tls_fragment_mode: fm,
+                tcp_fragment_length: fl,
+                tcp_fragment_delay: fd
+            });
+        }
+    }
+    if (length(overrides) > 0)
+        return sprintf("%J", { urls: urls, overrides: overrides });
+    return sprintf("%J", urls);
 }
 
 function subscription_urls_signature(section) {
     let result = [];
     for (let entry in connections.subscription_urls(section)) {
-        push(result, {
+        let item = {
             url: entry,
             // Part of the signature, not decoration: without it a toggle would
             // leave the signature identical and nothing would rebuild the config.
@@ -1399,7 +1875,23 @@ function subscription_urls_signature(section) {
             include_urltest_groups: connections.subscription_include_urltest_groups(section, entry) ? "1" : "0",
             hide_urltest_group_outbounds: connections.subscription_hide_urltest_group_outbounds(section, entry) ? "1" : "0",
             hide_detour_outbounds: connections.subscription_hide_detour_outbounds(section, entry) ? "1" : "0"
-        });
+        };
+        let eng = connections.subscription_engine(section, entry);
+        if (eng != "core")
+            item.subscription_engine = eng;
+        let fp = connections.subscription_tls_fingerprint(section, entry);
+        if (fp != "")
+            item.tls_fingerprint = fp;
+        let fm = connections.source_tls_fragment_mode(section, entry);
+        if (fm != "")
+            item.tls_fragment_mode = fm;
+        let fl = connections.source_tcp_fragment_length(section, entry);
+        if (fl != "")
+            item.tcp_fragment_length = fl;
+        let fd = connections.source_tcp_fragment_delay(section, entry);
+        if (fd != "")
+            item.tcp_fragment_delay = fd;
+        push(result, item);
     }
     return sprintf("%J", result);
 }
@@ -1471,20 +1963,20 @@ function priority_groups_signature(section) {
     let result = [];
     for (let group_id in connections.priority_groups(section)) {
         let levels = [];
-        for (let level_id in connections.priority_levels(group_id)) {
+        for (let level_id in connections.priority_levels(group_id, section)) {
             push(levels, {
                 id: level_id,
-                display_name: connections.priority_level_display_name(group_id, level_id),
-                order: connections.priority_level_order(group_id, level_id),
-                direct: connections.priority_level_direct(group_id, level_id) ? "1" : "0",
-                filter_mode: connections.priority_level_filter_mode(group_id, level_id),
-                detect_server_country: connections.priority_level_detect_server_country(group_id, level_id),
-                include_countries: connections.priority_level_include_countries(group_id, level_id),
-                include_outbounds: connections.priority_level_include_outbounds(group_id, level_id),
-                include_regex: connections.priority_level_include_regex(group_id, level_id),
-                exclude_countries: connections.priority_level_exclude_countries(group_id, level_id),
-                exclude_outbounds: connections.priority_level_exclude_outbounds(group_id, level_id),
-                exclude_regex: connections.priority_level_exclude_regex(group_id, level_id)
+                display_name: connections.priority_level_display_name(group_id, level_id, section),
+                order: connections.priority_level_order(group_id, level_id, section),
+                direct: connections.priority_level_direct(group_id, level_id, section) ? "1" : "0",
+                filter_mode: connections.priority_level_filter_mode(group_id, level_id, section),
+                detect_server_country: connections.priority_level_detect_server_country(group_id, level_id, section),
+                include_countries: connections.priority_level_include_countries(group_id, level_id, section),
+                include_outbounds: connections.priority_level_include_outbounds(group_id, level_id, section),
+                include_regex: connections.priority_level_include_regex(group_id, level_id, section),
+                exclude_countries: connections.priority_level_exclude_countries(group_id, level_id, section),
+                exclude_outbounds: connections.priority_level_exclude_outbounds(group_id, level_id, section),
+                exclude_regex: connections.priority_level_exclude_regex(group_id, level_id, section)
             });
         }
 
@@ -1541,7 +2033,10 @@ function append_list_update_signature_body(body, section) {
     let action = option(section, "action", "");
     body = signature_add_value(body, "lists." + name + ".action", action);
     if (action == "dns") {
-        body = signature_add_value(body, "lists." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+        body = signature_add_value(body, "lists." + name + ".domain_ip_lists", connections.domain_ip_lists_value(section));
+        let dns_rs = connections.rule_sets_value(section);
+        if (dns_rs != "")
+            body = signature_add_value(body, "lists." + name + ".rule_set", dns_rs);
         return body;
     }
     if (action == "hosts") {
@@ -1555,10 +2050,15 @@ function append_list_update_signature_body(body, section) {
 
     body = signature_add_value(body, "lists." + name + ".ports", section_rule_ports_csv(section));
     body = signature_add_value(body, "lists." + name + ".community_subnet_lists", rule_config.filter_community_subnet_lists_value(connections.community_lists_value(section)));
-    body = signature_add_value(body, "lists." + name + ".remote_domain_lists", option(section, "remote_domain_lists", ""));
-    body = signature_add_value(body, "lists." + name + ".remote_subnet_lists", option(section, "remote_subnet_lists", ""));
+    body = signature_add_value(body, "lists." + name + ".remote_domain_lists", section_leaf_option_text(section, "remote_domain_lists"));
+    body = signature_add_value(body, "lists." + name + ".remote_subnet_lists", section_leaf_option_text(section, "remote_subnet_lists"));
     body = signature_add_value(body, "lists." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-    body = signature_add_value(body, "lists." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+    body = signature_add_value(body, "lists." + name + ".domain_ip_lists", connections.domain_ip_lists_value(section));
+    let rs_val = connections.rule_sets_value(section);
+    if (rs_val != "")
+        body = signature_add_value(body, "lists." + name + ".rule_set", rs_val);
+    if (length(connections.section_condition_refs(section)) > 0)
+        body = signature_add_value(body, "lists." + name + ".community_lists", connections.community_lists_value(section));
 
     return body;
 }
@@ -1593,6 +2093,10 @@ function hosts_list_signature_body(sections) {
 function cron_signature_body(settings, sections) {
     let body = signature_add_value("", "settings.update_interval", settings_update_interval(settings));
     body = signature_add_value(body, "settings.component_update_check_interval", settings_component_update_check_interval(settings));
+    if (bool_option(settings, "component_auto_update_enabled", false)) {
+        body = signature_add_value(body, "settings.component_auto_update_enabled", "1");
+        body = signature_add_value(body, "settings.component_auto_update_mode", option(settings, "component_auto_update_mode", "immediate"));
+    }
 
     for (let section in sections)
         body = append_list_update_signature_body(body, object_or_empty(section));
@@ -1626,9 +2130,10 @@ function urltest_enabled_sections_value(sections) {
 
     for (let section in sections) {
         section = object_or_empty(section);
+        let act = option(section, "action", "");
         if (bool_option(section, "enabled", true) &&
-            connections.is_connections_action(option(section, "action", "")) &&
-            length(connections.urltests(section)) > 0)
+            ((connections.is_connections_action(act) && length(connections.urltests(section)) > 0) ||
+             (act == "awg" && (length(connections.amnezia_configs(section)) > 0 || length(connections.urltests(section)) > 0))))
             push(result, section_name(section));
     }
 
@@ -1639,7 +2144,7 @@ function print_urltest_enabled_sections(sections) {
     print(urltest_enabled_sections_value(sections), "\n");
 }
 
-function sing_box_signature_has_remote_ruleset_sources(sections) {
+function tachyon_core_signature_has_remote_ruleset_sources(sections) {
     for (let section in sections) {
         section = object_or_empty(section);
         if (!bool_option(section, "enabled", true))
@@ -1652,26 +2157,6 @@ function sing_box_signature_has_remote_ruleset_sources(sections) {
     }
 
     return false;
-}
-
-function sing_box_signature_enabled_action_index(sections, target_section, action) {
-    let result = 0;
-    target_section = as_string(target_section);
-    action = as_string(action);
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (section_name(section) == "" ||
-            !bool_option(section, "enabled", true) ||
-            option(section, "action", "") != action)
-            continue;
-
-        result++;
-        if (section_name(section) == target_section)
-            return result;
-    }
-
-    return 0;
 }
 
 function signature_add_mixed_proxy_body(body, section, prefix) {
@@ -1701,7 +2186,7 @@ function signature_add_outbound_detour_body(body, section, prefix) {
     return body;
 }
 
-function append_sing_box_rule_signature_body(body, section, sections) {
+function append_tachyon_core_rule_signature_body(body, section, sections) {
     section = object_or_empty(section);
     let name = section_name(section);
     if (name == "" || !bool_option(section, "enabled", true))
@@ -1741,18 +2226,88 @@ function append_sing_box_rule_signature_body(body, section, sections) {
         body = signature_add_mixed_proxy_body(body, section, prefix);
         body = signature_add_value(body, prefix + ".resolve_real_ip_for_routing", bool_option_value(section, "resolve_real_ip_for_routing", false));
     }
-    else if (action == "byedpi") {
-        body = signature_add_value(body, prefix + ".byedpi_index", sing_box_signature_enabled_action_index(sections, name, "byedpi"));
-        body = signature_add_mixed_proxy_body(body, section, prefix);
-        body = signature_add_value(body, prefix + ".resolve_real_ip_for_routing", "1");
-    }
     else if (action == "awg") {
+        body = signature_add_value(body, prefix + ".label", option(section, "label", ""));
+        body = signature_add_value(body, prefix + ".connection_urls", connection_urls_signature(section));
+        body = signature_add_value(body, prefix + ".urltests", urltests_signature(section));
+        body = signature_add_value(body, prefix + ".priority_groups", priority_groups_signature(section));
+        body = signature_add_value(body, prefix + ".dashboard_filter", dashboard_filter_signature(section));
+        body = signature_add_value(body, prefix + ".urltest_check_interval", section_urltest_check_interval(section));
+        body = signature_add_value(body, prefix + ".urltest_tolerance", option(section, "urltest_tolerance", "50"));
+        body = signature_add_value(body, prefix + ".urltest_testing_url", option(section, "urltest_testing_url", "https://www.gstatic.com/generate_204"));
+        body = signature_add_value(body, prefix + ".awg_local_address", join(",", list_option(section, "awg_local_address")));
+        for (let awg_key in [
+            "awg_private_key", "awg_peer_public_key", "awg_server_address", "awg_server_port",
+            "awg_preshared_key", "awg_mtu", "awg_keepalive", "awg_jc", "awg_jmin", "awg_jmax",
+            "awg_s1", "awg_s2", "awg_s3", "awg_s4", "awg_h1", "awg_h2", "awg_h3", "awg_h4",
+            "awg_i1", "awg_i2", "awg_i3", "awg_i4", "awg_i5", "awg_j1", "awg_j2", "awg_j3",
+            "awg_itime", "awg_version", "awg_header_protection_key", "awg_content_padding_addition",
+            "awg_rekey_after_time", "awg_rekey_timeout", "awg_reject_after_time",
+            "awg_keepalive_timeout", "awg_max_handshake_attempts", "awg_random_trailers",
+            "awg_disable_cookies"
+        ]) {
+            let awg_val = option(section, awg_key, "");
+            if (awg_val != "")
+                body = signature_add_value(body, prefix + "." + awg_key, awg_val);
+        }
         body = signature_add_outbound_detour_body(body, section, prefix);
         body = signature_add_mixed_proxy_body(body, section, prefix);
     }
-    else if (action == "zapret" || action == "zapret2") {
+    else if (action == "tailscale") {
+        body = signature_add_value(body, prefix + ".tailscale_auth_key", option(section, "tailscale_auth_key", ""));
+        body = signature_add_value(body, prefix + ".tailscale_control_url", option(section, "tailscale_control_url", "https://controlplane.tailscale.com"));
+        body = signature_add_value(body, prefix + ".tailscale_hostname", option(section, "tailscale_hostname", ""));
+        body = signature_add_value(body, prefix + ".tailscale_ephemeral", bool_option_value(section, "tailscale_ephemeral", false));
+        body = signature_add_value(body, prefix + ".tailscale_accept_routes", bool_option_value(section, "tailscale_accept_routes", true));
+        body = signature_add_value(body, prefix + ".tailscale_accept_dns", bool_option_value(section, "tailscale_accept_dns", true));
+        body = signature_add_value(body, prefix + ".tailscale_accept_default_resolvers", bool_option_value(section, "tailscale_accept_default_resolvers", true));
+        body = signature_add_value(body, prefix + ".tailscale_exit_node", option(section, "tailscale_exit_node", ""));
+        body = signature_add_value(body, prefix + ".tailscale_exit_node_allow_lan_access", bool_option_value(section, "tailscale_exit_node_allow_lan_access", false));
+        body = signature_add_value(body, prefix + ".tailscale_advertise_routes", join(",", list_option(section, "tailscale_advertise_routes")));
+        body = signature_add_value(body, prefix + ".tailscale_advertise_exit_node", bool_option_value(section, "tailscale_advertise_exit_node", false));
+        body = signature_add_value(body, prefix + ".tailscale_relay_server_port", option(section, "tailscale_relay_server_port", ""));
+        body = signature_add_value(body, prefix + ".tailscale_relay_server_static_endpoints", join(",", list_option(section, "tailscale_relay_server_static_endpoints")));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface", bool_option_value(section, "tailscale_system_interface", false));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface_name", option(section, "tailscale_system_interface_name", ""));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface_mtu", option(section, "tailscale_system_interface_mtu", ""));
+        body = signature_add_value(body, prefix + ".tailscale_udp_timeout", option(section, "tailscale_udp_timeout", ""));
+        body = signature_add_outbound_detour_body(body, section, prefix);
         body = signature_add_mixed_proxy_body(body, section, prefix);
-        body = signature_add_value(body, prefix + ".resolve_real_ip_for_routing", "1");
+    }
+    else if (index([
+        "warp", "masque", "openvpn", "anytls", "snell", "mieru", "naive",
+        "sudoku", "openconnect", "tewfai", "trusttunnel", "mtproto",
+        "shadowtls", "desync", "fptn", "tor", "wdtt", "csqtt"
+    ], action) >= 0) {
+        if (action == "wdtt" || action == "csqtt") {
+            // The native transport keeps its URI and overrides outside the
+            // protocol prefix, so fold the shared keys into the signature too.
+            for (let shared in [
+                "uri", "warp_flow_uri",
+                "csqtt_uri", "csqtt_server", "csqtt_server_port", "csqtt_password",
+                "csqtt_mode", "csqtt_workers", "csqtt_device_id", "csqtt_mtu",
+                "csqtt_obfs", "csqtt_hashes",
+                "mode", "workers", "device_id", "mtu"
+            ]) {
+                let shared_val = section[shared];
+                let shared_str = type(shared_val) == "array" ? join(",", shared_val) : as_string(shared_val || "");
+                if (shared_str != "")
+                    body = signature_add_value(body, prefix + "." + shared, shared_str);
+            }
+        }
+        let pkeys = keys(section);
+        sort(pkeys);
+        for (let pk in pkeys) {
+            if (index(pk, action + "_") == 0 || pk == "access_token" || pk == "label" ||
+                (action == "fptn" && (pk == "sni" || pk == "bypass_method" || pk == "preferred_server"))) {
+                let pv = section[pk];
+                let pv_str = type(pv) == "array" ? join(",", pv) : as_string(pv || "");
+                if (pv_str != "")
+                    body = signature_add_value(body, prefix + "." + pk, pv_str);
+            }
+        }
+        body = signature_add_outbound_detour_body(body, section, prefix);
+        body = signature_add_mixed_proxy_body(body, section, prefix);
     }
     else if (action == "dns") {
         body = signature_add_value(body, prefix + ".dns_type", option(section, "dns_type", "udp"));
@@ -1760,11 +2315,31 @@ function append_sing_box_rule_signature_body(body, section, sections) {
         body = signature_add_value(body, prefix + ".dns_detour_enabled", bool_option_value(section, "dns_detour_enabled", false));
         if (bool_option(section, "dns_detour_enabled", false))
             body = signature_add_value(body, prefix + ".dns_detour_section", option(section, "dns_detour_section", ""));
+        if (bool_option(section, "dns_use_wan", false))
+            body = signature_add_value(body, prefix + ".dns_use_wan", "1");
+        if (bool_option(section, "disable_fakeip", false))
+            body = signature_add_value(body, prefix + ".disable_fakeip", "1");
     }
     else if (action == "hosts") {
         body = signature_add_value(body, prefix + ".hosts_list_urls", option(section, "hosts_list_urls", ""));
         body = signature_add_value(body, prefix + ".hosts_list_disabled", option(section, "hosts_list_disabled", ""));
         body = signature_add_value(body, prefix + ".dns_hosts", option(section, "dns_hosts", ""));
+    }
+    else if (action == "group") {
+        body = signature_add_value(body, prefix + ".group_members", join(" ", list_option(section, "group_members")));
+        body = signature_add_value(body, prefix + ".urltests", urltests_signature(section));
+        body = signature_add_value(body, prefix + ".priority_groups", priority_groups_signature(section));
+        body = signature_add_value(body, prefix + ".urltest_check_interval", section_urltest_check_interval(section));
+        body = signature_add_value(body, prefix + ".urltest_tolerance", option(section, "urltest_tolerance", "50"));
+        body = signature_add_value(body, prefix + ".urltest_testing_url", option(section, "urltest_testing_url", "https://www.gstatic.com/generate_204"));
+        body = signature_add_outbound_detour_body(body, section, prefix);
+        body = signature_add_mixed_proxy_body(body, section, prefix);
+    }
+
+    if (connections.routed_dns_enabled(section)) {
+        body = signature_add_value(body, prefix + ".routed_dns_enabled", "1");
+        body = signature_add_value(body, prefix + ".routed_dns_type", connections.routed_dns_type(section));
+        body = signature_add_value(body, prefix + ".routed_dns_server", join(" ", connections.routed_dns_servers(section)));
     }
 
     body = signature_add_value(body, prefix + ".domain", section_rule_condition_csv(section, "domain", "domains"));
@@ -1776,29 +2351,68 @@ function append_sing_box_rule_signature_body(body, section, sections) {
     body = signature_add_value(body, prefix + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
     if (action != "dns")
         body = signature_add_value(body, prefix + ".ports", section_rule_ports_csv(section));
-    body = signature_add_value(body, prefix + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
+    body = signature_add_value(body, prefix + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
     if (action != "dns") {
-        body = signature_add_value(body, prefix + ".excluded_ips", option(section, "excluded_ips", ""));
-        body = signature_add_value(body, prefix + ".excluded_protocol", option(section, "excluded_protocol", ""));
-        body = signature_add_value(body, prefix + ".protocol", option(section, "protocol", ""));
+        body = signature_add_value(body, prefix + ".excluded_ips", section_leaf_option_text(section, "excluded_ips"));
+        body = signature_add_value(body, prefix + ".excluded_protocol", section_leaf_option_text(section, "excluded_protocol"));
+        body = signature_add_value(body, prefix + ".protocol", section_leaf_option_text(section, "protocol"));
     }
 
     body = signature_add_value(body, prefix + ".community_lists", connections.community_lists_value(section));
     body = signature_add_value(body, prefix + ".rule_set", connections.rule_sets_value(section));
     if (action != "dns")
         body = signature_add_value(body, prefix + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-    body = signature_add_value(body, prefix + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+    body = signature_add_value(body, prefix + ".domain_ip_lists", section_leaf_option_text(section, "domain_ip_lists"));
+    let rem_doms = section_leaf_option_text(section, "remote_domain_lists");
+    if (rem_doms != "")
+        body = signature_add_value(body, prefix + ".remote_domain_lists", rem_doms);
+    let loc_doms = section_leaf_option_text(section, "local_domain_lists");
+    if (loc_doms != "")
+        body = signature_add_value(body, prefix + ".local_domain_lists", loc_doms);
+    let rem_subs = section_leaf_option_text(section, "remote_subnet_lists");
+    if (rem_subs != "")
+        body = signature_add_value(body, prefix + ".remote_subnet_lists", rem_subs);
+    let geo_val = connections.geoip_country_value(section);
+    if (geo_val != "")
+        body = signature_add_value(body, prefix + ".geoip_country", connections.geoip_country_mode(section) + ":" + geo_val);
+    let user_doms = section_leaf_option_text(section, "user_domains");
+    let user_doms_txt = section_leaf_option_text(section, "user_domains_text");
+    if (user_doms != "" || user_doms_txt != "")
+        body = signature_add_value(body, prefix + ".user_domains", user_doms + "|" + user_doms_txt);
+    let excl_doms = trim(section_leaf_option_text(section, "excluded_domains"));
+    let excl_doms_txt = trim(section_leaf_option_text(section, "excluded_domains_text"));
+    if (excl_doms != "" || excl_doms_txt != "")
+        body = signature_add_value(body, prefix + ".excluded_domains", excl_doms + "|" + excl_doms_txt);
+    for (let if_key in [ "default_interface_address", "interface_address", "network_interface_address", "preferred_by" ]) {
+        let if_val = section_leaf_option_text(section, if_key);
+        if (if_val != "")
+            body = signature_add_value(body, prefix + "." + if_key, if_val);
+    }
+    if (length(connections.section_condition_refs(section)) > 0 || option(section, "condition_expression", "") != "")
+        body = signature_add_value(body, prefix + ".condition_clauses", sprintf("%J", connections.section_effective_clauses(section)));
+    if (length(connections.section_outbound_source_refs(section)) > 0 ||
+        length(connections.section_outbound_group_refs(section)) > 0 ||
+        length(connections.section_balancer_refs(section)) > 0) {
+        body = signature_add_value(body, prefix + ".modular_outbounds", sprintf("%J", {
+            sources: connections.section_effective_outbound_sources(section),
+            groups: connections.section_outbound_group_refs(section),
+            balancers: connections.section_balancer_refs(section)
+        }));
+    }
     let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
     if (fail_policy == "block" || fail_policy == "direct") {
         body = signature_add_value(body, prefix + ".fail_policy", fail_policy);
         if (section_runtime_failed(name))
             body = signature_add_value(body, prefix + ".runtime_failed", "1");
     }
+    let ipv6_sup = lc(trim(option(section, "ipv6_support", "")));
+    if (ipv6_sup != "" && ipv6_sup != "auto")
+        body = signature_add_value(body, prefix + ".ipv6_support", ipv6_sup);
 
     return body;
 }
 
-function append_sing_box_server_signature_body(body, server) {
+function append_tachyon_core_server_signature_body(body, server) {
     server = object_or_empty(server);
     let name = section_name(server);
     if (name == "")
@@ -1812,6 +2426,19 @@ function append_sing_box_server_signature_body(body, server) {
 
     if (option(server, "protocol", "vless") == "socks")
         body = signature_add_value(body, prefix + ".socks_auth_enabled", bool_option_value(server, "socks_auth_enabled", true));
+    if (option(server, "protocol", "vless") == "tailscale") {
+        body = signature_add_value(body, prefix + ".tailscale_ephemeral", bool_option_value(server, "tailscale_ephemeral", false));
+        body = signature_add_value(body, prefix + ".tailscale_accept_dns", bool_option_value(server, "tailscale_accept_dns", true));
+        body = signature_add_value(body, prefix + ".tailscale_accept_default_resolvers", bool_option_value(server, "tailscale_accept_default_resolvers", true));
+        body = signature_add_value(body, prefix + ".tailscale_exit_node", option(server, "tailscale_exit_node", ""));
+        body = signature_add_value(body, prefix + ".tailscale_exit_node_allow_lan_access", bool_option_value(server, "tailscale_exit_node_allow_lan_access", false));
+        body = signature_add_value(body, prefix + ".tailscale_relay_server_port", option(server, "tailscale_relay_server_port", ""));
+        body = signature_add_value(body, prefix + ".tailscale_relay_server_static_endpoints", join(",", list_option(server, "tailscale_relay_server_static_endpoints")));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface", bool_option_value(server, "tailscale_system_interface", false));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface_name", option(server, "tailscale_system_interface_name", ""));
+        body = signature_add_value(body, prefix + ".tailscale_system_interface_mtu", option(server, "tailscale_system_interface_mtu", ""));
+        body = signature_add_value(body, prefix + ".tailscale_udp_timeout", option(server, "tailscale_udp_timeout", ""));
+    }
 
     let fields = [
         [ "label", name ],
@@ -1870,12 +2497,63 @@ function append_sing_box_server_signature_body(body, server) {
         [ "tailscale_auth_key", "" ],
         [ "tailscale_control_url", "" ],
         [ "tailscale_hostname", "" ],
-        [ "tailscale_mode", "singbox" ],
         [ "tailscale_masquerade", "1" ],
         [ "tailscale_use_exit_node", "0" ],
         [ "tailscale_accept_routes", "" ],
         [ "tailscale_advertise_routes", "" ],
-        [ "tailscale_advertise_exit_node", "" ]
+        [ "tailscale_advertise_exit_node", "" ],
+        [ "shadowtls_handshake_server", "" ],
+        [ "shadowtls_handshake_server_port", "" ],
+        [ "shadowtls_version", "" ],
+        [ "awg_local_address", "" ],
+        [ "awg_private_key", "" ],
+        [ "awg_mtu", "" ],
+        [ "awg_server_address", "" ],
+        [ "awg_server_port", "" ],
+        [ "awg_peer_public_key", "" ],
+        [ "awg_peer_allowed_ips", "" ],
+        [ "awg_allowed_ips", "" ],
+        [ "awg_client_address", "" ],
+        [ "awg_preshared_key", "" ],
+        [ "awg_keepalive", "" ],
+        [ "awg_jc", "" ],
+        [ "awg_jmin", "" ],
+        [ "awg_jmax", "" ],
+        [ "awg_s1", "" ],
+        [ "awg_s2", "" ],
+        [ "awg_s3", "" ],
+        [ "awg_s4", "" ],
+        [ "awg_h1", "" ],
+        [ "awg_h2", "" ],
+        [ "awg_h3", "" ],
+        [ "awg_h4", "" ],
+        [ "awg_i1", "" ],
+        [ "awg_i2", "" ],
+        [ "awg_i3", "" ],
+        [ "awg_i4", "" ],
+        [ "awg_i5", "" ],
+        [ "awg_j1", "" ],
+        [ "awg_j2", "" ],
+        [ "awg_j3", "" ],
+        [ "awg_itime", "" ],
+        [ "awg_version", "" ],
+        [ "awg_header_protection_key", "" ],
+        [ "awg_content_padding_addition", "" ],
+        [ "awg_rekey_after_time", "" ],
+        [ "awg_rekey_timeout", "" ],
+        [ "awg_reject_after_time", "" ],
+        [ "awg_keepalive_timeout", "" ],
+        [ "awg_max_handshake_attempts", "" ],
+        [ "awg_random_trailers", "" ],
+        [ "awg_disable_cookies", "" ],
+        [ "isolate_lan_for_users", "" ],
+        [ "block_private_for_users", "" ],
+        [ "isolated_users", "" ],
+        [ "blocked_users", "" ],
+        [ "isolated_subnets", "" ],
+        [ "custom_route_rules", "" ],
+        [ "custom_rules_json", "" ],
+        [ "open_firewall_port", "" ]
     ];
 
     for (let field in fields)
@@ -1884,10 +2562,10 @@ function append_sing_box_server_signature_body(body, server) {
     return body;
 }
 
-function append_sing_box_profile_signature_body(body, profile) {
+function append_tachyon_core_profile_signature_body(body, profile) {
     let name = section_name(profile);
     if (name == "") return body;
-    let prefix = "sing_box.profile." + name;
+    let prefix = "tachyon_core.profile." + name;
     let enabled = bool_option(profile, "enabled", true) ? "1" : "0";
     body = signature_add_value(body, prefix + ".enabled", enabled);
     let dev_ips = join(",", list_option(profile, "device_ip"));
@@ -1899,10 +2577,10 @@ function append_sing_box_profile_signature_body(body, profile) {
     return body;
 }
 
-function append_sing_box_schedule_signature_body(body, schedule) {
+function append_tachyon_core_schedule_signature_body(body, schedule) {
     let name = section_name(schedule);
     if (name == "") return body;
-    let prefix = "sing_box.schedule." + name;
+    let prefix = "tachyon_core.schedule." + name;
     let enabled = bool_option(schedule, "enabled", true) ? "1" : "0";
     body = signature_add_value(body, prefix + ".enabled", enabled);
     let dev_ips = join(",", list_option(schedule, "device_ip"));
@@ -1917,10 +2595,11 @@ function append_sing_box_schedule_signature_body(body, schedule) {
     body = signature_add_value(body, prefix + ".start_time", option(schedule, "start_time", ""));
     body = signature_add_value(body, prefix + ".end_time", option(schedule, "end_time", ""));
     body = signature_add_value(body, prefix + ".days", join(",", list_option(schedule, "days")));
+    body = signature_add_value(body, prefix + ".dns_level", option(schedule, "dns_level", "1"));
     return body;
 }
 
-function sing_box_signature_body(settings, sections, servers, mwan3_active, schedules, profiles) {
+function tachyon_core_signature_body(settings, sections, servers, mwan3_active, schedules, profiles, telegram) {
     settings = object_or_empty(settings);
     let body = "";
 
@@ -1933,7 +2612,7 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
         body = signature_add_value(body, "settings.dns_fallback_server", value);
     for (let value in list_option(settings, "bootstrap_dns_server", "77.88.8.8"))
         body = signature_add_value(body, "settings.bootstrap_dns_server", value);
-    body = signature_add_value(body, "settings.dns_check_interval", option(settings, "dns_check_interval", "10s"));
+    body = signature_add_value(body, "settings.dns_check_interval", option(settings, "dns_check_interval", "30s"));
     body = signature_add_value(body, "settings.dns_recovery_check_interval", option(settings, "dns_recovery_check_interval", "60s"));
     body = signature_add_value(body, "settings.dns_check_timeout", option(settings, "dns_check_timeout", "2s"));
     body = signature_add_value(body, "settings.dns_failure_threshold", option(settings, "dns_failure_threshold", "3"));
@@ -1946,13 +2625,20 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
     body = signature_add_value(body, "settings.output_network_interface", option(settings, "output_network_interface", ""));
     body = signature_add_value(body, "settings.disable_quic", common.disable_quic_mode(option(settings, "disable_quic", "0")));
     body = signature_add_value(body, "settings.block_doh", bool_option_value(settings, "block_doh", false));
-    if (sing_box_signature_has_remote_ruleset_sources(sections))
+    let dns_intercept_mode = require("service.kill_switch").dns_intercept_mode(settings);
+    if (dns_intercept_mode != "auto")
+        body = signature_add_value(body, "settings.dns_intercept_all", dns_intercept_mode);
+    if (tachyon_core_signature_has_remote_ruleset_sources(sections))
         body = signature_add_value(body, "settings.update_interval", settings_update_interval(settings));
     body = signature_add_value(body, "settings.cache_path", option(settings, "cache_path", "/usr/share/tachyon-core/cache.db"));
     body = signature_add_value(body, "settings.config_path", option(settings, "config_path", ""));
     body = signature_add_value(body, "settings.log_level", option(settings, "log_level", "warn"));
     body = signature_add_value(body, "settings.service_listen_address", option(settings, "service_listen_address", ""));
     body = signature_add_value(body, "runtime.mwan3_active", bool_value(mwan3_active));
+    if (bool_option_value(settings, "enable_badwan_interface_monitoring", false) == "1")
+        body = signature_add_value(body, "settings.enable_badwan_interface_monitoring", "1");
+    if (bool_option_value(settings, "wan_failover_enabled", false) == "1")
+        body = signature_add_value(body, "settings.wan_failover_enabled", "1");
     body = signature_add_value(body, "settings.direct_bypass_enabled", bool_option_value(settings, "direct_bypass_enabled", false));
     body = signature_add_value(body, "settings.direct_bypass_port", option(settings, "direct_bypass_port", "2080"));
 
@@ -1960,6 +2646,8 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
     body = signature_add_value(body, "settings.enable_yacd", enable_yacd);
     if (enable_yacd == "1") {
         body = signature_add_value(body, "settings.enable_yacd_wan_access", bool_option_value(settings, "enable_yacd_wan_access", false));
+        body = signature_add_value(body, "settings.yacd_secret_key", option(settings, "yacd_secret_key", ""));
+    } else if (option(settings, "yacd_secret_key", "") != "") {
         body = signature_add_value(body, "settings.yacd_secret_key", option(settings, "yacd_secret_key", ""));
     }
 
@@ -1971,8 +2659,42 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
         body = signature_add_value(body, "settings.download_components_via_proxy_section", option(settings, "download_components_via_proxy_section", ""));
     body = signature_add_value(body, "settings.route_router_traffic", bool_option_value(settings, "route_router_traffic", false));
     body = signature_add_value(body, "settings.route_router_traffic_section", option(settings, "route_router_traffic_section", ""));
+    let bot_proxy_section = trim(option(telegram, "bot_proxy_section", ""));
+    if (bot_proxy_section != "")
+        body = signature_add_value(body, "telegram.bot_proxy_section", bot_proxy_section);
     if (bool_option(settings, "wifi_calling_direct", false))
         body = signature_add_value(body, "settings.wifi_calling_direct", "1");
+    if (bool_option(settings, "lite_mode", false))
+        body = signature_add_value(body, "settings.lite_mode", "1");
+    if (!common.is_tcp_bbr_enabled(settings))
+        body = signature_add_value(body, "settings.tcp_bbr", "0");
+    if (bool_option(settings, "smart_queue", false))
+        body = signature_add_value(body, "settings.smart_queue", "1");
+    let tcp_prof_sig = lc(trim(as_string(option(settings, "tcp_profile", ""))));
+    if (tcp_prof_sig == "auto" || tcp_prof_sig == "windows" || tcp_prof_sig == "macos" ||
+        tcp_prof_sig == "ios" || tcp_prof_sig == "android" || tcp_prof_sig == "linux")
+        body = signature_add_value(body, "settings.tcp_profile", tcp_prof_sig);
+    if (bool_option(settings, "selector_auto_failover", false))
+        body = signature_add_value(body, "settings.selector_auto_failover", "1");
+    let proxy_mode = lc(trim(as_string(option(settings, "proxy_mode", "tproxy"))));
+    if (proxy_mode != "" && proxy_mode != "tproxy") {
+        body = signature_add_value(body, "settings.proxy_mode", proxy_mode);
+        if (proxy_mode == "tun") {
+            body = signature_add_value(body, "settings.tun_inet4", option(settings, "tun_inet4", "172.19.0.1/30"));
+            body = signature_add_value(body, "settings.tun_inet6", option(settings, "tun_inet6", ""));
+            body = signature_add_value(body, "settings.tun_mtu", option(settings, "tun_mtu", "9000"));
+            body = signature_add_value(body, "settings.tun_stack", option(settings, "tun_stack", "system"));
+            if (option(settings, "tun_gso", "") != "")
+                body = signature_add_value(body, "settings.tun_gso", option(settings, "tun_gso", ""));
+            if (option(settings, "tun_endpoint_independent_nat", "") != "")
+                body = signature_add_value(body, "settings.tun_endpoint_independent_nat", option(settings, "tun_endpoint_independent_nat", ""));
+            if (option(settings, "tun_udp_timeout", "") != "")
+                body = signature_add_value(body, "settings.tun_udp_timeout", option(settings, "tun_udp_timeout", ""));
+        } else if (proxy_mode == "socks") {
+            body = signature_add_value(body, "settings.socks_port", option(settings, "socks_port", "1080"));
+            body = signature_add_value(body, "settings.socks_listen", option(settings, "socks_listen", "0.0.0.0"));
+        }
+    }
     let bt_policy = lc(trim(option(settings, "bittorrent_policy", "")));
     if (bt_policy == "")
         bt_policy = bool_option(settings, "isolate_p2p", false) ? "direct" : "off";
@@ -1980,230 +2702,45 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
         body = signature_add_value(body, "settings.bittorrent_policy", bt_policy);
         body = signature_add_value(body, "settings.p2p_ports", option(settings, "p2p_ports", ""));
     }
+    for (let pair in common.ipv6_signature_pairs(settings, true))
+        body = signature_add_value(body, pair[0], pair[1]);
+
+    let chunks = [ body ];
 
     for (let section in sections)
-        body = append_sing_box_rule_signature_body(body, object_or_empty(section), sections);
+        push(chunks, append_tachyon_core_rule_signature_body("", object_or_empty(section), sections));
 
     for (let server in servers)
-        body = append_sing_box_server_signature_body(body, object_or_empty(server));
+        push(chunks, append_tachyon_core_server_signature_body("", object_or_empty(server)));
 
     for (let profile in profiles)
-        body = append_sing_box_profile_signature_body(body, object_or_empty(profile));
+        push(chunks, append_tachyon_core_profile_signature_body("", object_or_empty(profile)));
 
     for (let schedule in schedules)
-        body = append_sing_box_schedule_signature_body(body, object_or_empty(schedule));
+        push(chunks, append_tachyon_core_schedule_signature_body("", object_or_empty(schedule)));
 
-    return body;
+    return join("", chunks);
 }
 
-function section_action_is_enabled(section, action) {
-    return section_name(section) != "" &&
-        bool_option(section, "enabled", true) &&
-        option(section, "action", "") == as_string(action);
-}
-
-function action_queue_signature_body(sections, action, signature_key) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (section_action_is_enabled(section, action))
-            body = signature_add_value(body, signature_key, section_name(section));
-    }
-
-    return body;
-}
-
-function section_user_domains_for_list_type(section) {
-    let list_type = option(section, "user_domain_list_type", "disabled");
-
-    if (list_type == "dynamic")
-        return option(section, "user_domains", "");
-    if (list_type == "text")
-        return option(section, "user_domains_text", "");
-    return "";
-}
-
-function append_zapret_runtime_signature_body(body, section, signature_prefix, opt_key, normalized_opt) {
-    let name = section_name(section);
-    let user_domain_list_type = option(section, "user_domain_list_type", "disabled");
-
-    body = signature_add_value(body, signature_prefix + "." + name + "." + opt_key, normalized_opt);
-    body = signature_add_value(body, signature_prefix + "." + name + ".domain", section_rule_condition_csv(section, "domain", "domains"));
-    body = signature_add_value(body, signature_prefix + "." + name + ".domain_suffix", section_rule_condition_csv(section, "domain_suffix", "domains"));
-    body = signature_add_value(body, signature_prefix + "." + name + ".community_lists", connections.community_lists_value(section));
-    body = signature_add_value(body, signature_prefix + "." + name + ".rule_set", connections.rule_sets_value(section));
-    body = signature_add_value(body, signature_prefix + "." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-    body = signature_add_value(body, signature_prefix + "." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
-    body = signature_add_value(body, signature_prefix + "." + name + ".user_domain_list_type", user_domain_list_type);
-    body = signature_add_value(body, signature_prefix + "." + name + ".local_domain_lists", option(section, "local_domain_lists", ""));
-    body = signature_add_value(body, signature_prefix + "." + name + ".remote_domain_lists", option(section, "remote_domain_lists", ""));
-    body = signature_add_value(body, signature_prefix + "." + name + ".user_domains", section_user_domains_for_list_type(section));
-
-    return body;
-}
-
-function zapret_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "zapret"))
-            continue;
-
-        body = append_zapret_runtime_signature_body(
-        body,
-        section,
-        "zapret",
-        "nfqws_opt",
-            zapret_validator.strategy_or_default(option(section, "nfqws_opt", ""), ZAPRET_DEFAULT_NFQWS_OPT)
-        );
-    }
-
-    return body;
-}
-
-function zapret2_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "zapret2"))
-            continue;
-
-        body = append_zapret_runtime_signature_body(
-        body,
-        section,
-        "zapret2",
-        "nfqws2_opt",
-            zapret2_validator.strategy_or_default(option(section, "nfqws2_opt", ""), ZAPRET2_DEFAULT_NFQWS2_OPT)
-        );
-    }
-
-    return body;
-}
-
-function enabled_action_index(sections, target_section, action) {
-    let result = 0;
-    target_section = as_string(target_section);
-    action = as_string(action);
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, action))
-            continue;
-
-        result++;
-        if (section_name(section) == target_section)
-            return result;
-    }
-
-    return 0;
-}
-
-function byedpi_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "byedpi"))
-            continue;
-
-        let name = section_name(section);
-        body = signature_add_value(body, "byedpi." + name + ".index", enabled_action_index(sections, name, "byedpi"));
-        body = signature_add_value(body, "byedpi." + name + ".byedpi_cmd_opts", byedpi_validator.strategy_or_default(option(section, "byedpi_cmd_opts", ""), BYEDPI_DEFAULT_CMD_OPTS));
-    }
-
-    return body;
-}
-
-function wdtt_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "wdtt"))
-            continue;
-
-        let name = section_name(section);
-        body = signature_add_value(body, "wdtt." + name + ".peer", option(section, "peer", ""));
-        body = signature_add_value(body, "wdtt." + name + ".password", option(section, "password", ""));
-        body = signature_add_value(body, "wdtt." + name + ".device_id", common.option_or_legacy(section, "device_id", "warp_flow_device_id", ""));
-        body = signature_add_value(body, "wdtt." + name + ".mode", common.option_or_legacy(section, "mode", "warp_flow_mode", ""));
-        body = signature_add_value(body, "wdtt." + name + ".workers", common.option_or_legacy(section, "workers", "warp_flow_workers", ""));
-        body = signature_add_value(body, "wdtt." + name + ".max_hashes", common.option_or_legacy(section, "max_hashes", "warp_flow_max_hashes", ""));
-        body = signature_add_value(body, "wdtt." + name + ".mtu", common.option_or_legacy(section, "mtu", "warp_flow_mtu", ""));
-        body = signature_add_value(body, "wdtt." + name + ".refresh", common.option_or_legacy(section, "refresh", "warp_flow_refresh", ""));
-        body = signature_add_value(body, "wdtt." + name + ".auto_update", common.bool_option_or_legacy(section, "auto_update", "warp_flow_auto_update", true) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".block_doh", common.bool_option_or_legacy(section, "block_doh", "warp_flow_block_doh", false) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".block_ipv6", common.bool_option_or_legacy(section, "block_ipv6", "warp_flow_block_ipv6", false) ? "1" : "0");
-        body = signature_add_value(body, "wdtt." + name + ".uri", common.option_or_legacy(section, "uri", "warp_flow_uri", ""));
-        body = signature_add_value(body, "wdtt." + name + ".subscription_links", join(" ", common.list_option_or_legacy(section, "subscription_links", "warp_flow_subscription_links")));
-        body = signature_add_value(body, "wdtt." + name + ".community_lists", join(" ", common.list_option_or_legacy(section, "community_lists", "warp_flow_community_lists")));
-        body = signature_add_value(body, "wdtt." + name + ".remote_domain_list", join(" ", common.list_option_or_legacy(section, "remote_domain_list", "warp_flow_remote_domain_list")));
-    }
-
-    return body;
-}
-
-function olcrtc_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "olcrtc"))
-            continue;
-
-        let name = section_name(section);
-        body = signature_add_value(body, "olcrtc." + name + ".provider", common.option_or_legacy(section, "provider", "olcrtc_provider", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".transport", common.option_or_legacy(section, "transport", "olcrtc_transport", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".room_id", common.option_or_legacy(section, "room_id", "olcrtc_room_id", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".crypto_key", common.option_or_legacy(section, "crypto_key", "olcrtc_crypto_key", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".socks_host", common.option_or_legacy(section, "socks_host", "olcrtc_socks_host", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".socks_port", common.option_or_legacy(section, "socks_port", "olcrtc_socks_port", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".dns_server", common.option_or_legacy(section, "dns_server", "olcrtc_dns_server", ""));
-        body = signature_add_value(body, "olcrtc." + name + ".subscription_links", join(" ", common.list_option_or_legacy(section, "subscription_links", "olcrtc_subscription_links")));
-    }
-
-    return body;
-}
-
-function fptn_runtime_signature_body(sections) {
-    let body = "";
-
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "fptn"))
-            continue;
-
-        let name = section_name(section);
-        body = signature_add_value(body, "fptn." + name + ".access_token", option(section, "access_token", ""));
-        body = signature_add_value(body, "fptn." + name + ".sni", option(section, "sni", ""));
-        body = signature_add_value(body, "fptn." + name + ".bypass_method", option(section, "bypass_method", ""));
-        body = signature_add_value(body, "fptn." + name + ".preferred_server", option(section, "preferred_server", ""));
-    }
-
-    return body;
-}
-
-function reload_state_values_from_sources(format, settings, sections, servers, dnsmasq, legacy_dnsmasq_present, mwan3_active_value, schedules, profiles, guest_modes) {
+function reload_state_values_from_sources(format, settings, sections, servers, dnsmasq, legacy_dnsmasq_present, mwan3_active_value, schedules, profiles, guest_modes, telegram) {
+    let hashes = signature_hashes_batch({
+        service_trigger_signature: service_trigger_signature_body(settings),
+        dnsmasq_signature: dnsmasq_signature_body(settings, dnsmasq, legacy_dnsmasq_present),
+        tachyon_core_signature: tachyon_core_signature_body(settings, sections, servers, mwan3_active_value, schedules, profiles, telegram),
+        nft_signature: nft_runtime_signature_body(settings, sections, schedules, profiles, guest_modes, servers),
+        list_signature: list_update_signature_body(sections),
+        hosts_list_signature: hosts_list_signature_body(sections),
+        cron_signature: cron_signature_body(settings, sections)
+    });
     return {
         format: as_string(format),
-        service_trigger_signature: signature_hash(service_trigger_signature_body(settings)),
-        dnsmasq_signature: signature_hash(dnsmasq_signature_body(settings, dnsmasq, legacy_dnsmasq_present)),
-        sing_box_signature: signature_hash(sing_box_signature_body(settings, sections, servers, mwan3_active_value, schedules, profiles)),
-        nft_signature: signature_hash(nft_runtime_signature_body(settings, sections, schedules, profiles, guest_modes)),
-        zapret_queue_signature: signature_hash(action_queue_signature_body(sections, "zapret", "zapret_queue.section")),
-        zapret_runtime_signature: signature_hash(zapret_runtime_signature_body(sections)),
-        zapret2_queue_signature: signature_hash(action_queue_signature_body(sections, "zapret2", "zapret2_queue.section")),
-        zapret2_runtime_signature: signature_hash(zapret2_runtime_signature_body(sections)),
-        byedpi_runtime_signature: signature_hash(byedpi_runtime_signature_body(sections)),
-        wdtt_runtime_signature: signature_hash(wdtt_runtime_signature_body(sections)),
-        olcrtc_runtime_signature: signature_hash(olcrtc_runtime_signature_body(sections)),
-        fptn_runtime_signature: signature_hash(fptn_runtime_signature_body(sections)),
-        list_signature: signature_hash(list_update_signature_body(sections)),
-        hosts_list_signature: signature_hash(hosts_list_signature_body(sections)),
-        cron_signature: signature_hash(cron_signature_body(settings, sections)),
+        service_trigger_signature: hashes.service_trigger_signature,
+        dnsmasq_signature: hashes.dnsmasq_signature,
+        tachyon_core_signature: hashes.tachyon_core_signature,
+        nft_signature: hashes.nft_signature,
+        list_signature: hashes.list_signature,
+        hosts_list_signature: hashes.hosts_list_signature,
+        cron_signature: hashes.cron_signature,
         urltest_enabled_sections: urltest_enabled_sections_value(sections),
         dont_touch_dhcp: dont_touch_dhcp_value(settings)
     };
@@ -2222,6 +2759,8 @@ function fixture_section_list(data, type_name) {
 }
 
 function uci_sections(type_name) {
+    if (type_name == "section")
+        connections.set_item_sections(null);
     return uci_core.section_objects(CONFIG_NAME, type_name);
 }
 
@@ -2237,19 +2776,61 @@ function mwan3_has_enabled_interface() {
     return false;
 }
 
-function mwan3_active() {
-    if (!command_success_from_args([ "test", "-x", "/etc/init.d/mwan3" ]))
-        return false;
-    if (!command_success_from_args([ "test", "-s", "/etc/config/mwan3" ]))
-        return false;
-    if (!mwan3_has_enabled_interface())
-        return false;
+function kmwan_has_enabled_member() {
+    for (let section in uci_core.section_objects("kmwan", "member"))
+        if (option(section, "disabled", "0") != "1" && option(section, "enabled", "1") != "0")
+            return true;
 
-    return command_success_from_args([ "/etc/init.d/mwan3", "status" ]) ||
-        command_success_from_args([ "/etc/init.d/mwan3", "enabled" ]);
+    return false;
 }
 
-function has_remote_sing_box_ruleset_sources_from_sections(sections) {
+function kmwan_active() {
+    if (!command_success_from_args([ "test", "-s", "/etc/config/kmwan" ]))
+        return false;
+    if (!command_success_from_args([ "test", "-x", "/etc/init.d/kmwan" ]) &&
+        !command_success_from_args([ "test", "-s", "/proc/gl-kmwan/config" ]))
+        return false;
+    if (!kmwan_has_enabled_member())
+        return false;
+
+    return command_success_from_args([ "test", "-s", "/proc/gl-kmwan/config" ]) ||
+        command_success_from_args([ "/etc/init.d/kmwan", "status" ]) ||
+        command_success_from_args([ "/etc/init.d/kmwan", "enabled" ]);
+}
+
+function multiwan_network_interfaces_active() {
+    let wan_count = 0;
+    for (let section in uci_core.section_objects("network", "interface")) {
+        let name = lc(trim(as_string(section[".name"] || "")));
+        if (name == "" || substr(name, -1) == "6")
+            continue;
+        if (match(name, /^(wan|wan[0-9]+|wanb|secondwan|wwan[0-9]*|lte[0-9]*|modem[0-9]*|tethering[0-9]*)$/) == null)
+            continue;
+        if (option(section, "proto", "") == "")
+            continue;
+        if (option(section, "disabled", "0") == "1" || option(section, "auto", "1") == "0")
+            continue;
+        wan_count++;
+        if (wan_count >= 2)
+            return true;
+    }
+    return false;
+}
+
+function mwan3_active() {
+    if (command_success_from_args([ "test", "-x", "/etc/init.d/mwan3" ]) &&
+        command_success_from_args([ "test", "-s", "/etc/config/mwan3" ]) &&
+        mwan3_has_enabled_interface()) {
+        if (command_success_from_args([ "/etc/init.d/mwan3", "status" ]) ||
+            command_success_from_args([ "/etc/init.d/mwan3", "enabled" ]))
+            return true;
+    }
+    if (kmwan_active())
+        return true;
+    return multiwan_network_interfaces_active();
+}
+
+function has_remote_tachyon_core_ruleset_sources_from_sections(sections) {
     for (let section in sections) {
         if (!bool_option(section, "enabled", true))
             continue;
@@ -2269,10 +2850,10 @@ function has_list_update_sources_from_sections(sections) {
             bool_option(section, "enabled", true),
             option(section, "action", ""),
             connections.community_lists_value(section),
-            option(section, "remote_domain_lists", ""),
-            option(section, "remote_subnet_lists", ""),
+            section_leaf_option_text(section, "remote_domain_lists"),
+            section_leaf_option_text(section, "remote_subnet_lists"),
             connections.rule_sets_with_subnets_value(section),
-            option(section, "domain_ip_lists", ""),
+            connections.domain_ip_lists_value(section),
             connections.rule_sets_value(section)
         ))
             return true;
@@ -2286,9 +2867,9 @@ function has_nft_list_update_sources_from_sections(sections) {
             bool_option(section, "enabled", true),
             option(section, "action", ""),
             connections.community_lists_value(section),
-            option(section, "remote_subnet_lists", ""),
+            section_leaf_option_text(section, "remote_subnet_lists"),
             connections.rule_sets_with_subnets_value(section),
-            option(section, "domain_ip_lists", "")
+            connections.domain_ip_lists_value(section)
         ))
             return true;
 
@@ -2391,7 +2972,8 @@ function current_reload_state_values(format) {
         mwan3_active(),
         uci_sections("schedule"),
         uci_sections("profile"),
-        uci_sections("guest_mode")
+        uci_sections("guest_mode"),
+        uci_section("telegram")
     );
 }
 
@@ -2442,11 +3024,53 @@ function fixture_reload_state_values(data, format) {
         fixture_mwan3_active(data),
         fixture_section_list(data, "schedule"),
         fixture_section_list(data, "profile"),
-        fixture_section_list(data, "guest_mode")
+        fixture_section_list(data, "guest_mode"),
+        object_or_empty(data.telegram)
     );
 }
 
 let mode = ARGV[0];
+
+const FAST_RUNTIME_MODES = {
+    "file-first-line": true,
+    "get": true,
+    "has-key": true,
+    "time-sync-needed": true,
+    "sync-time-if-needed": true,
+    "mark-pending-reload": true,
+    "consume-pending-reload": true,
+    "run-pending-reload-if-requested": true,
+    "acquire-runtime-dir-lock": true,
+    "acquire-runtime-dir-lock-wait": true,
+    "release-runtime-dir-lock": true,
+    "reload-core-runtime": true,
+    "sighup-core-runtime": true,
+    "hup-core-runtime": true,
+    "clear-reload-state": true,
+    "remove-file": true,
+    "write-reload-state": true,
+    "response-success": true,
+    "stdin-first-field": true,
+    "tachyon-core-service-pid": true,
+    "tachyon-core-service-runtime-pid": true,
+    "tachyon-core-service-pid-runtime": true,
+    "tachyon-core-service-running": true,
+    "tachyon-core-service-stable": true,
+    "process-age-seconds-fixture": true,
+    "tachyon-core-pid-replaced-fixture": true,
+    "tachyon-core-reload-previous-pid-fixture": true,
+    "tachyon-core-runtime-reload-needed-fixture": true,
+    "tachyon-running": true,
+    "tachyon-stably-running": true,
+    "wait-tachyon-stable-start": true,
+    "wait-tachyon-core-service-stable": true,
+    "write-provenance": true,
+    "verify-provenance": true,
+    "core-is-foreign": true,
+    "cleanup-provenance": true
+};
+if (mode != null && !FAST_RUNTIME_MODES[mode])
+    ensure_signature_deps();
 
 if (mode == "file-first-line")
     file_first_line(ARGV[1]);
@@ -2471,11 +3095,11 @@ else if (mode == "acquire-runtime-dir-lock-wait")
 else if (mode == "release-runtime-dir-lock")
     release_runtime_dir_lock(ARGV[1]);
 else if (mode == "reload-core-runtime")
-    reload_sing_box_runtime(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
+    reload_tachyon_core_runtime(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
 else if (mode == "sighup-core-runtime")
     exit(try_sighup_reload(ARGV[1]) ? 0 : 1);
 else if (mode == "hup-core-runtime")
-    hup_sing_box_runtime();
+    hup_tachyon_core_runtime();
 else if (mode == "clear-reload-state")
     clear_reload_state(ARGV[1], ARGV[2]);
 else if (mode == "remove-file")
@@ -2499,29 +3123,29 @@ else if (mode == "response-success")
 else if (mode == "stdin-first-field")
     stdin_first_field();
 else if (mode == "tachyon-core-service-pid")
-    sing_box_service_pid();
+    tachyon_core_service_pid();
 else if (mode == "tachyon-core-service-runtime-pid" || mode == "tachyon-core-service-pid-runtime") {
-    let pid = sing_box_service_pid_runtime();
+    let pid = tachyon_core_service_pid_runtime();
     if (pid <= 0)
         exit(1);
     print(pid, "\n");
 }
-else if (mode == "sing-box-service-running")
-    exit(sing_box_service_running() ? 0 : 1);
+else if (mode == "tachyon-core-service-running")
+    exit(tachyon_core_service_running() ? 0 : 1);
 else if (mode == "tachyon-core-service-stable")
-    exit(sing_box_service_stable(ARGV[1]) ? 0 : 1);
+    exit(tachyon_core_service_stable(ARGV[1]) ? 0 : 1);
 else if (mode == "process-age-seconds-fixture") {
     let age = process_age_seconds_from_ticks(ARGV[1], ARGV[2]);
     if (age == null)
         exit(1);
     print(age, "\n");
 }
-else if (mode == "sing-box-pid-replaced-fixture")
-    exit(sing_box_pid_replaced(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
-else if (mode == "sing-box-reload-previous-pid-fixture")
-    print(sing_box_reload_previous_pid(ARGV[1], ARGV[2], ARGV[3]), "\n");
-else if (mode == "sing-box-runtime-reload-needed-fixture")
-    exit(sing_box_runtime_reload_needed(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
+else if (mode == "tachyon-core-pid-replaced-fixture")
+    exit(tachyon_core_pid_replaced(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
+else if (mode == "tachyon-core-reload-previous-pid-fixture")
+    print(tachyon_core_reload_previous_pid(ARGV[1], ARGV[2], ARGV[3]), "\n");
+else if (mode == "tachyon-core-runtime-reload-needed-fixture")
+    exit(tachyon_core_runtime_reload_needed(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
 else if (mode == "tachyon-running")
     exit(tachyon_running(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
 else if (mode == "tachyon-stably-running")
@@ -2554,69 +3178,21 @@ else if (mode == "dnsmasq-signature-fixture") {
     let data = fixture_data(ARGV[1]);
     exit(print_signature_hash(dnsmasq_signature_body(fixture_settings(data), fixture_dnsmasq(data), fixture_legacy_dnsmasq_present(data))) ? 0 : 1);
 }
-else if (mode == "sing-box-signature")
-    exit(print_signature_hash(sing_box_signature_body(uci_settings(), uci_sections("section"), uci_servers(), mwan3_active(), uci_sections("schedule"), uci_sections("profile"))) ? 0 : 1);
-else if (mode == "sing-box-signature-fixture") {
+else if (mode == "tachyon-core-signature")
+    exit(print_signature_hash(tachyon_core_signature_body(uci_settings(), uci_sections("section"), uci_servers(), mwan3_active(), uci_sections("schedule"), uci_sections("profile"), uci_section("telegram"))) ? 0 : 1);
+else if (mode == "tachyon-core-signature-fixture") {
     let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(sing_box_signature_body(fixture_settings(data), fixture_section_list(data), fixture_servers(data), fixture_mwan3_active(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile"))) ? 0 : 1);
+    exit(print_signature_hash(tachyon_core_signature_body(fixture_settings(data), fixture_section_list(data), fixture_servers(data), fixture_mwan3_active(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile"), object_or_empty(data.telegram))) ? 0 : 1);
 }
-else if (mode == "sing-box-signature-body-fixture") {
+else if (mode == "tachyon-core-signature-body-fixture") {
     let data = fixture_data(ARGV[1]);
-    print(sing_box_signature_body(fixture_settings(data), fixture_section_list(data), fixture_servers(data), fixture_mwan3_active(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile")));
+    print(tachyon_core_signature_body(fixture_settings(data), fixture_section_list(data), fixture_servers(data), fixture_mwan3_active(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile"), object_or_empty(data.telegram)));
 }
 else if (mode == "nft-signature")
-    exit(print_signature_hash(nft_runtime_signature_body(uci_settings(), uci_sections("section"), uci_sections("schedule"), uci_sections("profile"), uci_sections("guest_mode"))) ? 0 : 1);
+    exit(print_signature_hash(nft_runtime_signature_body(uci_settings(), uci_sections("section"), uci_sections("schedule"), uci_sections("profile"), uci_sections("guest_mode"), uci_servers())) ? 0 : 1);
 else if (mode == "nft-signature-fixture") {
     let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(nft_runtime_signature_body(fixture_settings(data), fixture_section_list(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile"), fixture_section_list(data, "guest_mode"))) ? 0 : 1);
-}
-else if (mode == "zapret-queue-signature")
-    exit(print_signature_hash(action_queue_signature_body(uci_sections("section"), "zapret", "zapret_queue.section")) ? 0 : 1);
-else if (mode == "zapret-queue-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(action_queue_signature_body(fixture_section_list(data), "zapret", "zapret_queue.section")) ? 0 : 1);
-}
-else if (mode == "zapret-runtime-signature")
-    exit(print_signature_hash(zapret_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "zapret-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(zapret_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
-}
-else if (mode == "zapret2-queue-signature")
-    exit(print_signature_hash(action_queue_signature_body(uci_sections("section"), "zapret2", "zapret2_queue.section")) ? 0 : 1);
-else if (mode == "zapret2-queue-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(action_queue_signature_body(fixture_section_list(data), "zapret2", "zapret2_queue.section")) ? 0 : 1);
-}
-else if (mode == "zapret2-runtime-signature")
-    exit(print_signature_hash(zapret2_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "zapret2-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(zapret2_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
-}
-else if (mode == "byedpi-runtime-signature")
-    exit(print_signature_hash(byedpi_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "byedpi-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(byedpi_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
-}
-else if (mode == "wdtt-runtime-signature")
-    exit(print_signature_hash(wdtt_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "wdtt-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(wdtt_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
-}
-else if (mode == "olcrtc-runtime-signature")
-    exit(print_signature_hash(olcrtc_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "olcrtc-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(olcrtc_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
-}
-else if (mode == "fptn-runtime-signature")
-    exit(print_signature_hash(fptn_runtime_signature_body(uci_sections("section"))) ? 0 : 1);
-else if (mode == "fptn-runtime-signature-fixture") {
-    let data = fixture_data(ARGV[1]);
-    exit(print_signature_hash(fptn_runtime_signature_body(fixture_section_list(data))) ? 0 : 1);
+    exit(print_signature_hash(nft_runtime_signature_body(fixture_settings(data), fixture_section_list(data), fixture_section_list(data, "schedule"), fixture_section_list(data, "profile"), fixture_section_list(data, "guest_mode"), fixture_servers(data))) ? 0 : 1);
 }
 else if (mode == "dont-touch-dhcp")
     print(dont_touch_dhcp_value(uci_settings()), "\n");
@@ -2692,10 +3268,10 @@ else if (mode == "urltest-enabled-sections-fixture") {
     let data = fixture_data(ARGV[1]);
     print_urltest_enabled_sections(fixture_section_list(data));
 }
-else if (mode == "has-remote-sing-box-ruleset-sources")
-    exit(has_remote_sing_box_ruleset_sources_from_sections(uci_sections("section")) ? 0 : 1);
-else if (mode == "has-remote-sing-box-ruleset-sources-fixture")
-    exit(has_remote_sing_box_ruleset_sources_from_sections(fixture_sections(ARGV[1])) ? 0 : 1);
+else if (mode == "has-remote-tachyon-core-ruleset-sources")
+    exit(has_remote_tachyon_core_ruleset_sources_from_sections(uci_sections("section")) ? 0 : 1);
+else if (mode == "has-remote-tachyon-core-ruleset-sources-fixture")
+    exit(has_remote_tachyon_core_ruleset_sources_from_sections(fixture_sections(ARGV[1])) ? 0 : 1);
 else if (mode == "has-list-update-sources")
     exit(has_list_update_sources_from_sections(uci_sections("section")) ? 0 : 1);
 else if (mode == "has-list-update-sources-fixture")
@@ -2717,7 +3293,7 @@ else if (mode == "write-provenance")
 else if (mode == "verify-provenance")
     exit(verify_provenance() ? 0 : 1);
 else if (mode == "core-is-foreign")
-    exit(sing_box_is_foreign() ? 0 : 1);
+    exit(tachyon_core_is_foreign() ? 0 : 1);
 else if (mode == "cleanup-provenance") {
     cleanup_provenance_file();
     exit(0);

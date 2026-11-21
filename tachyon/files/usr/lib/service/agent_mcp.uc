@@ -48,12 +48,7 @@ function command_capture(command) {
     let pipe = fs.popen(command, "r");
     if (!pipe) return { status: 1, output: "" };
     let data = pipe.read("all");
-    let status = pipe.close();
-    status = int(status);
-    if (status == -1) status = 255;
-    let sig = status & 127;
-    if (sig != 0) status = 128 + sig;
-    else status = (status >> 8) & 255;
+    let status = common.normalize_status(pipe.close());
     return { status: status, output: data == null ? "" : as_string(data) };
 }
 
@@ -76,12 +71,50 @@ function read_file(path) {
 
 let read_json_file = common.read_json_file;
 
+let _sb_mod = null;
+function sb_mod() {
+    if (_sb_mod == null) {
+        try { _sb_mod = require("service.support_bundle"); } catch (e) { _sb_mod = false; }
+    }
+    return _sb_mod || null;
+}
+
+function redact_text(str) {
+    if (str == null || str == "") return "";
+    let s = as_string(str);
+    let sb = sb_mod();
+    if (sb && sb.redact_for_llm)
+        return sb.redact_for_llm(s);
+    if (sb && sb.redact_string)
+        return sb.redact_string(s);
+    return s;
+}
+
+function redact_obj(val) {
+    let sb = sb_mod();
+    if (sb && sb.redact_object)
+        return sb.redact_object(val);
+    let t = type(val);
+    if (t == "string") return redact_text(val);
+    if (t == "array") {
+        let out = [];
+        for (let item in val) push(out, redact_obj(item));
+        return out;
+    }
+    if (t == "object") {
+        let out = {};
+        for (let k, v in val) out[k] = redact_obj(v);
+        return out;
+    }
+    return val;
+}
+
 // ─── Tool Definitions ───────────────────────────────────────────────────────
 
 let TOOLS = [
     {
         name: "tachyon_health",
-        description: "Quick health status of all Tachyon services (sing-box, watchdog). Returns running/stopped state, incidents count.",
+        description: "Quick health status of all Tachyon services (tachyon-core, watchdog). Returns running/stopped state, incidents count.",
         inputSchema: { type: "object", properties: {} },
         annotations: { readOnlyHint: true }
     },
@@ -117,14 +150,14 @@ let TOOLS = [
     },
     {
         name: "tachyon_restart",
-        description: "Restart a subsystem: singbox | tachyon | dnsmasq | watchdog.",
+        description: "Restart a subsystem: tachyon-core | tachyon | dnsmasq | watchdog.",
         inputSchema: {
             type: "object",
             required: ["service"],
             properties: {
                 service: {
                     type: "string",
-                    enum: ["singbox", "tachyon", "dnsmasq", "watchdog"],
+                    enum: ["tachyon-core", "tachyon", "dnsmasq", "watchdog"],
                     description: "Service to restart"
                 }
             }
@@ -184,14 +217,14 @@ let TOOLS = [
     },
     {
         name: "tachyon_apply_fix",
-        description: "Apply a quick fix code. Available codes: start_singbox, rebuild_rules, fix_dnsmasq, fix_resolv_symlink, start_watchdog, restart_singbox_dns, fix_uci_config, fix_wan_interface, fix_gateway, clear_dns_cache, update_subscriptions, reset_firewall, restart_network, restart_zapret, optimize_memory, switch_to_doh.",
+        description: "Apply a quick fix code. Available codes: start_tachyon_core, rebuild_rules, fix_dnsmasq, fix_resolv_symlink, start_watchdog, restart_tachyon_core_dns, fix_uci_config, fix_wan_interface, fix_gateway, clear_dns_cache, update_subscriptions, reset_firewall, restart_network, optimize_memory, switch_to_doh.",
         inputSchema: {
             type: "object",
             required: ["codes"],
             properties: {
                 codes: {
                     type: "string",
-                    description: "Comma-separated fix codes (e.g. 'start_singbox,clear_dns_cache')"
+                    description: "Comma-separated fix codes (e.g. 'start_tachyon_core,clear_dns_cache')"
                 }
             }
         },
@@ -232,6 +265,34 @@ let TOOLS = [
             }
         },
         annotations: { readOnlyHint: false, destructiveHint: false }
+    },
+    {
+        name: "tachyon_route_explain",
+        description: "Explain why and how traffic from a LAN client to a target domain/IP is routed or bypassed across DNS, nftables (inet TachyonTable), policy routing (table tachyon), and tachyon-core.",
+        inputSchema: {
+            type: "object",
+            required: ["target"],
+            properties: {
+                target: { type: "string", description: "Destination domain or IP (e.g. youtube.com, 1.1.1.1)" },
+                client: { type: "string", description: "Optional LAN client IP or MAC address" },
+                port:   { type: "integer", description: "Destination port (default: 443)" },
+                proto:  { type: "string", enum: ["tcp", "udp"], description: "Transport protocol (default: tcp)" }
+            }
+        },
+        annotations: { readOnlyHint: true, destructiveHint: false }
+    },
+    {
+        name: "tachyon_docs_search",
+        description: "Search the built-in Tachyon RAG knowledge base (technical manuals covering architecture, modular UCI schema, nftables, DNS, native Desync, reconciler, transactions, jobs, events, troubleshooting) for relevant documentation chunks.",
+        inputSchema: {
+            type: "object",
+            required: ["query"],
+            properties: {
+                query: { type: "string", description: "Search keywords (e.g. 'desync multisplit', 'outbound_source balancer', 'bootstrap dns', 'reconciler')" },
+                top_k: { type: "integer", description: "Max documentation chunks to return (1..15, default: 5)" }
+            }
+        },
+        annotations: { readOnlyHint: true, destructiveHint: false }
     }
 ];
 
@@ -239,33 +300,45 @@ let TOOLS = [
 
 let RESOURCES = [
     {
+        uri: "tachyon://knowledge/architecture",
+        name: "Tachyon Architecture & Packet Pipeline",
+        description: "Complete architectural overview: tachyon-core routing engine, DNS & FakeIP pipeline, nftables inet TachyonTable, modular UCI entities, local packet desync & tunnel providers, self-healing reconciler & transaction engine.",
+        mimeType: "application/json"
+    },
+    {
+        uri: "tachyon://knowledge/privacy-rules",
+        name: "AI Privacy & Data Protection Rules",
+        description: "Mandatory privacy and redaction rules for connected LLMs and MCP/REST agents interacting with Tachyon.",
+        mimeType: "application/json"
+    },
+    {
         uri: "tachyon://knowledge/faq",
         name: "Tachyon FAQ",
-        description: "Frequently asked questions and troubleshooting guide for Tachyon proxy service on OpenWrt.",
+        description: "Frequently asked questions and operational guide for Tachyon on OpenWrt.",
         mimeType: "application/json"
     },
     {
         uri: "tachyon://knowledge/config-schema",
         name: "Configuration Schema",
-        description: "UCI configuration schema for /etc/config/tachyon — all sections, options, and their meanings.",
+        description: "Complete modular UCI configuration schema for /etc/config/tachyon — settings, section, condition, outbound_source, balancer, outbound_group, server, telegram, guest_mode.",
         mimeType: "application/json"
     },
     {
         uri: "tachyon://knowledge/codebase-map",
         name: "Codebase Map",
-        description: "Directory structure and module map of the Tachyon project for understanding the codebase.",
+        description: "Directory structure and ucode module map of the Tachyon project.",
         mimeType: "application/json"
     },
     {
         uri: "tachyon://knowledge/troubleshooting",
         name: "Troubleshooting Guide",
-        description: "Common symptoms, their root causes, and step-by-step fix procedures.",
+        description: "Common symptoms, root causes, and all 25 automated quick-fix codes.",
         mimeType: "application/json"
     },
     {
         uri: "tachyon://diagnostics/last",
         name: "Last AI Doctor Report",
-        description: "The most recent AI Doctor diagnosis report with root causes and quick fixes.",
+        description: "The most recent AI Doctor diagnosis report with root causes and quick fixes (redacted).",
         mimeType: "application/json"
     },
     {
@@ -279,183 +352,341 @@ let RESOURCES = [
 // ─── Knowledge Base ─────────────────────────────────────────────────────────
 
 let KNOWLEDGE_BASE = {
+    "tachyon://knowledge/architecture": {
+        tachyon_version: SERVER_VERSION,
+        engines: {
+            "tachyon-core": {
+                uci_value: "tachyon-core",
+                init_script: "/etc/init.d/tachyon-core",
+                binary: "/usr/bin/tachyon-core",
+                config_path: "/etc/tachyon-core/config.json",
+                generator_dir: "usr/lib/tachyon/tachyon_core/"
+            }
+        },
+        packet_and_dns_pipeline: {
+            dns_interception: "LAN client -> dnsmasq -> forwards queries to tachyon-core DNS on 127.0.0.42:53 -> FakeIP pool 198.18.0.0/15 or nftset population",
+            bootstrap_dns: "settings.bootstrap_dns_server (default 77.88.8.8 / 8.8.8.8) resolves proxy server hostnames directly to prevent circular DNS deadlocks",
+            nftables_table: "inet TachyonTable (isolated from system inet fw4)",
+            fwmarks: {
+                "0x04000000": "NFT_FAKEIP_MARK — TProxy redirection mark routed via ip rule to routing table 'tachyon' (205)"
+            },
+            listening_ports: {
+                tproxy: "1602 (TCP/UDP transparent proxy inbound)",
+                core_dns: "127.0.0.42:53",
+                clash_api: "127.0.0.1:9090"
+            }
+        },
+        local_providers: {
+            desync: "Native tachyon-core packet desynchronization (Adaptive 2.0).",
+            wdtt: "Native tachyon-core WebRTC / CSQTT tunnel protocol.",
+            tailscale: "Native tachyon-core Mesh VPN endpoint & outbound integration.",
+            fptn: "Native tachyon-core FPTN protocol integration.",
+            torrserver: "Direct bypass helper for TorrServer local media traffic (torrserver/direct.uc)."
+        },
+        reliability_and_self_healing: {
+            watchdog: "service/watchdog.uc — periodic health supervisor with WAN/Proxy/DNS fail streak hysteresis, OOM guard, and Smart Detect.",
+            reconciler: "service/reconciler.uc — declarative desired-vs-actual state diffing and targeted subsystem repair (engine, daemons, routing, nftables, dns) without dropping active connections.",
+            known_good: "service/known_good.uc — Last Known Good (/etc/tachyon/state/known_good/) observation window, promotion, and automatic rollback.",
+            transaction: "core/transaction.uc — atomic 8-phase transaction engine (PLAN -> PREFLIGHT -> SNAPSHOT -> MUTATE -> VALIDATE -> ACTIVATE -> VERIFY -> COMMIT) with LIFO rollback.",
+            jobs: "core/jobs.uc — background job engine with PID+starttime+boot_id identity, heartbeat, cooperative cancellation, and critical sections.",
+            events: "core/events.uc — in-memory pub/sub bus and bounded ring journal (/var/run/tachyon/events.jsonl) with write-time secret redaction."
+        }
+    },
+
+    "tachyon://knowledge/privacy-rules": {
+        policy: "Strict Zero-Secret-Leakage Policy for Connected LLMs and External Agents",
+        automatic_redaction: [
+            "All UCI configs returned by tachyon_config / GET /config are masked via diagnostics/status.uc (tachyon-config-masked).",
+            "All diffs returned by tachyon_config_plan / POST /config/plan redact old_value and new_value for sensitive options.",
+            "All logs, snapshots, diagnostic reports, and RAG queries are scrubbed by service/support_bundle.uc and core/events.uc redaction pipelines.",
+            "Redacted items include: Telegram bot tokens, chat IDs, Bearer tokens, LLM API keys (sk-*, AIza*, gsk_*, xai-*), proxy URIs (vless://, vmess://, trojan://, ss://, hysteria2://, fptn://, warp://), UUIDs, WireGuard/AWG/Reality keys, passwords, HWIDs, subscription URL tokens, and client MAC addresses."
+        ],
+        agent_instructions: [
+            "NEVER ask the user to paste plaintext private keys, passwords, API keys, Telegram bot tokens, UUIDs, or full subscription URLs.",
+            "NEVER attempt to read raw /etc/config/tachyon bypassing the masked config API.",
+            "Always use tachyon_config_plan to validate candidate changes before applying them.",
+            "When sharing diagnostics externally, use tachyon_support_bundle which produces a SHA-256 verified, fully redacted archive."
+        ]
+    },
+
     "tachyon://knowledge/faq": {
         tachyon_version: SERVER_VERSION,
         faq: [
             {
-                q: "YouTube/Discord/Telegram не работает",
-                a: "Проверьте тип подключения в настройках. Для YouTube рекомендуется 'Прокси для YouTube'. Для Telegram — 'Прокси для Telegram'. Для остальных сайтов — 'Общий прокси'.",
-                steps: ["Убедитесь что sing-box запущен", "Проверьте тип подключения", "Обновите подписку"]
+                q: "YouTube/Discord/Telegram не работает или тормозит",
+                a: "Используйте `tachyon_route_explain` для проверки маршрута до домена (например, youtube.com или discord.com). Для локальной десинхронизации пакетов без VPS используйте нативный протокол `desync` (tachyon-core Adaptive 2.0) или запустите Strategy Fuzzer (`tachyon fuzzer_start desync youtube_suite`). Для проксирования через VPS убедитесь, что секция активна и привязана к рабочему `outbound_source` / `balancer`.",
+                steps: [
+                    "Вызовите tachyon_route_explain с target='youtube.com'",
+                    "Проверьте статус ядра через tachyon_snapshot и tachyon_diagnose",
+                    "При необходимости обновите подписки (update_subscriptions) или перезапустите ядро (start_tachyon_core)"
+                ]
             },
             {
-                q: "Internet stopped working after enabling Tachyon",
-                a: "Tachyon перехватывает DNS-запросы. Если sing-box не запущен, DNS не резолвится. Запустите sing-box или отключите Tachyon.",
-                steps: ["Запустите sing-box через LuCI", "Проверьте DNS через 'nslookup google.com 127.0.0.42'", "Если DNS не работает, перезапустите dnsmasq"]
+                q: "Пропал интернет после включения Tachyon",
+                a: "Tachyon перенаправляет DNS-запросы из dnsmasq в tachyon-core (127.0.0.42:53). Если ядро остановлено или недоступен bootstrap DNS, резолвинг останавливается. Для мгновенного восстановления интернета выполните quick fix `restore_native_internet` или `heal_network_stack`.",
+                steps: [
+                    "Вызовите tachyon_diagnose для точного выявления причины",
+                    "Примените tachyon_apply_fix с кодом 'start_tachyon_core,fix_dnsmasq' или 'heal_network_stack'",
+                    "Для полного аварийного отключения перехвата: tachyon_apply_fix с кодом 'restore_native_internet'"
+                ]
             },
             {
-                q: "How to add a custom domain to proxy",
-                a: "В LuCI → Tachyon → Servers выберите секцию, добавьте домен в список. Или через API: tachyon_add_domain.",
+                q: "Как добавить домен в секцию маршрутизации?",
+                a: "Используйте инструмент `tachyon_add_domain` (он автоматически найдёт привязанный атомарный `condition` секции и добавит домен в `user_domains`, после чего перезагрузит правила).",
                 method: "POST /tachyon/agent/v1/domain/add"
             },
             {
-                q: "How to check if proxy is working",
-                a: "Используйте команду 'tachyon check_proxy' или проверьте через LuCI → Tachyon → Diagnostic.",
-                cli: "tachyon check_proxy"
+                q: "Как безопасно проверить изменения конфигурации перед применением?",
+                a: "Используйте `tachyon_config_plan` — он выполнит dry-run расчёт diff, проверит семантику UCI, коллизии портов, затенение правил (rule shadowing) и определит, нужен ли рестарт или достаточно мягкой перезагрузки.",
+                cli: "tachyon config_plan --json"
             },
             {
-                q: "sing-box config is invalid",
-                a: "Конфиг пересоздаётся автоматически. Если не помогло, перезапустите: tachyon restart.",
-                steps: ["tachyon restart", "Проверьте логи: logread | grep sing-box"]
+                q: "Как найти подробную документацию по любой подсистеме Tachyon?",
+                a: "Используйте инструмент `tachyon_docs_search` с ключевыми словами (например, 'desync', 'reconciler', 'outbound_group', 'fakeip', 'known_good'). Он ищет по техническим руководствам встроенной базы знаний RAG."
             }
         ],
         tips: [
-            "Always start with 'tachyon snapshot' to get the full picture.",
-            "Use 'tachyon diagnose' for structured problem list.",
-            "For memory-constrained routers, enable GOMEMLIMIT scaling.",
-            "Community lists are downloaded to /tmp/tachyon-core/rulesets/."
+            "Always start with 'tachyon_snapshot' and 'tachyon_diagnose' to get the full picture.",
+            "Use 'tachyon_route_explain' to trace exact DNS, nftables, and outbound decisions for any domain or IP.",
+            "Use 'tachyon_docs_search' whenever you need deep technical details on UCI options, native Desync parameters, or internal modules.",
+            "Use 'tachyon_config_plan' before mutating UCI configuration."
         ]
     },
 
     "tachyon://knowledge/config-schema": {
-        config_file: "/etc/config/tachyon",
+        config_file: "/etc/config/tachyon (chmod 0600)",
+        architecture_note: "Tachyon uses a modular relational UCI schema: `section` references `condition` (via condition_refs), `outbound_source` (via outbound_source_refs), `balancer` (via balancer_refs), and `outbound_group` (via outbound_group_ref).",
         sections: {
             settings: {
                 type: "settings",
-                description: "Global Tachyon settings",
+                description: "Global Tachyon settings (`config settings 'settings'`)",
                 options: {
-                    core: { type: "string", default: "sing-box", description: "Core proxy engine: sing-box" },
-                    routing_mode: { type: "string", default: "nftables", description: "Routing mode: nftables | tun2socks" },
-                    dns_type: { type: "string", default: "doh", description: "DNS type: doh | udp | tcp" },
-                    dns_server: { type: "list", description: "Main DNS server(s) as upstream" },
-                    bootstrap_dns_server: { type: "list", description: "Bootstrap DNS server(s)" },
-                    subscription_url: { type: "string", description: "Proxy subscription URL" },
-                    enable_watchdog: { type: "bool", default: "1", description: "Enable watchdog daemon" },
-                    enable_ai_doctor: { type: "bool", default: "0", description: "Enable AI Doctor LLM integration" },
-                    ai_doctor_provider: { type: "string", description: "LLM provider: openai | anthropic | deepseek | ollama | lmstudio | custom" },
-                    ai_doctor_api_key: { type: "string", description: "API key for LLM provider" },
-                    source_network_interfaces: { type: "string", default: "br-lan", description: "LAN interfaces for DNS redirection" },
-                    latency_test_url: { type: "string", description: "URL for latency testing" }
+                    engine: { type: "string", default: "tachyon-core", description: "Active routing engine: tachyon-core" },
+                    dns_type: { type: "string", default: "doh", description: "Upstream DNS protocol: doh | dot | udp" },
+                    dns_server: { type: "string/list", default: "1.1.1.1", description: "Remote DNS resolver(s)" },
+                    bootstrap_dns_server: { type: "string/list", default: "77.88.8.8", description: "Direct bootstrap DNS resolver(s) bypassing proxy" },
+                    fallback_dns_server: { type: "string", description: "Fallback DNS resolver" },
+                    source_network_interfaces: { type: "list", default: "br-lan", description: "LAN interfaces intercepted by Tachyon" },
+                    ipv6_mode: { type: "string", values: [ "off", "auto", "dual_stack", "tunnel_over_v4" ], default: "auto", description: "IPv6 routing mode: off, auto (full when WAN6 PD/GUA is active, else leak_guard), dual_stack (full), or tunnel_over_v4 (FakeIPv6 over IPv4 transport)" },
+                    ipv6_leak_guard: { type: "bool", default: "1", description: "Block direct IPv6 traffic when IPv6 proxying is inactive (effective state leak_guard)" },
+                    dns_strategy: { type: "string", values: [ "prefer_ipv4", "ipv4_only", "prefer_ipv6", "ipv6_only" ], default: "prefer_ipv4", description: "DNS resolution strategy for tachyon-core (auto-clamped to ipv4_only when IPv6 is inactive)" },
+                    fakeip_enabled: { type: "bool", default: "1", description: "Enable FakeIP DNS pool allocation" },
+                    fakeip_inet4_range: { type: "string", default: "198.18.0.0/15", description: "IPv4 FakeIP CIDR pool" },
+                    fakeip_inet6_range: { type: "string", default: "fc00::/18", description: "IPv6 FakeIP CIDR pool" },
+                    fakeip_exclude: { type: "list", description: "Domains, suffixes, or keywords excluded from FakeIP allocation" },
+                    tun_inet4: { type: "string", default: "172.16.250.1/30", description: "TUN IPv4 address CIDR" },
+                    tun_inet6: { type: "string", default: "fdfe:dcba:9876::1/126", description: "TUN IPv6 address CIDR" },
+                    tun_kill_switch: { type: "bool", default: "1", description: "TUN mode with a Fail-Closed section: no direct LAN default route while the core is down" },
+                    webrtc_leak_protect: { type: "string", values: [ "auto", "1", "0" ], default: "auto", description: "Block direct STUN/TURN UDP traffic bypassing the proxy; auto = on while a section is Fail-Closed" },
+                    ui_mode: { type: "string", values: [ "simple", "advanced" ], default: "simple", description: "UI complexity mode: simple or advanced" },
+                    enable_watchdog: { type: "bool", default: "1", description: "Enable autonomous watchdog supervisor" },
+                    enable_smart_detect: { type: "bool", default: "0", description: "Automatically detect degraded domains and suggest routing" },
+                    enable_ai_doctor: { type: "bool", default: "0", description: "Enable LLM AI Doctor integration" },
+                    enable_rag: { type: "bool", default: "1", description: "Enable RAG knowledge base retrieval for AI Doctor" },
+                    ai_doctor_provider: { type: "string", description: "openai | anthropic | gemini | deepseek | openrouter | groq | xai | mistral | ollama | lmstudio | custom" },
+                    ai_doctor_model: { type: "string", description: "Custom LLM model name override" },
+                    ai_doctor_api_key: { type: "string", description: "API key for LLM provider (REDACTED in outputs)" },
+                    ai_doctor_custom_url: { type: "string", description: "Custom OpenAI-compatible endpoint URL" },
+                    agent_api_token: { type: "string", description: "Bearer token enabling HTTP Agent API gateway and write operations" },
+                    latency_test_url: { type: "string", default: "http://cp.cloudflare.com/generate_204", description: "URL used for proxy latency probes" },
+                    recovery_bypass: { type: "bool", default: "0", description: "Emergency safe direct WAN bypass flag" }
                 }
             },
             section: {
                 type: "section",
-                description: "Routing/proxy section (each = one rule)",
+                description: "Routing rule orchestrator (`config section '<name>'`)",
                 options: {
-                    label: { type: "string", description: "Display name" },
-                    enabled: { type: "bool", description: "Enable/disable this section" },
-                    action: { type: "string", description: "Routing action: proxy | direct | block" },
-                    domain: { type: "list", description: "Domains to route through this section" },
-                    domain_list: { type: "list", description: "Community domain lists" },
-                    community_lists: { type: "list", description: "Community list names to download" },
-                    subscription_url: { type: "string", description: "Per-section subscription URL" }
+                    enabled: { type: "bool", default: "1", description: "Enable or disable this routing section" },
+                    label: { type: "string", description: "Human-readable display name" },
+                    connection_type: { type: "string", description: "Target mode: proxy | vpn | direct | block | desync | wdtt | csqtt | fptn | tailscale | multipath" },
+                    action: { type: "string", description: "Normalized action: proxy | direct | block | desync | wdtt | csqtt | fptn | tailscale" },
+                    priority: { type: "int", default: "100", description: "Rule evaluation order priority (lower runs first)" },
+                    condition_refs: { type: "list", description: "References to `condition` sections defining traffic matchers" },
+                    outbound_source_refs: { type: "list", description: "References to `outbound_source` sections providing proxy nodes" },
+                    balancer_refs: { type: "list", description: "References to `balancer` sections" },
+                    outbound_group_ref: { type: "string", description: "Reference to `outbound_group` section for primary/backup failover" },
+                    fail_policy: { type: "string", default: "direct", description: "Fallback behavior when all outbounds fail: direct | block |backup" }
+                }
+            },
+            condition: {
+                type: "condition",
+                description: "Reusable traffic matching condition (`config condition '<name>'`)",
+                options: {
+                    enabled: { type: "bool", default: "1", description: "Enable condition" },
+                    name: { type: "string", description: "Display label" },
+                    condition_type: { type: "string", default: "atomic", description: "atomic | composite" },
+                    community_lists: { type: "list", description: "Predefined community domain/subnet lists (e.g. youtube, discord, meta, telegram)" },
+                    user_domains: { type: "list", description: "Custom domains and suffixes" },
+                    user_domains_text: { type: "string", description: "Multiline custom domain list" },
+                    user_subnets: { type: "list", description: "Custom IPv4/IPv6 CIDR subnets" },
+                    remote_domain_lists: { type: "list", description: "External URLs for domain lists" },
+                    remote_subnet_lists: { type: "list", description: "External URLs for subnet lists" },
+                    geoip_codes: { type: "list", description: "GeoIP country codes" },
+                    geosite_codes: { type: "list", description: "GeoSite category codes" },
+                    dest_ports: { type: "list", description: "Destination TCP/UDP ports or ranges" },
+                    l4_proto: { type: "string", description: "Protocol filter: tcp | udp | both" },
+                    client_ips: { type: "list", description: "Source LAN client IP/CIDR filter" },
+                    client_macs: { type: "list", description: "Source LAN client MAC filter" }
+                }
+            },
+            outbound_source: {
+                type: "outbound_source",
+                description: "Proxy/tunnel node source (`config outbound_source '<name>'`)",
+                options: {
+                    enabled: { type: "bool", default: "1", description: "Enable source" },
+                    name: { type: "string", description: "Display label" },
+                    source_type: { type: "string", description: "subscription | url | links | json | amnezia | wireguard | desync | wdtt | csqtt | fptn | tailscale" },
+                    subscription_url: { type: "string", description: "Remote subscription URL (REDACTED)" },
+                    subscription_urls: { type: "list", description: "Multiple subscription URLs (REDACTED)" },
+                    proxy_links: { type: "list", description: "Direct proxy share links vless://, trojan://, hysteria2://, ss:// (REDACTED)" },
+                    outbound_json: { type: "string", description: "Custom tachyon-core outbound JSON (REDACTED)" },
+                    desync_preset: { type: "string", description: "Native tachyon-core Desync preset id (or 'custom')" },
+                    desync_mode: { type: "string", description: "Native tachyon-core Desync mode: split | multisplit | fake | fakedsplit | disorder | fake_disorder | tlsrec" }
+                }
+            },
+            balancer: {
+                type: "balancer",
+                description: "Load balancer and health probe policy (`config balancer '<name>'`)",
+                options: {
+                    enabled: { type: "bool", default: "1", description: "Enable balancer" },
+                    balancer_type: { type: "string", default: "urltest", description: "urltest | selector | least_ping | round_robin" },
+                    check_interval: { type: "string", default: "3m", description: "Health check interval" },
+                    tolerance: { type: "int", default: "50", description: "Latency tolerance in ms" },
+                    testing_url: { type: "string", description: "Probe URL for urltest" },
+                    sticky_hash: { type: "string", description: "Sticky session hashing mode (for extended/lx cores)" },
+                    passive_check: { type: "bool", description: "Enable passive health checking" }
+                }
+            },
+            outbound_group: {
+                type: "outbound_group",
+                description: "High-availability failover group (`config outbound_group '<name>'`)",
+                options: {
+                    enabled: { type: "bool", default: "1", description: "Enable group" },
+                    primary_balancer: { type: "string", description: "Primary balancer reference" },
+                    backup_balancer: { type: "string", description: "Backup failover balancer reference" },
+                    fail_policy: { type: "string", default: "direct", description: "Action if both primary and backup fail: direct | block" }
                 }
             },
             server: {
                 type: "server",
-                description: "Inbound server configuration (VLESS, VMess, Trojan, etc.)",
+                description: "Inbound server node hosted on the router (`config server '<name>'`)",
                 options: {
                     label: { type: "string", description: "Display name" },
-                    enabled: { type: "bool", description: "Enable/disable this server" },
-                    protocol: { type: "string", description: "Protocol: vless | vmess | trojan | shadowsocks | hysteria2 | tuic | wireguard | tailscale | json_inbound" },
-                    listen: { type: "string", default: "0.0.0.0", description: "Listen address" },
+                    enabled: { type: "bool", description: "Enable/disable this inbound server" },
+                    protocol: { type: "string", description: "vless | vmess | trojan | shadowsocks | hysteria2 | tuic | wireguard | amneziawg | tailscale | mixed | socks | http | shadowtls | anytls | naive | mieru | snell | trusttunnel | tewfai | sudoku | openconnect | mtproto | json_inbound" },
+                    listen: { type: "string", default: "0.0.0.0", description: "Listen IP address" },
                     listen_port: { type: "string", description: "Listen port" },
-                    public_host: { type: "string", description: "Public hostname for this server" },
-                    routing_mode: { type: "string", description: "Per-server routing mode" },
-                    security: { type: "string", description: "Security: tls reality none" }
+                    public_host: { type: "string", description: "Public hostname or IP for client share links" },
+                    routing_mode: { type: "string", description: "rules | direct | section" },
+                    routing_section: { type: "string", description: "Target section when routing_mode='section'" },
+                    isolate_lan_for_users: { type: "bool", description: "Block LAN access for inbound clients" }
                 }
             }
         }
     },
 
     "tachyon://knowledge/codebase-map": {
-        description: "Tachyon project structure",
+        description: "Tachyon codebase layout (ucode backend + TypeScript LuCI frontend)",
         structure: {
             "tachyon/files/": {
-                "etc/init.d/tachyon": "OpenWrt init script (procd service)",
-                "usr/bin/tachyon": "CLI entry point (ucode dispatcher)",
+                "etc/config/tachyon": "Main UCI configuration file (chmod 600)",
+                "etc/init.d/tachyon": "Main procd service init script",
+                "usr/bin/tachyon": "Main CLI dispatcher (ucode)",
                 "usr/lib/tachyon/": {
-                    "core/": "Core utilities: common, helpers, constants, events, ip, packages, uci, url",
-                    "config/": "Config management: domain, rule, connections, migration, validator",
-                    "diagnostics/": "Diagnostics engine: runtime, status, service_check",
-                    "service/": "Service layer: agent_api, agent_mcp, lifecycle, state, ui, watchdog, telegram, warp_generator",
-                    "singbox/": "sing-box integration: runtime, generator, dns, rulesets, subscription, urltest, country",
-                    "server/": "Server inbound management: service",
-                    "components/": "Component management: updates, updater, hosts, action",
-                    "providers/": "External providers: zapret, zapret2, byedpi, nfqueue",
-                    "nft/": "nftables rule generation: apply",
-                    "routing/": "Routing rulesets",
-                    "dns/": "DNS configuration: apply",
-                    "subscription/": "Subscription parsing: parser, cache, share_link"
+                    "core/": "Foundational modules: common.uc, constants.uc, engine.uc, events.uc (bus + ring journal + redaction), exec.uc, helpers.uc, ip.uc, jobs.uc (cancellable job engine), logging.uc, packages.uc, preflight.uc, process.uc (PID+starttime+boot_id), transaction.uc (atomic LIFO rollback), uci.uc, url.uc",
+                    "config/": "Configuration model: connections.uc, domain.uc, migration.uc, rule.uc, validator.uc",
+                    "diagnostics/": "Diagnostics & AI: runtime.uc, doctor.uc (Local & AI Doctor), repairs.uc (22 quick fixes), rag.uc (hybrid vector + lexical RAG), route_explain.uc (packet path tracer), fuzzer.uc & fuzzer/* (Strategy Fuzzer + AI generator for native desync), dns.uc, network.uc, routing.uc, status.uc, system_info.uc, leak_check.uc, stability.uc, server_stats.uc",
+                    "service/": "Lifecycle & APIs: lifecycle.uc, initd.uc, reload.uc, reset.uc, state.uc, reconciler.uc (self-healing drift repair), known_good.uc (LKG rollback), config_plan.uc (dry-run preflight & diff), support_bundle.uc (sanitized archive & redaction), watchdog.uc, smart_detect.uc, failover.uc, agent_api.uc (HTTP REST API), agent_mcp.uc (MCP stdio server), snapshot.uc, telegram.uc & telegram/*",
+                    "tachyon_core/": "tachyon-core config compiler: generator.uc, generator_outbounds.uc, generator_routes.uc, dns.uc, dns_failover.uc, dns_presets.uc, priority.uc, route.uc, rulesets.uc, runtime.uc, servers.uc, subscription.uc, urltest.uc",
+                    "providers/": "Native provider & rule helpers: fptn/validator.uc, rules.uc, status.uc",
+                    "nft/": "nftables compiler: apply.uc (table inet TachyonTable, sets, TProxy)",
+                    "dns/": "DNS coordinator: apply.uc, benchmark.uc, speed_test.uc",
+                    "components/": "Component manager: catalog.uc, action.uc, installer.uc, updater.uc, updates.uc, versions.uc, verifier.uc, engine_state.uc, hosts.uc",
+                    "subscription/": "Subscription & link parsers: parser.uc, cache.uc, share_link.uc, wireguard.uc, amnezia.uc, happ.uc, crypt4.uc",
+                    "server/": "Inbound server manager: service.uc, links.uc, subscription.uc",
+                    "torrserver/": "TorrServer direct bypass: direct.uc",
+                    "rag_index.json": "Compiled RAG documentation chunks from docs/knowledge-base/*.md"
                 }
             },
-            "luci-app-tachyon/": "LuCI web UI package",
-            "fe-app-tachyon/": "TypeScript source → builds into LuCI JS",
-            "tests/": "Shell-based test suite"
+            "fe-app-tachyon/": "TypeScript SPA source for LuCI UI",
+            "luci-app-tachyon/": "Compiled LuCI JS views and i18n translations",
+            "docs/knowledge-base/": "Technical reference manuals indexed into rag_index.json",
+            "tests/": "Standalone behavioral shell & ucode test suite"
         }
     },
 
     "tachyon://knowledge/troubleshooting": {
+        quick_fix_codes: [
+            "start_tachyon_core — Restart tachyon-core and restore dnsmasq wiring",
+            "rebuild_rules — Reload Tachyon nftables and policy routing rules",
+            "fix_dnsmasq — Restart dnsmasq daemon",
+            "fix_resolv_symlink — Repair broken /etc/resolv.conf symlink to resolv.conf.auto",
+            "start_watchdog — Restart Tachyon service and watchdog daemon",
+            "restart_tachyon_core_dns — Restart tachyon-core DNS subsystem",
+            "fix_uci_config — Restore /etc/config/tachyon from atomic backup",
+            "fix_wan_interface — Re-up WAN interface via ubus/ifup and flush route cache",
+            "fix_gateway — Restart network service to recover default gateway",
+            "clear_dns_cache — Flush DNS and route caches and restart dnsmasq",
+            "update_subscriptions — Trigger asynchronous proxy subscription refresh",
+            "reset_firewall — Restart OpenWrt fw4 firewall and reload Tachyon rules",
+            "restart_network — Restart OpenWrt network stack",
+            "fix_system_time — Force NTP clock synchronization (fixes TLS handshake failures)",
+            "flush_conntrack — Expand nf_conntrack_max to 65536 and flush conntrack table",
+            "fix_bootstrap_dns — Reset bootstrap_dns_server to 77.88.8.8 and reload",
+            "optimize_mtu — Run AWG MTU discovery and reload tunnels",
+            "heal_network_stack — Full recovery of resolv.conf, dnsmasq, tachyon, and WAN",
+            "enable_safe_bypass — Enable recovery_bypass='1' for direct WAN fallback",
+            "restore_native_internet — Stop Tachyon, delete inet TachyonTable, flush table tachyon, restore stock dnsmasq",
+            "optimize_memory — Drop kernel VM caches, clean tmp files, restart tachyon-core",
+            "switch_to_doh — Switch settings.dns_type to 'doh' and reload"
+        ],
         symptoms: [
             {
                 symptom: "No internet after enabling Tachyon",
                 causes: [
-                    "sing-box not running",
-                    "DNS hijack without working upstream",
-                    "nftables rules missing",
-                    "WAN interface down"
+                    "tachyon-core not running while dnsmasq forwards to 127.0.0.42:53",
+                    "Circular bootstrap DNS dependency or broken /etc/resolv.conf symlink",
+                    "Corrupted nftables inet TachyonTable or missing ip rule for table tachyon",
+                    "WAN interface or default gateway down"
                 ],
-                diagnose: "tachyon diagnose",
-                fixes: ["start_singbox", "rebuild_rules", "clear_dns_cache", "fix_wan_interface"]
+                diagnose: "tachyon_diagnose or tachyon_route_explain",
+                fixes: ["start_tachyon_core", "fix_resolv_symlink", "fix_bootstrap_dns", "rebuild_rules", "restore_native_internet"]
             },
             {
-                symptom: "YouTube blocked / not loading",
+                symptom: "YouTube / Discord / UDP games degrading or timing out",
                 causes: [
-                    "Wrong routing action (should be 'proxy')",
-                    "Subscription node offline",
-                    "ISP deep packet inspection blocking"
+                    "Outdated packet desynchronization parameters for current transit network filters",
+                    "Misconfigured native Desync preset or UDP fragmentation settings",
+                    "Dead proxy outbound in subscription"
                 ],
-                diagnose: "tachyon check_proxy",
-                fixes: ["update_subscriptions", "restart_zapret"]
+                diagnose: "tachyon_route_explain (check matched section and outbound)",
+                fixes: ["start_tachyon_core", "update_subscriptions"]
             },
             {
-                symptom: "Telegram not connecting",
+                symptom: "WireGuard / AmneziaWG tunnel shows TX > 0 but RX = 0 (handshake timeout)",
                 causes: [
-                    "Telegram proxy not enabled",
-                    "sing-box process crashed",
-                    "MTProto proxy misconfigured"
+                    "Outdated tachyon-core binary without full AmneziaWG parameter support",
+                    "Suboptimal tunnel MTU or external UDP endpoint filtering"
                 ],
-                diagnose: "tachyon check_sing_box",
-                fixes: ["start_singbox", "rebuild_rules"]
+                diagnose: "tachyon_diagnose (check WireGuard/AWG tunnel check)",
+                fixes: ["optimize_mtu"]
             },
             {
-                symptom: "High memory usage / OOM kills",
+                symptom: "High memory usage / OOM kills on 128-256 MB routers",
                 causes: [
-                    "sing-box using too much memory",
-                    "Too many routing rules",
-                    "GOMEMLIMIT too high for device"
+                    "Excessive ruleset compilation or memory pressure in core engine",
+                    "Conntrack table saturation"
                 ],
-                diagnose: "tachyon diagnose (look for RAM check)",
-                fixes: ["optimize_memory"]
+                diagnose: "tachyon_snapshot (check memory_mb_avail)",
+                fixes: ["optimize_memory", "flush_conntrack"]
             },
             {
-                symptom: "DNS resolution fails",
+                symptom: "TLS handshakes fail across all HTTPS sites after reboot",
                 causes: [
-                    "Bootstrap DNS unreachable",
-                    "ISP blocking DNS",
-                    "dnsmasq not pointing to sing-box"
+                    "Router clock desynchronized (no RTC battery, NTP blocked before tunnel up)"
                 ],
-                diagnose: "tachyon check_dns_available",
-                fixes: ["clear_dns_cache", "switch_to_doh", "fix_dnsmasq"]
-            },
-            {
-                symptom: "sing-box crash loop",
-                causes: [
-                    "Invalid generated config",
-                    "Port conflict (4534 or 9090)",
-                    "Missing sing-box binary"
-                ],
-                diagnose: "tachyon check_sing_box",
-                fixes: ["start_singbox"]
+                diagnose: "tachyon_diagnose (check System clock / NTP)",
+                fixes: ["fix_system_time"]
             }
         ]
     }
@@ -481,11 +712,11 @@ function error_result(text) {
 function execute_health() {
     let ai_raw = read_file("/tmp/tachyon_ai_status.json") || "{}";
     let ai = parse_json_safe(ai_raw) || {};
-    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
+    let core_pid = trim(command_output("pidof tachyon-core"));
     let wd_pid = trim(read_file("/var/run/tachyon_watchdog.pid") || "");
     return json_result({
-        status: ai.status || (sb_pid != "" ? "healthy" : "critical"),
-        singbox: sb_pid != "" ? "running" : "stopped",
+        status: ai.status || (core_pid != "" ? "healthy" : "critical"),
+        tachyon_core: core_pid != "" ? "running" : "stopped",
         watchdog: (wd_pid != "" && fs.stat("/proc/" + wd_pid) != null) ? "running" : "stopped",
         incidents: ai.incidents_resolved_total || 0,
         timestamp: time()
@@ -496,7 +727,7 @@ function execute_snapshot() {
     let res = module_capture(["get-system-info"]);
     let sys_info = parse_json_safe(res.output);
 
-    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
+    let core_pid = trim(command_output("pidof tachyon-core"));
     let wd_pid = trim(read_file("/var/run/tachyon_watchdog.pid") || "");
 
     let mem_info = read_file("/proc/meminfo") || "";
@@ -516,7 +747,7 @@ function execute_snapshot() {
     let logs = [];
     for (let line in split(logs_raw, "\n")) {
         line = trim(as_string(line));
-        if (line != "") push(logs, line);
+        if (line != "") push(logs, redact_text(line));
     }
 
     let c = uci.cursor();
@@ -527,20 +758,53 @@ function execute_snapshot() {
         push(sections, {
             name: s[".name"],
             label: s.label || s[".name"],
-            enabled: s.enabled == "1",
-            action: s.action || "unknown"
+            enabled: s.enabled != "0",
+            action: s.action || "unknown",
+            condition_refs: s.condition_refs || [],
+            outbound_source_refs: s.outbound_source_refs || [],
+            balancer_refs: s.balancer_refs || [],
+            group_members: s.group_members || []
+        });
+    }
+    let conditions = [];
+    for (let c_obj in uci.section_objects(CONFIG_NAME, "condition")) {
+        push(conditions, {
+            name: c_obj[".name"],
+            label: c_obj.name || c_obj.label || c_obj[".name"],
+            enabled: c_obj.enabled != "0"
+        });
+    }
+    let outbound_sources = [];
+    for (let src_obj in uci.section_objects(CONFIG_NAME, "outbound_source")) {
+        push(outbound_sources, {
+            name: src_obj[".name"],
+            label: src_obj.name || src_obj.label || src_obj[".name"],
+            enabled: src_obj.enabled != "0",
+            source_type: src_obj.source_type || "subscription"
+        });
+    }
+    let balancers = [];
+    for (let bal_obj in uci.section_objects(CONFIG_NAME, "balancer")) {
+        push(balancers, {
+            name: bal_obj[".name"],
+            label: bal_obj.name || bal_obj.label || bal_obj[".name"],
+            enabled: bal_obj.enabled != "0",
+            balancer_type: bal_obj.balancer_type || "urltest"
         });
     }
 
     return json_result({
         system: sys_info || {},
         services: {
-            singbox: sb_pid != "" ? "running" : "stopped",
+            tachyon_core: core_pid != "" ? "running" : "stopped",
             watchdog: (wd_pid != "" && fs.stat("/proc/" + wd_pid) != null) ? "running" : "stopped"
         },
         memory_mb_avail: mem_avail,
         uptime_sec: int(up_sec),
         sections: sections,
+        conditions: conditions,
+        outbound_sources: outbound_sources,
+        balancers: balancers,
         logs_tail: logs
     });
 }
@@ -562,7 +826,7 @@ function execute_logs() {
     let lines = [];
     for (let line in split(raw, "\n")) {
         line = trim(as_string(line));
-        if (line != "") push(lines, line);
+        if (line != "") push(lines, redact_text(line));
     }
     return json_result({ lines: lines });
 }
@@ -588,12 +852,12 @@ function execute_heal() {
 
 function execute_restart(args) {
     let svc = as_string(args.service || "");
-    let allowed = { singbox: 1, tachyon: 1, dnsmasq: 1, watchdog: 1 };
+    let allowed = { "tachyon-core": 1, tachyon: 1, dnsmasq: 1, watchdog: 1 };
     if (!allowed[svc]) {
-        return error_result("Unknown service '" + svc + "'. Allowed: singbox, tachyon, dnsmasq, watchdog");
+        return error_result("Unknown service '" + svc + "'. Allowed: tachyon-core, tachyon, dnsmasq, watchdog");
     }
     let cmd_map = {
-        singbox: "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
+        "tachyon-core": "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
         tachyon: "/etc/init.d/tachyon restart > /dev/null 2>&1",
         dnsmasq: "/etc/init.d/dnsmasq restart > /dev/null 2>&1",
         watchdog: "/usr/bin/tachyon watchdog start-runtime > /dev/null 2>&1"
@@ -621,7 +885,9 @@ function execute_set_config(args) {
     if (!uci.commit(CONFIG_NAME)) {
         return error_result("Failed to commit UCI config");
     }
-    return json_result({ message: "Set " + path + " = " + value });
+    let sb = sb_mod();
+    let display_val = (sb && sb.is_sensitive_key && sb.is_sensitive_key(option)) ? "[REDACTED]" : redact_text(value);
+    return json_result({ message: "Set " + path + " = " + display_val });
 }
 
 function execute_toggle_section(args) {
@@ -652,20 +918,33 @@ function execute_add_domain(args) {
         return error_result("Invalid domain: " + domain);
     }
 
-    let path = CONFIG_NAME + "." + section + ".domain";
+    let target_sec = section;
+    let sec_obj = uci.get_all(CONFIG_NAME, section);
+    if (type(sec_obj) == "object" && sec_obj[".type"] == "section") {
+        let crefs = type(sec_obj.condition_refs) == "array" ? sec_obj.condition_refs : (sec_obj.condition_refs ? split(trim(as_string(sec_obj.condition_refs)), /[ \t,]+/) : []);
+        for (let cid in crefs) {
+            let cond_obj = uci.get_all(CONFIG_NAME, cid);
+            if (type(cond_obj) == "object" && cond_obj.enabled != "0" && lc(as_string(cond_obj.condition_type || "atomic")) != "composite") {
+                target_sec = cid;
+                break;
+            }
+        }
+    }
+
+    let path = CONFIG_NAME + "." + target_sec + ".user_domains";
     if (!uci.add_list(path, domain)) {
         return error_result("Failed to add domain (section may not exist or domain already present)");
     }
     uci.commit(CONFIG_NAME);
     system("/usr/bin/tachyon reload > /dev/null 2>&1");
-    return json_result({ message: "Domain '" + domain + "' added to section '" + section + "'" });
+    return json_result({ message: "Domain '" + domain + "' added to '" + target_sec + "'" });
 }
 
 function execute_ai_doctor() {
     let res = command_capture("/usr/bin/tachyon ai_doctor 2>/dev/null");
     let data = parse_json_safe(res.output);
-    if (data) return json_result(data);
-    return text_result(res.output || "AI Doctor returned no output");
+    if (data) return json_result(redact_obj(data));
+    return text_result(redact_text(res.output || "AI Doctor returned no output"));
 }
 
 function execute_apply_fix(args) {
@@ -702,17 +981,48 @@ function execute_known_good(args) {
 
 function execute_support_bundle(args) {
     args = args || {};
-    let sb_mod = require("service.support_bundle");
+    let sb = sb_mod();
+    if (!sb) return error_result("Failed to load support_bundle module");
     let target = as_string(args.target_path || args.path || "");
     if (target == "") target = null;
     let opts = {
         no_archive: args.no_archive == true
     };
-    let res = sb_mod.create_bundle(target, opts);
+    let res = sb.create_bundle(target, opts);
     if (!res.ok) {
         return error_result(res.error || "Failed to create support bundle");
     }
     return json_result(res);
+}
+
+function execute_route_explain(args) {
+    args = args || {};
+    let client = as_string(args.client || "");
+    let target = as_string(args.target || "");
+    let port = int(args.port || 0);
+    let proto = as_string(args.proto || "tcp");
+    if (target == "") {
+        return error_result("target is required (e.g. domain or IP)");
+    }
+    let route_explain_mod = require("diagnostics.route_explain");
+    let report = route_explain_mod.explain_route(client, target, port, proto);
+    return json_result(report);
+}
+
+function execute_docs_search(args) {
+    args = args || {};
+    let q = trim(as_string(args.query || args.q || ""));
+    let top_k = int(args.top_k || 5);
+    if (q == "") {
+        return error_result("query is required");
+    }
+    let rag_mod = require("diagnostics.rag");
+    let results = rag_mod.search_docs ? rag_mod.search_docs(q, top_k) : [];
+    return json_result({
+        query: rag_mod.sanitize_query ? rag_mod.sanitize_query(q) : redact_text(q),
+        count: length(results),
+        results: results
+    });
 }
 
 function execute_tool(name, args) {
@@ -750,6 +1060,10 @@ function execute_tool(name, args) {
             return execute_known_good(args);
         case "tachyon_support_bundle":
             return execute_support_bundle(args);
+        case "tachyon_route_explain":
+            return execute_route_explain(args);
+        case "tachyon_docs_search":
+            return execute_docs_search(args);
         default:
             return { content: [{ type: "text", text: "Unknown tool: " + name }], isError: true };
         }
@@ -766,7 +1080,7 @@ function read_resource(uri) {
         if (raw == "") return error_result("No previous AI Doctor report found");
         let data = parse_json_safe(raw);
         if (data == null) return error_result("Corrupted AI Doctor history file");
-        return json_result(data);
+        return json_result(redact_obj(data));
     }
 
     if (uri == "tachyon://system/info") {
@@ -889,25 +1203,14 @@ function main() {
     let stdin = fs.open("/dev/stdin", "r");
     if (!stdin) return;
 
-    let tty_check = fs.popen("test -t 0", "r");
-    let is_tty = tty_check ? (tty_check.close() == 0) : false;
-
-    if (!is_tty) {
-        // Pipe mode: read all, split by newline
-        let data = stdin.read("all");
-        stdin.close();
-        if (data == null) return;
-        for (let line in split(as_string(data), "\n"))
-            process_line(line);
-    } else {
-        // Interactive mode: line by line
-        while (true) {
-            let line = stdin.read("line");
-            if (line == null) break;
-            process_line(as_string(line));
-        }
-        stdin.close();
+    // Read JSON-RPC requests line-by-line in all modes so long-lived pipes do not
+    // block waiting for EOF or buffer the entire stream in memory.
+    while (true) {
+        let line = stdin.read("line");
+        if (line == null) break;
+        process_line(as_string(line));
     }
+    stdin.close();
 }
 
 main();

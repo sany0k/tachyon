@@ -1,10 +1,9 @@
 #!/usr/bin/env ucode
 //
-// Fuzzer binaries, command bounding and nftables setup.
+// Fuzzer binaries, command bounding and probe bypass nftables setup.
 //
-// Extracted from diagnostics/fuzzer.uc (branch 6 god-module split). Everything
-// here is about talking to the host: locating nfqws/ciadpi, bounding blocking
-// shell calls, caching DoH capability and setting up the probe nftables table.
+// Extracted from diagnostics/fuzzer.uc. Locates tachyon-core, bounds blocking
+// shell calls, caches DoH capability and sets up the direct-bypass nftables chain.
 //
 
 let fs = require("fs");
@@ -20,8 +19,6 @@ let shell_quote = common.shell_quote;
 
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const STATE_DIR = getenv("TACHYON_FUZZER_STATE_DIR") || "/var/run/tachyon";
-const NFQUEUE_QNUM_ZAPRET = 298;
-const NFQUEUE_QNUM_ZAPRET2 = 299;
 const FUZZER_FWMARK = "0x40000000";
 const FUZZER_OUTBOUND_MARK = getenv("NFT_OUTBOUND_MARK") || "0x08000000";
 
@@ -42,85 +39,15 @@ function resolve_binary(paths) {
     return null;
 }
 
-function get_zapret2_bin() {
+function get_desync_bin() {
     return resolve_binary([
-        getenv("ZAPRET2_NFQWS2_BIN"),
-        "/opt/zapret2/nfq2/nfqws2",
-        "/opt/zapret2/nfq/nfqws2",
-        "/opt/zapret2/nfqws2",
-        "/usr/bin/nfqws2"
+        getenv("TACHYON_CORE_BIN"),
+        "/usr/bin/tachyon-core"
     ]);
-}
-
-function get_zapret_bin() {
-    return resolve_binary([
-        getenv("ZAPRET_NFQWS_BIN"),
-        "/opt/zapret/nfq/nfqws",
-        "/opt/zapret/nfqws",
-        "/usr/bin/nfqws"
-    ]);
-}
-
-function get_byedpi_bin() {
-    return resolve_binary([
-        getenv("BYEDPI_BIN"),
-        "/opt/byedpi/ciadpi",
-        "/usr/bin/ciadpi"
-    ]);
-}
-
-function get_zapret2_lua_flags(args_str) {
-    if (index(args_str, "--lua-init") >= 0)
-        return "";
-
-    let candidate_dirs = [
-        getenv("ZAPRET2_PROVIDER_LUA_DIR"),
-        LIB_DIR + "/providers/zapret2/lua",
-        "/usr/lib/tachyon/providers/zapret2/lua",
-        "/opt/zapret2/lua",
-        "/opt/zapret2/files/lua",
-        "/opt/zapret2/share/zapret/lua",
-        "/opt/zapret2/init.d/sysv/lua",
-        "/opt/zapret/lua",
-        "/opt/zapret/files/lua",
-        "/usr/share/zapret2/lua",
-        "/usr/share/zapret/lua",
-        "/etc/zapret2/lua",
-        "/etc/zapret/lua",
-        "/usr/lib/zapret2/lua",
-        "/usr/lib/zapret/lua"
-    ];
-
-    let lua_scripts = [
-        "zapret-lib.lua",
-        "zapret-antidpi.lua",
-        "zapret-auto.lua"
-    ];
-
-    let flags = "";
-    for (let script in lua_scripts) {
-        let found = null;
-        for (let d in candidate_dirs) {
-            if (!d || fs.stat(d) == null)
-                continue;
-            let p = d + "/" + script;
-            if (fs.stat(p) != null) {
-                found = p;
-                break;
-            }
-            if (fs.stat(p + ".gz") != null) {
-                found = p + ".gz";
-                break;
-            }
-        }
-        if (found != null)
-            flags += sprintf("--lua-init=@%s ", found);
-    }
-    return flags;
 }
 
 function has_timeout() {
-    if (_has_timeout === null)
+    if (_has_timeout == null)
         _has_timeout = (system("command -v timeout >/dev/null 2>&1 || [ -x /usr/bin/timeout ]") == 0);
     return _has_timeout;
 }
@@ -130,39 +57,28 @@ function get_timeout_prefix(sec) {
     return has_timeout() ? sprintf("timeout %d ", sec) : "";
 }
 
-function wrap_cmd_timeout(cmd, sec, pid_file) {
-    sec = sec || 8;
-    let t = has_timeout();
-    if (pid_file && pid_file != "") {
-        if (t)
-            return sprintf("( echo $$ > %s; timeout -s KILL %d %s )", shell_quote(pid_file), sec, cmd);
-        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), cmd);
-    }
-    if (t)
-        return sprintf("timeout -s KILL %d %s", sec, cmd);
-    return cmd;
-}
-
 // Shell watchdog: runs cmd bounded by sec seconds even when the `timeout`
-// binary is unavailable. Blocking forever on system()/pipe.read() wedges the
-// whole fuzzer worker (deadline checks in ucode never get to run), so every
-// blocking call must carry a hard wall-clock bound.
-const _WATCHDOG_SUBSHELL = "( %s & _bp=$!; ( sleep %d; kill -9 $_bp 2>/dev/null ) & _bw=$!; wait $_bp 2>/dev/null; kill $_bw 2>/dev/null; wait $_bw 2>/dev/null )";
+// binary is unavailable or lacks -s/-k flags (BusyBox OpenWrt). Blocking
+// forever on system()/pipe.read() wedges the whole fuzzer worker (deadline
+// checks in ucode never get to run), so every blocking call must carry a hard
+// wall-clock bound around the entire subshell.
+const _WATCHDOG_SUBSHELL = "( ( %s ) & _bp=$!; ( trap 'kill -9 $_bs 2>/dev/null; exit 0' TERM INT; sleep %d & _bs=$!; wait $_bs 2>/dev/null; kill -STOP $_bp 2>/dev/null; pkill -9 -P $_bp 2>/dev/null; _kpids=\"$_bp\"; for _pass in 1 2; do _next=\"\"; for _cp in /proc/[0-9]*/stat; do [ -r \"$_cp\" ] || continue; IFS= read -r _line <\"$_cp\" 2>/dev/null || continue; _pid=\"${_cp#/proc/}\"; _pid=\"${_pid%%/stat}\"; case \" $_kpids$_next \" in *\" $_pid \"*) continue ;; esac; _tail=\"${_line##*) }\"; set -- $_tail; case \" $_kpids \" in *\" $2 \"*) _next=\"$_next $_pid\"; kill -STOP \"$_pid\" 2>/dev/null ;; esac; done; [ -n \"$_next\" ] || break; _kpids=\"$_kpids$_next\"; done; for _pid in $_kpids; do [ \"$_pid\" != \"$_bp\" ] && kill -9 \"$_pid\" 2>/dev/null; done; kill -9 $_bp 2>/dev/null ) </dev/null >/dev/null 2>/dev/null & _bw=$!; wait $_bp 2>/dev/null; _rc=$?; kill -TERM $_bw 2>/dev/null; kill -9 $_bw 2>/dev/null; wait $_bw 2>/dev/null; exit $_rc )";
 
 function run_bounded(cmd, sec) {
     sec = sec || 8;
-    if (has_timeout())
-        return system(sprintf("timeout -s KILL %d %s", sec, cmd));
     return system(sprintf(_WATCHDOG_SUBSHELL, cmd, sec));
 }
 
 function wrap_probe_cmd(cmd, sec, pid_file) {
     sec = sec || 8;
-    if (has_timeout())
-        return wrap_cmd_timeout(cmd, sec, pid_file);
+    let bounded = sprintf(_WATCHDOG_SUBSHELL, cmd, sec);
     if (pid_file && pid_file != "")
-        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), sprintf(_WATCHDOG_SUBSHELL, cmd, sec));
-    return sprintf(_WATCHDOG_SUBSHELL, cmd, sec);
+        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), bounded);
+    return bounded;
+}
+
+function wrap_cmd_timeout(cmd, sec, pid_file) {
+    return wrap_probe_cmd(cmd, sec, pid_file);
 }
 
 function is_valid_public_ip(ip) {
@@ -181,7 +97,7 @@ function is_valid_public_ip(ip) {
 }
 
 function get_fuzzer_curl_dns_flags() {
-    if (_fuzzer_curl_dns_flags !== null)
+    if (_fuzzer_curl_dns_flags != null)
         return _fuzzer_curl_dns_flags;
     let uci_bootstrap = "77.88.8.8";
     try {
@@ -200,24 +116,71 @@ function get_fuzzer_curl_dns_flags() {
     return _fuzzer_curl_dns_flags;
 }
 
+function format_resolve_flags(host, ip, port) {
+    if (!ip || ip == "") return "";
+    let flags = sprintf("--resolve %s:443:%s --resolve %s:80:%s ", host, ip, host, ip);
+    if (port && port != "" && port != "443" && port != "80") {
+        flags += sprintf("--resolve %s:%s:%s ", host, port, ip);
+    }
+    return flags;
+}
+
+function append_dns_candidate(dns_candidates, seen_dns, srv) {
+    if (srv && !seen_dns[srv]) {
+        push(dns_candidates, srv);
+        seen_dns[srv] = true;
+    }
+}
+
+function collect_isp_nameservers() {
+    let list = [];
+    try {
+        let resolv_auto = fs.readfile("/tmp/resolv.conf.d/resolv.conf.auto");
+        if (resolv_auto) {
+            for (let line in split(resolv_auto, "\n")) {
+                let m_ns = match(trim(line), /^nameserver[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+                if (m_ns && m_ns[1] && is_valid_public_ip(m_ns[1]))
+                    push(list, m_ns[1]);
+            }
+        }
+    } catch (e) {}
+    return list;
+}
+
 function get_resolved_host_flags(url) {
-    let m = match(url, /^https?:\/\/([^\/:]+)/);
+    let m = match(as_string(url || ""), /^https?:\/\/([^\/:]+)(:([0-9]+))?/i);
     if (!m || !m[1]) return "";
     let host = m[1];
+    let host_lc = lc(host);
+    let port = m[3] || "";
     if (match(host, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) || index(host, ":") >= 0) return "";
     if (!fuzzer_runner.is_valid_hostname(host)) return "";
     if (exists(_fuzzer_host_cache, host))
-        return _fuzzer_host_cache[host];
+        return format_resolve_flags(host, _fuzzer_host_cache[host], port);
+    _fuzzer_host_cache[host] = "";
 
     // Do not use redirector.googlevideo.com/report_mapping here: the address on
     // the left of "=>" is the *client's* public IP (the router WAN address), not
     // a GGC cache node. Pinning googlevideo hosts to it made every YouTube probe
     // connect back to the router itself and time out (curl exit 28).
 
+    let is_googlevideo = (host_lc == "googlevideo.com" || index(host_lc, ".googlevideo.com") >= 0);
     let safe_host = shell_quote(host);
+    let resolve_gv_fallback = function() {
+        let gv_flags = (host_lc != "redirector.googlevideo.com")
+            ? get_resolved_host_flags("https://redirector.googlevideo.com/")
+            : "";
+        if (gv_flags == "") gv_flags = get_resolved_host_flags("https://googlevideo.com/");
+        if (gv_flags == "") gv_flags = get_resolved_host_flags("https://www.youtube.com/");
+        let m_ip = match(gv_flags, /:443:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+        return (m_ip && m_ip[1]) ? m_ip[1] : null;
+    };
     let ip = null;
+    if (match(host_lc, /^rr[0-9]+\.googlevideo\.com$/) != null) {
+        ip = resolve_gv_fallback();
+    }
 
-    // 1. Primary: query "наш DNS" (router bootstrap DNS & ISP upstream DNS) via UDP 53
+    // 1. Primary: query router bootstrap DNS & ISP upstream DNS via UDP 53
     // MUST NEVER query 127.0.0.1 or ::1 to prevent resolving into FakeIP (198.18.x.x)
     let dns_candidates = [];
     let seen_dns = {};
@@ -231,52 +194,44 @@ function get_resolved_host_flags(url) {
         if (b_val != "" && is_valid_public_ip(b_val))
             uci_bootstrap = b_val;
     } catch (e) {}
-    if (uci_bootstrap) {
-        push(dns_candidates, uci_bootstrap);
-        seen_dns[uci_bootstrap] = true;
-    }
 
-    // Check ISP nameservers from resolv.conf.auto
-    try {
-        let resolv_auto = fs.readfile("/tmp/resolv.conf.d/resolv.conf.auto");
-        if (resolv_auto) {
-            for (let line in split(resolv_auto, "\n")) {
-                let m_ns = match(trim(line), /^nameserver[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-                if (m_ns && m_ns[1] && is_valid_public_ip(m_ns[1]) && !seen_dns[m_ns[1]]) {
-                    push(dns_candidates, m_ns[1]);
-                    seen_dns[m_ns[1]] = true;
-                }
-            }
-        }
-    } catch (e) {}
+    let isp_dns = collect_isp_nameservers();
+    if (is_googlevideo) {
+        // Resolve media cache hosts via ISP DNS first to hit operator-local nodes.
+        for (let srv in isp_dns)
+            append_dns_candidate(dns_candidates, seen_dns, srv);
+        append_dns_candidate(dns_candidates, seen_dns, uci_bootstrap);
+    } else {
+        append_dns_candidate(dns_candidates, seen_dns, uci_bootstrap);
+        for (let srv in isp_dns)
+            append_dns_candidate(dns_candidates, seen_dns, srv);
+    }
 
     // Add dependable fallback public nameservers
-    for (let srv in [ "77.88.8.8", "8.8.8.8", "1.1.1.1" ]) {
-        if (!seen_dns[srv]) {
-            push(dns_candidates, srv);
-            seen_dns[srv] = true;
-        }
-    }
+    for (let srv in [ "77.88.8.8", "8.8.8.8", "1.1.1.1" ])
+        append_dns_candidate(dns_candidates, seen_dns, srv);
 
-    for (let srv in dns_candidates) {
-        let np = fs.popen(sprintf("nslookup %s %s 2>/dev/null", safe_host, srv), "r");
-        let nout = np ? np.read("all") : "";
-        if (np) np.close();
-        if (nout && nout != "") {
-            let lines = split(nout, "\n");
-            let name_seen = false;
-            for (let line in lines) {
-                if (index(line, "Name:") >= 0) { name_seen = true; continue; }
-                if (name_seen) {
-                    let nm = match(line, /Address:[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-                    if (nm && is_valid_public_ip(nm[1])) {
-                        ip = nm[1];
-                        break;
+    if (!ip) {
+        for (let srv in dns_candidates) {
+            let np = fs.popen(wrap_probe_cmd(sprintf("nslookup %s %s 2>/dev/null", safe_host, srv), 3), "r");
+            let nout = np ? np.read("all") : "";
+            if (np) np.close();
+            if (nout && nout != "") {
+                let lines = split(nout, "\n");
+                let name_seen = false;
+                for (let line in lines) {
+                    if (index(line, "Name:") >= 0) { name_seen = true; continue; }
+                    if (name_seen) {
+                        let nm = match(line, /Address:[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+                        if (nm && is_valid_public_ip(nm[1])) {
+                            ip = nm[1];
+                            break;
+                        }
                     }
                 }
             }
+            if (ip) break;
         }
-        if (ip) break;
     }
 
     // 2. Fallback: Google & Cloudflare DoH JSON (if UDP 53 was intercepted by ISP)
@@ -307,85 +262,84 @@ function get_resolved_host_flags(url) {
         }
     }
 
-    // 4. Fallback for googlevideo.com CDN nodes that are not in public DNS:
-    // resolve googlevideo.com or www.youtube.com IP so curl connects directly to Google's video infrastructure
-    // while preserving the regional SNI in ClientHello that triggers TSPU DPI rules.
-    if (!ip && (index(host, ".googlevideo.com") >= 0 || host == "googlevideo.com")) {
-        let gv_flags = get_resolved_host_flags("https://googlevideo.com/");
-        if (gv_flags == "") gv_flags = get_resolved_host_flags("https://www.youtube.com/");
-        let m_ip = match(gv_flags, /:443:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-        if (m_ip && m_ip[1]) {
-            ip = m_ip[1];
-        }
+    // 4. Fallback for regional googlevideo.com CDN nodes that are not in public DNS:
+    // resolve redirector.googlevideo.com, googlevideo.com or www.youtube.com IP so curl
+    // connects to Google's frontend while preserving the regional SNI in ClientHello.
+    if (!ip && index(host_lc, ".googlevideo.com") >= 0 && host != "googlevideo.com") {
+        ip = resolve_gv_fallback();
     }
 
     if (ip) {
-        let flags = sprintf("--resolve %s:443:%s --resolve %s:80:%s ", host, ip, host, ip);
-        _fuzzer_host_cache[host] = flags;
-        return flags;
+        _fuzzer_host_cache[host] = ip;
+        return format_resolve_flags(host, ip, port);
     }
     _fuzzer_host_cache[host] = "";
     return "";
 }
 
-const KNOWN_BLOB_FILES = {
-    tls_max: { file: "tls_clienthello_max_ru.bin", size: 654, desc: "Max.ru authentic ClientHello" },
-    tls_google: { file: "tls_clienthello_www_google_com.bin", size: 681, desc: "Google authentic ClientHello" },
-    tls_gosuslugi: { file: "tls_clienthello_gosuslugi_ru.bin", size: 517, desc: "Gosuslugi Russian Government ClientHello" },
-    tls_sber: { file: "tls_clienthello_sberbank_ru.bin", size: 517, desc: "Sberbank authentic ClientHello" },
-    tls_iana: { file: "tls_clienthello_iana_org.bin", size: 517, desc: "IANA root authority ClientHello" },
-    tls_vk: { file: "tls_clienthello_vk_com.bin", size: 517, desc: "VK authentic ClientHello" },
-    tls_onetrust: { file: "tls_clienthello_www_onetrust_com.bin", size: 664, desc: "OneTrust CDN ClientHello" },
-    quic_google: { file: "quic_initial_www_google_com.bin", size: 1200, desc: "Google QUIC Initial" },
-    quic_yt1: { file: "quic_initial_rr1---sn-xguxaxjvh-n8me_googlevideo_com_kyber_1.bin", size: 1230, desc: "GoogleVideo Kyber QUIC Initial" },
-    quic_vk: { file: "quic_initial_vk_com.bin", size: 1357, desc: "VK QUIC Initial" },
-    stun_fake: { file: "stun.bin", size: 100, desc: "STUN discovery packet" },
-    discord_udp: { file: "stun.bin", size: 100, desc: "Discord Voice UDP fake packet" }
-};
-
-function blob_candidate_dirs() {
-    return [
-        getenv("ZAPRET2_PROVIDER_FILES_DIR") ? (getenv("ZAPRET2_PROVIDER_FILES_DIR") + "/fake") : null,
-        "/opt/zapret2/files/fake",
-        "/opt/zapret/files/fake",
-        "/usr/share/zapret2/files/fake",
-        "/usr/share/zapret/files/fake",
-        "/etc/zapret2/files/fake",
-        "/etc/zapret/files/fake",
-        LIB_DIR + "/providers/zapret2/files/fake",
-        "/usr/lib/tachyon/providers/zapret2/files/fake"
-    ];
+function prewarm_targets_dns(urls_list) {
+    if (type(urls_list) != "array")
+        return;
+    let seen = {};
+    for (let item in urls_list) {
+        let u = as_string(item ? (item.url || "") : "");
+        let m = match(u, /^https?:\/\/([^\/:]+)(:([0-9]+))?/i);
+        if (!m || !m[1]) continue;
+        let k = m[1] + ":" + (m[3] || "");
+        if (seen[k]) continue;
+        seen[k] = true;
+        get_resolved_host_flags(u);
+    }
 }
 
-function get_zapret2_blob_dir() {
-    for (let d in blob_candidate_dirs()) {
-        if (d && fs.stat(d) != null) return d;
-    }
-    return "/opt/zapret2/files/fake";
+let _fuzzer_ip_cache = {};
+
+function resolve_host_ipv4(host) {
+    host = trim(as_string(host || ""));
+    if (host == "") return null;
+    if (is_valid_public_ip(host)) return host;
+    if (match(host, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) || index(host, ":") >= 0) return null;
+    if (!fuzzer_runner.is_valid_hostname(host)) return null;
+    if (exists(_fuzzer_ip_cache, host))
+        return _fuzzer_ip_cache[host];
+
+    let flags = get_resolved_host_flags("https://" + host + "/");
+    let m = match(flags, /:443:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+    let ip = (m && m[1] && is_valid_public_ip(m[1])) ? m[1] : null;
+    _fuzzer_ip_cache[host] = ip;
+    return ip;
 }
 
-function resolve_zapret2_blobs(args_str) {
-    if (!args_str || args_str == "") return "";
-    let candidate_dirs = blob_candidate_dirs();
-    let blob_flags = "";
-    for (let name, info in KNOWN_BLOB_FILES) {
-        if ((index(args_str, "blob=" + name) >= 0 || index(args_str, "seqovl_pattern=" + name) >= 0) &&
-            index(args_str, "--blob=" + name + ":") < 0) {
-            let actual_path = null;
-            for (let d in candidate_dirs) {
-                if (!d || fs.stat(d) == null) continue;
-                let p = d + "/" + info.file;
-                if (fs.stat(p) != null) {
-                    actual_path = p;
-                    break;
-                }
-            }
-            if (actual_path != null) {
-                blob_flags += sprintf("--blob=%s:@%s ", name, actual_path);
-            }
-        }
-    }
-    return blob_flags;
+function parse_udp_target_url(url) {
+    let u = trim(as_string(url || ""));
+    let m = match(u, /^udp:\/\/([^\/:]+)(:([0-9]{1,5}))?/);
+    if (!m || !m[1]) return null;
+    let host = m[1];
+    let port = (m[3] && m[3] != "") ? int(m[3]) : 3478;
+    if (port < 1 || port > 65535) port = 3478;
+    let ip = resolve_host_ipv4(host);
+    return {
+        host: host,
+        ip: ip || host,
+        port: port
+    };
+}
+
+function probe_udp_stun_cmd(host_ip, port, res_file) {
+    let rf = shell_quote(res_file || (STATE_DIR + "/fuzzer_udp_res.bin"));
+    let safe_ip = shell_quote(as_string(host_ip));
+    let p = int(port) || 19302;
+    return sprintf(
+        "rm -f %s; read _u1 _ < /proc/uptime 2>/dev/null || _u1=0; " +
+        "if [ -x /bin/bash ]; then printf 'exec 3<>/dev/udp/%%s/%%d && printf \"\\\\x00\\\\x01\\\\x00\\\\x00\\\\x21\\\\x12\\\\xa4\\\\x42tachyonstun1\" >&3 && dd bs=64 count=1 <&3 >%%s 2>/dev/null\\n' %s %d %s | /bin/bash 2>/dev/null; " +
+        "elif command -v socat >/dev/null 2>&1; then printf '\\x00\\x01\\x00\\x00\\x21\\x12\\xa4\\x42tachyonstun1' | socat -T 2 - UDP:%s:%d >%s 2>/dev/null; fi; " +
+        "read _u2 _ < /proc/uptime 2>/dev/null || _u2=\"$_u1\"; " +
+        "_sz=$(wc -c <%s 2>/dev/null || echo 0); _hdr=$(hexdump -n 2 -e '2/1 \"%%02x\"' %s 2>/dev/null || echo ''); rm -f %s; " +
+        "_dt=$(awk -v a=\"$_u1\" -v b=\"$_u2\" 'BEGIN{d=b-a; if(d<=0) d=0.02; printf \"%%.3f\", d}'); " +
+        "if [ \"$_sz\" -ge 20 ] 2>/dev/null && [ \"$_hdr\" = \"0101\" ]; then printf '200\\t%%s\\t%%s\\t32768\\t%%d\\t%%s\\t1\\t0\\n' \"$_dt\" \"$_dt\" \"$_sz\" \"$_dt\"; " +
+        "else printf '000\\t0.000\\t0.000\\t0\\t0\\t0.000\\t1\\t28\\n'; fi",
+        rf, safe_ip, p, rf, safe_ip, p, rf, rf, rf, rf
+    );
 }
 
 let _probe_port_seeded = false;
@@ -401,55 +355,24 @@ let _probe_port_seeded = false;
 // probe pins curl to a random source-port window and reads the conntrack state
 // of those ports afterwards: SYN_SENT means no SYN-ACK, anything else means TCP
 // was up. The verbose log is kept as a secondary signal for full curl builds.
-function probe_curl_cmd(extra_flags, target_flags, url, err_file) {
+function probe_curl_cmd(extra_flags, target_flags, url, err_file, connect_timeout, max_time) {
     let math = require("math");
     if (!_probe_port_seeded) {
         math.srand(clock()[1] ^ int(fs.readlink("/proc/self") || 0));
         _probe_port_seeded = true;
     }
+    let cto = int(connect_timeout) > 0 ? int(connect_timeout) : 4;
+    let mto = int(max_time) > 0 ? int(max_time) : 6;
     let port_lo = 20000 + (math.rand() % 4000) * 10;
     let port_hi = port_lo + 7;
     let ef = shell_quote(err_file);
     return sprintf(
-        "curl -v --local-port %d-%d %s%s-so /dev/null -w '%%{http_code}\\t%%{time_appconnect}\\t%%{time_starttransfer}\\t%%{speed_download}\\t%%{size_download}\\t%%{time_connect}' -L --connect-timeout 4 --max-time 6 %s 2>%s; _rc=$?; " +
+        "curl -v --local-port %d-%d %s%s-so /dev/null -w '%%{http_code}\\t%%{time_appconnect}\\t%%{time_starttransfer}\\t%%{speed_download}\\t%%{size_download}\\t%%{time_connect}' --connect-timeout %d --max-time %d %s 2>%s; _rc=$?; " +
         "if grep -qE 'ALPN|Client hello|TLS handshake|SSL connection|Connected to|Established connection' %s 2>/dev/null; then _tcp=1; " +
         "elif [ -r /proc/net/nf_conntrack ]; then _tcp=$(awk -v a=%d -v b=%d '$3==\"tcp\"{sp=-1; for(i=7;i<=NF;i++) if($i ~ /^sport=/){sp=substr($i,7)+0; break} if(sp>=a && sp<=b){seen=1; if($6!=\"SYN_SENT\") up=1}} END{print up ? 1 : (seen ? 0 : 2)}' /proc/net/nf_conntrack 2>/dev/null); [ -n \"$_tcp\" ] || _tcp=2; " +
         "else _tcp=2; fi; rm -f %s; printf '\\t%%d\\t%%d\\n' $_tcp $_rc",
-        port_lo, port_hi, extra_flags || "", target_flags || "", shell_quote(url), ef, ef, port_lo, port_hi, ef
+        port_lo, port_hi, extra_flags || "", target_flags || "", cto, mto, shell_quote(url), ef, ef, port_lo, port_hi, ef
     );
-}
-
-// Reads one queue line from /proc/net/netfilter/nfnetlink_queue:
-// queue_number peer_portid queue_total copy_mode copy_range queue_dropped user_dropped id_sequence 1
-// id_sequence counts packets handed to the listener since it bound the queue, so it
-// proves whether probe traffic actually reached the test daemon.
-function read_nfqueue_stats(qnum) {
-    let nfq = fs.readfile("/proc/net/netfilter/nfnetlink_queue");
-    if (!nfq)
-        return null;
-    for (let line in split(trim(nfq), "\n")) {
-        let cols = split(trim(line), /[ \t]+/);
-        if (length(cols) < 8 || int(cols[0]) != int(qnum))
-            continue;
-        return {
-            portid: int(cols[1]),
-            queue_dropped: int(cols[5]),
-            user_dropped: int(cols[6]),
-            packets: int(cols[7])
-        };
-    }
-    return null;
-}
-
-function wait_nfqueue_bound(qnum, tries) {
-    tries = tries || 20;
-    for (let i = 0; i < tries; i++) {
-        let st = read_nfqueue_stats(qnum);
-        if (st && st.portid > 0)
-            return true;
-        system("sleep 0.1");
-    }
-    return false;
 }
 
 // "ip daddr { a, b } " for the known IPv4 probe targets, or "" when unknown
@@ -471,7 +394,14 @@ function target_scope_match(target_ips) {
 function probe_target_ips(urls_list) {
     let ips = [];
     for (let item in (type(urls_list) == "array" ? urls_list : [])) {
-        let flags = get_resolved_host_flags(as_string(item.url));
+        let u = as_string(item.url || "");
+        if (index(u, "udp://") == 0) {
+            let udp_info = parse_udp_target_url(u);
+            if (udp_info && is_valid_public_ip(udp_info.ip))
+                push(ips, udp_info.ip);
+            continue;
+        }
+        let flags = get_resolved_host_flags(u);
         for (let m in match(flags, /:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) /g) || [])
             push(ips, m[1]);
     }
@@ -482,189 +412,21 @@ function probe_target_ips(urls_list) {
 // returns and it goes DIRECT to WAN. Only unmarked packets are touched: OR-ing
 // the bypass bit onto a section mark would pull that traffic out of its
 // production queue.
-function add_bypass_singbox_chain(scope, with_udp) {
+function add_bypass_core_chain(scope, with_udp) {
     scope = as_string(scope || "");
-    system("nft 'add chain inet tachyon_fuzzer bypass_singbox { type route hook output priority -155 ; policy accept; }' 2>/dev/null");
-    system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_singbox meta mark & %s == %s counter return' 2>/dev/null", FUZZER_FWMARK, FUZZER_FWMARK));
-    system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_singbox %smeta mark 0 meta l4proto tcp tcp dport { 80, 443, 2053, 2083, 2087, 2096, 8443 } meta mark set %s counter' 2>/dev/null", scope, FUZZER_OUTBOUND_MARK));
+    system("nft 'add chain inet tachyon_fuzzer bypass_core { type route hook output priority -155 ; policy accept; }' 2>/dev/null");
+    system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_core meta mark & %s == %s counter return' 2>/dev/null", FUZZER_FWMARK, FUZZER_FWMARK));
+    system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_core %smeta mark 0 meta l4proto tcp tcp dport { 80, 443, 2053, 2083, 2087, 2096, 8443 } meta mark set %s counter' 2>/dev/null", scope, FUZZER_OUTBOUND_MARK));
     if (with_udp) {
-        system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_singbox %smeta mark 0 meta l4proto udp udp dport { 80, 443, 19294-19344, 50000-65535 } meta mark set %s counter' 2>/dev/null", scope, FUZZER_OUTBOUND_MARK));
+        system(sprintf("nft 'add rule inet tachyon_fuzzer bypass_core %smeta mark 0 meta l4proto udp udp dport { 80, 443, 3478-3481, 5000-5020, 19294-19344, 27015-27050, 50000-65535 } meta mark set %s counter' 2>/dev/null", scope, FUZZER_OUTBOUND_MARK));
     }
 }
-
-// Ports the fuzzer queue rule matches. Split per protocol so each rule can carry
-// its own counter.
-const FUZZER_QUEUE_PORTS_TCP = "80, 443, 2053, 2083, 2087, 2096, 8443";
-const FUZZER_QUEUE_PORTS_UDP = "443, 2053, 2083, 2087, 2096, 8443, 3478, 5000-5020, 19294-19344, 50000-65535";
-
-/**
- * One nft rule for the fuzzer queue, with a per-protocol counter comment.
- *
- * The comment has to come AFTER the verdict. nft parses counter, comment and queue
- * as rule statements and rejects the comment in the middle: "syntax error,
- * unexpected queue". The fuzzer builds this table with stderr discarded, so the
- * only thing the user saw was "nftables setup failed: fuzzer queue rule could not
- * be installed" on every single strategy - the whole tool dead, with no reason.
- *
- * Built in one place so the ordering cannot drift between the UDP and TCP paths,
- * and so a test can assert it against this function instead of against the source
- * text.
- */
-function fuzzer_queue_rule_spec(scope, protocol, qnum, ports_csv) {
-    return sprintf(
-        "add rule inet tachyon_fuzzer postnat %smeta mark & %s == %s meta l4proto %s %s dport { %s } counter queue num %d comment \"%s-proto\"",
-        as_string(scope || ""),
-        FUZZER_OUTBOUND_MARK,
-        FUZZER_OUTBOUND_MARK,
-        protocol,
-        protocol,
-        ports_csv,
-        int(qnum),
-        protocol
-    );
-}
-
-function verify_fuzzer_queue_rule(qnum) {
-    // ── Verify the queue rule actually landed ─────────────────────────────
-    // Without it probes silently test a direct connection, defeating the purpose.
-    // nft output format varies by version: "queue num N bypass" (older) vs
-    // "queue flags bypass to N" (newer).  Match any qnum near the keyword.
-    let verified = command_success(sprintf("nft list table inet tachyon_fuzzer 2>/dev/null | grep -q 'queue.*%d'", qnum));
-    if (!verified) {
-        log_fuzzer_message(sprintf("nftables queue rule verification failed for qnum=%d; rules may not have been applied", qnum));
-    }
-    return verified;
-}
-
-// Packets each protocol put through the fuzzer queue.
-//
-// /proc/net/netfilter/nfnetlink_queue only knows the queue total, and the total is
-// exactly what hides a UDP strategy: curl sends TCP, the queue rule matches both
-// protocols, nfqws passes the TCP packets through because its --filter-udp does
-// not apply to them, and the strategy looks like a clean win while its filter
-// never saw a single packet. Per-rule counters answer the only question that
-// matters - did the packets the strategy filters actually arrive.
-function parse_proto_counters(listing) {
-    let result = { tcp: 0, udp: 0 };
-
-    for (let line in split(as_string(listing), "\n")) {
-        for (let proto in [ "tcp", "udp" ]) {
-            if (index(line, sprintf("comment \"%s-proto\"", proto)) < 0)
-                continue;
-            let m = match(line, /packets[ \t]+([0-9]+)/);
-            if (m && m[1])
-                result[proto] += int(m[1]);
-        }
-    }
-
-    return result;
-}
-
-function read_fuzzer_proto_counters() {
-    return parse_proto_counters(
-        command_output_from_args([ "nft", "list", "table", "inet", "tachyon_fuzzer" ])
-    );
-}
-
-function setup_fuzzer_direct_nftables(qnum, is_udp, target_ips) {
-    // ── Pre-cleanup: kill any orphaned fuzzer processes bound to our queues ──
-    // An orphaned nfqueue binding wedges the kernel nft subsystem; nft delete
-    // blocks forever and the subsequent add silently fails (2>/dev/null), so
-    // every strategy reports a false failure.  Kill the binding first.
-    for (let w = 0; w < 3; w++) {
-        let nfq = fs.readfile("/proc/net/netfilter/nfnetlink_queue");
-        let found = false;
-        if (nfq) {
-            let lines = split(trim(nfq), "\n");
-            for (let line in lines) {
-                let cols = split(trim(line), /[ \t]+/);
-                if (length(cols) >= 2) {
-                    let q = int(cols[0]);
-                    let p = int(cols[1]);
-                    if ((q == qnum || q == NFQUEUE_QNUM_ZAPRET || q == NFQUEUE_QNUM_ZAPRET2) && p > 0) {
-                        found = true;
-                        system(sprintf("kill -9 %d >/dev/null 2>&1", p));
-                    }
-                }
-            }
-        }
-        if (!found) break;
-        run_bounded("sleep 0.5", 2);
-    }
-
-    // ── Clean slate: delete any stale table ──────────────────────────────────
-    // 10s timeout — on slow ARM routers nft delete can block on orphaned
-    // in-kernel nfqueue bindings; 5s was not enough in some reports.
-    run_bounded("nft delete table inet tachyon_fuzzer >/dev/null 2>&1", 10);
-
-    // ── Create table with retry + backoff ────────────────────────────────────
-    let nft_err_file = STATE_DIR + "/fuzzer_nft_err.log";
-    try { fs.unlink(nft_err_file); } catch (e) {}
-    let table_created = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        if (system(sprintf("nft add table inet tachyon_fuzzer 2>%s", shell_quote(nft_err_file))) == 0) {
-            table_created = true;
-            break;
-        }
-        // Backoff: wait for orphaned bindings to release
-        run_bounded("sleep 0.5", 2);
-        run_bounded("nft delete table inet tachyon_fuzzer >/dev/null 2>&1", 10);
-    }
-    if (!table_created) {
-        let nft_err = trim(as_string(fs.readfile(nft_err_file)) || "");
-        log_fuzzer_message(sprintf("nftables table creation failed after 3 attempts (qnum=%d): %s", qnum, nft_err != "" ? nft_err : "unknown error"));
-        try { fs.unlink(nft_err_file); } catch (e) {}
-        return false;
-    }
-    try { fs.unlink(nft_err_file); } catch (e) {}
-
-    // ── Build ruleset ────────────────────────────────────────────────────────
-    // Priority -401: notrack before defrag/conntrack so desync packets (0x40000000 / 0x20000000)
-    // are not marked 'ct state invalid' and dropped by OpenWrt fw4 !fw4: Prevent NAT leakage
-    system("nft 'add chain inet tachyon_fuzzer predefrag { type filter hook output priority -401 ; policy accept; }' 2>/dev/null");
-    system("nft 'add rule inet tachyon_fuzzer predefrag meta mark & 0x60000000 != 0 notrack counter' 2>/dev/null");
-    system("nft 'add chain inet tachyon_fuzzer predefrag_pre { type filter hook prerouting priority -401 ; policy accept; }' 2>/dev/null");
-    system("nft 'add rule inet tachyon_fuzzer predefrag_pre meta mark & 0x60000000 != 0 notrack counter' 2>/dev/null");
-
-    // Queue in postrouting after routing/NAT (priority 101), like upstream zapret's
-    // postnat chain and blockcheck. Queuing in the output hook at priority -200
-    // made every strategy fail: an A/B test on a real router with the same nfqws
-    // and strategy gave curl exit 35/28 with output -200 and HTTP 200 with
-    // postrouting 101 for both YouTube and Discord.
-    // Scope every fuzzer rule to the probe targets when their addresses are known.
-    // Matching all router TCP 443 also captured sing-box's own outbound
-    // connections (same 0x08000000 mark): while a benchmark ran, every proxy
-    // dial went through the test strategy and timed out, and OR-ing the bypass
-    // mark onto zapret section marks (0x01000001 -> 0x09000001) took that
-    // traffic out of its production queue.
-    let scope = target_scope_match(target_ips);
-
-    system("nft 'add chain inet tachyon_fuzzer postnat { type filter hook postrouting priority 101 ; policy accept; }' 2>/dev/null");
-    system(sprintf("nft 'add rule inet tachyon_fuzzer postnat meta mark & %s == %s counter return' 2>/dev/null", FUZZER_FWMARK, FUZZER_FWMARK));
-    system("nft 'add rule inet tachyon_fuzzer postnat oifname \"lo\" return' 2>/dev/null");
-    system("nft 'add rule inet tachyon_fuzzer postnat ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4, 77.88.8.8 } counter return' 2>/dev/null");
-    system("nft 'add rule inet tachyon_fuzzer postnat ip6 daddr { 2606:4700:4700::1111, 2606:4700:4700::1001, 2001:4860:4860::8888, 2001:4860:4860::8844 } counter return' 2>/dev/null");
-if (is_udp) {
-        // Two rules, not one "l4proto { tcp, udp }" rule: each carries its own
-        // counter so a UDP strategy can be told apart from one that was never
-        // exercised. See read_fuzzer_proto_counters().
-        command_output_from_args([ "nft", fuzzer_queue_rule_spec(scope, "tcp", qnum, FUZZER_QUEUE_PORTS_TCP) ]);
-        command_output_from_args([ "nft", fuzzer_queue_rule_spec(scope, "udp", qnum, FUZZER_QUEUE_PORTS_UDP) ]);
-    } else {
-        command_output_from_args([ "nft", fuzzer_queue_rule_spec(scope, "tcp", qnum, FUZZER_QUEUE_PORTS_TCP) ]);
-    }
-    // Route hook with priority -155 (before TachyonTable's -150) marks test traffic with FUZZER_OUTBOUND_MARK (direct outbound mark)
-    // This guarantees that TachyonTable's mangle_output immediately returns and test traffic goes DIRECT to WAN without Sing-box TProxy
-    add_bypass_singbox_chain(scope, is_udp);
-    return verify_fuzzer_queue_rule(qnum);
-}
-
 
 const TARGET_SUITES = {
     youtube_suite: {
         name: "YouTube Full Suite (Stream + CDN + Web)",
         urls: [
-            { name: "GoogleVideo Stream CDN", url: "https://redirector.googlevideo.com/videoplayback", weight: 60, required: true, probe_kind: "streaming" },
+            { name: "GoogleVideo Stream CDN", url: "https://rr1.googlevideo.com/videoplayback", weight: 60, required: true, probe_kind: "streaming" },
             { name: "Static Assets (i.ytimg)", url: "https://i.ytimg.com/generate_204", weight: 15, required: false, probe_kind: "tls_http" },
             { name: "Web Interface", url: "https://www.youtube.com/", weight: 25, required: true, probe_kind: "tls_http" }
         ]
@@ -720,6 +482,22 @@ const TARGET_SUITES = {
             { name: "Main Portal", url: "https://rutracker.org", weight: 60, required: true, probe_kind: "tls_http" },
             { name: "CDN Static Logo", url: "https://static.rutracker.cc/logo/logo-3.png", weight: 40, required: false, probe_kind: "tls_http" }
         ]
+    },
+    cs2_faceit_suite: {
+        name: "CS2 / Faceit / Cybershoke Suite (Web + API + UDP)",
+        urls: [
+            { name: "Faceit Web Portal", url: "https://www.faceit.com/", weight: 35, required: true, probe_kind: "tls_http" },
+            { name: "Cybershoke CS2 Servers", url: "https://cybershoke.net/", weight: 30, required: true, probe_kind: "tls_http" },
+            { name: "Steam SDR Relay Config (CS2)", url: "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730", weight: 20, required: false, probe_kind: "tls_http" },
+            { name: "Gaming STUN / UDP Session", url: "udp://stun.l.google.com:19302", weight: 15, required: false, probe_kind: "udp_stun" }
+        ]
+    },
+    gaming_udp_suite: {
+        name: "Gaming & Voice UDP Suite (STUN + Source)",
+        urls: [
+            { name: "Google STUN UDP (19302)", url: "udp://stun.l.google.com:19302", weight: 60, required: true, probe_kind: "udp_stun" },
+            { name: "Cloudflare STUN UDP (3478)", url: "udp://stun.cloudflare.com:3478", weight: 40, required: false, probe_kind: "udp_stun" }
+        ]
     }
 };
 
@@ -741,60 +519,111 @@ const TARGET_URLS = {
     rutracker: "https://rutracker.org",
     telegram_suite: "https://web.telegram.org",
     telegram: "https://web.telegram.org",
+    cs2_faceit_suite: "https://www.faceit.com/",
+    cs2_faceit: "https://www.faceit.com/",
+    cybershoke: "https://cybershoke.net/",
+    gaming_udp_suite: "udp://stun.l.google.com:19302",
     quic_http3: "https://www.google.com"
 };
 
 function resolve_target_url(target_key, custom_url) {
-    if (custom_url && custom_url != "")
-        return custom_url;
+    target_key = trim(as_string(target_key || ""));
+    let custom_parts = split(as_string(custom_url || ""), /[\r\n,;\t ]+/);
+    if (index(target_key, ",") >= 0) {
+        for (let part in split(target_key, ",")) {
+            let k = trim(as_string(part));
+            if (k == "") continue;
+            if (k == "custom" && custom_url && custom_url != "") {
+                for (let u in custom_parts) {
+                    let norm = fuzzer_runner.normalize_target_url(u);
+                    if (norm != "")
+                        return norm;
+                }
+            }
+            if (TARGET_URLS[k])
+                return TARGET_URLS[k];
+        }
+    }
+    if (custom_url && custom_url != "") {
+        for (let u in custom_parts) {
+            let norm = fuzzer_runner.normalize_target_url(u);
+            if (norm != "")
+                return norm;
+        }
+    }
     return TARGET_URLS[target_key] || TARGET_URLS.youtube;
 }
 
-function resolve_target_urls_list(target_key, custom_url) {
-    if (custom_url && custom_url != "") {
-        let urls = split(custom_url, /[,\n]+/);
-        let result = [];
-        let idx = 0;
-        for (let u in urls) {
-            let trimmed = trim(as_string(u));
-            if (trimmed == "") continue;
-            idx++;
-            push(result, {
-                name: sprintf("Custom Target %d", idx),
-                url: trimmed,
-                weight: 100,
-                required: true,
-                probe_kind: "tls_http"
-            });
-        }
-        if (length(result) > 0) return result;
-        return [ { name: "Custom Target", url: custom_url, weight: 100, required: true, probe_kind: "tls_http" } ];
+function build_custom_targets_list(custom_url) {
+    let urls = split(as_string(custom_url || ""), /[\r\n,;\t ]+/);
+    let result = [];
+    let seen = {};
+    let idx = 0;
+    for (let u in urls) {
+        let norm = fuzzer_runner.normalize_target_url(u);
+        if (norm == "" || seen[norm]) continue;
+        seen[norm] = true;
+        idx++;
+        let is_udp_url = index(norm, "udp://") == 0;
+        let hm = match(norm, /^(https?|udp):\/\/([^\/]+)/i);
+        let disp = (hm && hm[2]) ? hm[2] : sprintf("Custom Target %d", idx);
+        push(result, {
+            name: disp,
+            url: norm,
+            weight: 100,
+            required: true,
+            probe_kind: is_udp_url ? "udp_stun" : "tls_http"
+        });
     }
-    target_key = as_string(target_key || "youtube_suite");
-    if (target_key == "quic_http3") {
+    if (length(result) > 0) return result;
+    return [ { name: "Custom Target", url: fuzzer_runner.normalize_target_url(custom_url) || as_string(custom_url || ""), weight: 100, required: true, probe_kind: "tls_http" } ];
+}
+
+function resolve_single_target_urls(key, custom_url) {
+    if (key == "custom" && custom_url && custom_url != "")
+        return build_custom_targets_list(custom_url);
+    if (key == "quic_http3")
         return [ { name: "Google QUIC Initial / HTTP3", url: "https://www.google.com", weight: 100, required: true, probe_kind: "quic" } ];
-    }
-    let suite = TARGET_SUITES[target_key];
-    if (suite && suite.urls && length(suite.urls) > 0) {
+    let suite = TARGET_SUITES[key];
+    if (suite && suite.urls && length(suite.urls) > 0)
         return suite.urls;
+    let single = TARGET_URLS[key] || TARGET_URLS.youtube;
+    let is_udp_url = index(as_string(single), "udp://") == 0;
+    return [ { name: key, url: single, weight: 100, required: true, probe_kind: is_udp_url ? "udp_stun" : (key == "quic_http3" ? "quic" : "tls_http") } ];
+}
+
+function resolve_target_urls_list(target_key, custom_url) {
+    target_key = trim(as_string(target_key || "youtube_suite"));
+    if (index(target_key, ",") >= 0) {
+        let keys_arr = split(target_key, ",");
+        let combined = [];
+        let seen = {};
+        for (let raw_k in keys_arr) {
+            let k = trim(as_string(raw_k));
+            if (k == "") continue;
+            let sub_list = resolve_single_target_urls(k, custom_url);
+            for (let item in sub_list) {
+                let sig = as_string(item.url) + "|" + as_string(item.probe_kind || "tls_http");
+                if (seen[sig]) continue;
+                seen[sig] = true;
+                push(combined, item);
+            }
+        }
+        if (length(combined) > 0)
+            return combined;
     }
-    let single = TARGET_URLS[target_key] || TARGET_URLS.youtube;
-    return [ { name: target_key, url: single, weight: 100, required: true, probe_kind: (target_key == "quic_http3" ? "quic" : "tls_http") } ];
+    if (custom_url && custom_url != "")
+        return build_custom_targets_list(custom_url);
+    return resolve_single_target_urls(target_key, custom_url);
 }
 
 function module_exports() {
     return {
-        NFQUEUE_QNUM_ZAPRET,
-        NFQUEUE_QNUM_ZAPRET2,
         FUZZER_FWMARK,
         FUZZER_OUTBOUND_MARK,
-        KNOWN_BLOB_FILES,
         log_fuzzer_message,
         resolve_binary,
-        get_zapret2_bin,
-        get_zapret_bin,
-        get_byedpi_bin,
-        get_zapret2_lua_flags,
+        get_desync_bin,
         has_timeout,
         get_timeout_prefix,
         wrap_cmd_timeout,
@@ -803,18 +632,14 @@ function module_exports() {
         is_valid_public_ip,
         get_fuzzer_curl_dns_flags,
         get_resolved_host_flags,
-        get_zapret2_blob_dir,
-        resolve_zapret2_blobs,
-        setup_fuzzer_direct_nftables,
+        prewarm_targets_dns,
+        resolve_host_ipv4,
+        parse_udp_target_url,
+        probe_udp_stun_cmd,
         probe_target_ips,
         target_scope_match,
-        add_bypass_singbox_chain,
+        add_bypass_core_chain,
         probe_curl_cmd,
-        read_nfqueue_stats,
-        read_fuzzer_proto_counters,
-        parse_proto_counters,
-    fuzzer_queue_rule_spec,
-        wait_nfqueue_bound,
         TARGET_SUITES,
         TARGET_URLS,
         resolve_target_url,

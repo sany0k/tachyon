@@ -280,21 +280,30 @@ function github_to_jsdelivr(url) {
     return "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@" + ref + "/" + file;
 }
 
+// Classify subscription inputs without loading the decryption implementation.
+// Unknown Happ schemes stay out of the manual proxy parser as well.
+function is_subscription_url(value) {
+    value = replace(as_string(value), /^\s+|\s+$/g, "");
+    return match(value, /^(https?:\/\/|happ:\/\/|v2raytun:\/\/|incy:\/\/|crypt([2-5])?\/)/i) != null;
+}
+
 function download_candidates(value) {
     value = as_string(value);
     if (value == "")
         return [];
 
+    // Mirrors only serve GitHub resources. Inspect the authority before
+    // normalization: a provider URL may itself contain a GitHub URL in its path.
+    let source_host = lc(host(value));
+    let is_github = match(source_host, /^(github\.com|api\.github\.com|([a-z0-9-]+\.)?githubusercontent\.com)$/) != null;
+    if ((scheme(value) != "http" && scheme(value) != "https") || !is_github)
+        return [ value ];
+
     value = normalize_github_raw(value);
 
     let candidates = [ value ];
-    let is_github = index(value, "github.com") >= 0 ||
-                    index(value, "api.github.com") >= 0 ||
-                    index(value, "raw.githubusercontent.com") >= 0 ||
-                    index(value, "githubusercontent.com") >= 0;
-    let is_http = substr(value, 0, 7) == "http://" || substr(value, 0, 8) == "https://";
 
-    if (is_github || is_http) {
+    if (is_github) {
         let is_release = index(value, "/releases/") >= 0;
 
         // jsDelivr CDN works for file blobs but not release binaries
@@ -306,10 +315,11 @@ function download_candidates(value) {
         // For release downloads all of these work; for raw content only the
         // gh-proxy family does (jsDelivr already handled above).
         let mirrors = [
+            "https://ghfast.top/",
             "https://gh-proxy.com/",
+            "https://gh.llkk.cc/",
             "https://ghproxy.net/",
             "https://mirror.ghproxy.com/",
-            "https://ghfast.top/",
             "https://github.moeyy.xyz/",
         ];
         for (let prefix in mirrors) {
@@ -335,5 +345,6 @@ return {
     query_params,
     normalize_github_raw,
     github_to_jsdelivr,
+    is_subscription_url,
     download_candidates
 };

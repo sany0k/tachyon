@@ -79,6 +79,26 @@ function get_system_uptime() {
 
 function get_process_uptime(pid) {
     if (!pid || int(pid) <= 0) return null;
+    let stat_raw = safe_read_file("/proc/" + pid + "/stat");
+    let uptime_raw = safe_read_file("/proc/uptime");
+    if (stat_raw != "" && uptime_raw != "") {
+        let rpar = rindex(stat_raw, ")");
+        if (rpar > 0) {
+            let tail = split(trim(substr(stat_raw, rpar + 1)), /[ \t]+/);
+            if (length(tail) >= 20) {
+                let start_sec = int(int(tail[19]) / 100);
+                let sys_sec = int(split(trim(uptime_raw), /[ \t]+/)[0]);
+                let uptime = sys_sec - start_sec;
+                if (uptime < 0) uptime = 0;
+                return {
+                    pid: int(pid),
+                    started_at: time() - uptime,
+                    uptime_seconds: uptime,
+                    pretty: format_duration_pretty(uptime)
+                };
+            }
+        }
+    }
     let st = fs.stat("/proc/" + pid);
     if (!st || !st.mtime) return null;
     let now = time();
@@ -92,63 +112,215 @@ function get_process_uptime(pid) {
     };
 }
 
-function find_named_pid(name) {
-    let pid_files = {
-        "sing-box": [ "/var/run/sing-box.pid" ],
-        "steer": [ "/var/run/steer.pid" ],
-        "watchdog": [ "/var/run/tachyon_watchdog.pid" ],
-        "telegram": [ "/var/run/tachyon_telegram.pid" ],
-        "dnsmasq": [ "/var/run/dnsmasq/dnsmasq.cfg01411c.pid", "/var/run/dnsmasq.pid" ]
-    };
+let cached_proc_map = null;
 
-    if (pid_files[name]) {
-        for (let p in pid_files[name]) {
-            let val = safe_read_file(p);
-            if (val != "" && match(val, /^[0-9]+$/)) {
-                let st = fs.stat("/proc/" + val);
-                if (st) return val;
-            }
-        }
-    }
-
-    // Fallback: scan /proc
+function scan_proc_comm_map() {
+    if (cached_proc_map != null)
+        return cached_proc_map;
+    cached_proc_map = {};
     let proc_dir = fs.opendir("/proc");
     if (proc_dir) {
         let ent;
         while ((ent = proc_dir.read()) != null) {
-            if (match(ent, /^[0-9]+$/)) {
+            if (ltrim(ent, "0123456789") == "") {
                 let comm = safe_read_file("/proc/" + ent + "/comm");
-                if (comm == name || (name == "watchdog" && index(comm, "watchdog") >= 0)) {
-                    proc_dir.close();
-                    return ent;
+                if (comm != "") {
+                    if (!cached_proc_map[comm])
+                        cached_proc_map[comm] = [];
+                    push(cached_proc_map[comm], ent);
                 }
             }
         }
         proc_dir.close();
     }
-    return "";
+    return cached_proc_map;
+}
+
+function get_daemon_pids(name) {
+    let pmap = scan_proc_comm_map();
+
+    if (name == "tachyon-core") {
+        let pids = [];
+        let seen = {};
+        let proc = require("core.process");
+        for (let path in proc.core_contract().pid_files) {
+            let val = safe_read_file(path);
+            if (val != "" && match(val, /^[0-9]+$/) && proc.exe_basename(val) == name && !proc.is_core_initscript(val)) {
+                push(pids, val);
+                seen[val] = true;
+            }
+        }
+        for (let pid in proc.core_daemon_pids()) {
+            if (!seen[pid] && proc.exe_basename(pid) == name) {
+                push(pids, pid);
+                seen[pid] = true;
+            }
+        }
+        for (let pid in (pmap[name] || [])) {
+            if (!seen[pid]) {
+                let cmd = safe_read_file("/proc/" + pid + "/cmdline");
+                if (index(cmd, "run") >= 0 && index(cmd, "check") < 0) {
+                    push(pids, pid);
+                    seen[pid] = true;
+                }
+            }
+        }
+        return pids;
+    }
+
+    if (name == "tachyon") {
+        let pids = [];
+        let seen = {};
+        let pidfiles = [
+            "/var/run/tachyon/dns-failover.pid",
+            "/var/run/tachyon/priority.pid",
+            "/var/run/tachyon-feedback.pid",
+            "/var/run/tachyon/fuzzer-worker.pid"
+        ];
+        for (let pf in pidfiles) {
+            let val = safe_read_file(pf);
+            if (val != "" && match(val, /^[0-9]+$/) && fs.stat("/proc/" + val) != null) {
+                push(pids, val);
+                seen[val] = true;
+            }
+        }
+        let self_stat = safe_read_file("/proc/self/stat");
+        let self_pid = split(self_stat, /[ \t]+/)[0] || "";
+        for (let pid in (pmap["ucode"] || [])) {
+            if (seen[pid] || pid == self_pid) continue;
+            let cmd = safe_read_file("/proc/" + pid + "/cmdline");
+            if (index(cmd, "/usr/lib/tachyon/") >= 0 &&
+                index(cmd, "tachyon_entry.uc") < 0 &&
+                index(cmd, "service/ui.uc") < 0 &&
+                index(cmd, "diagnostics/stability.uc") < 0 &&
+                index(cmd, "watchdog.uc") < 0 &&
+                index(cmd, "telegram.uc") < 0) {
+                push(pids, pid);
+                seen[pid] = true;
+            }
+        }
+        return pids;
+    }
+
+    if (name == "watchdog") {
+        let pids = [];
+        let seen = {};
+        for (let pf in [ "/var/run/tachyon_watchdog.pid", "/var/run/tachyon_watchdog.supervisor.pid" ]) {
+            let val = safe_read_file(pf);
+            if (val != "" && match(val, /^[0-9]+$/) && fs.stat("/proc/" + val) != null) {
+                let comm = safe_read_file("/proc/" + val + "/comm");
+                if (comm == "ucode" || comm == "sh") {
+                    push(pids, val);
+                    seen[val] = true;
+                }
+            }
+        }
+        for (let pid in (pmap["ucode"] || [])) {
+            if (!seen[pid] && index(safe_read_file("/proc/" + pid + "/cmdline"), "watchdog.uc") >= 0) {
+                push(pids, pid);
+                seen[pid] = true;
+            }
+        }
+        return pids;
+    }
+
+    if (name == "telegram") {
+        let pids = [];
+        let seen = {};
+        let val = safe_read_file("/var/run/tachyon_telegram.pid");
+        if (val != "" && match(val, /^[0-9]+$/) && fs.stat("/proc/" + val) != null) {
+            push(pids, val);
+            seen[val] = true;
+        }
+        for (let pid in (pmap["ucode"] || [])) {
+            if (!seen[pid] && index(safe_read_file("/proc/" + pid + "/cmdline"), "telegram.uc") >= 0) {
+                push(pids, pid);
+                seen[pid] = true;
+            }
+        }
+        return pids;
+    }
+
+    if (name == "dnsmasq") {
+        let pids = [];
+        let all = pmap["dnsmasq"] || [];
+        for (let pid in all) {
+            let cmd = safe_read_file("/proc/" + pid + "/cmdline");
+            if (index(cmd, "ujail") < 0)
+                push(pids, pid);
+        }
+        if (length(pids) == 0 && length(all) > 0)
+            pids = all;
+        return pids;
+    }
+
+    return pmap[name] || [];
+}
+
+function find_named_pid(name) {
+    let pids = get_daemon_pids(name);
+    return length(pids) > 0 ? pids[0] : "";
+}
+
+function get_relevant_daemons() {
+    let cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let tg_cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
+
+    let list = [];
+    push(list, "tachyon-core");
+
+    if (length(get_daemon_pids("tachyon")) > 0)
+        push(list, "tachyon");
+
+    if (cfg.enable_watchdog != "0" || length(get_daemon_pids("watchdog")) > 0)
+        push(list, "watchdog");
+
+    if (tg_cfg.enabled == "1" || length(get_daemon_pids("telegram")) > 0)
+        push(list, "telegram");
+
+    push(list, "dnsmasq");
+    if (length(get_daemon_pids("AdGuardHome")) > 0)
+        push(list, "AdGuardHome");
+
+    return list;
 }
 
 function get_daemon_uptimes() {
-    let daemons = [ "tachyon-core", "steer", "watchdog", "telegram", "dnsmasq", "nfqws", "nfqws2", "ciadpi" ];
+    let daemons = get_relevant_daemons();
     let result = {};
 
     for (let d in daemons) {
-        let pid = find_named_pid(d);
-        if (pid != "") {
-            let u = get_process_uptime(pid);
-            if (u) {
+        let pids = get_daemon_pids(d);
+        if (length(pids) > 0) {
+            let best_u = null;
+            let pid_nums = [];
+            for (let p in pids) {
+                push(pid_nums, int(p));
+                let u = get_process_uptime(p);
+                if (u && (best_u == null || u.uptime_seconds > best_u.uptime_seconds))
+                    best_u = u;
+            }
+            if (best_u) {
                 result[d] = {
                     running: true,
-                    pid: int(pid),
-                    uptime_seconds: u.uptime_seconds,
-                    pretty: u.pretty
+                    pid: int(pids[0]),
+                    pids: pid_nums,
+                    workers: length(pid_nums),
+                    uptime_seconds: best_u.uptime_seconds,
+                    pretty: best_u.pretty
                 };
             } else {
-                result[d] = { running: true, pid: int(pid), uptime_seconds: 0, pretty: "0s" };
+                result[d] = {
+                    running: true,
+                    pid: int(pids[0]),
+                    pids: pid_nums,
+                    workers: length(pid_nums),
+                    uptime_seconds: 0,
+                    pretty: "0s"
+                };
             }
         } else {
-            result[d] = { running: false, pid: null, uptime_seconds: 0, pretty: "stopped" };
+            result[d] = { running: false, pid: null, pids: [], workers: 0, uptime_seconds: 0, pretty: "stopped" };
         }
     }
     return result;
@@ -156,7 +328,7 @@ function get_daemon_uptimes() {
 
 // --- Memory & Resource Pressure ---
 
-function get_memory_pressure() {
+function get_memory_pressure(daemon_uptimes) {
     let meminfo = safe_read_file("/proc/meminfo");
     let total = 0;
     let free = 0;
@@ -192,17 +364,34 @@ function get_memory_pressure() {
     if (used_pct >= 90) pressure = "critical";
     else if (used_pct >= 75) pressure = "warning";
 
-    // VmRSS per daemon
-    let daemons = [ "tachyon-core", "steer", "watchdog", "dnsmasq" ];
+    // VmRSS per daemon (de-duplicating shared RssFile across multi-worker daemons)
+    let daemons = type(daemon_uptimes) == "object" ? keys(daemon_uptimes) : get_relevant_daemons();
     let daemon_rss = {};
     for (let d in daemons) {
-        let pid = find_named_pid(d);
-        if (pid != "") {
-            let status = safe_read_file("/proc/" + pid + "/status");
-            let rm = match(status, /VmRSS:[ \t]+([0-9]+)\s+kB/);
-            if (rm) {
-                daemon_rss[d] = int(rm[1]) || 0;
+        let pids = (type(daemon_uptimes) == "object" && type(daemon_uptimes[d]?.pids) == "array")
+            ? map(daemon_uptimes[d].pids, function(p) { return as_string(p); })
+            : get_daemon_pids(d);
+        if (length(pids) > 0) {
+            let sum_anon = 0;
+            let max_file = 0;
+            let sum_vmrss = 0;
+            let has_breakdown = false;
+            for (let pid in pids) {
+                let status = safe_read_file("/proc/" + pid + "/status");
+                let anon_m = match(status, /RssAnon:[ \t]+([0-9]+)\s+kB/);
+                let file_m = match(status, /RssFile:[ \t]+([0-9]+)\s+kB/);
+                let shmem_m = match(status, /RssShmem:[ \t]+([0-9]+)\s+kB/);
+                let rm = match(status, /VmRSS:[ \t]+([0-9]+)\s+kB/);
+                if (anon_m && file_m) {
+                    has_breakdown = true;
+                    sum_anon += (int(anon_m[1]) || 0) + (shmem_m ? (int(shmem_m[1]) || 0) : 0);
+                    let rf = int(file_m[1]) || 0;
+                    if (rf > max_file) max_file = rf;
+                } else if (rm) {
+                    sum_vmrss += int(rm[1]) || 0;
+                }
             }
+            daemon_rss[d] = has_breakdown ? (sum_anon + max_file) : sum_vmrss;
         }
     }
 
@@ -222,7 +411,7 @@ function get_memory_pressure() {
 
 // --- File Descriptors & Orphan Detection ---
 
-function get_fd_stats() {
+function get_fd_stats(daemon_uptimes) {
     let fnr = safe_read_file("/proc/sys/fs/file-nr");
     let parts = split(fnr, /[ \t]+/);
     let allocated = 0;
@@ -232,19 +421,23 @@ function get_fd_stats() {
         max = int(parts[2]) || 0;
     }
 
-    let daemons = [ "tachyon-core", "steer", "watchdog", "dnsmasq" ];
+    let daemons = type(daemon_uptimes) == "object" ? keys(daemon_uptimes) : get_relevant_daemons();
     let daemon_fds = {};
     for (let d in daemons) {
-        let pid = find_named_pid(d);
-        if (pid != "") {
+        let pids = (type(daemon_uptimes) == "object" && type(daemon_uptimes[d]?.pids) == "array")
+            ? map(daemon_uptimes[d].pids, function(p) { return as_string(p); })
+            : get_daemon_pids(d);
+        if (length(pids) > 0) {
             let fds = 0;
-            let fd_dir = fs.opendir("/proc/" + pid + "/fd");
-            if (fd_dir) {
-                let ent;
-                while ((ent = fd_dir.read()) != null) {
-                    if (ent != "." && ent != "..") fds++;
+            for (let pid in pids) {
+                let fd_dir = fs.opendir("/proc/" + pid + "/fd");
+                if (fd_dir) {
+                    let ent;
+                    while ((ent = fd_dir.read()) != null) {
+                        if (ent != "." && ent != "..") fds++;
+                    }
+                    fd_dir.close();
                 }
-                fd_dir.close();
             }
             daemon_fds[d] = fds;
         }
@@ -260,12 +453,12 @@ function get_fd_stats() {
 
 function get_orphan_processes() {
     let orphans = [];
-    let tracked = [ "curl", "nfqws", "nfqws2", "ciadpi" ];
+    let tracked = [ "curl" ];
     let proc_dir = fs.opendir("/proc");
     if (proc_dir) {
         let ent;
         while ((ent = proc_dir.read()) != null) {
-            if (match(ent, /^[0-9]+$/)) {
+            if (ltrim(ent, "0123456789") == "") {
                 let comm = safe_read_file("/proc/" + ent + "/comm");
                 for (let t in tracked) {
                     if (comm == t) {
@@ -347,7 +540,7 @@ function analyze_incidents_and_logs() {
             wan_flaps++;
         if (index(l, "wan.down") >= 0 || index(l, "watchdog: wan check failed") >= 0)
             wan_flaps++;
-        if (index(l, "sing-box") >= 0 &&
+        if (index(l, "tachyon-core") >= 0 &&
             (index(l, "panic:") >= 0 || index(l, "fatal error:") >= 0 || index(l, "sigsegv") >= 0 || index(l, "died unexpectedly") >= 0))
             engine_crashes++;
         if (index(l, "dnsmasq") >= 0 &&
@@ -444,12 +637,12 @@ function compute_stability_score(incidents, memory, servers, jobs, daemons) {
     let score = 100;
     let penalties = [];
 
-    // 1. Process health: engine and watchdog must be running
-    if (!daemons["tachyon-core"]?.running && !daemons["steer"]?.running) {
+    // 1. Process health: engine and (if enabled) watchdog must be running
+    if (!daemons["tachyon-core"]?.running) {
         score -= 40;
         push(penalties, "Routing engine is not running (-40)");
     }
-    if (!daemons["watchdog"]?.running) {
+    if (daemons["watchdog"] != null && !daemons["watchdog"].running) {
         score -= 15;
         push(penalties, "Watchdog daemon is stopped (-15)");
     }
@@ -519,10 +712,11 @@ function compute_stability_score(incidents, memory, servers, jobs, daemons) {
 // --- Main Report & Status Builders ---
 
 function get_stability_report() {
+    cached_proc_map = null;
     let sys_uptime = get_system_uptime();
     let daemons = get_daemon_uptimes();
-    let memory = get_memory_pressure();
-    let fd_stats = get_fd_stats();
+    let memory = get_memory_pressure(daemons);
+    let fd_stats = get_fd_stats(daemons);
     let orphans = get_orphan_processes();
     let incidents = analyze_incidents_and_logs();
     let jobs = get_jobs_metrics();

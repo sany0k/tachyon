@@ -37,6 +37,10 @@ grep -Fq 'function ipv4_in_cidr(' "$EXPLAIN_UC" ||
   fail "route_explain.uc must define ipv4_in_cidr"
 grep -Fq 'function is_private_ip(' "$EXPLAIN_UC" ||
   fail "route_explain.uc must define is_private_ip"
+grep -Fq 'function target_matches_country(' "$EXPLAIN_UC" ||
+  fail "route_explain.uc must define target_matches_country"
+grep -Fq 'function evaluate_section_match(' "$EXPLAIN_UC" ||
+  fail "route_explain.uc must define evaluate_section_match"
 grep -Fq 'function selftest()' "$EXPLAIN_UC" ||
   fail "route_explain.uc must define selftest"
 
@@ -121,6 +125,9 @@ if command -v ucode >/dev/null 2>&1; then
   tachyon_out=$(TACHYON_LIB="$TACHYON_LIB" ucode "$BIN_TACHYON" route_explain 192.168.1.50 github.com 443)
   assert_contains "$tachyon_out" "TACHYON ROUTE DECISION EXPLAINER" "tachyon binary route_explain execution"
 
+  tachyon_case_out=$(TACHYON_LIB="$TACHYON_LIB" ucode "$BIN_TACHYON" route_explain 192.168.1.50 Github.COM 443)
+  assert_contains "$tachyon_case_out" "TACHYON ROUTE DECISION EXPLAINER" "tachyon binary route_explain case insensitive execution"
+
   # 4.6 Execution via diagnostics/runtime.uc facade
   runtime_out=$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$RUNTIME_UC" route-explain 192.168.1.50 github.com 443)
   assert_contains "$runtime_out" "TACHYON ROUTE DECISION EXPLAINER" "runtime.uc route-explain facade execution"
@@ -129,6 +136,47 @@ if command -v ucode >/dev/null 2>&1; then
   agent_out=$(TACHYON_LIB="$TACHYON_LIB" ucode "$BIN_TACHYON" agent "/tachyon/agent/v1/route/explain?target=github.com&client=192.168.1.50" GET)
   assert_contains "$agent_out" '"success": true' "agent_api route/explain success"
   assert_contains "$agent_out" '"target": "github.com"' "agent_api route/explain target"
+
+  # 4.8 GeoIP evaluation verification (Issue #179)
+  geoip_test_out=$(ucode -L "$TACHYON_LIB" -e '
+    let r = require("diagnostics.route_explain");
+    let sec = { ".name": "sec_main", enabled: "1", action: "connection", geoip_country: ["ru"], geoip_mode: "exclude" };
+    let client = { ip: "192.168.1.100", mac: null, is_router: false, is_excluded: false };
+    let m1 = r.evaluate_section_match(sec, client, { host: "4pda.to", type: "domain" }, 443, "tcp");
+    let m2 = r.evaluate_section_match(sec, client, { host: "yandex.ru", type: "domain" }, 443, "tcp");
+    print(sprintf("4pda:%s,yandex:%s", m1 ? m1.rule_type : "none", m2 ? m2.rule_type : "none"));
+  ')
+  assert_eq "$geoip_test_out" "4pda:geoip_exclude,yandex:none" "GeoIP exclusion matching in route_explain"
+
+  # 4.9 WireGuard endpoint resolution in sb_cfg.endpoints and no cross-section fallback
+  wg_ep_out=$(ucode -L "$TACHYON_LIB" -e '
+    let r = require("diagnostics.route_explain");
+    let sec = { ".name": "AWG_HL", enabled: "1", action: "connection" };
+    let res = r.resolve_outbound_node(sec, "connection", {
+      _clash_proxies: {},
+      _sb_cfg: {
+        outbounds: [
+          { type: "desync", tag: "YTB-desync-out", mode: "disorder" },
+          { type: "selector", tag: "AWG_HL-out", outbounds: [ "AWG_HL-1-out" ], "default": "AWG_HL-1-out" }
+        ],
+        endpoints: [
+          { type: "wireguard", tag: "AWG_HL-1-out", jc: 4, peers: [ { address: "198.51.100.10", port: 51820 } ] }
+        ]
+      }
+    });
+    let miss = r.resolve_outbound_node(sec, "connection", {
+      _clash_proxies: {},
+      _sb_cfg: {
+        outbounds: [
+          { type: "desync", tag: "YTB-desync-out", mode: "disorder" },
+          { type: "selector", tag: "AWG_HL-out", outbounds: [ "AWG_HL-missing-out" ], "default": "AWG_HL-missing-out" }
+        ],
+        endpoints: []
+      }
+    });
+    print(sprintf("%s|%s|%s|%s", res.selected_node, res.node_type, miss.selected_node, miss.node_type));
+  ')
+  assert_eq "$wg_ep_out" "AWG_HL-1-out|wireguard|AWG_HL-missing-out|unresolved" "WireGuard endpoint resolution and no foreign section fallback"
 fi
 
 echo "All route_explain tests passed successfully!"

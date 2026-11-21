@@ -501,6 +501,96 @@ function ip_stage_result(paths) {
     };
 }
 
+function is_leak_guard_nft_present() {
+    let nft_out = command_capture("nft list table inet " + shell_quote(constants.NFT_TABLE_NAME || "TachyonTable") + " 2>/dev/null");
+    if (!nft_out || nft_out.status != 0)
+        return false;
+    return index(as_string(nft_out.output), "tachyon-ipv6-leak-guard") >= 0;
+}
+
+function parse_ip_candidate(text) {
+    let parsed = parse_ip_response(text);
+    if (parsed != null && parsed.ok && ip_utils.valid_ipv6(parsed.ip))
+        return parsed.ip;
+    return "";
+}
+
+function probe_ipv6_paths(wan_iface, mixed_port, proxy_listening) {
+    let cfg = uci_core.get_all(CONFIG_NAME, "settings") || {};
+    let eff = common.resolve_effective_ipv6_state(cfg, null);
+    let direct_ipv6 = "";
+    let proxy_ipv6 = "";
+
+    let skip_net = getenv("TACHYON_LEAK_CHECK_SKIP_V6") == "1";
+    let should_probe = !skip_net && (eff.kernel_v6 || proxy_listening || getenv("TACHYON_LEAK_CHECK_FORCE_V6") == "1");
+    if (should_probe) {
+        let direct_argv_prefix = [ "curl", "-6", "-s", "-m", "2", "--connect-timeout", "1" ];
+        let iface6 = eff.wan6_iface != "" ? eff.wan6_iface : "";
+        if (iface6 != "") {
+            push(direct_argv_prefix, "--interface");
+            push(direct_argv_prefix, iface6);
+        }
+        // In leak_guard mode, omit outbound fwmark so direct v6 exercises the same filter path as normal hosts.
+        if (!eff.leak_guard_active && curl_supports_so_mark()) {
+            push(direct_argv_prefix, "--so-mark");
+            push(direct_argv_prefix, as_string(constants.NFT_OUTBOUND_MARK || "0x08000000"));
+        }
+
+        for (let url in [
+            "https://api64.ipify.org?format=json",
+            "https://api.ip.sb/geoip",
+            "https://cloudflare.com/cdn-cgi/trace"
+        ]) {
+            let argv = [];
+            for (let a in direct_argv_prefix)
+                push(argv, a);
+            push(argv, url);
+            let out = common.command_output_from_args(argv);
+            direct_ipv6 = parse_ip_candidate(out);
+            if (direct_ipv6 != "")
+                break;
+        }
+
+        if (proxy_listening) {
+            let proxy_url = "http://127.0.0.1:" + mixed_port;
+            for (let url in [
+                "https://api6.ipify.org?format=json",
+                "https://v6.ident.me",
+                "https://ipv6.icanhazip.com"
+            ]) {
+                let out = common.command_output_from_args([
+                    "curl", "-s", "-m", "2", "--connect-timeout", "1",
+                    "--proxy", proxy_url, url
+                ]);
+                proxy_ipv6 = parse_ip_candidate(out);
+                if (proxy_ipv6 != "")
+                    break;
+            }
+        }
+    }
+
+    let nft_guard = eff.leak_guard_active ? is_leak_guard_nft_present() : false;
+    let guard_ok = eff.leak_guard_active && direct_ipv6 == "" && (nft_guard || !eff.wan6_available);
+    let leaked = false;
+    if (eff.leak_guard_active) {
+        leaked = direct_ipv6 != "";
+    } else if (eff.effective == "tunnel_over_v4") {
+        leaked = direct_ipv6 != "" && (proxy_ipv6 == "" || direct_ipv6 == proxy_ipv6);
+    } else if (eff.effective == "full") {
+        leaked = direct_ipv6 != "" && proxy_listening && (proxy_ipv6 == "" || direct_ipv6 == proxy_ipv6);
+    }
+
+    return {
+        direct_ipv6: direct_ipv6,
+        proxy_ipv6: proxy_ipv6,
+        ipv6_leak_guard: guard_ok,
+        ipv6_leaked: leaked,
+        ipv6_effective_state: eff.effective,
+        wan6_available: eff.wan6_available,
+        nft_leak_guard_present: nft_guard
+    };
+}
+
 /**
  * Unified diagnostic check for both IP and DNS leaks.
  *
@@ -519,6 +609,7 @@ function run_leak_check_stages(wan_iface, mixed_port, want, test_mode) {
 
     let direct_dns_servers = get_direct_dns_servers();
     let paths = probe_ip_paths(wan_iface, mixed_port);
+    let v6_res = probe_ipv6_paths(wan_iface, mixed_port, paths.proxy_listening);
     let ip_res = want_ip ? ip_stage_result(paths) : null;
 
     // A DNS "verdict" of proxy_online must mean the DNS stage actually reached
@@ -535,7 +626,17 @@ function run_leak_check_stages(wan_iface, mixed_port, want, test_mode) {
     };
 
     if (!want_dns)
-        return { ip_leak: ip_res, dns_leak: dns_res, timestamp: time() };
+        return {
+            ip_leak: ip_res,
+            dns_leak: dns_res,
+            direct_ipv6: v6_res.direct_ipv6,
+            proxy_ipv6: v6_res.proxy_ipv6,
+            ipv6_leak_guard: v6_res.ipv6_leak_guard,
+            ipv6_leaked: v6_res.ipv6_leaked,
+            ipv6_effective_state: v6_res.ipv6_effective_state,
+            ipv6_leak: v6_res,
+            timestamp: time()
+        };
 
     let tmp_res = command_capture("mktemp -d /tmp/tachyon_leak_dns_XXXXXX 2>/dev/null");
     let work_dir = (tmp_res && tmp_res.status == 0) ? trim(as_string(tmp_res.output)) : "";
@@ -671,6 +772,12 @@ function run_leak_check_stages(wan_iface, mixed_port, want, test_mode) {
         mode: plus ? "plus" : "default",
         ip_leak: ip_res,
         dns_leak: dns_res,
+        direct_ipv6: v6_res.direct_ipv6,
+        proxy_ipv6: v6_res.proxy_ipv6,
+        ipv6_leak_guard: v6_res.ipv6_leak_guard,
+        ipv6_leaked: v6_res.ipv6_leaked,
+        ipv6_effective_state: v6_res.ipv6_effective_state,
+        ipv6_leak: v6_res,
         timestamp: time()
     };
 }
@@ -858,36 +965,38 @@ function print_cli_summary(res) {
 }
 
 // --- CLI Dispatcher ---
-let mode = ARGV[0] || "";
-let test_mode = ARGV[1] == "plus" || ARGV[2] == "plus" ? "plus" : "default";
+if ((sourcepath(1) == null || sourcepath(1) == "") && length(ARGV) > 0) {
+    let mode = ARGV[0] || "";
+    let test_mode = ARGV[1] == "plus" || ARGV[2] == "plus" ? "plus" : "default";
 
-if (mode == "leak-check" || mode == "leak_check") {
-    let res = run_leak_check(null, null, test_mode);
-    if (ARGV[1] == "--pretty" || ARGV[1] == "-p" || ARGV[2] == "--pretty" || ARGV[2] == "-p") {
-        print_cli_summary(res);
-    } else {
-        print(sprintf("%J\n", res));
+    if (mode == "leak-check" || mode == "leak_check") {
+        let res = run_leak_check(null, null, test_mode);
+        if (ARGV[1] == "--pretty" || ARGV[1] == "-p" || ARGV[2] == "--pretty" || ARGV[2] == "-p") {
+            print_cli_summary(res);
+        } else {
+            print(sprintf("%J\n", res));
+        }
+        exit(0);
     }
-    exit(0);
-}
-else if (mode == "leak-check-async" || mode == "leak_check_async") {
-    start_leak_check_async(test_mode);
-}
-else if (mode == "leak-check-worker") {
-    leak_check_worker(ARGV[1], ARGV[2]);
-}
-else if (mode == "leak-check-status" || mode == "leak_check_status") {
-    get_leak_check_status(ARGV[1]);
-}
-else if (mode == "ip-leak" || mode == "check_ip_leak") {
-    let res = check_ip_leak(null, null);
-    print(sprintf("%J\n", res));
-    exit(0);
-}
-else if (mode == "dns-leak" || mode == "check_dns_leak") {
-    let res = check_dns_leak(null, null, null, null);
-    print(sprintf("%J\n", res));
-    exit(0);
+    else if (mode == "leak-check-async" || mode == "leak_check_async") {
+        start_leak_check_async(test_mode);
+    }
+    else if (mode == "leak-check-worker") {
+        leak_check_worker(ARGV[1], ARGV[2]);
+    }
+    else if (mode == "leak-check-status" || mode == "leak_check_status") {
+        get_leak_check_status(ARGV[1]);
+    }
+    else if (mode == "ip-leak" || mode == "check_ip_leak") {
+        let res = check_ip_leak(null, null);
+        print(sprintf("%J\n", res));
+        exit(0);
+    }
+    else if (mode == "dns-leak" || mode == "check_dns_leak") {
+        let res = check_dns_leak(null, null, null, null);
+        print(sprintf("%J\n", res));
+        exit(0);
+    }
 }
 
 return {

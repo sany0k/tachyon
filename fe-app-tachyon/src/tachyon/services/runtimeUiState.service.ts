@@ -60,13 +60,17 @@ function scheduleRuntimeUiStatePoll(delay = getNextPollDelay()) {
   if (
     !runtimeStatePollingStarted ||
     runtimeStatePollTimer ||
-    typeof window === 'undefined'
+    typeof window === 'undefined' ||
+    !isDocumentVisible()
   ) {
     return;
   }
 
   runtimeStatePollTimer = window.setTimeout(() => {
     runtimeStatePollTimer = null;
+    if (!isDocumentVisible()) {
+      return;
+    }
     void refreshRuntimeUiState()
       .catch(() => undefined)
       .finally(() => {
@@ -101,7 +105,7 @@ export async function refreshRuntimeUiState({
     !force &&
     now - lastRuntimeUiStateRefreshAt < RUNTIME_UI_STATE_REFRESH_MIN_INTERVAL_MS
   ) {
-    return undefined;
+    return lastRuntimeUiState;
   }
 
   lastRuntimeUiStateRefreshAt = now;
@@ -170,7 +174,9 @@ export function registerRuntimeStateResumeRefresh() {
       return;
     }
 
-    void refreshRuntimeUiState({ force: true });
+    void refreshRuntimeUiState({ force: true }).finally(() => {
+      scheduleRuntimeUiStatePoll();
+    });
   };
 
   document.addEventListener('visibilitychange', refreshOnResume);

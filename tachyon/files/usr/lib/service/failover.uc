@@ -5,7 +5,7 @@
 // threshold in a row, switch the tachyon-failover selector to a healthy one,
 // persist the choice and notify Telegram.
 //
-// The runtime switch only works when sing-box was generated with
+// The runtime switch only works when tachyon-core config was generated with
 // section_failover_enabled=1 (the catch-all route then points at the
 // tachyon-failover selector group).
 //
@@ -20,8 +20,10 @@ let connections = require("config.connections");
 let as_string = common.as_string;
 let object_or_empty = common.object_or_empty;
 let option = common.option;
+let list_option = common.list_option;
 let int_option = common.int_option;
 let bool_option = common.bool_option;
+let contains = common.contains;
 let shell_quote = common.shell_quote;
 let command_from_args = common.command_from_args;
 let command_status = common.command_status;
@@ -66,11 +68,11 @@ function candidates() {
         if (!bool_option(section, "enabled", true))
             continue;
         let action = option(section, "action", "");
-        if (connections.is_remote_proxy_action(action)) {
+        if (connections.is_remote_proxy_section ? connections.is_remote_proxy_section(section) : connections.is_remote_proxy_action(action)) {
             push(proxies, as_string(section[".name"]));
             push(all, as_string(section[".name"]));
-        } else if (action == "byedpi" || action == "zapret" || action == "zapret2" ||
-            action == "wdtt" || action == "olcrtc") {
+        } else if (connections.is_remote_proxy_action(action) ||
+            action == "wdtt" || action == "csqtt" || action == "desync") {
             push(all, as_string(section[".name"]));
         }
     }
@@ -109,8 +111,12 @@ function write_streak(value) {
     fs.writefile(STREAK_FILE, as_string(value) + "\n");
 }
 
-function clash_delay_ok(tag) {
-    let out = trim(command_output_from_args([ TACHYON_BIN, "clash_api", "get_proxy_latency", tag, PROBE_TIMEOUT_MS ]) || "");
+function clash_delay_ok_url(tag, timeout_ms, probe_url, expected_status) {
+    let args = [ TACHYON_BIN, "clash_api", "get_proxy_latency", tag, as_string(timeout_ms || PROBE_TIMEOUT_MS) ];
+    let url = trim(as_string(probe_url || ""));
+    if (url != "")
+        push(args, url);
+    let out = trim(command_output_from_args(args) || "");
     if (out == "")
         return false;
     let parsed = null;
@@ -119,7 +125,53 @@ function clash_delay_ok(tag) {
     } catch (e) {
         return false;
     }
-    return object_or_empty(parsed)["delay"] != null;
+    let obj = object_or_empty(parsed);
+    let has_delay = obj["delay"] != null && int(obj["delay"]) > 0;
+    if (!has_delay && obj["error"] == null) {
+        for (let k, v in obj) {
+            if (k != "status" && type(v) == "int" && v > 0) {
+                has_delay = true;
+                break;
+            }
+        }
+    }
+    if (!has_delay)
+        return false;
+    if (expected_status && expected_status != "") {
+        let allowed = split(expected_status, /[[:space:],]+/);
+        if (parsed.status != null && !contains(allowed, as_string(parsed.status)))
+            return false;
+    }
+    return true;
+}
+
+function clash_delay_ok(tag) {
+    return clash_delay_ok_url(tag, PROBE_TIMEOUT_MS, "", "");
+}
+
+function section_fail_policy_urls(section) {
+    let urls = [];
+    for (let item in list_option(section, "fail_policy_urls")) {
+        for (let part in split(as_string(item || ""), /[[:space:],]+/)) {
+            let clean = trim(as_string(part || ""));
+            if (clean != "")
+                push(urls, clean);
+        }
+    }
+    if (length(urls) == 0)
+        push(urls, "");
+    return urls;
+}
+
+function probe_tag_urls(tag, urls, timeout_ms, expected_status) {
+    let checked = [];
+    for (let url in urls) {
+        let label = url != "" ? url : "default";
+        if (!clash_delay_ok_url(tag, timeout_ms, url, expected_status))
+            return { ok: false, failed_url: label, checked: checked };
+        push(checked, label);
+    }
+    return { ok: true, failed_url: "", checked: checked };
 }
 
 function switch_group(section_name, outbound_name) {
@@ -134,9 +186,14 @@ function switch_group(section_name, outbound_name) {
 
 function send_notification(message) {
     let tcfg = object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
-    if (as_string(tcfg.enabled || "0") != "1" || !tcfg.bot_token || !tcfg.admin_ids)
+    if (as_string(tcfg.enabled || "0") != "1" || !tcfg.bot_token || !tcfg.admin_ids ||
+        as_string(tcfg.notify_failover || "1") == "0")
         return;
-    system(common.background_command(TACHYON_BIN + " telegram send " + shell_quote(message)));
+    if (TACHYON_BIN != "/usr/bin/tachyon" || getenv("TACHYON_FAILOVER_SYNC_NOTIFY") == "1") {
+        command_success_from_args([ TACHYON_BIN, "telegram", "send", as_string(message) ]);
+        return;
+    }
+    command_status(common.background_command(command_from_args([ TACHYON_BIN, "telegram", "send", as_string(message) ])));
 }
 
 function read_section_fail_state() {
@@ -185,31 +242,114 @@ function check_section_fail_policies() {
         let prev_streak = int(prev.streak || 0);
         if (prev_streak < 0)
             prev_streak = 0;
+        let prev_recover_streak = int(prev.recover_streak || 0);
+        if (prev_recover_streak < 0)
+            prev_recover_streak = 0;
+        let prev_transition_at = int(prev.last_transition_at || 0);
+        if (prev_transition_at < 0)
+            prev_transition_at = 0;
 
-        if (clash_delay_ok(name + "-out")) {
-            next_map[name] = {
-                streak: 0,
-                failed: false,
-                policy: policy,
-                updated_at: time()
-            };
+        let sec_timeout = int_option(section, "fail_policy_timeout", int(PROBE_TIMEOUT_MS));
+        if (sec_timeout < 500)
+            sec_timeout = int(PROBE_TIMEOUT_MS);
+        let sec_threshold = int_option(section, "fail_policy_threshold", max_streak);
+        if (sec_threshold < 1)
+            sec_threshold = max_streak;
+        let recover_threshold = int_option(section, "fail_policy_recover_threshold", 1);
+        if (recover_threshold < 1)
+            recover_threshold = 1;
+        let cooldown_sec = int_option(section, "fail_policy_cooldown", 0);
+        if (cooldown_sec < 0)
+            cooldown_sec = 0;
+        let check_direct = policy == "direct" && bool_option(section, "fail_policy_check_direct", true);
+        let urls = section_fail_policy_urls(section);
+        let now = time();
+
+        let check_interval_sec = int_option(section, "fail_policy_check_interval", 0);
+        let recover_interval_sec = int_option(section, "fail_policy_recover_interval", 0);
+        let last_probe_at = int(prev.last_probe_at || prev.updated_at || 0);
+
+        if (prev_failed && recover_interval_sec > 0 && last_probe_at > 0 && (now - last_probe_at) < recover_interval_sec) {
+            next_map[name] = prev;
+            continue;
+        }
+        if (!prev_failed && check_interval_sec > 0 && last_probe_at > 0 && (now - last_probe_at) < check_interval_sec) {
+            next_map[name] = prev;
+            continue;
+        }
+
+        let expected_status = trim(option(section, "fail_policy_expected_status", ""));
+        let cooldown_ready = cooldown_sec <= 0 || prev_transition_at <= 0 || (now - prev_transition_at) >= cooldown_sec;
+        let probe = probe_tag_urls(name + "-out", urls, sec_timeout, expected_status);
+
+        if (probe.ok) {
             if (prev_failed) {
-                state_changed = true;
-                log_message("section " + name + " recovered from fail_policy=" + policy, "info");
-                send_notification("✅ *Fail Policy*: секция `" + name + "` восстановилась (политика `" + policy + "` снята).");
+                let recover_streak = prev_recover_streak + 1;
+                if (recover_streak >= recover_threshold && cooldown_ready) {
+                    next_map[name] = {
+                        streak: 0,
+                        recover_streak: 0,
+                        failed: false,
+                        policy: policy,
+                        last_reason: "recovered",
+                        last_transition_at: now,
+                        last_probe_at: now,
+                        updated_at: now
+                    };
+                    state_changed = true;
+                    log_message("section " + name + " recovered from fail_policy=" + policy + " after " + as_string(recover_streak) + " successful probes", "info");
+                    send_notification("✅ *Fail Policy*: секция `" + name + "` восстановилась (политика `" + policy + "` снята).");
+                } else {
+                    next_map[name] = {
+                        streak: prev_streak,
+                        recover_streak: recover_streak,
+                        failed: true,
+                        policy: policy,
+                        last_reason: cooldown_ready ? "recovering" : "cooldown",
+                        last_transition_at: prev_transition_at,
+                        last_probe_at: now,
+                        updated_at: now
+                    };
+                }
+            } else {
+                next_map[name] = {
+                    streak: 0,
+                    recover_streak: 0,
+                    failed: false,
+                    policy: policy,
+                    last_reason: "ok",
+                    last_transition_at: prev_transition_at,
+                    last_probe_at: now,
+                    updated_at: now
+                };
             }
         } else {
             let streak = prev_streak + 1;
-            let failed = prev_failed || streak >= max_streak;
+            let should_fail = prev_failed || (streak >= sec_threshold && cooldown_ready);
+            let reason = "probe_failed:" + as_string(probe.failed_url || "default");
+            if (!prev_failed && should_fail && check_direct) {
+                let direct_probe = probe_tag_urls("direct-out", urls, sec_timeout, expected_status);
+                if (!direct_probe.ok) {
+                    should_fail = false;
+                    reason = "direct_unreachable:" + as_string(direct_probe.failed_url || "default");
+                    log_message("section " + name + " probe failed (" + as_string(probe.failed_url) + "), but direct-out is also unreachable; skipping switch to direct", "warn");
+                }
+            }
+            let transition_at = (!prev_failed && should_fail) ? now : prev_transition_at;
             next_map[name] = {
                 streak: streak,
-                failed: failed,
+                recover_streak: 0,
+                failed: should_fail,
                 policy: policy,
-                updated_at: time()
+                failed_url: probe.failed_url,
+                last_reason: reason,
+                last_transition_at: transition_at,
+                last_probe_at: now,
+                updated_at: now
             };
-            if (!prev_failed && failed) {
+            if (!prev_failed && should_fail) {
                 state_changed = true;
-                log_message("section " + name + " entered fail_policy=" + policy + " after " + as_string(streak) + " failed probes", "warn");
+                log_message("section " + name + " entered fail_policy=" + policy + " after " + as_string(streak) + " failed probes (" + as_string(probe.failed_url) + ")", "warn");
                 send_notification("⚠️ *Fail Policy*: секция `" + name + "` недоступна, применена политика `" + policy + "`.");
             }
         }
@@ -227,7 +367,7 @@ function check_section_fail_policies() {
         write_section_fail_state(next_map);
 
     if (state_changed && getenv("TACHYON_FAILOVER_SKIP_RELOAD") != "1") {
-        command_success_from_args([ TACHYON_BIN, "reload" ]);
+        command_success_from_args([ TACHYON_BIN, "reload", "section_fail_policy" ]);
     }
 }
 

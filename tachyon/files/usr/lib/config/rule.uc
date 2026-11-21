@@ -61,7 +61,7 @@ function prefixed_domain_kind_value(value) {
     let body = value;
     if (colon > 0) {
         let candidate = domain_config.ascii_lower(substr(value, 0, colon));
-        if (candidate == "full" || candidate == "keyword" || candidate == "regex") {
+        if (candidate == "full" || candidate == "domain" || candidate == "keyword" || candidate == "regex") {
             prefix = candidate;
             body = substr(value, colon + 1);
         }
@@ -77,7 +77,7 @@ function prefixed_domain_kind_value(value) {
     if (body == "" || substr(body, 0, 2) == "//" || substr(body, 0, 1) == "#")
         return null;
 
-    if (prefix == "") {
+    if (prefix == "" || prefix == "domain") {
         let normalized = domain_config.suffix_to_ascii(body);
         return normalized == null ? null : { kind: "domain_suffix", value: normalized };
     }
@@ -97,8 +97,15 @@ function prefixed_domain_kind_value(value) {
 }
 
 function prefixed_domain_value(value, requested_kind) {
-    let normalized = prefixed_domain_kind_value(value);
+    value = trim(as_string(value));
+    if (value == "")
+        return null;
+
     requested_kind = as_string(requested_kind);
+    if (requested_kind != "domain_suffix" && index(value, ":") <= 0)
+        return null;
+
+    let normalized = prefixed_domain_kind_value(value);
 
     return normalized != null && normalized.kind == requested_kind ? normalized.value : null;
 }
@@ -154,8 +161,14 @@ function condition_text_csv_value(value, kind) {
 }
 
 function legacy_condition_csv_value(kind, text_mode, conditions_text_mode, text_value, list_value) {
-    if (int(text_mode || 0) == 1 || int(conditions_text_mode || 0) == 1)
+    if (int(text_mode || 0) == 1)
         return condition_text_csv_value(text_value, kind);
+
+    if (int(conditions_text_mode || 0) == 1) {
+        let text_csv = condition_text_csv_value(text_value, kind);
+        if (text_csv != "")
+            return text_csv;
+    }
 
     list_value = as_string(list_value);
     if (list_value != "")
@@ -171,9 +184,16 @@ function legacy_condition_csv_value(kind, text_mode, conditions_text_mode, text_
 }
 
 function combined_domain_csv_value(value, requested_kind) {
+    value = as_string(value);
+    if (value == "")
+        return "";
+    requested_kind = as_string(requested_kind);
+    if (requested_kind != "domain_suffix" && index(value, ":") < 0)
+        return "";
+
     let result = [];
 
-    for (let item in split(as_string(value), ",")) {
+    for (let item in split(value, ",")) {
         let normalized = prefixed_domain_value(item, requested_kind);
         if (normalized != null)
             push(result, normalized);
@@ -183,6 +203,13 @@ function combined_domain_csv_value(value, requested_kind) {
 }
 
 function combined_domain_text_csv_value(value, requested_kind) {
+    value = as_string(value);
+    if (value == "")
+        return "";
+    requested_kind = as_string(requested_kind);
+    if (requested_kind != "domain_suffix" && index(value, ":") < 0)
+        return "";
+
     let result = [];
 
     for (let item in text_list_values(value, "comma-space")) {
@@ -296,8 +323,52 @@ let community_subnet_lists = {
     digitalocean: true,
     cloudfront: true,
     discord: true,
-    roblox: true
+    roblox: true,
+    google_meet: true,
+    zoom_teams: true,
+    discord_voice: true,
+    callofduty: true,
+    game_backends: true,
+    cs2_dota2: true,
+    doh_dot_dns: true,
+    vps_clouds: true,
+    et_spamhaus_block: true,
+    hagezi_tif_ip_block: true,
+    botnet_attackers_ip_block: true,
+    antifilter: true,
+    refilter: true,
+    ru_blocked: true,
+    ru_blocked_all: true,
+    ru_domains: true,
+    ru_whitelist: true,
+    fastly: true,
+    games_all: true,
+    geoip_cn: true,
+    geoip_ru: true,
+    geoip_us: true,
+    netflix: true,
+    origin: true,
+    pubg: true,
+    tor: true,
+    antifilter_community: true,
+    runetfreedom_blocked: true,
+    runetfreedom_blocked_all: true,
+    roscomvpn_whitelist: true,
+    roscomvpn_ru: true
 };
+
+let community_subnet_aliases = {
+    antifilter_community: "antifilter",
+    runetfreedom_blocked: "ru_blocked",
+    runetfreedom_blocked_all: "ru_blocked_all",
+    roscomvpn_whitelist: "ru_whitelist",
+    roscomvpn_ru: "ru_domains"
+};
+
+function canonical_community_subnet_service(value) {
+    let key = as_string(value);
+    return community_subnet_aliases[key] || key;
+}
 
 function community_service_has_subnet_list(value) {
     return community_subnet_lists[as_string(value)] == true;
@@ -334,6 +405,7 @@ return {
     legacy_condition_csv_value,
     rule_condition_csv_value,
     rule_ports_csv_value,
+    canonical_community_subnet_service,
     community_service_has_subnet_list,
     filter_community_subnet_lists_value,
     has_community_subnet_list

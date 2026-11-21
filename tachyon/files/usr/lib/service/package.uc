@@ -12,14 +12,15 @@ function env(name, fallback) {
 }
 
 const CONFIG_NAME = env("TACHYON_CONFIG_NAME", "tachyon");
+const SERVICE_NAME = env("TACHYON_SERVICE_NAME", "tachyon");
 const RT_TABLES_PATH = env("TACHYON_RT_TABLES", "/etc/iproute2/rt_tables");
 const BIN_PATH = env("TACHYON_BIN", "/usr/bin/tachyon");
 const INIT_PATH = env("TACHYON_INIT", "/etc/init.d/tachyon");
 const DNS_APPLY_UC = env("TACHYON_DNS_APPLY_UC", "/usr/lib/tachyon/dns/apply.uc");
-const SING_BOX_INIT = env("TACHYON_SING_BOX_INIT", "/etc/init.d/tachyon-core");
-const SING_BOX_BIN = env("TACHYON_SING_BOX_BIN", "/usr/bin/tachyon-core");
-const SING_BOX_CRONET = env("TACHYON_SING_BOX_CRONET", "/usr/lib/libcronet.so");
-const SING_BOX_MANAGED_MARKER = env("SB_MANAGED_SERVICE_MARKER", "Tachyon managed sing-box service for binary variants");
+const TACHYON_CORE_INIT = env("TACHYON_CORE_INIT", "/etc/init.d/tachyon-core");
+const TACHYON_CORE_BIN = env("TACHYON_CORE_BIN", "/usr/bin/tachyon-core");
+const TACHYON_CORE_CRONET = env("TACHYON_CORE_CRONET", "/usr/lib/libcronet.so");
+const TACHYON_CORE_MANAGED_MARKER = env("TACHYON_CORE_MANAGED_SERVICE_MARKER", "Tachyon managed tachyon-core service");
 const PACKAGE_UPGRADE_STATE = env("TACHYON_PACKAGE_UPGRADE_STATE", "/tmp/tachyon-package-was-running");
 const RUNTIME_STATE_DIR = env("TACHYON_RUNTIME_STATE_DIR", "/var/run/tachyon");
 const COMPONENT_ACTION_DIR = env("TACHYON_UI_COMPONENT_ACTION_DIR", RUNTIME_STATE_DIR + "/component-actions");
@@ -34,7 +35,7 @@ const PACKAGE_TEST_MODE = env("TACHYON_PACKAGE_TEST_MODE", "") != "";
 // for a quarter of an hour. Every such call is bounded instead.
 const HOOK_COMMAND_TIMEOUT = env("TACHYON_HOOK_COMMAND_TIMEOUT", "20");
 // Starting the service legitimately takes longer than probing or stopping it —
-// sing-box comes up, nft rules load, subscriptions may be re-read — so it gets
+// tachyon-core comes up, nft rules load, subscriptions may be re-read — so it gets
 // its own, larger budget. Still bounded: postinst must end.
 const HOOK_START_TIMEOUT = env("TACHYON_HOOK_START_TIMEOUT", "180");
 
@@ -42,15 +43,7 @@ let shell_quote = common.shell_quote;
 
 let command_from_args = common.command_from_args;
 
-function normalize_status(status) {
-    status = int(status);
-    if (status == -1)
-        return 255;
-    let signal = status & 127;
-    if (signal != 0)
-        return 128 + signal;
-    return (status >> 8) & 255;
-}
+let normalize_status = common.normalize_status;
 
 function command_success_from_args(args) {
     return normalize_status(system(command_from_args(args) + " >/dev/null 2>&1")) == 0;
@@ -81,7 +74,9 @@ function timeout_prefix() {
 // here already treats as "could not do it, carry on" — the alternative is an
 // upgrade the package manager rolls back.
 function bounded_command_success_from_args(args, seconds) {
-    seconds = as_string(seconds) != "" ? as_string(seconds) : HOOK_COMMAND_TIMEOUT;
+    seconds = as_string(seconds || "");
+    if (seconds == "")
+        seconds = HOOK_COMMAND_TIMEOUT;
 
     let prefix = timeout_prefix();
     if (length(prefix) == 0)
@@ -109,7 +104,7 @@ function kill_matching_command(grep_args) {
         "__anc=\"$__anc$__p \"; " +
         "__p=$(awk '{ sub(/.*\\) /, \"\"); print $2 }' \"/proc/$__p/stat\" 2>/dev/null); " +
         "done; " +
-        "ps 2>/dev/null | grep " + grep_args + " | grep -v grep | grep -v -E 'action[.]uc|updates[.]uc' | awk '{print $1}' | " +
+        "ps 2>/dev/null | grep " + grep_args + " | grep -v grep | grep -v -E 'action[.]uc|updates[.]uc|package[.]uc|migration[.]uc|package_postinst|package_prerm|luci_postinst' | awk '{print $1}' | " +
         "while read _pid; do case \"$__anc\" in *\" $_pid \"*) continue;; esac; " +
         "kill -9 \"$_pid\" 2>/dev/null; done; true";
 }
@@ -167,16 +162,16 @@ function restore_dnsmasq_if_needed() {
         bounded_command_success_from_args([ "ucode", DNS_APPLY_UC, "failsafe-restore" ]);
 }
 
-function remove_managed_sing_box() {
-    let data = fs.readfile(SING_BOX_INIT);
-    if (data == null || index(data, SING_BOX_MANAGED_MARKER) < 0)
+function remove_managed_core() {
+    let data = fs.readfile(TACHYON_CORE_INIT);
+    if (data == null || index(data, TACHYON_CORE_MANAGED_MARKER) < 0)
         return;
 
-    bounded_command_success_from_args([ SING_BOX_INIT, "stop" ]);
-    bounded_command_success_from_args([ SING_BOX_INIT, "disable" ]);
-    unlink_if_exists(SING_BOX_INIT);
-    unlink_if_exists(SING_BOX_BIN);
-    unlink_if_exists(SING_BOX_CRONET);
+    bounded_command_success_from_args([ TACHYON_CORE_INIT, "stop" ]);
+    bounded_command_success_from_args([ TACHYON_CORE_INIT, "disable" ]);
+    unlink_if_exists(TACHYON_CORE_INIT);
+    unlink_if_exists(TACHYON_CORE_BIN);
+    unlink_if_exists(TACHYON_CORE_CRONET);
 }
 
 function remember_upgrade_state(action) {
@@ -219,21 +214,191 @@ function prerm_cleanup(action) {
 
     remember_upgrade_state(action);
     if (!PACKAGE_TEST_MODE) {
-        // Stop the service using BIN_PATH directly (bypasses rc.common flock)
-        bounded_command_success_from_args([BIN_PATH, "stop"]);
-        bounded_command_success_from_args([INIT_PATH, "stop"]);
+        // Stop the service using BIN_PATH directly (bypasses rc.common flock);
+        // only fall back to INIT_PATH when BIN_PATH is unavailable or fails.
+        if (!bounded_command_success_from_args([BIN_PATH, "stop"]))
+            bounded_command_success_from_args([INIT_PATH, "stop"]);
 
         // Kill any remaining tachyon processes, minus this hook's own ancestors.
         system(kill_matching_command("-F '" + BIN_PATH + "'"));
-        restore_dnsmasq_if_needed();
+        if (as_string(action) != "upgrade" ||
+            uci_core.get(CONFIG_NAME + ".settings.keep_dns_on_upgrade") == "0")
+            restore_dnsmasq_if_needed();
     }
     remove_rt_tables_entry(); // best-effort
     return true;
 }
 
+function purge_legacy_steer() {
+    for (let svc in [ "/etc/init.d/tachyon-steer-zapret", "/etc/init.d/steer" ]) {
+        if (path_exists(svc)) {
+            bounded_command_success_from_args([ svc, "stop" ]);
+            bounded_command_success_from_args([ svc, "disable" ]);
+            unlink_if_exists(svc);
+        }
+    }
+    for (let path in (fs.glob("/etc/rc.d/*steer*") || []))
+        unlink_if_exists(path);
+    for (let bin in [ "/usr/sbin/steer", "/usr/bin/steer" ])
+        unlink_if_exists(bin);
+    command_success_from_args([ "rm", "-rf", "/etc/steer", "/usr/lib/tachyon/steer" ]);
+    for (let st in (fs.glob(RUNTIME_STATE_DIR + "/*steer*") || []))
+        unlink_if_exists(st);
+    command_success_from_args([ "nft", "delete", "table", "inet", "steer" ]);
+}
+
+function backup_external_config_path(comp, src_rel, root_prefix) {
+    root_prefix = as_string(root_prefix || "");
+    let src_path = root_prefix + as_string(src_rel);
+    if (!path_exists(src_path))
+        return;
+
+    let basename = replace(as_string(src_rel), /^.*\//, "");
+    if (basename == "")
+        return;
+
+    let dest_dir = root_prefix + "/etc/tachyon/external-configs-backup/" + as_string(comp);
+    command_success_from_args([ "mkdir", "-p", dest_dir ]);
+    let dest = dest_dir + "/" + basename;
+    if (!path_exists(dest))
+        command_success_from_args([ "cp", "-a", src_path, dest ]);
+}
+
+function backup_external_configs(root_prefix) {
+    let sources = {
+        zapret: [ "/etc/config/zapret", "/opt/zapret/config", "/opt/zapret/ipset" ],
+        zapret2: [ "/etc/config/zapret2", "/opt/zapret2/config", "/opt/zapret2/ipset" ],
+        byedpi: [ "/etc/config/byedpi", "/etc/byedpi" ],
+        wdtt: [ "/etc/config/wdtt", "/etc/wdtt" ],
+        qwdtt: [ "/etc/qwdtt" ],
+        olcrtc: [ "/etc/config/olcrtc", "/etc/olcrtc" ],
+        "sing-box": [ "/etc/sing-box/config.json", "/etc/config/sing-box" ]
+    };
+    for (let comp in keys(sources)) {
+        for (let src_rel in sources[comp])
+            backup_external_config_path(comp, src_rel, root_prefix);
+    }
+}
+
+function has_tachyon_managed_init(init_rel, root_prefix) {
+    let init_path = as_string(root_prefix || "") + as_string(init_rel);
+    let init_data = fs.readfile(init_path);
+    return init_data != null && index(init_data, "Tachyon managed") >= 0;
+}
+
+function is_tachyon_managed_component(svc, comp_marker, root_prefix) {
+    root_prefix = as_string(root_prefix || "");
+    svc = as_string(svc);
+    comp_marker = as_string(comp_marker || svc);
+
+    if (has_tachyon_managed_init("/etc/init.d/" + svc, root_prefix))
+        return true;
+    if (comp_marker != svc && has_tachyon_managed_init("/etc/init.d/" + comp_marker, root_prefix))
+        return true;
+
+    let marker_names = [ comp_marker ];
+    let alt_marker = replace(svc, /-/g, "_");
+    if (alt_marker != comp_marker)
+        push(marker_names, alt_marker);
+
+    for (let name in marker_names) {
+        if (path_exists(root_prefix + "/etc/tachyon/component-backups/" + name))
+            return true;
+        let run_st = fs.stat(root_prefix + "/var/run/tachyon/" + name);
+        if (run_st != null && as_string(run_st.type || "") == "directory")
+            return true;
+    }
+    return false;
+}
+
+function selective_cleanup_legacy_components(root_prefix) {
+    root_prefix = as_string(root_prefix || "");
+    let mock_mode = root_prefix != "";
+
+    backup_external_configs(root_prefix);
+
+    let ts_init = root_prefix + "/etc/init.d/tailscale";
+    if (has_tachyon_managed_init("/etc/init.d/tailscale", root_prefix)) {
+        if (!mock_mode) {
+            bounded_command_success_from_args([ ts_init, "stop" ], HOOK_COMMAND_TIMEOUT);
+            bounded_command_success_from_args([ ts_init, "disable" ], HOOK_COMMAND_TIMEOUT);
+        }
+        for (let rc in (fs.glob(root_prefix + "/etc/rc.d/*tailscale*") || []))
+            fs.unlink(rc);
+        unlink_if_exists(ts_init);
+        let ts_rm = [ "rm", "-rf", root_prefix + "/var/run/tachyon/tailscale", root_prefix + "/etc/tachyon/component-backups/tailscale" ];
+        for (let p in (fs.glob(root_prefix + "/etc/tachyon/tailscale/*/native") || []))
+            push(ts_rm, p);
+        command_success_from_args(ts_rm);
+        if (!mock_mode)
+            command_success_from_args([ "nft", "delete", "table", "inet", "tachyon_tailscale" ]);
+    }
+
+    let components = [
+        { svc: "zapret", marker: "zapret", procs: [ "nfqws" ], nfts: [ "zapret" ],
+          paths: [ "/usr/bin/nfqws", "/opt/zapret", "/etc/config/zapret", "/var/run/tachyon/zapret", "/etc/tachyon/component-backups/zapret", "/var/run/tachyon/component-update-checks/zapret.json" ],
+          globs: [ "/var/run/tachyon/zapret*" ] },
+        { svc: "zapret2", marker: "zapret2", procs: [ "nfqws2" ], nfts: [ "zapret2" ],
+          paths: [ "/usr/bin/nfqws2", "/opt/zapret2", "/etc/config/zapret2", "/etc/tachyon/component-backups/zapret2", "/var/run/tachyon/component-update-checks/zapret2.json" ],
+          globs: [] },
+        { svc: "byedpi", marker: "byedpi", procs: [ "ciadpi" ], nfts: [],
+          paths: [ "/usr/bin/ciadpi", "/etc/config/byedpi", "/var/run/tachyon/byedpi", "/etc/tachyon/component-backups/byedpi", "/var/run/tachyon/component-update-checks/byedpi.json" ],
+          globs: [] },
+        { svc: "wdtt-client", marker: "wdtt", procs: [ "wdtt", "qwdtt-client" ], nfts: [],
+          paths: [ "/usr/bin/wdtt", "/usr/bin/qwdtt-client", "/usr/sbin/wdtt-genlists", "/usr/sbin/wdtt-resolve", "/etc/qwdtt", "/etc/wdtt", "/etc/config/wdtt", "/var/run/tachyon/wdtt", "/var/run/qwdtt", "/etc/tachyon/component-backups/wdtt", "/var/run/tachyon/component-update-checks/wdtt.json" ],
+          globs: [] },
+        { svc: "qwdtt", marker: "wdtt", procs: [ "wdtt", "qwdtt-client" ], nfts: [],
+          paths: [ "/usr/bin/wdtt", "/usr/bin/qwdtt-client", "/usr/sbin/wdtt-genlists", "/usr/sbin/wdtt-resolve", "/etc/qwdtt", "/etc/wdtt", "/etc/config/wdtt", "/var/run/tachyon/wdtt", "/var/run/qwdtt", "/etc/tachyon/component-backups/wdtt", "/var/run/tachyon/component-update-checks/wdtt.json" ],
+          globs: [] },
+        { svc: "olcrtc", marker: "olcrtc", procs: [ "olcrtc" ], nfts: [],
+          paths: [ "/usr/bin/olcrtc", "/etc/olcrtc", "/etc/config/olcrtc", "/var/run/tachyon/olcrtc", "/etc/tachyon/component-backups/olcrtc", "/var/run/tachyon/component-update-checks/olcrtc.json" ],
+          globs: [] }
+    ];
+
+    for (let item in components) {
+        if (!is_tachyon_managed_component(item.svc, item.marker, root_prefix))
+            continue;
+
+        let svc_init = root_prefix + "/etc/init.d/" + item.svc;
+        for (let rc in (fs.glob(root_prefix + "/etc/rc.d/*" + item.svc + "*") || []))
+            fs.unlink(rc);
+        if (path_exists(svc_init)) {
+            if (!mock_mode) {
+                bounded_command_success_from_args([ svc_init, "stop" ], HOOK_COMMAND_TIMEOUT);
+                bounded_command_success_from_args([ svc_init, "disable" ], HOOK_COMMAND_TIMEOUT);
+            }
+            unlink_if_exists(svc_init);
+        }
+
+        if (!mock_mode) {
+            for (let proc in item.procs)
+                command_success_from_args([ "killall", "-9", proc ]);
+            for (let tbl in item.nfts) {
+                for (let fam in [ "inet", "ip", "ip6" ])
+                    command_success_from_args([ "nft", "delete", "table", fam, tbl ]);
+            }
+        }
+
+        let rm_cmd = [ "rm", "-rf" ];
+        for (let rel_p in item.paths)
+            push(rm_cmd, root_prefix + rel_p);
+        for (let rel_g in item.globs) {
+            for (let matched in (fs.glob(root_prefix + rel_g) || []))
+                push(rm_cmd, matched);
+        }
+        if (length(rm_cmd) > 2)
+            command_success_from_args(rm_cmd);
+    }
+}
+
 function postinst_restore() {
     if (env("IPKG_INSTROOT", "") != "")
         return true;
+
+    if (!PACKAGE_TEST_MODE) {
+        purge_legacy_steer();
+        selective_cleanup_legacy_components("");
+    }
 
     let should_restore = path_exists(PACKAGE_UPGRADE_STATE);
     unlink_if_exists(PACKAGE_UPGRADE_STATE);
@@ -284,8 +449,19 @@ function remove_luci_index_cache() {
 // existed, got no message and no stderr, and rendered its "Failed to execute"
 // fallback over an update that had in fact succeeded. Only finished results are
 // stale; a job still marked running must survive to write its own result.
+function component_job_state_for_entry(path) {
+    path = as_string(path);
+    if (substr(path, -9) == ".json.pid")
+        return substr(path, 0, length(path) - 4);
+    if (substr(path, -9) == ".out.json")
+        return substr(path, 0, length(path) - 9) + ".json";
+    if (substr(path, -4) == ".log" || substr(path, -4) == ".out")
+        return substr(path, 0, length(path) - 4) + ".json";
+    return path;
+}
+
 function component_job_is_running(path) {
-    let data = fs.readfile(path);
+    let data = fs.readfile(component_job_state_for_entry(path));
     if (data == null)
         return false;
     return match(as_string(data), /"running"[ \t]*:[ \t]*(true|1)/) != null;
@@ -341,11 +517,21 @@ function ensure_ucitrack_entry() {
 function luci_postinst() {
     remove_luci_index_cache();
     remove_component_update_cache();
+    for (let js_file in (fs.glob("/www/luci-static/resources/view/tachyon/*.js") || []))
+        command_success_from_args([ "touch", js_file ]);
+    command_success_from_args([ "touch", "/www/luci-static/resources/luci.js" ]);
+    command_success_from_args([ "touch", "/www/luci-static/resources/view/tachyon" ]);
+    command_success_from_args([ "touch", "/www/luci-static/resources" ]);
     if (!PACKAGE_TEST_MODE) {
         ensure_guest_mode_section();
         ensure_ucitrack_entry();
         if (path_exists("/etc/init.d/rpcd"))
             command_success_from_args([ "/etc/init.d/rpcd", "reload" ]);
+        if (path_exists(BIN_PATH)) {
+            let warm_cmd = command_from_args([ BIN_PATH, "get_ui_capabilities" ]) + " >/dev/null 2>&1; " +
+                command_from_args([ BIN_PATH, "get_system_info" ]) + " >/dev/null 2>&1";
+            common.command_status(common.background_command(warm_cmd));
+        }
         command_success_from_args([ "logger", "-t", "tachyon", "[info] Package defaults applied" ]);
     }
     return true;
@@ -361,7 +547,16 @@ else if (mode == "remove-rt-tables-entry")
     exit(remove_rt_tables_entry() ? 0 : 1);
 else if (mode == "luci-postinst")
     exit(luci_postinst() ? 0 : 1);
+else if (mode == "selective-cleanup-test") {
+    let test_root = trim(as_string(ARGV[1] || ""));
+    if (test_root == "" || test_root == "/") {
+        warn("selective-cleanup-test requires a dedicated mock root path\n");
+        exit(1);
+    }
+    selective_cleanup_legacy_components(test_root);
+    exit(0);
+}
 else {
-    warn("Usage: service/package.uc <prerm|postinst|remove-rt-tables-entry|luci-postinst>\n");
+    warn("Usage: service/package.uc <prerm|postinst|remove-rt-tables-entry|luci-postinst|selective-cleanup-test>\n");
     exit(1);
 }

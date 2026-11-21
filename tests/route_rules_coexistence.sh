@@ -72,7 +72,7 @@ for (let r in rules) {
 }
 
 if (found_combined) {
-    print("ERROR: found merged domain_suffix AND rule_set in single rule! Sing-box treats this as logical AND!\n");
+    print("ERROR: found merged domain_suffix AND rule_set in single rule! tachyon-core treats this as logical AND!\n");
     exit(1);
 }
 if (!found_domain_only) {
@@ -129,8 +129,8 @@ for (let rs in rulesets) {
 }
 ' || fail "DPI-out must never be set as download_detour"
 
-# 3. Verify zapret section generates resolve action for rulesets and domains
-cat >"$WORK_DIR/fixture_zapret_resolve.json" <<'JSON'
+# 3. Verify desync section generates resolve action for rulesets and domains
+cat >"$WORK_DIR/fixture_desync_resolve.json" <<'JSON'
 {
   "settings": {
     ".name": "settings",
@@ -142,42 +142,71 @@ cat >"$WORK_DIR/fixture_zapret_resolve.json" <<'JSON'
   },
   "section": [
     {
-      ".name": "zapret",
+      ".name": "desync_sec",
       ".type": "section",
       "enabled": "1",
-      "action": "zapret",
+      "action": "desync",
+      "desync_preset": "auto",
       "community_lists": [ "youtube" ]
+    },
+    {
+      ".name": "desync_routed",
+      ".type": "section",
+      "enabled": "1",
+      "action": "desync",
+      "desync_preset": "auto",
+      "domain_suffix": [ "ytimg.com" ],
+      "routed_dns_enabled": "1",
+      "routed_dns_type": "udp",
+      "routed_dns_server": "1.1.1.1"
     }
   ]
 }
 JSON
 
-output_zapret_resolve="$WORK_DIR/out_zapret_resolve.json"
-mkdir -p "$output_zapret_resolve.section-cache" "$output_zapret_resolve.rulesets"
-ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
-  "$WORK_DIR/fixture_zapret_resolve.json" "$output_zapret_resolve" "127.0.0.1" "0" "1"
+output_desync_resolve="$WORK_DIR/out_desync_resolve.json"
+mkdir -p "$output_desync_resolve.section-cache" "$output_desync_resolve.rulesets"
+TACHYON_CORE_VERSION_OVERRIDE="0.5.7" ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+  "$WORK_DIR/fixture_desync_resolve.json" "$output_desync_resolve" "127.0.0.1" "0" "1"
 
 ucode -e '
 let fs = require("fs");
-let raw = fs.readfile("'"$output_zapret_resolve"'");
+let raw = fs.readfile("'"$output_desync_resolve"'");
 let cfg = json(raw);
 let rules = cfg.route.rules || [];
 let found_resolve = false;
+let found_routed_resolve = false;
 let found_route = false;
 for (let r in rules) {
-    if (r.action == "resolve" && r.rule_set)
+    if (r.action == "resolve" && r.rule_set) {
+        if (r.server != "dns-server") {
+            print("ERROR: desync resolve rule expected server=dns-server, got " + r.server + "\n");
+            exit(3);
+        }
         found_resolve = true;
-    if (r.action == "route" && r.outbound == "zapret-out")
+    }
+    if (r.action == "resolve" && r.domain_suffix) {
+        if (r.server != "desync_routed-routed-dns-server") {
+            print("ERROR: desync routed resolve rule expected server=desync_routed-routed-dns-server, got " + r.server + "\n");
+            exit(4);
+        }
+        found_routed_resolve = true;
+    }
+    if (r.action == "route" && r.outbound == "desync_sec-out")
         found_route = true;
 }
 if (!found_resolve) {
-    print("ERROR: zapret section did not generate action: resolve rule!\n");
+    print("ERROR: desync section did not generate action: resolve rule!\n");
     exit(1);
 }
+if (!found_routed_resolve) {
+    print("ERROR: desync_routed section did not generate routed DNS resolve rule!\n");
+    exit(5);
+}
 if (!found_route) {
-    print("ERROR: zapret section did not generate action: route rule to zapret-out!\n");
+    print("ERROR: desync section did not generate action: route rule to desync_sec-out!\n");
     exit(2);
 }
-' || fail "zapret section must generate resolve rule before route rule"
+' || fail "desync section must generate resolve rule before route rule"
 
 printf "Route rules coexistence and detour checks passed\n"

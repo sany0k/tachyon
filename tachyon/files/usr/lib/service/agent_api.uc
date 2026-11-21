@@ -38,6 +38,44 @@ let write_json = common.write_json;
 
 let command_output = common.command_output;
 
+let _sb_mod = null;
+function sb_mod() {
+    if (_sb_mod == null) {
+        try { _sb_mod = require("service.support_bundle"); } catch (e) { _sb_mod = false; }
+    }
+    return _sb_mod || null;
+}
+
+function redact_text(str) {
+    if (str == null || str == "") return "";
+    let s = as_string(str);
+    let sb = sb_mod();
+    if (sb && sb.redact_for_llm)
+        return sb.redact_for_llm(s);
+    if (sb && sb.redact_string)
+        return sb.redact_string(s);
+    return s;
+}
+
+function redact_obj(val) {
+    let sb = sb_mod();
+    if (sb && sb.redact_object)
+        return sb.redact_object(val);
+    let t = type(val);
+    if (t == "string") return redact_text(val);
+    if (t == "array") {
+        let out = [];
+        for (let item in val) push(out, redact_obj(item));
+        return out;
+    }
+    if (t == "object") {
+        let out = {};
+        for (let k, v in val) out[k] = redact_obj(v);
+        return out;
+    }
+    return val;
+}
+
 function ok(data) {
     let result = { success: true };
     for (let k in keys(data)) result[k] = data[k];
@@ -52,12 +90,7 @@ function command_capture(command) {
     let pipe = fs.popen(command, "r");
     if (!pipe) return { status: 1, output: "" };
     let data = pipe.read("all");
-    let status = pipe.close();
-    status = int(status);
-    if (status == -1) status = 255;
-    let sig = status & 127;
-    if (sig != 0) status = 128 + sig;
-    else status = (status >> 8) & 255;
+    let status = common.normalize_status(pipe.close());
     return { status: status, output: data == null ? "" : as_string(data) };
 }
 
@@ -102,14 +135,14 @@ function check_write_auth(bearer) {
 function handle_health() {
     let ai_raw = fs.readfile("/tmp/tachyon_ai_status.json") || "{}";
     let ai = parse_json_safe(ai_raw) || {};
-    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
+    let core_pid = trim(command_output("pidof tachyon-core"));
     let wd_pid = trim(fs.readfile("/var/run/tachyon_watchdog.pid") || "");
     ok({
-        status:    ai.status || (sb_pid != "" ? "healthy" : "critical"),
-        singbox:   sb_pid != "" ? "running" : "stopped",
-        watchdog:  (wd_pid != "" && fs.stat("/proc/" + wd_pid) != null) ? "running" : "stopped",
-        incidents: ai.incidents_resolved_total || 0,
-        timestamp: time()
+        status:       ai.status || (core_pid != "" ? "healthy" : "critical"),
+        tachyon_core: core_pid != "" ? "running" : "stopped",
+        watchdog:     (wd_pid != "" && fs.stat("/proc/" + wd_pid) != null) ? "running" : "stopped",
+        incidents:    ai.incidents_resolved_total || 0,
+        timestamp:    time()
     });
 }
 
@@ -132,7 +165,7 @@ function handle_logs() {
     let lines = [];
     for (let line in split(raw, "\n")) {
         line = trim(as_string(line));
-        if (line != "") push(lines, line);
+        if (line != "") push(lines, redact_text(line));
     }
     ok({ lines: lines });
 }
@@ -169,7 +202,7 @@ function handle_snapshot() {
     if (tachyon_ver == "")
         tachyon_ver = trim(command_output("apk list tachyon 2>/dev/null | head -1"));
 
-    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
+    let core_pid = trim(command_output("pidof tachyon-core"));
     let wd_pid = trim(fs.readfile("/var/run/tachyon_watchdog.pid") || "");
     let wd_ok = wd_pid != "" && fs.stat("/proc/" + wd_pid) != null;
 
@@ -183,17 +216,47 @@ function handle_snapshot() {
     let logs = [];
     for (let line in split(logs_raw, "\n")) {
         line = trim(as_string(line));
-        if (line != "") push(logs, line);
+        if (line != "") push(logs, redact_text(line));
     }
 
     let sections = [];
     let section_objs = uci.section_objects(CONFIG_NAME, "section");
     for (let s in section_objs) {
         push(sections, {
-            name:    s[".name"],
-            label:   s.label || s[".name"],
-            enabled: s.enabled == "1",
-            action:  s.action || "unknown"
+            name:                 s[".name"],
+            label:                s.label || s[".name"],
+            enabled:              s.enabled != "0",
+            action:               s.action || "unknown",
+            condition_refs:       s.condition_refs || [],
+            outbound_source_refs: s.outbound_source_refs || [],
+            balancer_refs:        s.balancer_refs || [],
+            group_members:        s.group_members || []
+        });
+    }
+    let conditions = [];
+    for (let c_obj in uci.section_objects(CONFIG_NAME, "condition")) {
+        push(conditions, {
+            name:    c_obj[".name"],
+            label:   c_obj.name || c_obj.label || c_obj[".name"],
+            enabled: c_obj.enabled != "0"
+        });
+    }
+    let outbound_sources = [];
+    for (let src_obj in uci.section_objects(CONFIG_NAME, "outbound_source")) {
+        push(outbound_sources, {
+            name:        src_obj[".name"],
+            label:       src_obj.name || src_obj.label || src_obj[".name"],
+            enabled:     src_obj.enabled != "0",
+            source_type: src_obj.source_type || "subscription"
+        });
+    }
+    let balancers = [];
+    for (let bal_obj in uci.section_objects(CONFIG_NAME, "balancer")) {
+        push(balancers, {
+            name:          bal_obj[".name"],
+            label:         bal_obj.name || bal_obj.label || bal_obj[".name"],
+            enabled:       bal_obj.enabled != "0",
+            balancer_type: bal_obj.balancer_type || "urltest"
         });
     }
 
@@ -206,8 +269,8 @@ function handle_snapshot() {
             timestamp:       time()
         },
         services: {
-            singbox:  sb_pid != "" ? "running" : "stopped",
-            watchdog: wd_ok ? "running" : "stopped"
+            tachyon_core: core_pid != "" ? "running" : "stopped",
+            watchdog:     wd_pid != "" && fs.stat("/proc/" + wd_pid) != null ? "running" : "stopped"
         },
         connectivity: {
             direct_ok: int(direct_resp || "0") >= 200 && int(direct_resp || "0") < 400,
@@ -215,10 +278,13 @@ function handle_snapshot() {
         },
         incidents: {
             total: ai_status.incidents_resolved_total || 0,
-            last:  ai_status.last_incident || null
+            last:  ai_status.last_incident != null ? redact_obj(ai_status.last_incident) : null
         },
-        sections:  sections,
-        logs_tail: logs,
+        sections:         sections,
+        conditions:       conditions,
+        outbound_sources: outbound_sources,
+        balancers:        balancers,
+        logs_tail:        logs,
         agent_api: {
             version:              API_VERSION,
             tools_url:            "/tachyon/agent/v1/tools",
@@ -302,8 +368,8 @@ function handle_known_good_check() {
 }
 
 function handle_support_bundle(body) {
-    let sb_mod = require("service.support_bundle");
-    if (!sb_mod) {
+    let sb = sb_mod();
+    if (!sb) {
         err("Failed to load support_bundle module", 500);
         return;
     }
@@ -312,12 +378,29 @@ function handle_support_bundle(body) {
     let opts = {
         no_archive: body ? (body.no_archive == true) : false
     };
-    let res = sb_mod.create_bundle(target, opts);
+    let res = sb.create_bundle(target, opts);
     if (!res.ok) {
         err(res.error || "Failed to create support bundle", 500);
         return;
     }
     ok(res);
+}
+
+function handle_docs_search(path_str, body) {
+    let qp = parse_query_params(path_str);
+    let q = trim(as_string((body && (body.query || body.q)) || qp.query || qp.q || ""));
+    let top_k = int((body && body.top_k) || qp.top_k || 5);
+    if (q == "") {
+        err("query (or q) parameter is required", 400);
+        return;
+    }
+    let rag_mod = require("diagnostics.rag");
+    let results = rag_mod.search_docs ? rag_mod.search_docs(q, top_k) : [];
+    ok({
+        query: rag_mod.sanitize_query ? rag_mod.sanitize_query(q) : redact_text(q),
+        count: length(results),
+        results: results
+    });
 }
 
 function handle_tools() {
@@ -370,7 +453,7 @@ function handle_tools() {
             },
             {
                 name:         "tachyon_restart",
-                description:  "Restart a subsystem: singbox | tachyon | dnsmasq | watchdog. Requires Bearer token.",
+                description:  "Restart a subsystem: tachyon-core | tachyon | dnsmasq | watchdog. Requires Bearer token.",
                 method:       "POST",
                 path:         "/tachyon/agent/v1/restart",
                 auth:         "bearer",
@@ -380,7 +463,7 @@ function handle_tools() {
                     properties: {
                         service: {
                             type:        "string",
-                            enum:        ["singbox", "tachyon", "dnsmasq", "watchdog"],
+                            enum:        ["tachyon-core", "tachyon", "dnsmasq", "watchdog"],
                             description: "Service to restart"
                         }
                     }
@@ -441,7 +524,7 @@ function handle_tools() {
             },
             {
                 name:         "tachyon_route_explain",
-                description:  "Explain why and how traffic from a client to a target domain/IP is routed or bypassed (nftables, DNS, policy routing, sing-box/steer outbound).",
+                description:  "Explain why and how traffic from a client to a target domain/IP is routed or bypassed (nftables, DNS, policy routing, tachyon-core outbound).",
                 method:       "GET",
                 path:         "/tachyon/agent/v1/route/explain",
                 input_schema: {
@@ -494,6 +577,20 @@ function handle_tools() {
                         no_archive:  { type: "boolean", description: "Collect files without packaging into .tar.gz (optional)" }
                     }
                 }
+            },
+            {
+                name:         "tachyon_docs_search",
+                description:  "Search the built-in Tachyon RAG knowledge base (architecture, UCI schema, nftables, DNS, native Desync, troubleshooting, reconciler, transactions, jobs) for authoritative documentation chunks.",
+                method:       "GET",
+                path:         "/tachyon/agent/v1/docs/search",
+                input_schema: {
+                    type:       "object",
+                    required:   ["query"],
+                    properties: {
+                        query: { type: "string", description: "Search query keywords (e.g. 'desync multisplit', 'outbound_source balancer', 'bootstrap dns')" },
+                        top_k: { type: "integer", description: "Max chunks to return (1..15, default: 5)" }
+                    }
+                }
             }
         ]
     });
@@ -516,17 +613,17 @@ function handle_heal() {
 
 function handle_restart(body) {
     let svc = as_string(body.service || "");
-    let allowed = { singbox: 1, tachyon: 1, dnsmasq: 1, watchdog: 1 };
+    let allowed = { "tachyon-core": 1, tachyon: 1, dnsmasq: 1, watchdog: 1 };
     if (!allowed[svc]) {
-        err("Unknown service '" + svc + "'. Allowed: singbox, tachyon, dnsmasq, watchdog");
+        err("Unknown service '" + svc + "'. Allowed: tachyon-core, tachyon, dnsmasq, watchdog");
         return;
     }
 
     let cmd_map = {
-        singbox:  "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
-        tachyon:  "/etc/init.d/tachyon restart > /dev/null 2>&1",
-        dnsmasq:  "/etc/init.d/dnsmasq restart > /dev/null 2>&1",
-        watchdog: "/usr/bin/tachyon watchdog start-runtime > /dev/null 2>&1"
+        "tachyon-core": "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
+        tachyon:        "/etc/init.d/tachyon restart > /dev/null 2>&1",
+        dnsmasq:        "/etc/init.d/dnsmasq restart > /dev/null 2>&1",
+        watchdog:       "/usr/bin/tachyon watchdog start-runtime > /dev/null 2>&1"
     };
 
     system(cmd_map[svc]);
@@ -559,7 +656,9 @@ function handle_config_set(body) {
         return;
     }
 
-    ok({ message: "Set " + path + " = " + value });
+    let sb = sb_mod();
+    let display_val = (sb && sb.is_sensitive_key && sb.is_sensitive_key(option)) ? "[REDACTED]" : redact_text(value);
+    ok({ message: "Set " + path + " = " + display_val });
 }
 
 function handle_section_toggle(body) {
@@ -593,7 +692,20 @@ function handle_domain_add(body) {
         return;
     }
 
-    let path = CONFIG_NAME + "." + section + ".domain";
+    let target_sec = section;
+    let sec_obj = uci.get_all(CONFIG_NAME, section);
+    if (type(sec_obj) == "object" && sec_obj[".type"] == "section") {
+        let crefs = type(sec_obj.condition_refs) == "array" ? sec_obj.condition_refs : (sec_obj.condition_refs ? split(trim(as_string(sec_obj.condition_refs)), /[ \t,]+/) : []);
+        for (let cid in crefs) {
+            let cond_obj = uci.get_all(CONFIG_NAME, cid);
+            if (type(cond_obj) == "object" && cond_obj.enabled != "0" && lc(as_string(cond_obj.condition_type || "atomic")) != "composite") {
+                target_sec = cid;
+                break;
+            }
+        }
+    }
+
+    let path = CONFIG_NAME + "." + target_sec + ".user_domains";
     if (!uci.add_list(path, domain)) {
         err("Failed to add domain (section may not exist or domain already present)");
         return;
@@ -601,7 +713,7 @@ function handle_domain_add(body) {
     uci.commit(CONFIG_NAME);
     system(common.background_command("/usr/bin/tachyon reload"));
 
-    ok({ message: "Domain '" + domain + "' added to section '" + section + "'" });
+    ok({ message: "Domain '" + domain + "' added to '" + target_sec + "'" });
 }
 
 function handle_openapi() {
@@ -688,7 +800,7 @@ function handle_openapi() {
                                 schema: {
                                     type: "object",
                                     properties: {
-                                        fix: { type: "string", example: "clear_dns_cache,start_singbox" }
+                                        fix: { type: "string", example: "clear_dns_cache,start_tachyon_core" }
                                     }
                                 }
                             }
@@ -709,7 +821,7 @@ function handle_openapi() {
                                 schema: {
                                     type: "object",
                                     properties: {
-                                        service: { type: "string", enum: ["singbox", "tachyon", "dnsmasq", "watchdog"] }
+                                        service: { type: "string", enum: ["tachyon-core", "tachyon", "dnsmasq", "watchdog"] }
                                     }
                                 }
                             }
@@ -839,7 +951,7 @@ function handle_ai_doctor_last() {
         err("Corrupted AI Doctor history file", 500);
         return;
     }
-    ok(data);
+    ok(redact_obj(data));
 }
 
 function handle_ai_doctor_fix(body) {
@@ -900,6 +1012,8 @@ if (method == "GET") {
         handle_known_good_check();
     else if (route == "/support-bundle" || route == "/support-bundle/" || route == "/support_bundle" || route == "/support_bundle/")
         handle_support_bundle(body);
+    else if (index(route, "/docs/search") == 0 || index(route, "/knowledge/search") == 0)
+        handle_docs_search(path_arg, body);
     else
         err("Unknown endpoint: GET " + route, 404);
 } else if (method == "POST") {
@@ -909,6 +1023,8 @@ if (method == "GET") {
         handle_config_plan(path_arg, body);
     } else if (route == "/support-bundle" || route == "/support-bundle/" || route == "/support_bundle" || route == "/support_bundle/") {
         handle_support_bundle(body);
+    } else if (index(route, "/docs/search") == 0 || index(route, "/knowledge/search") == 0) {
+        handle_docs_search(path_arg, body);
     } else if ((route == "/known-good" || route == "/known-good/" || route == "/known_good" || route == "/known_good/") && (body.action == "status" || body.action == "check")) {
         if (body.action == "check")
             handle_known_good_check();

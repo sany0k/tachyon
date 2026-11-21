@@ -104,8 +104,12 @@ function ensure_dirs() {
     let state = getenv("TACHYON_RUNTIME_STATE_DIR") || STATE_DIR;
     let jobs_d = state + "/jobs";
     let logs_d = state + "/job-logs";
-    exec.run({ argv: ["mkdir", "-p", jobs_d], capture: false, timeout: 5 });
-    exec.run({ argv: ["mkdir", "-p", logs_d], capture: false, timeout: 5 });
+    let st_jobs = fs.stat(jobs_d);
+    if (st_jobs == null || st_jobs.type != "directory")
+        exec.run({ argv: ["mkdir", "-p", jobs_d], capture: false, timeout: 5 });
+    let st_logs = fs.stat(logs_d);
+    if (st_logs == null || st_logs.type != "directory")
+        exec.run({ argv: ["mkdir", "-p", logs_d], capture: false, timeout: 5 });
 }
 
 function job_state_path(job_id) {
@@ -1163,10 +1167,10 @@ if (mode == "selftest") {
     assert(type(all) == "array", "list_all should return array");
 
     // Test 7: generate_id
-    let id1 = generate_id("cmp", "sing_box", "update");
-    let id2 = generate_id("cmp", "sing_box", "update");
+    let id1 = generate_id("cmp", "tachyon_core", "update");
+    let id2 = generate_id("cmp", "tachyon_core", "update");
     assert(id1 != id2, "IDs should be unique");
-    assert(match(id1, /^cmp-sing_box-update-/), "ID should have expected prefix");
+    assert(match(id1, /^cmp-tachyon_core-update-/), "ID should have expected prefix");
 
     // Test 8: request_cancel sets flags
     let cjob = create("test", "cancel", "cooperative");

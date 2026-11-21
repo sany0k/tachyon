@@ -14,7 +14,6 @@ BUILD_SH="$ROOT_DIR/build.sh"
 required_sources=(
   "files/etc/init.d/tachyon"
   "files/etc/init.d/tachyon-torrserver-direct"
-  "files/etc/init.d/olcrtc-yaml"
   "files/etc/config/tachyon"
   "files/usr/bin/tachyon"
   "files/etc/hotplug.d/iface/99-tachyon-wan-monitor"

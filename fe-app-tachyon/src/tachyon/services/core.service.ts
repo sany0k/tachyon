@@ -20,16 +20,12 @@ type CoreServiceOptions = {
 
 const LOG_WATCHER_INTERVAL_MS = 30000;
 const LOG_WATCHER_START_DELAY_MS = 5000;
+let watcherStartTimer: number | null = null;
 
 function componentDisplayName(component: string) {
   const names: Record<string, string> = {
     tachyon: 'Tachyon',
-    sing_box: 'sing-box',
-    zapret: 'Zapret',
-    zapret2: 'Zapret2',
-    byedpi: 'ByeDPI',
-    wdtt: 'WDTT',
-    olcrtc: 'OlcRTC',
+    'tachyon-core': 'Tachyon Core',
   };
 
   return names[component] || component;
@@ -104,10 +100,16 @@ export function coreService(options: CoreServiceOptions = {}) {
 
     watcher.start();
   };
-  const scheduleStartWatcher = () =>
-    window.setTimeout(() => {
+  const scheduleStartWatcher = () => {
+    if (watcherStartTimer !== null) {
+      window.clearTimeout(watcherStartTimer);
+      watcherStartTimer = null;
+    }
+    watcherStartTimer = window.setTimeout(() => {
+      watcherStartTimer = null;
       void startWatcher();
     }, options.logWatcherStartDelayMs ?? LOG_WATCHER_START_DELAY_MS);
+  };
 
   if (typeof window !== 'undefined') {
     scheduleStartWatcher();

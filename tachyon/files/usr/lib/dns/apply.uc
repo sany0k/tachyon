@@ -4,12 +4,14 @@ let fs = require("fs");
 let uci = require("core.uci");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
-const SB_DNS_INBOUND_ADDRESS = getenv("SB_DNS_INBOUND_ADDRESS") || "127.0.0.42";
+const CORE_DNS_INBOUND_ADDRESS = getenv("TACHYON_CORE_DNS_INBOUND_ADDRESS") || "127.0.0.42";
 let common = require("core.common");
+let kill_switch = require("service.kill_switch");
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
 
 const DNSMASQ_INIT = getenv("DNSMASQ_INIT") || "/etc/init.d/dnsmasq";
+const ODHCPD_INIT = getenv("ODHCPD_INIT") || "/etc/init.d/odhcpd";
 const HOSTS_CACHE_FILE = getenv("TACHYON_HOSTS_CACHE_FILE") || "/etc/tachyon/hosts-lists/combined.txt";
 const DNSMASQ_SNAPSHOT_FILE = getenv("TACHYON_DNSMASQ_SNAPSHOT_FILE") || "/var/run/tachyon/dnsmasq-snapshot.json";
 
@@ -182,7 +184,7 @@ function dnsmasq_default_servers() {
 }
 
 function dnsmasq_default_has_tachyon_dns() {
-    return list_has(dnsmasq_default_servers(), SB_DNS_INBOUND_ADDRESS);
+    return list_has(dnsmasq_default_servers(), CORE_DNS_INBOUND_ADDRESS);
 }
 
 function dnsmasq_has_tachyon_dns() {
@@ -194,6 +196,7 @@ function dnsmasq_has_tachyon_managed_state() {
         uci_get("dhcp.@dnsmasq[0].tachyon_noresolv") != "" ||
         uci_get("dhcp.@dnsmasq[0].tachyon_cachesize") != "" ||
         uci_get("dhcp.@dnsmasq[0].tachyon_notinterface") != "" ||
+        fs.stat(DNSMASQ_SNAPSHOT_FILE) != null ||
         dnsmasq_legacy_instance_exists();
 }
 
@@ -241,7 +244,7 @@ function backup_dnsmasq_server_list() {
         return;
 
     for (let server in words(dnsmasq_default_servers())) {
-        if (server != SB_DNS_INBOUND_ADDRESS && !starts_with(server, SB_DNS_INBOUND_ADDRESS + "#"))
+        if (server != CORE_DNS_INBOUND_ADDRESS && !starts_with(server, CORE_DNS_INBOUND_ADDRESS + "#"))
             uci_add_list("dhcp.@dnsmasq[0].tachyon_server", server);
     }
 }
@@ -283,6 +286,17 @@ function dnsmasq_cleanup_legacy_instance() {
     uci_delete("dhcp.@dnsmasq[0].tachyon_notinterface");
 }
 
+function core_dns_listening() {
+    let udp = fs.readfile("/proc/net/udp");
+    // 127.0.0.42:53 in hex is 2A00007F:0035; 0.0.0.0:53 is 00000000:0035
+    if (udp && (index(udp, "2A00007F:0035") >= 0 || index(udp, "00000000:0035") >= 0))
+        return true;
+    let udp6 = fs.readfile("/proc/net/udp6");
+    if (udp6 && index(udp6, "0035") >= 0)
+        return true;
+    return false;
+}
+
 function dnsmasq_configure_default_instance() {
     let default_has_tachyon_dns = dnsmasq_default_has_tachyon_dns();
 
@@ -293,18 +307,20 @@ function dnsmasq_configure_default_instance() {
     }
 
     backup_dnsmasq_config_option("addn_hosts", "tachyon_addn_hosts");
+    backup_dnsmasq_config_option("rebind_protection", "tachyon_rebind_protection");
     uci_delete("dhcp.@dnsmasq[0].addn_hosts");
 
     uci_delete("dhcp.@dnsmasq[0].server");
-    uci_add_list("dhcp.@dnsmasq[0].server", SB_DNS_INBOUND_ADDRESS);
+    uci_add_list("dhcp.@dnsmasq[0].server", CORE_DNS_INBOUND_ADDRESS);
     uci_set("dhcp.@dnsmasq[0].noresolv", "1");
+    uci_set("dhcp.@dnsmasq[0].rebind_protection", "0");
     uci_set("dhcp.@dnsmasq[0].cachesize", dnsmasq_target_cachesize());
 }
 
 function dnsmasq_restore_default_instance() {
     let server_list = dnsmasq_default_servers();
     let backup_servers = uci_get("dhcp.@dnsmasq[0].tachyon_server");
-    let managed_global_dns = list_has(server_list, SB_DNS_INBOUND_ADDRESS);
+    let managed_global_dns = list_has(server_list, CORE_DNS_INBOUND_ADDRESS);
 
     uci_delete("dhcp.@dnsmasq[0].server");
     if (backup_servers != "") {
@@ -314,7 +330,7 @@ function dnsmasq_restore_default_instance() {
     }
     else {
         for (let value in words(server_list)) {
-            if (value != SB_DNS_INBOUND_ADDRESS && !starts_with(value, SB_DNS_INBOUND_ADDRESS + "#"))
+            if (value != CORE_DNS_INBOUND_ADDRESS && !starts_with(value, CORE_DNS_INBOUND_ADDRESS + "#"))
                 uci_add_list("dhcp.@dnsmasq[0].server", value);
         }
     }
@@ -323,14 +339,20 @@ function dnsmasq_restore_default_instance() {
     let noresolv = uci_get("dhcp.@dnsmasq[0].tachyon_noresolv");
     if (noresolv != "")
         restore_dnsmasq_config_option("noresolv", "tachyon_noresolv", "");
-    else if (managed_global_dns)
+    else if (managed_global_dns || uci_get("dhcp.@dnsmasq[0].noresolv") == "1")
         uci_set("dhcp.@dnsmasq[0].noresolv", "0");
 
     let cachesize = uci_get("dhcp.@dnsmasq[0].tachyon_cachesize");
     if (cachesize != "")
         restore_dnsmasq_config_option("cachesize", "tachyon_cachesize", "");
-    else if (managed_global_dns)
+    else if (managed_global_dns || uci_get("dhcp.@dnsmasq[0].cachesize") == "0")
         uci_set("dhcp.@dnsmasq[0].cachesize", "150");
+
+    let rebind_protection = uci_get("dhcp.@dnsmasq[0].tachyon_rebind_protection");
+    if (rebind_protection != "")
+        restore_dnsmasq_config_option("rebind_protection", "tachyon_rebind_protection", "");
+    else if (managed_global_dns || uci_get("dhcp.@dnsmasq[0].rebind_protection") == "0")
+        uci_set("dhcp.@dnsmasq[0].rebind_protection", "1");
 
     restore_dnsmasq_config_option("addn_hosts", "tachyon_addn_hosts", "");
 }
@@ -344,15 +366,15 @@ function restore_resolv_conf_symlink() {
     }
 }
 
-// Resolves sing-box multi-fallback PID detection across pidfiles, ubus procd, and pidof
-function sing_box_running_pid() {
-    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid", "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+// Resolves tachyon-core multi-fallback PID detection across pidfiles, ubus procd, and pidof
+function core_running_pid() {
+    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid" ]) {
         let pid = trim(fs.readfile(path) || "");
         if (pid != "" && run("kill -0 " + shell_quote(pid) + " 2>/dev/null"))
             return pid;
     }
 
-    for (let svc in [ "tachyon-core", "sing-box" ]) {
+    for (let svc in [ "tachyon-core" ]) {
         let p = fs.popen("ubus call service list '{\"name\":\"" + svc + "\"}' 2>/dev/null", "r");
         if (p) {
             let out = p.read("all");
@@ -368,7 +390,7 @@ function sing_box_running_pid() {
         }
     }
 
-    let p2 = fs.popen("pidof tachyon-core sing-box 2>/dev/null", "r");
+    let p2 = fs.popen("pidof tachyon-core 2>/dev/null", "r");
     if (p2) {
         let out2 = p2.read("all");
         p2.close();
@@ -385,6 +407,286 @@ function sing_box_running_pid() {
     return "";
 }
 
+function reload_odhcpd() {
+    if (ODHCPD_INIT == "")
+        return true;
+    if (run("[ -x " + shell_quote(ODHCPD_INIT) + " ] && " + shell_quote(ODHCPD_INIT) + " reload"))
+        return true;
+    return run("[ -x " + shell_quote(ODHCPD_INIT) + " ] && " + shell_quote(ODHCPD_INIT) + " restart");
+}
+
+function tachyon_ipv6_settings_from_uci() {
+    return {
+        ipv6_mode: uci_get(CONFIG_NAME + ".settings.ipv6_mode") || "auto",
+        ipv6_leak_guard: uci_get(CONFIG_NAME + ".settings.ipv6_leak_guard") || "1",
+        dns_strategy: uci_get(CONFIG_NAME + ".settings.dns_strategy") || "prefer_ipv4",
+        fakeip_enabled: uci_get(CONFIG_NAME + ".settings.fakeip_enabled") || "1"
+    };
+}
+
+const ODHCPD_MANAGED_KEYS = [ "ra", "dhcpv6", "ndp", "ra_dns", "ra_default" ];
+
+function odhcpd_backup_lan_defaults() {
+    let changed = false;
+
+    for (let key in ODHCPD_MANAGED_KEYS) {
+        let bkey = "tachyon_lan_" + key;
+        if (uci_exists("dhcp.lan." + bkey))
+            continue;
+        let cur = uci_get("dhcp.lan." + key);
+        uci_set("dhcp.lan." + bkey, (cur != null && cur != "") ? cur : "__absent__");
+        changed = true;
+    }
+
+    if (!uci_exists("dhcp.lan.tachyon_lan_dns")) {
+        let dns_vals = words(uci_get("dhcp.lan.dns"));
+        if (length(dns_vals) == 0) {
+            uci_set("dhcp.lan.tachyon_lan_dns", "__absent__");
+        } else {
+            for (let val in dns_vals)
+                uci_add_list("dhcp.lan.tachyon_lan_dns", val);
+        }
+        changed = true;
+    }
+
+    if (uci_get("dhcp.lan.tachyon_lan_managed") != "1") {
+        uci_set("dhcp.lan.tachyon_lan_managed", "1");
+        changed = true;
+    }
+    return changed;
+}
+
+function odhcpd_restore_option(key) {
+    let bkey = "tachyon_lan_" + key;
+    if (!uci_exists("dhcp.lan." + bkey))
+        return false;
+    let saved = uci_get("dhcp.lan." + bkey);
+    let cur = uci_get("dhcp.lan." + key);
+    let changed = false;
+    if (saved == "__absent__") {
+        if (cur != null && cur != "") {
+            uci_delete("dhcp.lan." + key);
+            changed = true;
+        }
+    } else if (saved != null && saved != "" && cur != saved) {
+        uci_set("dhcp.lan." + key, saved);
+        changed = true;
+    }
+    uci_delete("dhcp.lan." + bkey);
+    return changed;
+}
+
+function odhcpd_restore_dns_list() {
+    if (!uci_exists("dhcp.lan.tachyon_lan_dns"))
+        return false;
+    let saved_vals = words(uci_get("dhcp.lan.tachyon_lan_dns"));
+    let cur_vals = words(uci_get("dhcp.lan.dns"));
+    let changed = false;
+
+    if (length(saved_vals) == 1 && saved_vals[0] == "__absent__") {
+        if (length(cur_vals) > 0) {
+            uci_delete("dhcp.lan.dns");
+            changed = true;
+        }
+    } else if (join(" ", saved_vals) != join(" ", cur_vals)) {
+        uci_delete("dhcp.lan.dns");
+        for (let val in saved_vals)
+            uci_add_list("dhcp.lan.dns", val);
+        changed = true;
+    }
+    uci_delete("dhcp.lan.tachyon_lan_dns");
+    return changed;
+}
+
+function odhcpd_sync_option_from_backup(key, force_if_disabled_or_absent) {
+    let target = null;
+    let bkey = "tachyon_lan_" + key;
+    if (uci_exists("dhcp.lan." + bkey))
+        target = uci_get("dhcp.lan." + bkey);
+    if (force_if_disabled_or_absent != null &&
+        (target == null || target == "" || target == "__absent__" || target == "disabled"))
+        target = force_if_disabled_or_absent;
+
+    if (target == null)
+        return false;
+
+    let cur = uci_get("dhcp.lan." + key);
+    if (target == "__absent__") {
+        if (cur != null && cur != "") {
+            uci_delete("dhcp.lan." + key);
+            return true;
+        }
+        return false;
+    }
+
+    if (target != "" && cur != target) {
+        uci_set("dhcp.lan." + key, target);
+        return true;
+    }
+    return false;
+}
+
+function lan_devices_for_ipv6_sync() {
+    let raw = words(uci_get(CONFIG_NAME + ".settings.source_network_interfaces"));
+    let devs = [];
+    let seen = {};
+    for (let dev in raw) {
+        if (dev == "" || dev == "lo" || starts_with(dev, "wan") || starts_with(dev, "pppoe"))
+            continue;
+        if (!exists(seen, dev)) {
+            seen[dev] = true;
+            push(devs, dev);
+        }
+    }
+    if (length(devs) == 0)
+        push(devs, "br-lan");
+    return devs;
+}
+
+function flush_lan_ipv6_global_addrs(force_flush) {
+    if (getenv("TACHYON_SKIP_RUNTIME_IPV6_FLUSH") == "1")
+        return;
+    for (let dev in lan_devices_for_ipv6_sync()) {
+        let cur = trim(common.command_output("ip -6 -o addr show dev " + shell_quote(dev) + " scope global 2>/dev/null"));
+        if (force_flush || cur != "")
+            common.command_status("ip -6 addr flush dev " + shell_quote(dev) + " scope global >/dev/null 2>&1");
+    }
+}
+
+function maybe_renew_lan_ipv6(had_disabled_lan) {
+    if (getenv("TACHYON_SKIP_RUNTIME_IPV6_RENEW") == "1" || !had_disabled_lan)
+        return;
+    for (let dev in lan_devices_for_ipv6_sync()) {
+        let cur = trim(common.command_output("ip -6 -o addr show dev " + shell_quote(dev) + " scope global 2>/dev/null"));
+        if (cur == "") {
+            common.command_status("ubus call network.interface.lan renew >/dev/null 2>&1");
+            return;
+        }
+    }
+}
+
+function odhcpd_restore() {
+    if (!uci_available() || !uci_exists("dhcp.lan"))
+        return true;
+
+    let has_backup = uci_exists("dhcp.lan.tachyon_lan_managed") ||
+        uci_exists("dhcp.lan.tachyon_lan_dns");
+    for (let key in ODHCPD_MANAGED_KEYS) {
+        if (uci_exists("dhcp.lan.tachyon_lan_" + key))
+            has_backup = true;
+    }
+    if (!has_backup)
+        return true;
+
+    let changed = false;
+    for (let key in ODHCPD_MANAGED_KEYS) {
+        if (odhcpd_restore_option(key))
+            changed = true;
+    }
+    if (odhcpd_restore_dns_list())
+        changed = true;
+    if (uci_exists("dhcp.lan.tachyon_lan_managed")) {
+        uci_delete("dhcp.lan.tachyon_lan_managed");
+        changed = true;
+    }
+
+    if (changed) {
+        uci_commit("dhcp");
+        reload_odhcpd();
+    }
+    return true;
+}
+
+function odhcpd_configure() {
+    if (!uci_available() || !uci_exists("dhcp.lan") || dnsmasq_management_disabled())
+        return true;
+
+    let eff_v6 = common.resolve_effective_ipv6_state(tachyon_ipv6_settings_from_uci());
+    let prev_disabled = (uci_get("dhcp.lan.ra") == "disabled" || uci_get("dhcp.lan.dhcpv6") == "disabled");
+    let changed = odhcpd_backup_lan_defaults();
+
+    if (eff_v6.ipv6_mode == "off" || !eff_v6.ipv6_active) {
+        for (let key in [ "ra", "dhcpv6", "ndp" ]) {
+            if (uci_get("dhcp.lan." + key) != "disabled") {
+                uci_set("dhcp.lan." + key, "disabled");
+                changed = true;
+            }
+        }
+        if (uci_get("dhcp.lan.ra_dns") != "0") {
+            uci_set("dhcp.lan.ra_dns", "0");
+            changed = true;
+        }
+        if (uci_get("dhcp.lan.ra_default") != "0") {
+            uci_set("dhcp.lan.ra_default", "0");
+            changed = true;
+        }
+        if (length(words(uci_get("dhcp.lan.dns"))) > 0) {
+            uci_delete("dhcp.lan.dns");
+            changed = true;
+        }
+
+        if (changed) {
+            uci_commit("dhcp");
+            reload_odhcpd();
+        }
+        flush_lan_ipv6_global_addrs(changed);
+        return true;
+    }
+
+    if (eff_v6.ipv6_mode == "tunnel_over_v4") {
+        if (odhcpd_sync_option_from_backup("ra", "server"))
+            changed = true;
+        if (odhcpd_sync_option_from_backup("dhcpv6", null))
+            changed = true;
+        if (odhcpd_sync_option_from_backup("ndp", null))
+            changed = true;
+        if (uci_get("dhcp.lan.ra_dns") != "1") {
+            uci_set("dhcp.lan.ra_dns", "1");
+            changed = true;
+        }
+        if (uci_get("dhcp.lan.ra_default") != "2") {
+            uci_set("dhcp.lan.ra_default", "2");
+            changed = true;
+        }
+        if (length(words(uci_get("dhcp.lan.dns"))) > 0) {
+            uci_delete("dhcp.lan.dns");
+            changed = true;
+        }
+
+        if (changed) {
+            uci_commit("dhcp");
+            reload_odhcpd();
+        }
+        maybe_renew_lan_ipv6(prev_disabled || changed);
+        return true;
+    }
+
+    // eff_v6.effective == "full" (dual_stack or auto with WAN6 PD/GUA)
+    if (odhcpd_sync_option_from_backup("ra", eff_v6.ipv6_mode == "dual_stack" ? "server" : null))
+        changed = true;
+    if (odhcpd_sync_option_from_backup("dhcpv6", null))
+        changed = true;
+    if (odhcpd_sync_option_from_backup("ndp", null))
+        changed = true;
+    if (odhcpd_sync_option_from_backup("ra_default", null))
+        changed = true;
+    if (uci_get("dhcp.lan.ra_dns") != "1") {
+        uci_set("dhcp.lan.ra_dns", "1");
+        changed = true;
+    }
+    if (length(words(uci_get("dhcp.lan.dns"))) > 0) {
+        uci_delete("dhcp.lan.dns");
+        changed = true;
+    }
+
+    if (changed) {
+        uci_commit("dhcp");
+        reload_odhcpd();
+    }
+    maybe_renew_lan_ipv6(prev_disabled || changed);
+    return true;
+}
+
 function dnsmasq_configure(force) {
     if (!uci_available())
         return true;
@@ -397,7 +699,7 @@ function dnsmasq_configure(force) {
     // The restart churn (stop_main, netifd, dnsmasq) routinely clobbers the
     // /etc/resolv.conf symlink into a regular file. Restore it here, before the
     // early returns below — "unclean shutdown, already configured" and
-    // "sing-box not running yet" both used to skip the restore on the happy
+    // "tachyon-core not running yet" both used to skip the restore on the happy
     // path only, leaving a plain-file resolv.conf after every such restart.
     restore_resolv_conf_symlink();
 
@@ -406,29 +708,38 @@ function dnsmasq_configure(force) {
         return true;
     }
 
-    if (as_string(force) != "force" && uci_get(CONFIG_NAME + ".settings.shutdown_correctly") == "0") {
-        if (dnsmasq_default_config_is_complete()) {
-            log("Previous Tachyon shutdown was unclean; dnsmasq already points to sing-box", "info");
-            return true;
-        }
-        log("Previous Tachyon shutdown was unclean and dnsmasq is not ready; applying Tachyon DNS settings", "info");
-    }
-
     if (as_string(force) != "force") {
-        let sb_pid = sing_box_running_pid();
-        if (sb_pid == "") {
-            log("sing-box is not running; dnsmasq will forward to system DNS until sing-box starts", "warn");
+        let core_pid = core_running_pid();
+        let wait_attempt = 0;
+        while (core_pid == "" && wait_attempt < 5) {
+            common.command_status_from_args([ "sleep", "1" ]);
+            core_pid = core_running_pid();
+            wait_attempt++;
+        }
+        if (core_pid == "") {
+            log("tachyon-core is not running; dnsmasq will forward to system DNS until tachyon-core starts", "warn");
+            return true;
+        }
+
+        let listen_attempt = 0;
+        while (!core_dns_listening() && listen_attempt < 5) {
+            common.command_status_from_args([ "sleep", "1" ]);
+            listen_attempt++;
+        }
+        if (!core_dns_listening()) {
+            log("tachyon-core DNS inbound (127.0.0.42:53) is not listening yet; dnsmasq will forward to system DNS", "warn");
             return true;
         }
     }
 
-    log("Configuring dnsmasq to forward DNS to sing-box", "info");
+    log("Configuring dnsmasq to forward DNS to tachyon-core", "info");
     dnsmasq_cleanup_legacy_instance();
     dnsmasq_configure_default_instance();
     uci_commit("dhcp");
 
     save_dnsmasq_snapshot();
     restore_resolv_conf_symlink();
+    odhcpd_configure();
 
     return reload_dnsmasq();
 }
@@ -441,6 +752,7 @@ function dnsmasq_restore(force, quiet) {
         log("Restoring DNS settings in dnsmasq", "info");
     if (as_string(force) != "force" && uci_get(CONFIG_NAME + ".settings.shutdown_correctly") == "1") {
         if (!dnsmasq_has_tachyon_dns()) {
+            odhcpd_restore();
             log("dnsmasq already uses non-Tachyon DNS settings; restore is not required", "info");
             return true;
         }
@@ -463,62 +775,7 @@ function dnsmasq_restore(force, quiet) {
     uci_commit("dhcp");
     cleanup_dnsmasq_snapshot();
     restore_resolv_conf_symlink();
-
-    return reload_dnsmasq();
-}
-
-function dnsmasq_configure_steer() {
-    if (!uci_available())
-        return true;
-
-    if (dnsmasq_management_disabled()) {
-        log("dnsmasq steer configuration skipped: dont_touch_dhcp is enabled", "info");
-        return true;
-    }
-
-    log("Configuring dnsmasq for steer routing engine", "info");
-    dnsmasq_cleanup_legacy_instance();
-    dnsmasq_restore_default_instance();
-
-    let server_list = dnsmasq_default_servers();
-    let clean_servers = [];
-    for (let s in words(server_list)) {
-        if (s != SB_DNS_INBOUND_ADDRESS && !starts_with(s, SB_DNS_INBOUND_ADDRESS + "#"))
-            push(clean_servers, s);
-    }
-
-    uci_set("dhcp.@dnsmasq[0].noresolv", "0");
-
-    let cachesize = uci_get("dhcp.@dnsmasq[0].cachesize");
-    if (cachesize == "0" || cachesize == "")
-        uci_set("dhcp.@dnsmasq[0].cachesize", "1000");
-
-    uci_delete("dhcp.@dnsmasq[0].server");
-
-    let smartdns_port = trim(as_string(fs.readfile("/var/run/tachyon/steer-dns-upstream-port") || ""));
-    if (smartdns_port == "" && run("test -x /usr/sbin/smartdns"))
-        smartdns_port = "5354";
-
-    if (smartdns_port != "")
-        uci_add_list("dhcp.@dnsmasq[0].server", "127.0.0.1#" + smartdns_port);
-
-    let has_other_upstream = false;
-    for (let s in clean_servers) {
-        if (s != ("127.0.0.1#" + smartdns_port)) {
-            uci_add_list("dhcp.@dnsmasq[0].server", s);
-            has_other_upstream = true;
-        }
-    }
-
-    if (!has_other_upstream) {
-        let b_srv = trim(as_string(uci_get(CONFIG_NAME + ".settings.bootstrap_dns_server") || ""));
-        if (b_srv == "") b_srv = "77.88.8.8";
-        uci_add_list("dhcp.@dnsmasq[0].server", b_srv);
-    }
-
-    uci_commit("dhcp");
-    cleanup_dnsmasq_snapshot();
-    restore_resolv_conf_symlink();
+    odhcpd_restore();
 
     return reload_dnsmasq();
 }
@@ -527,8 +784,19 @@ function failsafe_restore() {
     if (!uci_available())
         return true;
 
+    // Every automatic rollback lands here (watchdog, failed start, unclean
+    // boot, init.d, the CLI loader, doctor). Direct DNS hands clients real IPs
+    // that bypass fakeip interception, so a fail-closed setup keeps DNS on the
+    // proxy and fails closed instead.
+    let veto = kill_switch.dns_veto();
+    if (veto != "") {
+        log("DNS rollback skipped: Fail-Closed keeps DNS on the proxy (" + veto + ")", "warn");
+        return true;
+    }
+
     if (dnsmasq_management_disabled()) {
         if (!dnsmasq_has_tachyon_managed_state()) {
+            odhcpd_restore();
             log("DNS rollback skipped: dont_touch_dhcp is enabled and no Tachyon dnsmasq changes were found", "info");
             return true;
         }
@@ -536,26 +804,43 @@ function failsafe_restore() {
         log("Rolling back previous Tachyon dnsmasq changes because dont_touch_dhcp is enabled", "warn");
     }
     else {
-        if (!dnsmasq_has_tachyon_dns() && !dnsmasq_has_tachyon_managed_state())
+        if (!dnsmasq_has_tachyon_dns() && !dnsmasq_has_tachyon_managed_state()) {
+            odhcpd_restore();
             return true;
+        }
 
         log("Rolling back Tachyon DNS changes in dnsmasq", "warn");
     }
 
-    dnsmasq_restore("force", true);
-    return true;
+    return dnsmasq_restore("force", true);
+}
+
+function recovery_ready() {
+    if (dnsmasq_management_disabled()) return true;
+    if (uci_get("dhcp.@dnsmasq[0].port") == "0" &&
+        (run("pidof AdGuardHome >/dev/null 2>&1") || run("pidof adguardhome >/dev/null 2>&1")))
+        return true;
+    return core_dns_listening() && dnsmasq_default_config_is_complete() &&
+        common.command_success_from_args([
+            "sh", "-c", "nslookup -timeout=2 connectivitycheck.gstatic.com 127.0.0.1 >/dev/null 2>&1 || " +
+            "nslookup -timeout=2 openwrt.org 127.0.0.1 >/dev/null 2>&1"
+        ]);
 }
 
 let mode = ARGV[0] || "";
 
 if (mode == "configure")
     exit(dnsmasq_configure(ARGV[1]) ? 0 : 1);
-else if (mode == "configure-steer")
-    exit(dnsmasq_configure_steer() ? 0 : 1);
 else if (mode == "restore")
     exit(dnsmasq_restore(ARGV[1]) ? 0 : 1);
+else if (mode == "odhcpd-configure")
+    exit(odhcpd_configure() ? 0 : 1);
+else if (mode == "odhcpd-restore")
+    exit(odhcpd_restore() ? 0 : 1);
 else if (mode == "failsafe-restore")
     exit(failsafe_restore() ? 0 : 1);
+else if (mode == "recovery-ready")
+    exit(recovery_ready() ? 0 : 1);
 else if (mode == "has-tachyon-dns")
     exit(dnsmasq_has_tachyon_dns() ? 0 : 1);
 else if (mode == "has-managed-state")
@@ -569,5 +854,5 @@ else if (mode == "cleanup-snapshot") {
     exit(0);
 }
 
-warn("Usage: dns/apply.uc <configure|configure-steer|restore|failsafe-restore|has-tachyon-dns|has-managed-state|default-config-complete|save-snapshot|cleanup-snapshot>\n");
+warn("Usage: dns/apply.uc <configure|restore|odhcpd-configure|odhcpd-restore|failsafe-restore|recovery-ready|has-tachyon-dns|has-managed-state|default-config-complete|save-snapshot|cleanup-snapshot>\n");
 exit(1);

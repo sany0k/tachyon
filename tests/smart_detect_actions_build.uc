@@ -4,7 +4,9 @@ source = replace(source, 'let uci_core = require("core.uci");', 'let uci_core = 
 source = replace(source, 'return { create, bind_message, keyboard, apply };', 'let actions = { create, bind_message, keyboard, apply };');
 let fixture = replace(fs.readfile(ARGV[1]), "/* IMPLEMENTATION */", source);
 let runtime = fs.readfile(ARGV[3]);
-let start = index(runtime, "function persist_offset(");
+let start = index(runtime, "function extract_bot_id(");
+if (start < 0)
+    start = index(runtime, "function persist_offset(");
 let end = index(runtime, "function worker(", start);
 if (start < 0 || end < start) die("Telegram runtime boundaries missing\n");
 let functions = substr(runtime, start, end - start);
@@ -13,4 +15,8 @@ let send_start = index(runtime, "function send_api(");
 let send_end = index(runtime, "function send_daily_digest(", send_start);
 functions += replace(substr(runtime, send_start, send_end - send_start),
     'require("service.telegram.smart_detect_actions")', 'fixture_actions');
+let queue = fs.readfile(ARGV[4]);
+queue = replace(queue, 'require("service.telegram.transport")', 'fixture_transport');
+queue = replace(queue, 'require("service.telegram.smart_detect_actions")', 'fixture_actions');
+functions = 'let notifications = (function() {\n' + queue + '\n})();\n' + functions;
 fs.writefile(ARGV[2], replace(fixture, "/* RUNTIME */", functions));

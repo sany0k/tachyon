@@ -33,9 +33,8 @@
 
 ```
 /etc/tachyon/state/known_good/
-  manifest.json      версия, время промоушена, причина, sha256, движок, метрики
+  manifest.json      версия, время промоушена, причина, sha256, ядро, метрики
   config             атомарная копия /etc/config/tachyon
-  sing-box-variant   резервная копия варианта ядра
   history.json       кольцо событий смены состояния
   last_failed_config конфиг, сохранённый перед откатом (для посмертного анализа)
 ```
@@ -64,7 +63,6 @@ LKG. Без этого два отказа подряд превращались
 | `dns-failover.json` | позиция резолвера | сброс на основной DNS |
 | `selector_state.json` | выбранный узел в группе | сброс на первый рабочий |
 | `emergency_state.json` (+ `/tmp`) | аварийный режим | сброс флага |
-| `steer-dns-upstream-port` | порт smartdns для steer | пересоздастся при старте |
 | `tx/<tx_id>/` | снапшоты незавершённых транзакций | откат придётся делать вручную |
 
 ### Почему tmpfs
@@ -131,10 +129,10 @@ watchdog-воркер, Telegram-бот). Отсюда два правила:
 |---|---|---|
 | `observation_state.json` | watchdog | watchdog, UI |
 | `known_good/manifest.json` | `known_good.uc` | reconciler, watchdog, UI, AI Doctor |
-| `section-cache/` | `singbox/generator_outbounds.uc`, `steer/section_cache.uc` | UI-дашборд, steer-спека |
+| `section-cache/` | `tachyon_core/generator_outbounds.uc` | UI-дашборд, генератор |
 | `smart_detect_seen.json` | watchdog | watchdog |
 | `selector_state.json` | UI, Telegram | генераторы, Clash-эмуляция |
-| `dns-failover.json` | `singbox/dns_failover.uc` | watchdog, UI |
+| `dns-failover.json` | `tachyon_core/dns_failover.uc` | watchdog, UI |
 | `events.jsonl` | шина | UI, `eventClient`, support bundle, AI Doctor |
 | `tx/<id>/` | `core/transaction.uc` | `transaction.uc recover`, watchdog |
 

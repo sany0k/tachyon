@@ -8,7 +8,8 @@
     "format:js": "prettier --write ../luci-app-tachyon/htdocs/luci-static/resources/view/tachyon",
     "lint": "eslint src --ext .ts,.tsx",
     "lint:fix": "eslint src --ext .ts,.tsx --fix",
-    "build": "npm run contracts:generate && tsc --noEmit && tsup src/main.ts",
+    "build:views": "node --no-warnings build-views.js",
+    "build": "npm run contracts:generate && tsc --noEmit && tsup src/main.ts && npm run build:views",
     "dev": "tsup src/main.ts --watch",
     "test": "vitest",
     "ci": "npm run contracts:generate && npm run format && npm run lint -- --max-warnings=0 && npm run test -- --run && npm run build",
@@ -30,12 +31,18 @@
     "tsup": "8.5.0",
     "typescript": "5.9.3",
     "typescript-eslint": "8.45.0",
-    "vitest": "^5.0.0"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "@humanfs/node": ">=0.16.8",
     "postcss": "8.5.23",
-    "js-yaml": "^5.4.1"
+    "js-yaml": "^5.4.1",
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.5"
+    },
+    "sucrase": {
+      "glob": "^14.0.4"
+    }
   },
   "optionalDependencies": {
     "@esbuild/win32-x64": "^0.28.2",

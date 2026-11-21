@@ -95,7 +95,11 @@ export function resolvePrefixBadgeStyle(prefix?: string): PrefixPalette {
       border: localCustom.border || localCustom.bg || uciMap?.bg || base.border,
     };
   }
-  if (uciMap && (uciMap.bg || uciMap.color)) {
+  const isLegacyDefaultUci =
+    uciMap &&
+    String(uciMap.bg || '').toLowerCase() === '#f3e8ff' &&
+    (!uciMap.color || String(uciMap.color).toLowerCase() === '#6b21a8');
+  if (uciMap && !isLegacyDefaultUci && (uciMap.bg || uciMap.color)) {
     return {
       name: 'UCI',
       bg: uciMap.bg || base.bg,
@@ -103,7 +107,12 @@ export function resolvePrefixBadgeStyle(prefix?: string): PrefixPalette {
       border: uciMap.bg || base.border,
     };
   }
-  return base;
+  return {
+    name: 'Theme',
+    bg: 'var(--tachyon-accent-soft, rgba(128, 128, 128, 0.14))',
+    color: 'var(--tachyon-accent-text, inherit)',
+    border: 'var(--tachyon-accent-border, rgba(128, 128, 128, 0.28))',
+  };
 }
 
 function translatePresetColorName(name: string): string {
@@ -374,7 +383,7 @@ export function parseNodeProtocolBreakdown(
 ) {
   const base = formatOutboundType(type, transport);
   const rawParts = (details || '')
-    .split('·')
+    .split(/[·+]/)
     .map((s) => s.trim())
     .filter(Boolean);
   const rows: Array<{ label: string; value: string }> = [];
@@ -422,6 +431,11 @@ export function parseNodeProtocolBreakdown(
       rows.push({ label: _('SNI / Host'), value: part.slice(4).trim() });
     } else if (low.startsWith('pin:')) {
       rows.push({ label: _('Pinning'), value: part.slice(4).trim() });
+    } else if (low === 'cert_sha256' || low === 'pubkey_sha256') {
+      if (!seen.has('pin:sha-256')) {
+        seen.add('pin:sha-256');
+        rows.push({ label: _('Pinning'), value: 'SHA-256' });
+      }
     } else if (low.startsWith('mux:')) {
       rows.push({ label: _('Multiplex'), value: part.slice(4).trim() });
     } else if (low.startsWith(':')) {
@@ -436,6 +450,13 @@ export function parseNodeProtocolBreakdown(
     transport.toLowerCase() !== proto.toLowerCase()
   ) {
     rows.push({ label: _('Transport'), value: transport.toUpperCase() });
+  } else if (
+    !hasTransportRow &&
+    (proto === 'HYSTERIA2' || proto === 'HYSTERIA' || proto === 'TUIC')
+  ) {
+    rows.push({ label: _('Transport'), value: 'UDP / QUIC' });
+  } else if (!hasTransportRow && (proto === 'WIREGUARD' || proto === 'AWG')) {
+    rows.push({ label: _('Transport'), value: 'UDP' });
   }
   return { base, rows };
 }
@@ -456,7 +477,7 @@ export function renderProtocolPopoverNodes(
   details?: string,
 ): HTMLElement | null {
   const { base, rows } = parseNodeProtocolBreakdown(type, transport, details);
-  if (rows.length <= 1 && !details) {
+  if (!rows.length) {
     return null;
   }
   return E('div', { class: 'tachyon_proto-popover' }, [

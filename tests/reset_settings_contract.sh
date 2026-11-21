@@ -21,7 +21,7 @@ grep -Fq 'reset_settings [no-start]' "$TACHYON_BIN" ||
 mkdir -p "$WORK_DIR/lib/defaults"
 cat >"$WORK_DIR/default-config" <<'EOF'
 config settings 'settings'
-        option config_version '1.0.5'
+        option config_version '1.8.0'
         option dns_type 'udp'
         option shutdown_correctly '0'
 EOF
@@ -32,11 +32,12 @@ mkdir -p \
   "$WORK_DIR/persistent/rulesets" \
   "$WORK_DIR/persistent/tailscale/server-main" \
   "$WORK_DIR/runtime" \
-  "$WORK_DIR/sing-box-tmp"
+  "$WORK_DIR/tachyon-core-tmp"
 printf '%s\n' stale >"$WORK_DIR/persistent/subscription-cache/cache.json"
 printf '%s\n' stale >"$WORK_DIR/persistent/rulesets/community.srs"
 printf '%s\n' identity >"$WORK_DIR/persistent/tailscale/server-main/node.key"
-printf '%s\n' '{}' >"$WORK_DIR/sing-box-config"
+printf '%s\n' 0.3.9 >"$WORK_DIR/persistent/tachyon-core-version"
+printf '%s\n' '{}' >"$WORK_DIR/tachyon-core-config"
 printf '%s\n' custom >"$WORK_DIR/config"
 
 : >"$WORK_DIR/bin.log"
@@ -60,8 +61,8 @@ run_reset() {
   TACHYON_CONFIG_PATH="$WORK_DIR/config" \
   TACHYON_PERSISTENT_DIR="$WORK_DIR/persistent" \
   TACHYON_RUNTIME_STATE_DIR="$WORK_DIR/runtime" \
-  TACHYON_SING_BOX_TMP_DIR="$WORK_DIR/sing-box-tmp" \
-  TACHYON_SING_BOX_CONFIG_PATH="$WORK_DIR/sing-box-config" \
+  TACHYON_CORE_TMP_DIR="$WORK_DIR/tachyon-core-tmp" \
+  TACHYON_CORE_CONFIG_PATH="$WORK_DIR/tachyon-core-config" \
   TACHYON_RESET_BIN_LOG="$WORK_DIR/bin.log" \
   TACHYON_RESET_INIT_LOG="$WORK_DIR/init.log" \
     ucode -L "$WORK_DIR/lib" -L "$REAL_LIB" "$RESET_UC" reset-settings "$@"
@@ -78,9 +79,35 @@ cmp -s "$WORK_DIR/config" "$WORK_DIR/default-config" || fail "reset must restore
 [ ! -e "$WORK_DIR/persistent/subscription-cache" ] || fail "reset must clear subscription cache"
 [ ! -e "$WORK_DIR/persistent/rulesets" ] || fail "reset must clear ruleset cache"
 [ "$(cat "$WORK_DIR/persistent/tailscale/server-main/node.key")" = identity ] || fail "reset must preserve Tailscale identity"
+[ "$(cat "$WORK_DIR/persistent/tachyon-core-version")" = 0.3.9 ] || fail "reset must preserve core version marker"
 [ ! -e "$WORK_DIR/runtime" ] || fail "reset must clear runtime state"
-[ ! -e "$WORK_DIR/sing-box-tmp" ] || fail "reset must clear sing-box temporary state"
-[ ! -e "$WORK_DIR/sing-box-config" ] || fail "reset must remove generated sing-box config"
+[ ! -e "$WORK_DIR/tachyon-core-tmp" ] || fail "reset must clear tachyon-core temporary state"
+[ ! -e "$WORK_DIR/tachyon-core-config" ] || fail "reset must remove generated tachyon-core config"
+
+# Default reset without no-start must not start service when factory defaults have no enabled sections
+: >"$WORK_DIR/init.log"
+run_reset >"$WORK_DIR/result-empty.json"
+if grep -Fxq 'start' "$WORK_DIR/init.log"; then fail "reset with empty factory sections must not attempt service start"; fi
+[ "$(wc -l < "$WORK_DIR/result-empty.json" | tr -d ' ')" = "1" ] || fail "reset must print a single JSON line"
+
+# When default config has an enabled section and start fails, reset must still return 0 and emit valid single-line JSON
+cat >>"$WORK_DIR/lib/defaults/config" <<'EOF'
+
+config section 'main'
+        option enabled '1'
+EOF
+cat >"$WORK_DIR/fake-init" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >> "$TACHYON_RESET_INIT_LOG"
+[ "$1" = "start" ] && exit 1
+exit 0
+SH
+chmod 0755 "$WORK_DIR/fake-init"
+: >"$WORK_DIR/init.log"
+run_reset >"$WORK_DIR/result-start-fail.json"
+grep -Fxq 'start' "$WORK_DIR/init.log" || fail "reset with enabled section must attempt service start"
+[ "$(wc -l < "$WORK_DIR/result-start-fail.json" | tr -d ' ')" = "1" ] || fail "failed start after reset must still print a single JSON line"
+grep -Fq '"success":true,"started":false' "$WORK_DIR/result-start-fail.json" || fail "failed start after reset must report started:false in single JSON payload"
 
 # Installer v3 preserves configuration and delegates package initialization to
 # package hooks/runtime modules. It must never implement reset semantics itself.

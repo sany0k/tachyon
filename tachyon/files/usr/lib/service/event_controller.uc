@@ -12,7 +12,7 @@
 //           Probing lives here, in one loop, instead of being duplicated
 //           inside every healer: one tick collects each observation exactly
 //           once and publishes it, where the old code called is_dns_working()
-//           from two healers and get_sing_box_pid() from eight.
+//           from two healers and get_tachyon_core_pid() from eight.
 //
 // Probe tiers and their intervals are unchanged from the timer-based
 // watchdog: fast 15s, normal adaptive 120/300s, slow 300s.
@@ -21,9 +21,14 @@ let fs = require("fs");
 let uci_core = require("core.uci");
 let common = require("core.common");
 let helpers = require("core.helpers");
-let rule_config = require("config.rule");
+let rule_config = null;
+function get_rule_config() {
+    if (rule_config == null) rule_config = require("config.rule");
+    return rule_config;
+}
 let smart_detect = require("service.smart_detect");
 let smart_plus = require("service.smart_detect_plus");
+let firewall_health = require("service.firewall_health");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 
@@ -56,7 +61,6 @@ const EV = {
     CORE_STOPPED:        "core.stopped",
     FIREWALL_RELOADED:      "firewall.reloaded",
     OOM_DETECTED:           "oom.detected",
-    OOM_RECOVERABLE:        "oom.recoverable",
     SMARTDETECT_CANDIDATE:  "smartdetect.candidate",
     URLTEST_SWITCHED:       "urltest.switched",
     HONEYPOT_HIT:           "honeypot.hit",
@@ -77,8 +81,6 @@ const EV = {
     SECTIONS_EMPTY:         "sections.empty",
     ANOMALY_RECONNECTS:     "anomaly.reconnects",
     PAUSE_EXPIRED:          "pause.expired",
-    NFQUEUE_DOWN:           "nfqueue.down",
-    NFQUEUE_UP:             "nfqueue.up",
     TICK:                   "tick"
 };
 
@@ -126,27 +128,25 @@ function process_running(pid, expected_name) {
 
 // ─── Shared observations ──────────────────────────────────────────────────────
 // Resolved once per tick and handed to every probe that needs them. This is
-// what removes the repeated get_sing_box_pid() / is_dns_working() calls that
+// what removes the repeated get_tachyon_core_pid() / is_dns_working() calls that
 // the per-healer detection prologues used to make.
 
-function get_sing_box_pid() {
-    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid", "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+function get_tachyon_core_pid() {
+    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid" ]) {
         let pid = trim(fs.readfile(path) || "");
         if (pid != "" && process_running(pid, "tachyon-core")) return pid;
     }
 
-    for (let svc in [ "tachyon-core", "sing-box" ]) {
-        let ubus_res = command_capture("ubus call service list '{\"name\":\"" + svc + "\"}' 2>/dev/null");
-        if (ubus_res.status == 0 && ubus_res.output != "") {
-            let matched = match(ubus_res.output, /"pid":\s*([0-9]+)/);
-            if (matched && matched[1] != "") {
-                let pid = matched[1];
-                if (process_running(pid, "tachyon-core")) return pid;
-            }
+    let ubus_res = command_capture("ubus call service list '{\"name\":\"tachyon-core\"}' 2>/dev/null");
+    if (ubus_res.status == 0 && ubus_res.output != "") {
+        let matched = match(ubus_res.output, /"pid":\s*([0-9]+)/);
+        if (matched && matched[1] != "") {
+            let pid = matched[1];
+            if (process_running(pid, "tachyon-core")) return pid;
         }
     }
 
-    let pidof_res = command_capture("pidof tachyon-core sing-box 2>/dev/null");
+    let pidof_res = command_capture("pidof tachyon-core 2>/dev/null");
     if (pidof_res.status == 0 && pidof_res.output != "") {
         let fields = split(trim(pidof_res.output), /[ \t]+/);
         if (length(fields) > 0 && fields[0] != "") {
@@ -158,19 +158,19 @@ function get_sing_box_pid() {
     return "";
 }
 
-// Scans /proc for a tachyon-core or sing-box executable. Slower than get_sing_box_pid(), used
+// Scans /proc for a tachyon-core executable. Slower than get_tachyon_core_pid(), used
 // only to confirm a suspected stop before publishing the fact.
-function sing_box_in_proc() {
+function tachyon_core_in_proc() {
     let proc = fs.opendir("/proc");
     if (!proc) return "";
     let entry;
     let pid = "";
     while ((entry = proc.read()) != null) {
-        if (match(entry, /^[0-9]+$/)) {
+        if (ltrim(entry, "0123456789") == "") {
             let exe = fs.readlink("/proc/" + entry + "/exe") || "";
             let slash = rindex(exe, "/");
             let base = slash >= 0 ? substr(exe, slash + 1) : exe;
-            if (base == "tachyon-core" || base == "sing-box") {
+            if (base == "tachyon-core") {
                 pid = entry;
                 break;
             }
@@ -181,10 +181,26 @@ function sing_box_in_proc() {
 }
 
 function is_dns_working() {
-    return command_success_from_args([ "sh", "-c",
-        "nslookup -timeout=2 yandex.ru 127.0.0.1 >/dev/null 2>&1 || " +
-        "nslookup -timeout=2 connectivitycheck.gstatic.com 127.0.0.1 >/dev/null 2>&1 || " +
-        "nslookup -timeout=2 google.com 127.0.0.1 >/dev/null 2>&1" ]);
+    let has_dig = fs.access("/usr/bin/dig", "x") == true || fs.access("/bin/dig", "x") == true;
+    for (let domain in [ "yandex.ru", "connectivitycheck.gstatic.com", "google.com" ]) {
+        if (has_dig) {
+            let res = command_capture(command_from_args([
+                "dig", "@127.0.0.1", "-p", "53", domain, "A", "+short", "+time=2", "+timeout=2", "+tries=1"
+            ]) + " 2>/dev/null");
+            if (res.status == 0 && match(as_string(res.output), /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) != null)
+                return true;
+            continue;
+        }
+        let res = command_capture(command_from_args([
+            "nslookup", "-type=a", "-timeout=2", domain, "127.0.0.1"
+        ]) + " 2>&1");
+        if (res.status == 0)
+            return true;
+        if (match(as_string(res.output), /Usage:|invalid|unrecognized/i) != null &&
+            command_capture(command_from_args([ "nslookup", "-timeout=2", domain, "127.0.0.1" ]) + " 2>&1").status == 0)
+            return true;
+    }
+    return false;
 }
 
 function check_tachyon_cli_running() {
@@ -214,18 +230,18 @@ function is_reload_in_progress() {
     return fs.stat("/var/run/tachyon.reload.lock") != null || check_tachyon_cli_running();
 }
 
-// Reads a port out of the generated sing-box config. Both callers fall back to
+// Reads a port out of the generated tachyon-core config. Both callers fall back to
 // a compiled-in default when the file cannot be parsed, and that fallback is
-// worth a log line: a watchdog probing 4534 while sing-box listens elsewhere
+// worth a log line: a watchdog probing 4534 while tachyon-core listens elsewhere
 // reports the proxy as down forever and heals it in a loop. The failure used to
 // be swallowed by an empty catch, so the symptom was a permanently unhealthy
 // proxy with nothing in the log to connect it to the config.
 //
 // Logged once per process — these are called on every tick, and a config that
 // fails to parse fails to parse every time.
-let sb_config_parse_reported = false;
+let core_config_parse_reported = false;
 
-function parse_singbox_config() {
+function parse_core_config() {
     let data = fs.readfile("/etc/tachyon-core/config.json");
     if (data == null)
         return null;
@@ -234,8 +250,8 @@ function parse_singbox_config() {
         return json(data);
     }
     catch (e) {
-        if (!sb_config_parse_reported) {
-            sb_config_parse_reported = true;
+        if (!core_config_parse_reported) {
+            core_config_parse_reported = true;
             command_success_from_args([ "logger", "-t", "tachyon",
                 "[err] Watchdog: /etc/tachyon-core/config.json is unparseable (" + as_string(e) +
                 "); falling back to default inbound ports, proxy checks may probe the wrong port" ]);
@@ -244,24 +260,61 @@ function parse_singbox_config() {
     }
 }
 
-// Reads the http/mixed inbound port from the generated sing-box config.
-// Cached because the config only changes across a reload.
+// An inbound whose route rule points at a "direct" outbound (an external OS
+// interface via bind_interface such as awg-out, a routing_mark daemon, or
+// direct-bypass-in) does not traverse any proxy inside the core: restarting
+// tachyon-core cannot heal an external interface that lost connectivity.
+function inbound_routes_to_direct(sb_cfg, inb_tag) {
+    if (type(sb_cfg) != "object" || inb_tag == null || inb_tag == "")
+        return false;
+    if (inb_tag == "direct-bypass-in")
+        return true;
+    let rules = (type(sb_cfg.route) == "object" && type(sb_cfg.route.rules) == "array")
+        ? sb_cfg.route.rules
+        : [];
+    let target_out = "";
+    for (let r in rules) {
+        if (type(r) != "object" || r.ip_is_private == true || r.outbound == null)
+            continue;
+        let matches = (r.inbound == inb_tag) ||
+            (type(r.inbound) == "array" && index(r.inbound, inb_tag) >= 0);
+        if (matches) {
+            target_out = as_string(r.outbound);
+            break;
+        }
+    }
+    if (target_out == "")
+        return false;
+    let outbounds = type(sb_cfg.outbounds) == "array" ? sb_cfg.outbounds : [];
+    for (let out in outbounds) {
+        if (type(out) == "object" && out.tag == target_out)
+            return out.type == "direct";
+    }
+    return false;
+}
+
+// Reads the http/mixed inbound port from the generated tachyon-core config.
+// Cached because the config only changes across a reload or regeneration.
 let cached_proxy_port = null;
 let cached_proxy_host = null;
 let cached_tproxy_port = null;
+let cached_proxy_cfg_mtime = 0;
 function proxy_port() {
-    if (cached_proxy_port !== null)
+    let st = fs.stat("/etc/tachyon-core/config.json");
+    let current_mtime = st ? st.mtime : 0;
+    if (cached_proxy_port != null && cached_proxy_cfg_mtime == current_mtime)
         return as_string(cached_proxy_port);
 
     // Empty when the generated config has no http/mixed inbound: probing the
     // default port would measure a dead listener and report the proxy broken.
     let port = "";
     let host = "127.0.0.1";
-    let sb_cfg = parse_singbox_config();
+    let sb_cfg = parse_core_config();
     if (sb_cfg && sb_cfg.inbounds) {
-        // 1. Prefer service-mixed-in
+        // 1. Prefer service-mixed-in (unless bound to an external direct interface)
         for (let inb in sb_cfg.inbounds) {
-            if (inb.tag == "service-mixed-in" && inb.listen_port != null) {
+            if (inb.tag == "service-mixed-in" && inb.listen_port != null &&
+                !inbound_routes_to_direct(sb_cfg, inb.tag)) {
                 port = as_string(inb.listen_port);
                 let h = as_string(inb.listen || "127.0.0.1");
                 if (h != "0.0.0.0" && h != "::" && h != "") host = h;
@@ -271,7 +324,8 @@ function proxy_port() {
         // 2. Localhost listeners
         if (port == "") {
             for (let inb in sb_cfg.inbounds) {
-                if ((inb.type == "http" || inb.type == "mixed") && inb.listen_port != null) {
+                if ((inb.type == "http" || inb.type == "mixed") && inb.listen_port != null &&
+                    !inbound_routes_to_direct(sb_cfg, inb.tag)) {
                     let listen = as_string(inb.listen || "");
                     if (listen == "127.0.0.1" || listen == "0.0.0.0" || listen == "::" || listen == "") {
                         port = as_string(inb.listen_port);
@@ -284,7 +338,8 @@ function proxy_port() {
         // 3. Any http or mixed inbound
         if (port == "") {
             for (let inb in sb_cfg.inbounds) {
-                if ((inb.type == "http" || inb.type == "mixed") && inb.listen_port != null) {
+                if ((inb.type == "http" || inb.type == "mixed") && inb.listen_port != null &&
+                    !inbound_routes_to_direct(sb_cfg, inb.tag)) {
                     port = as_string(inb.listen_port);
                     let h = as_string(inb.listen || "127.0.0.1");
                     if (h != "0.0.0.0" && h != "::" && h != "") host = h;
@@ -295,11 +350,12 @@ function proxy_port() {
     }
     cached_proxy_port = port;
     cached_proxy_host = host;
+    cached_proxy_cfg_mtime = current_mtime;
     return port;
 }
 
 function proxy_host() {
-    if (cached_proxy_host !== null)
+    if (cached_proxy_host != null)
         return cached_proxy_host;
     proxy_port();
     return cached_proxy_host || "127.0.0.1";
@@ -309,14 +365,17 @@ function forget_proxy_port() {
     cached_proxy_port = null;
     cached_proxy_host = null;
     cached_tproxy_port = null;
-    sb_config_parse_reported = false;
+    cached_proxy_cfg_mtime = 0;
+    core_config_parse_reported = false;
 }
 
 function tproxy_port() {
-    if (cached_tproxy_port !== null)
+    let st = fs.stat("/etc/tachyon-core/config.json");
+    let current_mtime = st ? st.mtime : 0;
+    if (cached_tproxy_port != null && cached_proxy_cfg_mtime == current_mtime)
         return cached_tproxy_port;
     let port = 4530;
-    let sb_cfg = parse_singbox_config();
+    let sb_cfg = parse_core_config();
     if (sb_cfg && sb_cfg.inbounds) {
         for (let inb in sb_cfg.inbounds) {
             if (inb.type == "tproxy") {
@@ -326,6 +385,7 @@ function tproxy_port() {
         }
     }
     cached_tproxy_port = port;
+    cached_proxy_cfg_mtime = current_mtime;
     return port;
 }
 
@@ -333,14 +393,14 @@ function tproxy_port() {
 // Pure functions: a syslog line in, a fact (or null) out. No I/O, so the
 // classifier is directly testable — see tests/event_controller.sh.
 
-// Extract a candidate domain from a sing-box log line. Returns null when the
+// Extract a candidate domain from a tachyon-core log line. Returns null when the
 // line carries no usable hostname. Kept separate from log handling so the
 // pattern can be exercised directly by tests.
 function smart_detect_extract_domain(line) {
     return smart_detect.extract_host(line);
 }
 
-// Hostnames of connections that are still open, keyed by trace id. sing-box
+// Hostnames of connections that are still open, keyed by trace id. tachyon-core
 // logs the resolved IP on the failure line, so this is the only place the
 // hostname of a failing connection can come from.
 // ponytail: bounded twice over — entries older than TRACE_HOST_TTL are dropped
@@ -350,14 +410,19 @@ function smart_detect_extract_domain(line) {
 const TRACE_HOST_TTL = 300;
 const TRACE_HOSTS_MAX = 256;
 let trace_hosts = {};
+let trace_hosts_last_prune = 0;
 
 function remember_trace_host(trace, host) {
     if (trace == null || host == null) return;
     let now = time();
     trace_hosts[trace] = { host: host, at: now };
-    if (length(keys(trace_hosts)) > TRACE_HOSTS_MAX) trace_hosts = {};
-    for (let key in keys(trace_hosts)) {
-        if (now - trace_hosts[key].at > TRACE_HOST_TTL) delete trace_hosts[key];
+    if (now - trace_hosts_last_prune >= 30 || length(trace_hosts) > TRACE_HOSTS_MAX) {
+        trace_hosts_last_prune = now;
+        for (let key in keys(trace_hosts)) {
+            if (now - trace_hosts[key].at > TRACE_HOST_TTL) delete trace_hosts[key];
+        }
+        if (length(trace_hosts) > TRACE_HOSTS_MAX)
+            trace_hosts = { [trace]: { host: host, at: now } };
     }
 }
 
@@ -373,19 +438,26 @@ function remember_trace_host(trace, host) {
 //     an array return rather than a single fact.
 //
 // The netlink/nlbwmon discrimination is preserved: misreading a netlink
-// warning as OOM would shrink GOMEMLIMIT for nothing.
+// warning as OOM would trigger false OOM alerts.
 let plus_trace_hosts = {};
+let plus_trace_last_prune = 0;
 function classify_plus_log_line(line) {
     let trace = smart_detect.parse_trace(line);
     let candidate = smart_plus.log_candidate(line);
-    let text = lc(as_string(line));
-    let destination = match(text, /(outbound connection to|open connection to) ([a-z0-9.-]+):([0-9]+)/);
-    if (trace && destination) {
-        if (length(plus_trace_hosts) >= 256) plus_trace_hosts = {};
-        plus_trace_hosts[trace] = { domain: destination[2], port: destination[3], at: time() };
+    let now = time();
+    if (trace && index(line, "connection to ") >= 0) {
+        let text = lc(as_string(line));
+        let destination = match(text, /(outbound connection to|open connection to) ([a-z0-9.-]+):([0-9]+)/);
+        if (destination)
+            plus_trace_hosts[trace] = { domain: destination[2], port: destination[3], at: now };
     }
-    for (let key in keys(plus_trace_hosts))
-        if (time() - plus_trace_hosts[key].at > 300) delete plus_trace_hosts[key];
+    if (now - plus_trace_last_prune >= 30 || length(plus_trace_hosts) >= 256) {
+        plus_trace_last_prune = now;
+        for (let key in keys(plus_trace_hosts))
+            if (now - plus_trace_hosts[key].at > 300) delete plus_trace_hosts[key];
+        if (length(plus_trace_hosts) >= 256)
+            plus_trace_hosts = {};
+    }
     if (!candidate && trace && plus_trace_hosts[trace]) {
         let dest = plus_trace_hosts[trace];
         candidate = smart_plus.log_candidate(line, dest);
@@ -409,7 +481,7 @@ function classify_log_line(line, plus_mode) {
     let is_oom = (index(line_lower, "oom-killer") >= 0 ||
                   index(line_lower, "out of memory: kill process") >= 0 ||
                   (index(line_lower, "kernel:") >= 0 && index(line_lower, "out of memory") >= 0) ||
-                  (index(line_lower, "sing-box") >= 0 && index(line_lower, "out of memory") >= 0) ||
+                  (index(line_lower, "tachyon-core") >= 0 && index(line_lower, "out of memory") >= 0) ||
                   index(line_lower, "fatal error: out of memory") >= 0);
     let is_netlink_warning = (index(line_lower, "netlink") >= 0 || index(line_lower, "nlbwmon") >= 0);
 
@@ -436,9 +508,9 @@ function classify_log_line(line, plus_mode) {
     else if ((index(line_lower, "direct") >= 0 || index(line_lower, "DIRECT") >= 0) &&
         (index(line_lower, "failed") >= 0 || index(line_lower, "timeout") >= 0 ||
          index(line_lower, "reset") >= 0)) {
-        // "direct" is the outbound TYPE. A section backed by a local DPI bypass
-        // logs outbound/direct[<section>-out] and its failure says nothing
-        // about the destination, so only the bypass outbounds count.
+        // "direct" is the outbound TYPE. A section backed by a local desync
+        // outbound logs outbound/direct[<section>-out] and its failure says
+        // nothing about the destination, so only the bypass outbounds count.
         if (smart_detect.failure_outbound_is_bypass(line)) {
             let trace = smart_detect.parse_trace(line);
             let domain = smart_detect_extract_domain(line)
@@ -480,7 +552,10 @@ function controller(bus, opts) {
         healthy_streak: 0,
         subscription_fail_streak: 0,
         wan_fail_streak: 0,
-        smart_detect_connections: {}
+        smart_detect_connections: {},
+        last_subnet_sets_probe: 0,
+        subnet_sets_last_pid: "",
+        subnet_sets_had_empty: false
     };
 
     let self = { EV: EV, state: state };
@@ -511,7 +586,7 @@ function controller(bus, opts) {
                 if (state.syslog_start_time > 0 && (now - state.syslog_start_time > 3) &&
                     (now - state.last_oom_time > 60)) {
                     state.last_oom_time = now;
-                    bus.emit(EV.OOM_DETECTED, {});
+                    bus.emit(EV.OOM_DETECTED, fact.payload || {});
                     push(published, EV.OOM_DETECTED);
                 }
                 continue;
@@ -562,7 +637,7 @@ function controller(bus, opts) {
     };
 
     // ── Probe: expired pause ──────────────────────────────────────────────────
-    // Declared ahead of probe_singbox, which consults it on every fast tick.
+    // Declared ahead of probe_tachyon_core, which consults it on every fast tick.
     function probe_pause() {
         let val = trim(fs.readfile("/tmp/tachyon_paused_until") || "");
         if (val == "") return false;
@@ -585,8 +660,8 @@ function controller(bus, opts) {
         let cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
         let reload = is_reload_in_progress();
         let list_upd = is_list_update_running();
-        let sb_pid = get_sing_box_pid();
-        let sb_running = (sb_pid != "" && process_running(sb_pid, "sing-box"));
+        let core_pid = get_tachyon_core_pid();
+        let core_running = (core_pid != "" && process_running(core_pid, "tachyon-core"));
         let port = proxy_port();
         let host = proxy_host();
         let paused = probe_pause();
@@ -596,8 +671,8 @@ function controller(bus, opts) {
             settings: cfg,
             reload_in_progress: reload,
             list_update_running: list_upd,
-            singbox_pid: sb_pid,
-            singbox_running: sb_running,
+            tachyon_core_pid: core_pid,
+            tachyon_core_running: core_running,
             proxy_port: port,
             proxy_host: host,
             is_paused: paused
@@ -629,7 +704,7 @@ function controller(bus, opts) {
     function probe_smart_detect_connections() {
         let ctx = current_tick_ctx || create_tick_context();
         if (!smart_plus.capture_enabled(ctx.settings) || ctx.is_paused ||
-            ctx.reload_in_progress || !ctx.singbox_running) {
+            ctx.reload_in_progress || !ctx.tachyon_core_running) {
             state.smart_detect_connections = {};
             state.smart_detect_silent_drops = {};
             last_smart_detect_poll = 0;
@@ -673,36 +748,24 @@ function controller(bus, opts) {
     }
 
     self.set_tick_context = function(ctx) { current_tick_ctx = ctx; };
+    self.get_tick_context = function() { return current_tick_ctx; };
     self.clear_tick_context = function() { current_tick_ctx = null; };
 
-    // ── Probe: sing-box liveness ──────────────────────────────────────────────
+    // ── Probe: tachyon-core liveness ──────────────────────────────────────────
     // The expensive /proc scan only runs once the cheap pidfile/ubus/pidof
     // path has already failed, preserving the original fast-path ordering.
-    function probe_singbox() {
+    function probe_tachyon_core() {
         let ctx = current_tick_ctx || create_tick_context();
         if (setting("recovery_bypass", "0") == "1") return;
-        // An active pause means sing-box is stopped on purpose.
+        // An active pause means tachyon-core is stopped on purpose.
         if (ctx.is_paused) return;
         if (ctx.reload_in_progress) return;
         if (ctx.list_update_running) return;
 
-        let active_engine = "tachyon-core";
-        try {
-            active_engine = require("core.engine").get_active();
-        } catch (e) {}
+        let pid = ctx.tachyon_core_pid;
+        if (pid != "" && ctx.tachyon_core_running) return;
 
-        if (active_engine != "tachyon-core") {
-            let steer_running = command_success_from_args([ "/etc/init.d/steer", "status" ]) ||
-                                command_success_from_args([ "pgrep", "-f", "steer" ]);
-            if (!steer_running)
-                bus.emit(EV.CORE_STOPPED, { reason: "steer service stopped" });
-            return;
-        }
-
-        let pid = ctx.singbox_pid;
-        if (pid != "" && ctx.singbox_running) return;
-
-        // No configured sections means sing-box is legitimately absent.
+        // No configured sections means tachyon-core is legitimately absent.
         let has_sections = false;
         let uci_sections = uci_core.get_all(CONFIG_NAME);
         if (uci_sections) {
@@ -715,7 +778,7 @@ function controller(bus, opts) {
         }
         if (!has_sections) return;
 
-        if (sing_box_in_proc() == "")
+        if (tachyon_core_in_proc() == "")
             bus.emit(EV.CORE_STOPPED, { reason: "process missing from /proc" });
     }
 
@@ -733,8 +796,8 @@ function controller(bus, opts) {
         // land in the latency history as a fault that never happened.
         if (ctx.reload_in_progress) return;
 
-        let pid = ctx.singbox_pid;
-        if (pid == "" || !ctx.singbox_running) return;
+        let pid = ctx.tachyon_core_pid;
+        if (pid == "" || !ctx.tachyon_core_running) return;
 
         let port = ctx.proxy_port;
         // No http/mixed inbound in the generated config: there is nothing to
@@ -744,12 +807,20 @@ function controller(bus, opts) {
 
         // Adaptive interval pacing: honor ai_proxy_health_interval (default 30s)
         // when healthy (consecutive fails == 0).
-        // On failure, switch to fast retry on every tick (10-15s) until restored.
-        let proxy_interval = int(ctx.settings.ai_proxy_health_interval || "30");
+        // On failure, switch to fast retry for the first 3 attempts so transient
+        // blips or failover confirm quickly, then back off to avoid hammering CPU
+        // with curl processes when the connection stays down.
+        let proxy_interval = int(ctx.settings.ai_proxy_health_interval || "60");
         if (proxy_interval < 15) proxy_interval = 15;
 
-        if (state.proxy_consecutive_fails == 0 && state.last_proxy_probe > 0 &&
-            (ctx.now - state.last_proxy_probe < proxy_interval))
+        let effective_proxy_interval = proxy_interval;
+        if (state.proxy_consecutive_fails > 0 && state.proxy_consecutive_fails < 3)
+            effective_proxy_interval = 15;
+        else if (state.proxy_consecutive_fails >= 6 && effective_proxy_interval < 60)
+            effective_proxy_interval = 60;
+
+        if (state.last_proxy_probe > 0 &&
+            (ctx.now - state.last_proxy_probe < effective_proxy_interval))
             return;
 
         state.last_proxy_probe = ctx.now;
@@ -758,7 +829,7 @@ function controller(bus, opts) {
         let started = time();
         let ok = command_success_from_args([
             "curl", "-s", "-o", "/dev/null",
-            "--connect-timeout", "3", "--max-time", "5",
+            "--connect-timeout", "5", "--max-time", "8",
             "--proxy", "http://" + host + ":" + port,
             check_url
         ]);
@@ -772,7 +843,7 @@ function controller(bus, opts) {
                 : "https://connectivitycheck.gstatic.com/generate_204";
             ok = command_success_from_args([
                 "curl", "-s", "-o", "/dev/null",
-                "--connect-timeout", "3", "--max-time", "5",
+                "--connect-timeout", "5", "--max-time", "8",
                 "--proxy", "http://" + host + ":" + port,
                 fallback_url
             ]);
@@ -791,7 +862,7 @@ function controller(bus, opts) {
         state.proxy_consecutive_fails++;
 
         // Distinguish "proxy is broken" from "the whole uplink is down": only
-        // the former is worth restarting sing-box over.
+        // the former is worth restarting tachyon-core over.
         // Check primary URL, and if that fails, check fallback URL directly too
         // in case the primary URL is blocked directly on the ISP WAN.
         let direct_ok = command_success_from_args([
@@ -837,34 +908,25 @@ function controller(bus, opts) {
             return;
         }
 
-        let active_engine = "tachyon-core";
-        try {
-            active_engine = require("core.engine").get_active();
-        } catch (e) {}
-
-        if (active_engine == "steer" || active_engine == "steer-extended") {
-            let steer_running = command_success_from_args([ "/etc/init.d/steer", "status" ]) ||
-                                command_success_from_args([ "pgrep", "-f", "steer" ]);
-            if (!steer_running) {
-                clear_dns_streak();
-                return;
-            }
-        } else {
-            let pid = ctx.singbox_pid;
-            if (pid == "" || !ctx.singbox_running) {
-                clear_dns_streak();
-                return;
-            }
+        let pid = ctx.tachyon_core_pid;
+        if (pid == "" || !ctx.tachyon_core_running) {
+            clear_dns_streak();
+            return;
         }
 
         // Adaptive interval pacing: honor ai_dns_interval (default 60s)
         // when healthy (consecutive fails == 0).
-        // On failure, switch to fast retry on every tick (10-15s) until restored.
-        let dns_interval = int(ctx.settings.ai_dns_interval || "60");
+        // On failure, switch to fast retry for the first 3 attempts, then pace at
+        // dns_interval so nslookup probes do not churn CPU while upstream is down.
+        let dns_interval = int(ctx.settings.ai_dns_interval || "180");
         if (dns_interval < 15) dns_interval = 15;
 
-        if (state.dns_consecutive_fails == 0 && state.last_dns_probe > 0 &&
-            (ctx.now - state.last_dns_probe < dns_interval))
+        let effective_dns_interval = (state.dns_consecutive_fails > 0 && state.dns_consecutive_fails < 3)
+            ? 15
+            : dns_interval;
+
+        if (state.last_dns_probe > 0 &&
+            (ctx.now - state.last_dns_probe < effective_dns_interval))
             return;
 
         state.last_dns_probe = ctx.now;
@@ -929,48 +991,23 @@ function controller(bus, opts) {
     // ── Probe: nftables table and QoS marks ───────────────────────────────────
     function probe_nftables() {
         let ctx = current_tick_ctx || create_tick_context();
-        if (setting("recovery_bypass", "0") == "1") return;
-        if (fs.stat("/var/run/tachyon/native_internet_restored") != null) return;
+        if (firewall_health.interception_suppressed(ctx.settings)) return;
         if (ctx.list_update_running) return;
         if (ctx.reload_in_progress) return;
-
-        let active_engine = "tachyon-core";
-        try {
-            active_engine = require("core.engine").get_active();
-        } catch (e) {}
-
-        if (active_engine != "tachyon-core") {
-            let steer_nft = command_output_from_args(["sh", "-c", "nft list table inet steer 2>/dev/null; exit 0"]);
-            if (index(steer_nft, "table inet steer") < 0) {
-                bus.emit(EV.NFT_MISSING, { table: "inet steer" });
-            }
+        let health = firewall_health.inspect(ctx.settings);
+        let table = getenv("NFT_TABLE_NAME") || "TachyonTable";
+        if (!health.nft_ok) {
+            bus.emit(EV.NFT_MISSING, { table: table });
             return;
         }
-
-        let nft_table = getenv("NFT_TABLE_NAME") || "TachyonTable";
-        let routing_mode = ctx.settings.routing_mode || "nftables";
-        let out_nft = command_output_from_args(["sh", "-c",
-            "nft list table inet " + nft_table + " | grep -E 'chain|tproxy|priority_rules|dscp'; exit 0"]);
-
-        if (routing_mode == "nftables") {
-            if (index(out_nft, "tproxy") < 0 || index(out_nft, "priority_rules") < 0) {
-                bus.emit(EV.NFT_MISSING, { table: nft_table });
-                return;
-            }
-        }
-
-        let qos_pref = ctx.settings.qos_priority_engine || "";
-        if (qos_pref == "0") return;
-        if ((index(out_nft, "dscp set 0x2e") < 0 && index(out_nft, "dscp set ef") < 0) ||
-            (index(out_nft, "dscp set 0x22") < 0 && index(out_nft, "dscp set af41") < 0))
-            bus.emit(EV.QOS_MISSING, { table: nft_table });
+        if (!health.qos_ok)
+            bus.emit(EV.QOS_MISSING, { table: table });
     }
 
     // ── Probe: TPROXY port liveness ───────────────────────────────────────────
     function probe_tproxy() {
         let ctx = current_tick_ctx || create_tick_context();
-        if (setting("recovery_bypass", "0") == "1") return;
-        if (fs.stat("/var/run/tachyon/native_internet_restored") != null) return;
+        if (firewall_health.interception_suppressed(ctx.settings)) return;
         if (ctx.reload_in_progress) return;
 
         let active_engine = "tachyon-core";
@@ -979,25 +1016,14 @@ function controller(bus, opts) {
         } catch (e) {}
         if (active_engine != "tachyon-core") return;
 
-        let pid = ctx.singbox_pid;
-        if (pid == "" || !ctx.singbox_running) return;
+        let pid = ctx.tachyon_core_pid;
+        if (pid == "" || !ctx.tachyon_core_running) return;
+
+        let proxy_mode = lc(trim(as_string(ctx.settings.proxy_mode || "tproxy")));
+        if (proxy_mode == "tun" || proxy_mode == "socks") return;
 
         let port = tproxy_port();
-        // /proc/net/tcp encodes the local port in hex; 0A is TCP_LISTEN.
-        let hex_port = sprintf("%04X", port);
-        let listening = false;
-        for (let proc_file in ["/proc/net/tcp6", "/proc/net/tcp"]) {
-            let tcp_data = fs.readfile(proc_file) || "";
-            for (let line in split(tcp_data, "\n")) {
-                if (index(line, ":" + hex_port + " ") >= 0 && index(line, " 0A ") >= 0) {
-                    listening = true;
-                    break;
-                }
-            }
-            if (listening) break;
-        }
-
-        if (!listening)
+        if (!firewall_health.tproxy_listening(port))
             bus.emit(EV.TPROXY_DOWN, { port: port });
     }
 
@@ -1013,7 +1039,7 @@ function controller(bus, opts) {
         if (!proc_dir) return;
         let entry;
         while ((entry = proc_dir.read()) != null) {
-            if (!match(entry, /^[0-9]+$/)) continue;
+            if (ltrim(entry, "0123456789") != "") continue;
             let comm = trim(fs.readfile("/proc/" + entry + "/comm") || "");
             if (comm == "rpcd") { rpcd_pid = entry; break; }
         }
@@ -1024,7 +1050,7 @@ function controller(bus, opts) {
         if (!fd_dir) return;
         let fd_count = 0;
         while ((entry = fd_dir.read()) != null) {
-            if (match(entry, /^[0-9]+$/)) fd_count++;
+            if (ltrim(entry, "0123456789") == "") fd_count++;
         }
         fd_dir.close();
 
@@ -1220,15 +1246,40 @@ function controller(bus, opts) {
         });
     }
 
+    function nft_set_state(table, set_name) {
+        let pipe = fs.popen(
+            command_from_args([ "nft", "list", "set", "inet", table, set_name ]) + " 2>/dev/null",
+            "r");
+        if (!pipe)
+            return "missing";
+        let head = as_string(pipe.read(4096) || "");
+        let has_elements = index(head, "elements") >= 0;
+        let status = pipe.close();
+        if (has_elements)
+            return "populated";
+        if (status != 0 || head == "")
+            return "missing";
+        return "empty";
+    }
+
     // ── Probe: community subnet nft sets ──────────────────────────────────────
     function probe_subnet_sets() {
         let ctx = current_tick_ctx || create_tick_context();
-        if (setting("recovery_bypass", "0") == "1") return;
+        if (firewall_health.interception_suppressed(ctx.settings)) return;
         if (ctx.reload_in_progress) return;
         if (ctx.list_update_running) return;
 
-        let pid = ctx.singbox_pid;
-        if (pid == "" || !ctx.singbox_running) return;
+        let pid = ctx.tachyon_core_pid;
+        if (pid == "" || !ctx.tachyon_core_running) return;
+
+        let now = time();
+        if (!state.subnet_sets_had_empty &&
+            state.subnet_sets_last_pid == pid &&
+            state.last_subnet_sets_probe > 0 &&
+            (now - state.last_subnet_sets_probe) < 1800)
+            return;
+        state.last_subnet_sets_probe = now;
+        state.subnet_sets_last_pid = pid;
 
         let nft_table = getenv("NFT_TABLE_NAME") || "TachyonTable";
         let all_sections = uci_core.get_all(CONFIG_NAME);
@@ -1239,18 +1290,40 @@ function controller(bus, opts) {
             let s = all_sections[sec_name];
             if (s[".type"] != "section" || s.enabled != "1") continue;
             if (s.community_subnets == "0") continue;
-            if (!s.community_lists || !rule_config.has_community_subnet_list(s.community_lists)) continue;
+            let eff_lists = [];
+            if (type(s.community_lists) == "array") {
+                for (let cl in s.community_lists) push(eff_lists, cl);
+            } else if (type(s.community_lists) == "string" && s.community_lists != "") {
+                for (let cl in split(s.community_lists, /\s+/)) {
+                    if (cl != "") push(eff_lists, cl);
+                }
+            }
+            let cond_refs = s.condition_refs;
+            if (type(cond_refs) == "string" && cond_refs != "") cond_refs = split(cond_refs, /\s+/);
+            if (type(cond_refs) == "array") {
+                for (let cref in cond_refs) {
+                    let csec = all_sections[cref];
+                    if (type(csec) != "object" || csec.enabled == "0") continue;
+                    let clists = csec.community_lists || csec.domain_lists;
+                    if (type(clists) == "array") {
+                        for (let cl in clists) push(eff_lists, cl);
+                    } else if (type(clists) == "string" && clists != "") {
+                        for (let cl in split(clists, /\s+/)) {
+                            if (cl != "") push(eff_lists, cl);
+                        }
+                    }
+                }
+            }
+            if (length(eff_lists) == 0 || !get_rule_config().has_community_subnet_list(eff_lists)) continue;
 
             // A non-zero exit means the set does not exist for this section
             // (no subnet community configured) — not an emptiness problem.
             let set_name = "tachyon_rule_" + sec_name + "_subnets";
-            let result = command_capture(
-                command_from_args(["nft", "list", "set", "inet", nft_table, set_name]) + " 2>/dev/null");
-            if (result.status != 0 || result.output == "") continue;
-            if (index(result.output, "elements") < 0)
+            if (nft_set_state(nft_table, set_name) == "empty")
                 push(empty, set_name);
         }
 
+        state.subnet_sets_had_empty = length(empty) > 0;
         if (length(empty) > 0)
             bus.emit(EV.SUBNETS_EMPTY, { sets: empty });
     }
@@ -1261,7 +1334,7 @@ function controller(bus, opts) {
         if (sub_url == "") return;
 
         let res = command_capture(
-            "curl -s -o /dev/null -w %{http_code} --connect-timeout 10 " + shell_quote(sub_url) + " 2>&1");
+            "curl -s -o /dev/null -w %{http_code} --connect-timeout 10 --max-time 15 " + shell_quote(sub_url) + " 2>&1");
         let code = int(res.output);
         if (res.status == 0 && code >= 200 && code < 400) {
             state.subscription_fail_streak = 0;
@@ -1327,97 +1400,6 @@ function controller(bus, opts) {
             bus.emit(EV.ANOMALY_RECONNECTS, { count: reconnects, threshold: threshold });
     }
 
-    // ── Probe: OOM scale recovery window ──────────────────────────────────────
-    // Half an hour without an OOM means the shrunk GOMEMLIMIT can start
-    // creeping back up; the healer decides by how much.
-    // A scale of 1.0 means there is nothing to restore, so the marker file is
-    // dropped here rather than published as a fact: removing a stale file is an
-    // observation cleanup, not a repair a subscriber should have to schedule.
-    function probe_oom_recovery() {
-        let now = time();
-        if (state.last_oom_time == 0) return;
-        if (now - state.last_oom_time < 1800) return;
-
-        let scale_path = "/etc/tachyon/mem_scale";
-        let scale_data = fs.readfile(scale_path);
-        if (scale_data == null) return;
-        let current_scale = double(trim(as_string(scale_data)));
-        if (current_scale >= 1.0) {
-            // Absent file already satisfies the caller; fs.unlink throws on ENOENT.
-            try { fs.unlink(scale_path); } catch (e) {}
-            return;
-        }
-        if (current_scale < 0.1) return;
-
-        bus.emit(EV.OOM_RECOVERABLE, { last_oom: state.last_oom_time, scale: current_scale });
-    }
-
-    // ── Probe: nfqueue/zapret runtime health ──────────────────────────────────
-    // Checks if nfqws/nfqws2 supervisor processes are alive by counting PID
-    // files. A mismatch means the DPI bypass engine crashed or was killed.
-    function probe_nfqueue() {
-        let ctx = current_tick_ctx || create_tick_context();
-        if (!bus.has(EV.NFQUEUE_DOWN) && !bus.has(EV.NFQUEUE_UP)) return;
-        if (ctx.reload_in_progress) return;
-
-        let pid_dirs = [
-            "/var/run/tachyon/zapret/child-pid",
-            "/var/run/tachyon/zapret2/child-pid"
-        ];
-
-        let configured_nfqueue = { zapret: 0, zapret2: 0 };
-        let sections = uci_core.get_all(CONFIG_NAME);
-        if (type(sections) == "object") {
-            for (let sname, sec in sections) {
-                if (type(sec) == "object" && sec.enabled == "1") {
-                    if (sec.action == "zapret")
-                        configured_nfqueue.zapret++;
-                    else if (sec.action == "zapret2")
-                        configured_nfqueue.zapret2++;
-                }
-            }
-        }
-
-        for (let i = 0; i < length(pid_dirs); i++) {
-            let child_dir = pid_dirs[i];
-            let kind = index(child_dir, "zapret2") >= 0 ? "zapret2" : "zapret";
-            let cfg_count = configured_nfqueue[kind];
-            let expected = 0;
-            let running = 0;
-            let dir = fs.opendir(child_dir);
-            if (dir) {
-                let entry;
-                while ((entry = dir.read()) != null) {
-                    if (entry == "." || entry == "..") continue;
-                    expected++;
-                    let pid_data = fs.readfile(child_dir + "/" + entry);
-                    if (pid_data == null) continue;
-                    let pid = trim(as_string(pid_data));
-                    if (pid == "" || match(pid, /^[0-9]+$/) == null) continue;
-                    if (fs.stat("/proc/" + pid) != null) {
-                        running++;
-                    }
-                }
-                dir.close();
-            }
-
-            if (expected == 0 && cfg_count > 0)
-                expected = cfg_count;
-
-            if (expected == 0) continue;
-
-            if (running == expected) {
-                bus.emit(EV.NFQUEUE_UP, { running: running, expected: expected });
-            } else {
-                bus.emit(EV.NFQUEUE_DOWN, {
-                    running: running,
-                    expected: expected,
-                    dir: child_dir
-                });
-            }
-        }
-    }
-
     // ── Tier drivers ──────────────────────────────────────────────────────────
     // Each probe is wrapped so one failing observation cannot stop the tier;
     // this mirrors the safe_call() isolation the old per-check loop had.
@@ -1446,6 +1428,7 @@ function controller(bus, opts) {
     self.handle_ubus_firewall_reload = function() {
         bus.emit(EV.FIREWALL_RELOADED, {});
         current_tick_ctx = create_tick_context();
+        state.last_subnet_sets_probe = 0;
         run_probe(probe_nftables, "nftables");
         run_probe(probe_subnet_sets, "subnet_sets");
         return true;
@@ -1453,7 +1436,7 @@ function controller(bus, opts) {
 
     self.probe_fast = function(ctx) {
         current_tick_ctx = ctx || create_tick_context();
-        run_probe(probe_singbox, "singbox");
+        run_probe(probe_tachyon_core, "tachyon_core");
         run_probe(probe_proxy, "proxy");
         run_probe(probe_dns, "dns");
     };
@@ -1475,8 +1458,6 @@ function controller(bus, opts) {
         run_probe(probe_config, "config");
         run_probe(probe_empty_sections, "empty_sections");
         run_probe(probe_anomalies, "anomalies");
-        run_probe(probe_oom_recovery, "oom_recovery");
-        run_probe(probe_nfqueue, "nfqueue");
     };
 
     // Health is graded by how long we go without publishing a fault: after a
@@ -1513,12 +1494,13 @@ function controller(bus, opts) {
     self.healthy_streak = function() { return state.healthy_streak; };
 
     self.forget_proxy_port = forget_proxy_port;
-    self.get_sing_box_pid = get_sing_box_pid;
+    self.get_tachyon_core_pid = get_tachyon_core_pid;
     self.is_dns_working = is_dns_working;
     self.is_reload_in_progress = is_reload_in_progress;
     self.is_list_update_running = is_list_update_running;
     self.check_tachyon_cli_running = check_tachyon_cli_running;
     self.proxy_port = proxy_port;
+    self.tproxy_port = tproxy_port;
     self.setting = setting;
     self.settings = settings;
     self.enabled = enabled;

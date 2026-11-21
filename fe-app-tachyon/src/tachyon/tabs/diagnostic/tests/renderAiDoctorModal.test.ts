@@ -136,22 +136,27 @@ describe('renderAiDoctorModal helpers', () => {
   });
 
   it('maps device icon based on hostname', () => {
-    expect(getDeviceIcon('Samsung-TV-LivingRoom')).toBe('📺');
-    expect(getDeviceIcon('iPhone-15-Pro')).toBe('📱');
-    expect(getDeviceIcon('MacBook-Pro')).toBe('💻');
-    expect(getDeviceIcon('Playstation-5')).toBe('🎮');
-    expect(getDeviceIcon('SmartPlug-102')).toBe('📟');
+    expect((getDeviceIcon('Samsung-TV-LivingRoom') as any)?.tagName).toBe(
+      'SVG',
+    );
+    expect((getDeviceIcon('iPhone-15-Pro') as any)?.tagName).toBe('SVG');
+    expect((getDeviceIcon('MacBook-Pro') as any)?.tagName).toBe('SVG');
+    expect((getDeviceIcon('Playstation-5') as any)?.tagName).toBe('SVG');
+    expect((getDeviceIcon('SmartPlug-102') as any)?.tagName).toBe('SVG');
   });
 
   it('has readable labels for common fixes', () => {
-    expect(FIX_LABELS.start_singbox).toBeDefined();
+    expect(FIX_LABELS.doctor_fix).toBeDefined();
+    expect(FIX_LABELS.start_tachyon_core).toBeDefined();
     expect(FIX_LABELS.rebuild_rules).toBeDefined();
     expect(FIX_LABELS.restore_native_internet).toBeDefined();
-    expect(getFixLabel('start_singbox', true)).toBe('Start Tachyon Core');
-    expect(getFixLabel('restart_singbox_dns', true)).toBe(
+    expect(getFixLabel('doctor_fix')).toBe(
+      'Auto-repair config & IPv6 rules (doctor --fix)',
+    );
+    expect(getFixLabel('start_tachyon_core')).toBe('Start Tachyon Core');
+    expect(getFixLabel('restart_tachyon_core_dns')).toBe(
       'Restart Tachyon Core DNS',
     );
-    expect(getFixLabel('start_singbox', false)).toBe(FIX_LABELS.start_singbox);
   });
 
   it('renders modal with root cause nodes and report', () => {
@@ -163,11 +168,11 @@ describe('renderAiDoctorModal helpers', () => {
 
     renderAiDoctorModal({
       report: 'All subsystems operational. No issues detected.',
-      quickFixes: ['start_singbox'],
+      quickFixes: ['doctor_fix', 'start_tachyon_core'],
       backendNodes: [
         { name: 'WAN', status: 'OK' },
         { name: 'DNS', status: 'OK' },
-        { name: 'sing-box', status: 'OK' },
+        { name: 'Tachyon Core', status: 'OK' },
         { name: 'nftables', status: 'OK' },
       ],
     });

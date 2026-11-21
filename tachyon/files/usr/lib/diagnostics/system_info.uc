@@ -2,13 +2,15 @@
 
 let fs = require("fs");
 let constants = require("core.constants");
-let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let common = require("core.common");
-let cmp_cat = require("components.catalog");
-let network_mod = require("diagnostics.network");
-let dns_mod = require("diagnostics.dns");
-let status_bridge = require("diagnostics.status_bridge");
+
+let _cmp_cat = null;
+let _network_mod = null;
+let _status_bridge = null;
+function get_cmp_cat() { if (_cmp_cat == null) _cmp_cat = require("components.catalog"); return _cmp_cat; }
+function network_mod() { if (_network_mod == null) _network_mod = require("diagnostics.network"); return _network_mod; }
+function status_bridge() { if (_status_bridge == null) _status_bridge = require("diagnostics.status_bridge"); return _status_bridge; }
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || constants.TACHYON_CONFIG_NAME || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
@@ -21,14 +23,14 @@ const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachy
 const LOGREAD_LINE_LIMIT = "500";
 const SYSTEM_INFO_CACHE_FILE = getenv("TACHYON_SYSTEM_INFO_CACHE_FILE") || RUNTIME_STATE_DIR + "/system-info.json";
 const SYSTEM_INFO_CACHE_TTL = int(getenv("TACHYON_SYSTEM_INFO_CACHE_TTL") || "3600");
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/tachyon-core";
-const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || constants.TMP_SUBSCRIPTION_FOLDER || TMP_SING_BOX_FOLDER + "/subscriptions";
+const TMP_TACHYON_CORE_FOLDER = getenv("TMP_TACHYON_CORE_FOLDER") || constants.TMP_TACHYON_CORE_FOLDER || "/tmp/tachyon-core";
+const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || constants.TMP_SUBSCRIPTION_FOLDER || TMP_TACHYON_CORE_FOLDER + "/subscriptions";
 const SECTION_CACHE_DIR = getenv("TACHYON_SECTION_CACHE_DIR") || RUNTIME_STATE_DIR + "/section-cache";
 const RT_TABLE_NAME = getenv("RT_TABLE_NAME") || constants.RT_TABLE_NAME || "tachyon";
 const NFT_TABLE_NAME = getenv("NFT_TABLE_NAME") || constants.NFT_TABLE_NAME || "TachyonTable";
 const NFT_FAKEIP_MARK = getenv("NFT_FAKEIP_MARK") || constants.NFT_FAKEIP_MARK || "0x04000000";
-const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || constants.SB_VARIANT_STATE_FILE || "/etc/tachyon/tachyon-core-variant";
-const SING_BOX_BIN_PATH = getenv("TACHYON_DIAGNOSTICS_SING_BOX_BIN_PATH") || "/usr/bin/tachyon-core";
+const TACHYON_CORE_VERSION_STATE_FILE = getenv("TACHYON_CORE_VERSION_FILE") || constants.TACHYON_CORE_VERSION_FILE || constants.CORE_VERSION_STATE_FILE || "/etc/tachyon/tachyon-core-version";
+const TACHYON_CORE_BIN_PATH = getenv("TACHYON_DIAGNOSTICS_CORE_BIN_PATH") || getenv("TACHYON_CORE_BIN") || "/usr/bin/tachyon-core";
 const CLOUDFLARE_OCTETS = getenv("CLOUDFLARE_OCTETS") || constants.CLOUDFLARE_OCTETS || "8.47 162.159 188.114";
 const RUNTIME_STABLE_MIN_AGE = getenv("TACHYON_RUNTIME_STABLE_MIN_AGE") || "2";
 
@@ -38,17 +40,7 @@ const SERVICE_STATE_UC = LIB_DIR + "/service/state.uc";
 const SERVICE_UI_UC = LIB_DIR + "/service/ui.uc";
 const SUBSCRIPTION_CACHE_UC = LIB_DIR + "/subscription/cache.uc";
 const PROVIDERS_STATUS_UC = LIB_DIR + "/providers/status.uc";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
-const ZAPRET_RUNTIME_UC = LIB_DIR + "/providers/zapret/runtime.uc";
-const ZAPRET2_RUNTIME_UC = LIB_DIR + "/providers/zapret2/runtime.uc";
-const BYEDPI_RUNTIME_UC = LIB_DIR + "/providers/byedpi/runtime.uc";
-const WDTT_RUNTIME_UC = LIB_DIR + "/providers/wdtt/runtime.uc";
-const OLCRTC_RUNTIME_UC = LIB_DIR + "/providers/olcrtc/runtime.uc";
-const FPTN_RUNTIME_UC = LIB_DIR + "/providers/fptn/runtime.uc";
-const TAILSCALE_RUNTIME_UC = LIB_DIR + "/providers/tailscale/runtime.uc";
-const ZAPRET_VALIDATOR_UC = LIB_DIR + "/providers/zapret/validator.uc";
-const ZAPRET2_VALIDATOR_UC = LIB_DIR + "/providers/zapret2/validator.uc";
-const BYEDPI_VALIDATOR_UC = LIB_DIR + "/providers/byedpi/validator.uc";
+const TACHYON_CORE_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const DNS_APPLY_UC = LIB_DIR + "/dns/apply.uc";
 
 let as_string = common.as_string;
@@ -66,10 +58,20 @@ let read_json_file = common.read_json_file;
 let write_json = common.write_json;
 
 function arg_number(value) { return int(value); }
-function words(value) { return network_mod.words(value); }
-function parse_json_or_null(text) { return network_mod.parse_json_or_null(text); }
-function get_wan_ip_addresses() { return network_mod.get_wan_ip_addresses(); }
-function sing_box_standard_ports_listening(netstat) { return network_mod.sing_box_standard_ports_listening(netstat); }
+function words(value) {
+    let out = [];
+    for (let item in split(trim(as_string(value)), /[ \t\r\n]+/))
+        if (item != "") push(out, item);
+    return out;
+}
+function parse_json_or_null(text) {
+    text = trim(as_string(text));
+    if (text == "") return null;
+    try { return json(text); } catch (e) { return null; }
+}
+function get_wan_ip_addresses() { return network_mod().get_wan_ip_addresses(); }
+function tachyon_core_missing_standard_ports(netstat) { return network_mod().tachyon_core_missing_standard_ports(netstat); }
+function tachyon_core_standard_ports_listening(netstat) { return network_mod().tachyon_core_standard_ports_listening(netstat); }
 
 function option(cfg, key, fallback) {
     if (type(cfg) != "object") return fallback;
@@ -97,14 +99,9 @@ function active_engine_name() {
     return (engine != null && engine != "") ? as_string(engine) : "tachyon-core";
 }
 
-function active_engine_is_steer() {
-    let name = active_engine_name();
-    return name == "steer" || name == "steer-extended";
-}
-
-function status_capture(args, input) { return status_bridge.status_capture(args, input); }
-function status_output(args, input) { return status_bridge.status_output(args, input); }
-function status_success(args, input) { return status_bridge.status_success(args, input); }
+function status_capture(args, input) { return status_bridge().status_capture(args, input); }
+function status_output(args, input) { return status_bridge().status_output(args, input); }
+function status_success(args, input) { return status_bridge().status_success(args, input); }
 
 function module_args(module_path, args) {
     let result = [ "ucode", "-L", LIB_DIR, "--", module_path ];
@@ -153,7 +150,10 @@ function helper_output(mode, args) {
 }
 
 function file_exists(path) { return fs.stat(as_string(path)) != null; }
-function file_executable(path) { return command_success_from_args([ "test", "-x", as_string(path) ]); }
+function file_executable(path) {
+    let st = fs.stat(as_string(path));
+    return st != null && st.mode != null && (int(st.mode) & 73) != 0;
+}
 function command_exists(name) { return command_success_from_args([ "command", "-v", as_string(name) ]); }
 function stdout_is_tty() { return command_status("test -t 1") == 0; }
 function nolog(message) { if (stdout_is_tty()) print(as_string(message), "
@@ -164,14 +164,15 @@ function remove_file(path) {
     if (path != "" && fs.stat(path) != null) fs.unlink(path);
 }
 
-function first_line_value(path) {
+function first_line_value(path, fallback) {
+    let fb = fallback != null ? as_string(fallback) : "";
     path = as_string(path);
-    if (path == "" || fs.stat(path) == null) return "";
+    if (path == "" || fs.stat(path) == null) return fb;
     let data = fs.readfile(path);
-    if (!data) return "";
-    let lines = split(as_string(data), "
-");
-    return length(lines) > 0 ? trim(lines[0]) : "";
+    if (!data) return fb;
+    let lines = split(as_string(data), "\n");
+    let val = length(lines) > 0 ? trim(lines[0]) : "";
+    return val != "" ? val : fb;
 }
 
 function check_logs() {
@@ -189,18 +190,33 @@ function check_logs() {
     return 0;
 }
 
-function check_sing_box_logs() {
+function check_tachyon_core_logs() {
+    let log_path = TMP_TACHYON_CORE_FOLDER + "/tachyon-core.log";
+    let st = fs.stat(log_path);
+    if (st != null && int(st.size || 0) > 0) {
+        let tail_out = command_output_from_args([ "tail", "-n", "500", log_path ]);
+        if (tail_out != "") {
+            let filtered = status_capture([ "matching-log-tail", "*", "100" ], tail_out);
+            let out_text = filtered.output != "" ? filtered.output : tail_out;
+            print(out_text);
+            if (substr(out_text, length(out_text) - 1, 1) != "\n")
+                print("\n");
+            return 0;
+        }
+    }
     if (!command_exists("logread")) {
         nolog("Error: logread command not found");
         return 1;
     }
+    let needle = "tachyon-core";
     // Use bounded_command to prevent logread from hanging and leaking a zombie process.
     let cmd = common.bounded_command("logread -l " + LOGREAD_LINE_LIMIT + " 2>/dev/null", "5");
-    let rendered = status_capture([ "matching-log-tail", "sing-box", "100" ], command_output(cmd));
+    let raw_logs = command_output(cmd);
+    let rendered = status_capture([ "matching-log-tail", needle, "100" ], raw_logs);
     if (rendered.output != "")
         print(rendered.output);
     else
-        print("No matching logs found in system journal (needle: sing-box)\n");
+        print("No matching logs found in system journal (needle: " + needle + ")\n");
     return 0;
 }
 
@@ -211,18 +227,18 @@ function tachyon_logs_fixture() {
     return rendered.status;
 }
 
-function show_sing_box_config(visibility) {
+function show_tachyon_core_config(visibility) {
     visibility = as_string(visibility || "masked");
-    let sing_box_config_path = option(settings(), "config_path", "");
-    nolog("Current sing-box configuration:");
-    if (!file_exists(sing_box_config_path)) {
+    let core_config_path = option(settings(), "config_path", "");
+    nolog("Current tachyon-core configuration:");
+    if (!file_exists(core_config_path)) {
         nolog("Configuration file not found");
         return 1;
     }
     if (visibility == "raw")
-        print(as_string(fs.readfile(sing_box_config_path)));
+        print(as_string(fs.readfile(core_config_path)));
     else
-        print(status_output([ "mask-sing-box-config", sing_box_config_path ], null));
+        print(status_output([ "mask-core-config", core_config_path ], null));
     return 0;
 }
 
@@ -244,8 +260,8 @@ function show_version() {
     return 0;
 }
 
-function show_sing_box_version() {
-    print(replace(module_output(SINGBOX_RUNTIME_UC, [ "version" ]), /[\r\n]+$/g, ""), "\n");
+function show_tachyon_core_version() {
+    print(replace(module_output(TACHYON_CORE_RUNTIME_UC, [ "version" ]), /[\r\n]+$/g, ""), "\n");
     return 0;
 }
 
@@ -277,9 +293,11 @@ function system_info_cache_is_valid() {
     let generated_at = arg_number(cache.generated_at || 0);
     if (now > 0 && generated_at > 0 && SYSTEM_INFO_CACHE_TTL > 0 && now - generated_at >= SYSTEM_INFO_CACHE_TTL)
         return false;
-    let cfg_st = fs.stat(TACHYON_CONFIG);
-    if (cfg_st && cfg_st.mtime > generated_at)
-        return false;
+    for (let watched_path in [ TACHYON_CONFIG, TACHYON_CORE_BIN_PATH, TACHYON_CORE_VERSION_STATE_FILE ]) {
+        let st = fs.stat(watched_path);
+        if (st && st.mtime > generated_at)
+            return false;
+    }
     return cache.tachyon_version == TACHYON_VERSION && cache.luci_app_version == get_luci_app_version();
 }
 
@@ -303,74 +321,33 @@ function write_system_info_cache(value) {
     return true;
 }
 
-function sing_box_marker_is(expected) {
-    return module_success(SINGBOX_RUNTIME_UC, [ "marker-is", expected ]);
+function tachyon_core_component_action_running() {
+    return module_success(SERVICE_UI_UC, [ "component-action-running-for", "tachyon-core" ]);
 }
 
-function sing_box_component_action_running() {
-    return module_success(SERVICE_UI_UC, [ "component-action-running-for", "sing_box" ]);
-}
-
-// Only the variants whose binary cannot be executed for a version string fall back
-// to the state file: `extended-compressed` is a self-extracting stub and `lx` needs
-// a runtime that may be absent. Plain `extended` runs `sing-box version` fine, and
-// listing it here made the UI show whatever was last written to
-// /etc/tachyon/tachyon-core-version — a file only the component action updates. A
-// sing-box installed any other way (install.sh, opkg, by hand) then displayed a
-// stale version forever, and the update badge compared against it.
-function sing_box_live_probe_disabled() {
-    return sing_box_marker_is("extended-compressed") ||
-        sing_box_marker_is("lx") ||
-        sing_box_component_action_running();
-}
-
-// Resolves the pair (version, version-output) both callers below need. The state
-// file is only consulted for variants whose binary cannot be run, and an empty or
-// missing state falls through to the live probe rather than reporting "unknown":
-// the state is written by the component action alone, so any sing-box installed by
-// install.sh, opkg or by hand has none.
-function sing_box_resolved_version() {
-    if (sing_box_live_probe_disabled()) {
-        let state = replace(module_output(SINGBOX_RUNTIME_UC, [ "read-version-state" ]), /[\r\n]+$/g, "");
+function tachyon_core_resolved_version() {
+    if (tachyon_core_component_action_running()) {
+        let state = replace(module_output(TACHYON_CORE_RUNTIME_UC, [ "read-version-state" ]), /[\r\n]+$/g, "");
         if (state != "")
             return { version: state, output: "" };
     }
 
-    let output = module_output(SINGBOX_RUNTIME_UC, [ "version-output" ]);
+    let output = module_output(TACHYON_CORE_RUNTIME_UC, [ "version-output" ]);
     return {
-        version: replace(module_output_stdin(SINGBOX_RUNTIME_UC, [ "version-from-output" ], output), /[\r\n]+$/g, ""),
+        version: replace(module_output_stdin(TACHYON_CORE_RUNTIME_UC, [ "version-from-output" ], output), /[\r\n]+$/g, ""),
         output: output
     };
 }
 
-function sing_box_tiny_package_installed() {
-    return module_success(PACKAGES_UC, [ "installed", "sing-box-tiny" ]);
-}
-
-function sing_box_capability_flags(sing_box_version, sing_box_version_output) {
-    // The whole answer comes from the one profile model, in one process: the
-    // function below used to shell out per predicate (marker-is, is-extended,
-    // is-lx, supports-tailscale, supports-cert-pin) and each copy of the
-    // question could - and did - answer differently from the next.
-    let caps = parse_json_or_null(module_output(SINGBOX_RUNTIME_UC,
-        [ "core-capabilities", as_string(sing_box_version), "", as_string(sing_box_version_output) ]));
+function tachyon_core_capability_flags(core_version, core_version_output) {
+    let caps = parse_json_or_null(module_output(TACHYON_CORE_RUNTIME_UC,
+        [ "core-capabilities", as_string(core_version), "", as_string(core_version_output) ]));
     if (type(caps) != "object")
         caps = {};
 
-    let profile = as_string(caps.profile);
-    let tachyon_core = profile == "tachyon-core" ? 1 : 0;
-    let extended = (profile == "lx" || profile == "extended" || profile == "extended-compressed") ? 1 : 0;
-    let tiny = 0;
-    if (tachyon_core == 0 && extended == 0 &&
-        (sing_box_marker_is("tiny") || sing_box_tiny_package_installed()))
-        tiny = 1;
-
     let tailscale = caps.tailscale ? 1 : 0;
-    // A component job rebuilding the binary answers for itself, but only when
-    // there was no banner to ask: a readable banner is the ground truth about
-    // the build that is on disk right now.
-    if (tailscale == 0 && tiny == 0 && as_string(sing_box_version_output) == "" &&
-        sing_box_component_action_running())
+    if (tailscale == 0 && as_string(core_version_output) == "" &&
+        tachyon_core_component_action_running())
         tailscale = 1;
 
     let cert_pin = caps.cert_pin ? 1 : 0;
@@ -379,7 +356,7 @@ function sing_box_capability_flags(sing_box_version, sing_box_version_output) {
         if (item == "fptn")
             fptn = 1;
 
-    return { extended, tiny, tailscale, cert_pin, tachyon_core, fptn };
+    return { tailscale, cert_pin, fptn };
 }
 
 function provider_installed(runtime_uc) {
@@ -391,20 +368,87 @@ function provider_version(runtime_uc) {
     return value != "" ? value : "unknown";
 }
 
+function unquote_release_value(value) {
+    let v = trim(as_string(value));
+    if (length(v) >= 2) {
+        let quote = substr(v, 0, 1);
+        if ((quote == "\"" || quote == "'") && substr(v, length(v) - 1) == quote)
+            v = substr(v, 1, length(v) - 2);
+    }
+    return v;
+}
+
 function openwrt_release() {
     let data = fs.readfile("/etc/os-release");
-    if (data == null)
-        return "unknown";
-    for (let line in split(as_string(data), "\n")) {
-        if (substr(line, 0, length("OPENWRT_RELEASE=")) != "OPENWRT_RELEASE=")
-            continue;
-        let value = substr(line, length("OPENWRT_RELEASE="));
-        if (length(value) >= 2) {
-            let quote = substr(value, 0, 1);
-            if ((quote == "\"" || quote == "'") && substr(value, length(value) - 1) == quote)
-                value = substr(value, 1, length(value) - 2);
+    if (data != null) {
+        let pretty_name = "";
+        for (let line in split(as_string(data), "\n")) {
+            if (substr(line, 0, length("OPENWRT_RELEASE=")) == "OPENWRT_RELEASE=") {
+                let value = unquote_release_value(substr(line, length("OPENWRT_RELEASE=")));
+                if (value != "")
+                    return value;
+            }
+            if (pretty_name == "" && substr(line, 0, length("PRETTY_NAME=")) == "PRETTY_NAME=")
+                pretty_name = unquote_release_value(substr(line, length("PRETTY_NAME=")));
         }
-        return value != "" ? value : "unknown";
+        if (pretty_name != "")
+            return pretty_name;
+    }
+    let owrt = fs.readfile("/etc/openwrt_release");
+    if (owrt != null) {
+        for (let line in split(as_string(owrt), "\n")) {
+            if (substr(line, 0, length("DISTRIB_DESCRIPTION=")) == "DISTRIB_DESCRIPTION=") {
+                let value = unquote_release_value(substr(line, length("DISTRIB_DESCRIPTION=")));
+                if (value != "")
+                    return value;
+            }
+        }
+    }
+    let entware = fs.readfile("/opt/etc/entware_release");
+    if (entware != null) {
+        for (let line in split(as_string(entware), "\n")) {
+            if (substr(line, 0, length("release=")) == "release=") {
+                let value = unquote_release_value(substr(line, length("release=")));
+                if (value != "")
+                    return "Entware " + value;
+            }
+        }
+    }
+    return "unknown";
+}
+
+function detect_device_model() {
+    let model = first_line_value("/tmp/sysinfo/model", "");
+    if (model != "")
+        return model;
+    let dt_raw = fs.readfile("/proc/device-tree/model");
+    if (dt_raw != null) {
+        let dt_parts = split(as_string(dt_raw), "\x00");
+        let dt_model = length(dt_parts) > 0 ? trim(dt_parts[0]) : "";
+        if (dt_model != "")
+            return dt_model;
+    }
+    let board = read_json_file("/etc/board.json");
+    if (type(board) == "object" && type(board.model) == "object") {
+        let bname = trim(as_string(board.model.name));
+        if (bname != "")
+            return bname;
+    }
+    if (command_exists("ndmc")) {
+        let ndm_out = command_output_from_args([ "ndmc", "-c", "show version" ]);
+        for (let line in split(as_string(ndm_out), "\n")) {
+            let trimmed = trim(line);
+            if (substr(trimmed, 0, length("model:")) == "model:") {
+                let m = trim(substr(trimmed, length("model:")));
+                if (m != "")
+                    return m;
+            }
+            if (substr(trimmed, 0, length("device:")) == "device:") {
+                let d = trim(substr(trimmed, length("device:")));
+                if (d != "")
+                    return d;
+            }
+        }
     }
     return "unknown";
 }
@@ -435,81 +479,135 @@ function get_system_arch_candidates() {
     return arch_list;
 }
 
-function is_fptn_supported() {
-    let arch_list = get_system_arch_candidates();
-    let supported = [
-        "x86_64", "amd64",
-        "aarch64", "arm64",
-        "arm_cortex-a7_neon-vfpv4",
-        "arm_cortex-a7"
-    ];
-    for (let s in supported) {
-        if (index(arch_list, s) >= 0)
-            return true;
+function detect_primary_arch() {
+    let candidates = words(get_system_arch_candidates());
+    return length(candidates) > 0 ? as_string(candidates[0]) : "unknown";
+}
+
+function collect_system_telemetry() {
+    let kernel_version = first_line_value("/proc/sys/kernel/osrelease", "unknown");
+    let uptime_raw = first_line_value("/proc/uptime", "");
+    let uptime_parts = words(uptime_raw);
+    let uptime_seconds = length(uptime_parts) > 0 ? int(split(as_string(uptime_parts[0]), ".")[0] || 0) : 0;
+
+    let load_raw = first_line_value("/proc/loadavg", "");
+    let load_parts = words(load_raw);
+    let load_avg = length(load_parts) >= 3
+        ? (as_string(load_parts[0]) + " / " + as_string(load_parts[1]) + " / " + as_string(load_parts[2]))
+        : "";
+
+    let mem_total_kb = 0;
+    let mem_avail_kb = 0;
+    let mem_free_kb = 0;
+    let mem_buffers_kb = 0;
+    let mem_cached_kb = 0;
+    let meminfo = fs.readfile("/proc/meminfo");
+    if (meminfo != null) {
+        for (let line in split(as_string(meminfo), "\n")) {
+            let parts = words(line);
+            if (length(parts) < 2)
+                continue;
+            let k = as_string(parts[0]);
+            let v = int(parts[1] || 0);
+            if (k == "MemTotal:")
+                mem_total_kb = v;
+            else if (k == "MemAvailable:")
+                mem_avail_kb = v;
+            else if (k == "MemFree:")
+                mem_free_kb = v;
+            else if (k == "Buffers:")
+                mem_buffers_kb = v;
+            else if (k == "Cached:")
+                mem_cached_kb = v;
+        }
     }
-    return false;
+    if (mem_avail_kb <= 0 && mem_total_kb > 0)
+        mem_avail_kb = mem_free_kb + mem_buffers_kb + mem_cached_kb;
+    let mem_used_kb = mem_total_kb > mem_avail_kb ? (mem_total_kb - mem_avail_kb) : 0;
+    let mem_used_pct = mem_total_kb > 0 ? int((mem_used_kb * 100) / mem_total_kb) : 0;
+
+    let conntrack_count = int(first_line_value("/proc/sys/net/netfilter/nf_conntrack_count", "0") || 0);
+    let conntrack_max = int(first_line_value("/proc/sys/net/netfilter/nf_conntrack_max", "0") || 0);
+
+    let cfg = settings();
+    let dns_type = option(cfg, "dns_type", "doh");
+    let v6_info = network_mod().get_ipv6_runtime_telemetry(cfg);
+    let fakeip_enabled = v6_info.fakeip_enabled;
+    let inbound_mode = option(cfg, "inbound_mode", "tproxy");
+
+    let sections_total_count = 0;
+    let sections_enabled_count = 0;
+    let sec_objs = uci_core.section_objects(CONFIG_NAME, "section");
+    for (let s in sec_objs) {
+        sections_total_count++;
+        if (as_string(s.enabled) != "0" && as_string(s.enabled) != "false")
+            sections_enabled_count++;
+    }
+
+    let q_path = getenv("TACHYON_QUARANTINED_SECTIONS_FILE") || "/var/run/tachyon/quarantined-sections.state";
+    let d_path = getenv("TACHYON_SUBSCRIPTION_DEFERRED_SECTIONS_FILE") || "/var/run/tachyon/subscription-deferred-sections.state";
+    let quarantined_sections_count = length(words(as_string(fs.readfile(q_path) || "")));
+    let deferred_sections_count = length(words(as_string(fs.readfile(d_path) || "")));
+
+    return {
+        kernel_version,
+        uptime_seconds,
+        load_avg,
+        mem_total_kb,
+        mem_available_kb: mem_avail_kb,
+        mem_total_mb: int((mem_total_kb + 512) / 1024),
+        mem_used_mb: int((mem_used_kb + 512) / 1024),
+        mem_free_mb: int((mem_avail_kb + 512) / 1024),
+        mem_used_pct,
+        conntrack_count,
+        conntrack_max,
+        dns_type,
+        fakeip_enabled,
+        inbound_mode,
+        router_hostname: v6_info.router_hostname,
+        wan_ipv6: v6_info.wan_ipv6,
+        lan_ipv6: v6_info.lan_ipv6,
+        wan6_available: v6_info.wan6_available,
+        wan6_iface: v6_info.wan6_iface,
+        wan6_prefix: v6_info.wan6_prefix,
+        wan6_pd: v6_info.wan6_pd,
+        ipv6_effective_state: v6_info.ipv6_effective_state,
+        ipv6_mode: v6_info.ipv6_mode,
+        ipv6_leak_guard: v6_info.ipv6_leak_guard,
+        dns_strategy: v6_info.dns_strategy,
+        runtime_dns_strategy: v6_info.runtime_dns_strategy,
+        sections_total_count,
+        sections_enabled_count,
+        total_sections_count: sections_total_count,
+        active_sections_count: sections_enabled_count,
+        quarantined_sections_count,
+        deferred_sections_count
+    };
 }
 
 function build_system_info() {
     let tachyon_latest_version = first_line_value("/tmp/tachyon.latest-version.cache", "unknown");
     let luci_app_version = get_luci_app_version();
-    let sing_box_version = "";
-    let sing_box_version_output = "";
+    let tachyon_core_version = "";
+    let tachyon_core_version_output = "";
 
-    if (command_exists("tachyon-core") || command_exists("sing-box")) {
-        let resolved = sing_box_resolved_version();
-        sing_box_version = resolved.version;
-        sing_box_version_output = resolved.output;
-        if (sing_box_version == "")
-            sing_box_version = "unknown";
+    if (command_exists("tachyon-core")) {
+        let resolved = tachyon_core_resolved_version();
+        tachyon_core_version = resolved.version;
+        tachyon_core_version_output = resolved.output;
+        if (tachyon_core_version == "")
+            tachyon_core_version = "unknown";
     }
     else {
-        sing_box_version = "not installed";
-        sing_box_version_output = "";
+        tachyon_core_version = "not installed";
+        tachyon_core_version_output = "";
     }
 
-    let flags = sing_box_capability_flags(sing_box_version, sing_box_version_output);
-    let sing_box_compressed = flags.extended == 1 && sing_box_marker_is("extended-compressed") ? 1 : 0;
-    let sing_box_lx = flags.extended == 1 && sing_box_marker_is("lx") ? 1 : 0;
-    let sing_box_tachyon_core = flags.tachyon_core == 1 ? 1 : 0;
-    let sing_box_fptn = flags.fptn == 1 ? 1 : 0;
+    let flags = tachyon_core_capability_flags(tachyon_core_version, tachyon_core_version_output);
+    let tachyon_core_fptn = flags.fptn == 1 ? 1 : 0;
+    let tachyon_core_repo_url = "https://github.com/Dushnilin/tachyon-core";
 
-    let sing_box_repo_url = "https://github.com/SagerNet/sing-box";
-    if (sing_box_tachyon_core == 1)
-        sing_box_repo_url = "https://github.com/Dushnilin/tachyon-core";
-    else if (sing_box_lx == 1)
-        sing_box_repo_url = "https://github.com/Leadaxe/sing-box-lx";
-    else if (flags.extended == 1)
-        sing_box_repo_url = "https://github.com/shtorm-7/sing-box-extended";
-
-    let zapret_installed = provider_installed(ZAPRET_RUNTIME_UC) ? 1 : 0;
-    let zapret_version = zapret_installed ? provider_version(ZAPRET_RUNTIME_UC) : "not installed";
-    let zapret2_installed = provider_installed(ZAPRET2_RUNTIME_UC) ? 1 : 0;
-    let zapret2_version = zapret2_installed ? provider_version(ZAPRET2_RUNTIME_UC) : "not installed";
-    let byedpi_installed = provider_installed(BYEDPI_RUNTIME_UC) ? 1 : 0;
-    let byedpi_version = byedpi_installed ? provider_version(BYEDPI_RUNTIME_UC) : "not installed";
-    let wdtt_installed = provider_installed(WDTT_RUNTIME_UC) ? 1 : 0;
-    let wdtt_version = wdtt_installed ? provider_version(WDTT_RUNTIME_UC) : "not installed";
-    let olcrtc_installed = provider_installed(OLCRTC_RUNTIME_UC) ? 1 : 0;
-    let olcrtc_version = olcrtc_installed ? provider_version(OLCRTC_RUNTIME_UC) : "not installed";
-    let tailscale_installed = provider_installed(TAILSCALE_RUNTIME_UC) ? 1 : 0;
-    let tailscale_version = tailscale_installed ? provider_version(TAILSCALE_RUNTIME_UC) : "not installed";
-    let fptn_installed = provider_installed(FPTN_RUNTIME_UC) ? 1 : 0;
-    let fptn_supported = (fptn_installed == 1 || is_fptn_supported()) ? 1 : 0;
-    let fptn_version = fptn_installed ? provider_version(FPTN_RUNTIME_UC) : "not installed";
-    let fptn_mode = require("config.connections").fptn_transport_mode();
-    let steer_installed = file_executable("/usr/sbin/steer") ? 1 : 0;
-    let steer_version = "not installed";
-    let steer_extended = 0;
-    if (steer_installed) {
-        let steer_out = trim(command_output_from_args([ "/usr/sbin/steer", "version" ]));
-        let m = match(steer_out, /steer\s+([0-9a-zA-Z\.\-]+)/);
-        steer_version = m ? m[1] : (steer_out != "" ? steer_out : "installed");
-        steer_extended = (match(steer_out, /расширенная|extended/i) != null ||
-            command_success_from_args([ "/usr/sbin/steer", "help", "vless" ]) ||
-            module_success(PACKAGES_UC, [ "installed", "steer-extended" ])) ? 1 : 0;
-    }
-    let device_model = first_line_value("/tmp/sysinfo/model", "unknown");
+    let device_model = detect_device_model();
 
     let direct_bypass_enabled = bool_option(settings(), "direct_bypass_enabled", false) ? 1 : 0;
     let direct_bypass_port = option(settings(), "direct_bypass_port", "2080");
@@ -520,13 +618,6 @@ function build_system_info() {
     if (type(torrserver_direct_status) != "object")
         torrserver_direct_status = {};
 
-    let show_component_zapret = bool_option(settings(), "show_component_zapret", true) ? 1 : 0;
-    let show_component_zapret2 = bool_option(settings(), "show_component_zapret2", true) ? 1 : 0;
-    let show_component_byedpi = bool_option(settings(), "show_component_byedpi", true) ? 1 : 0;
-    let show_component_wdtt = bool_option(settings(), "show_component_wdtt", true) ? 1 : 0;
-    let show_component_olcrtc = bool_option(settings(), "show_component_olcrtc", true) ? 1 : 0;
-    let show_component_fptn = bool_option(settings(), "show_component_fptn", true) ? 1 : 0;
-    let show_component_tailscale = bool_option(settings(), "show_component_tailscale", true) ? 1 : 0;
     let show_component_direct_bypass = bool_option(settings(), "show_component_direct_bypass", true) ? 1 : 0;
     let show_component_torrserver_direct = bool_option(settings(), "show_component_torrserver_direct", true) ? 1 : 0;
 
@@ -543,84 +634,31 @@ function build_system_info() {
         } catch (e) {}
         return null;
     };
-    let sb_meta = read_backup_meta("sing_box");
-    let zapret_meta = read_backup_meta("zapret");
-    let zapret2_meta = read_backup_meta("zapret2");
-    let byedpi_meta = read_backup_meta("byedpi");
-    let wdtt_meta = read_backup_meta("wdtt");
-    let olcrtc_meta = read_backup_meta("olcrtc");
-    let tailscale_meta = read_backup_meta("tailscale");
-    let fptn_meta = read_backup_meta("fptn");
+    let tcore_meta = read_backup_meta("tachyon_core");
+    let cmp_cat = get_cmp_cat();
 
     return {
         tachyon_version: TACHYON_VERSION,
         tachyon_commit_sha: constants.TACHYON_COMMIT_SHA && !match(constants.TACHYON_COMMIT_SHA, /COMPILED/) ? constants.TACHYON_COMMIT_SHA : "",
         tachyon_latest_version: tachyon_latest_version || "unknown",
         luci_app_version,
-        active_engine: active_engine_name(),
-        sing_box_version,
-        sing_box_extended: flags.extended,
-        sing_box_tiny: flags.tiny,
-        sing_box_compressed,
-        sing_box_lx,
-        sing_box_tachyon_core,
-        sing_box_fptn,
-        sing_box_tailscale: flags.tailscale,
-        sing_box_cert_pin: flags.cert_pin,
-        sing_box_repo_url,
-        sing_box_backup_version: sb_meta ? as_string(sb_meta.version) : "",
-        sing_box_backup_time: sb_meta ? int(sb_meta.timestamp || 0) : 0,
-        zapret_version,
-        zapret_installed,
-        zapret_backup_version: zapret_meta ? as_string(zapret_meta.version) : "",
-        zapret_backup_time: zapret_meta ? int(zapret_meta.timestamp || 0) : 0,
-        zapret2_version,
-        zapret2_installed,
-        zapret2_backup_version: zapret2_meta ? as_string(zapret2_meta.version) : "",
-        zapret2_backup_time: zapret2_meta ? int(zapret2_meta.timestamp || 0) : 0,
-        byedpi_version,
-        byedpi_installed,
-        byedpi_backup_version: byedpi_meta ? as_string(byedpi_meta.version) : "",
-        byedpi_backup_time: byedpi_meta ? int(byedpi_meta.timestamp || 0) : 0,
-        wdtt_version,
-        wdtt_installed,
-        wdtt_backup_version: wdtt_meta ? as_string(wdtt_meta.version) : "",
-        wdtt_backup_time: wdtt_meta ? int(wdtt_meta.timestamp || 0) : 0,
-        olcrtc_version,
-        olcrtc_installed,
-        olcrtc_backup_version: olcrtc_meta ? as_string(olcrtc_meta.version) : "",
-        olcrtc_backup_time: olcrtc_meta ? int(olcrtc_meta.timestamp || 0) : 0,
-        tailscale_version,
-        tailscale_installed,
-        tailscale_backup_version: tailscale_meta ? as_string(tailscale_meta.version) : "",
-        tailscale_backup_time: tailscale_meta ? int(tailscale_meta.timestamp || 0) : 0,
-        fptn_version,
-        fptn_installed,
-        fptn_supported,
-        fptn_mode,
-        fptn_backup_version: fptn_meta ? as_string(fptn_meta.version) : "",
-        fptn_backup_time: fptn_meta ? int(fptn_meta.timestamp || 0) : 0,
-        steer_version,
-        steer_installed,
-        steer_extended,
-        // What the next steer install will keep: the configured selection, with
-        // an absent option meaning every module.
-        steer_modules: cmp_cat.steer_modules_from_settings(settings()),
-        steer_repo_url: "https://github.com/xyzmean/steer",
+        active_engine: "tachyon-core",
+        tachyon_core_version,
+        tachyon_core_fptn,
+        tachyon_core_tailscale: flags.tailscale,
+        tachyon_core_cert_pin: flags.cert_pin,
+        tachyon_core_repo_url,
+        tachyon_core_backup_version: tcore_meta ? as_string(tcore_meta.version) : "",
+        tachyon_core_backup_time: tcore_meta ? int(tcore_meta.timestamp || 0) : 0,
         direct_bypass_enabled,
         direct_bypass_address,
         direct_bypass_port,
+        torrserver_installed: int(torrserver_direct_status.installed || 0),
+        torrserver_version: as_string(torrserver_direct_status.version || "not installed"),
         torrserver_running: int(torrserver_direct_status.running || 0),
         torrserver_direct_available: int(torrserver_direct_status.available || 0),
         torrserver_direct_enabled: int(torrserver_direct_status.enabled || 0),
         torrserver_direct_active: int(torrserver_direct_status.active || 0),
-        show_component_zapret,
-        show_component_zapret2,
-        show_component_byedpi,
-        show_component_wdtt,
-        show_component_olcrtc,
-        show_component_fptn,
-        show_component_tailscale,
         show_component_direct_bypass,
         show_component_torrserver_direct,
         dashboard_hide_na_servers: (() => {
@@ -633,12 +671,22 @@ function build_system_info() {
         })(),
         openwrt_version: openwrt_release(),
         device_model,
+        cpu_arch: detect_primary_arch(),
+        ...collect_system_telemetry(),
         generated_at: int(clock()[0])
     };
 }
 
 function get_system_info() {
     if (system_info_cache_is_valid()) {
+        let cached = read_json_file(SYSTEM_INFO_CACHE_FILE);
+        if (type(cached) == "object") {
+            let live = collect_system_telemetry();
+            for (let k in live)
+                cached[k] = live[k];
+            print(sprintf("%J\n", cached));
+            return 0;
+        }
         print(as_string(fs.readfile(SYSTEM_INFO_CACHE_FILE)));
         return 0;
     }
@@ -650,32 +698,28 @@ function get_system_info() {
 }
 
 function get_server_capabilities() {
-    if (!file_executable(SING_BOX_BIN_PATH)) {
+    let bin_ok = file_executable(TACHYON_CORE_BIN_PATH);
+    if (!bin_ok) {
         write_json({
-            sing_box_extended: 0,
-            sing_box_tiny: 0,
-            sing_box_tailscale: 0,
-            sing_box_cert_pin: 0
+            tachyon_core_tailscale: 0,
+            tachyon_core_cert_pin: 0
         });
         return 0;
     }
 
-    let resolved = sing_box_resolved_version();
-    let flags = sing_box_capability_flags(resolved.version, resolved.output);
+    let resolved = tachyon_core_resolved_version();
+    let flags = tachyon_core_capability_flags(resolved.version, resolved.output);
     write_json({
-        sing_box_extended: flags.extended,
-        sing_box_tiny: flags.tiny,
-        sing_box_tailscale: flags.tailscale,
-        sing_box_cert_pin: flags.cert_pin
+        tachyon_core_tailscale: flags.tailscale,
+        tachyon_core_cert_pin: flags.cert_pin
     });
     return 0;
 }
 
 
-function sing_box_process_is_running() {
+function tachyon_core_process_is_running() {
     return command_success_from_args([ "pgrep", "-x", "tachyon-core" ]) ||
-        command_success_from_args([ "pgrep", "-x", "sing-box" ]) ||
-        command_success_from_args([ "pgrep", "-f", "^/usr/bin/(tachyon-core|sing-box)[[:space:]]" ]);
+        command_success_from_args([ "pgrep", "-f", "^/usr/bin/tachyon-core[[:space:]]" ]);
 }
 
 function service_status_label(running, enabled) {
@@ -694,103 +738,45 @@ function write_service_status(running, enabled, dns_configured) {
 }
 
 function dnsmasq_has_tachyon_dns() {
-    return module_success(DNS_APPLY_UC, [ "has-tachyon-dns" ]);
+    let addr = getenv("TACHYON_CORE_DNS_INBOUND_ADDRESS") || getenv("CORE_DNS_INBOUND_ADDRESS") || "127.0.0.42";
+    let servers = uci_core.get("dhcp.@dnsmasq[0].server");
+    let raw = type(servers) == "array" ? join(" ", servers) : as_string(servers);
+    for (let item in words(raw))
+        if (item == addr)
+            return true;
+    return uci_core.exists("dhcp.tachyon");
 }
 
-function get_sing_box_status() {
+function get_tachyon_core_status() {
     let running = module_success(SERVICE_STATE_UC, [
         "tachyon-core-service-stable",
         RUNTIME_STABLE_MIN_AGE
     ]) ? 1 : 0;
-    let enabled = file_executable("/etc/rc.d/S99sing-box") ? 1 : 0;
+    let enabled = file_executable("/etc/rc.d/S99" + TACHYON_SERVICE_NAME) ? 1 : 0;
     let dns_configured = dnsmasq_has_tachyon_dns() ? 1 : 0;
     write_service_status(running, enabled, dns_configured);
     return 0;
 }
 
-// Engine-aware service status for the dashboard. On sing-box it is the same
-// answer as get_sing_box_status; on steer it reports the steer service and the
-// active engine, so the UI does not show a false "sing-box stopped".
 function get_engine_status() {
-    let active = "tachyon-core";
-    try {
-        active = require("core.engine").get_active();
-    }
-    catch (e) {
-        active = "tachyon-core";
-    }
-
-    if (active == "tachyon-core") {
-        let running = module_success(SERVICE_STATE_UC, [
-            "tachyon-core-service-stable",
-            RUNTIME_STABLE_MIN_AGE
-        ]) ? 1 : 0;
-        let enabled = file_executable("/etc/rc.d/S99sing-box") ? 1 : 0;
-        let dns_configured = dnsmasq_has_tachyon_dns() ? 1 : 0;
-        write_json({
-            running,
-            enabled,
-            engine: "sing-box",
-            status: service_status_label(running, enabled),
-            dns_configured
-        });
-        return 0;
-    }
-
-    let running = 0;
-    let enabled = 0;
-    let channels = [];
-    try {
-        // The library, not the CLI shim: requiring service/engine_runtime.uc would run
-        // its main() with this process's arguments and then exit the interpreter.
-        let engine_runtime = require("service.engine_runtime_lib");
-        let info = require("core.engine").detect(active);
-        // steer registers with START=94, so the enable symlink is S94steer
-        // (get_status below has the same check). Liveness comes from the init
-        // script itself, not from the symlink: an enabled-but-dead service
-        // must not be reported as running.
-        enabled = command_success_from_args([ "sh", "-c", "ls /etc/rc.d/S*steer >/dev/null 2>&1" ]) ? 1 : 0;
-        running = info.installed && command_success_from_args([ "/etc/init.d/steer", "status" ]) ? 1 : 0;
-        if (running) {
-            let status_raw = fs.readfile("/var/lib/steer/status.json");
-            if (status_raw == null || status_raw == "") {
-                status_raw = command_output_from_args([ "/usr/sbin/steer", "status" ]);
-            }
-            if (status_raw != null && status_raw != "") {
-                let parsed = json(status_raw);
-                if (parsed && type(parsed.channels) == "array")
-                    channels = parsed.channels;
-            }
-        }
-    }
-    catch (e) {
-        running = 0;
-        enabled = 0;
-    }
-    let dns_configured = 1;
+    let running = module_success(SERVICE_STATE_UC, [
+        "tachyon-core-service-stable",
+        RUNTIME_STABLE_MIN_AGE
+    ]) ? 1 : 0;
+    let enabled = file_executable("/etc/rc.d/S99" + TACHYON_SERVICE_NAME) ? 1 : 0;
+    let dns_configured = dnsmasq_has_tachyon_dns() ? 1 : 0;
     write_json({
         running,
         enabled,
-        engine: active,
+        engine: "tachyon-core",
+        managed_by: TACHYON_SERVICE_NAME,
         status: service_status_label(running, enabled),
-        dns_configured,
-        channels
+        dns_configured
     });
     return 0;
 }
 
 function get_status() {
-    // On steer the sing-box runtime checks do not apply: liveness comes from
-    // the steer init script and its own nftables table.
-    if (active_engine_is_steer()) {
-        let running = command_success_from_args([ "/etc/init.d/steer", "status" ]) ? 1 : 0;
-        // steer uses START=94, so the enable symlink is S94steer.
-        let enabled = command_success_from_args([ "sh", "-c", "ls /etc/rc.d/S*steer >/dev/null 2>&1" ]) ? 1 : 0;
-        let dns_configured = 1;
-        write_service_status(running, enabled, dns_configured);
-        return 0;
-    }
-
     let running = module_success(SERVICE_STATE_UC, [
         "tachyon-stably-running", RT_TABLE_NAME, NFT_TABLE_NAME, NFT_FAKEIP_MARK, RUNTIME_STABLE_MIN_AGE
     ]) ? 1 : 0;
@@ -820,12 +806,19 @@ function section_safe(section) {
 
 function get_outbound_metadata(section) {
     subscription_cache([ "ensure-runtime-dirs" ]);
-    if (!section_safe(section))
+    let sec_str = trim(as_string(section));
+    if (sec_str == "" || sec_str == "all") {
+        let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, "all", "" ]);
+        if (result.status != 0)
+            result = subscription_cache([ "empty-outbound-metadata" ]);
+        return print_subscription_result(result, "");
+    }
+    if (!section_safe(sec_str))
         return print_subscription_result(subscription_cache([ "empty-outbound-metadata" ]), "");
-    let metadata_path = replace(module_output(SUBSCRIPTION_CACHE_UC, [ "outbound-metadata-path", section ]), /[\r\n]+$/g, "");
+    let metadata_path = replace(module_output(SUBSCRIPTION_CACHE_UC, [ "outbound-metadata-path", sec_str ]), /[\r\n]+$/g, "");
     if (metadata_path == "")
         return print_subscription_result(subscription_cache([ "empty-outbound-metadata" ]), "");
-    let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, section, metadata_path ]);
+    let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, sec_str, metadata_path ]);
     if (result.status != 0)
         result = subscription_cache([ "empty-outbound-metadata" ]);
     return print_subscription_result(result, "");
@@ -846,160 +839,134 @@ function get_subscription_metadata(section) {
     return print_subscription_result(result, "{}\n");
 }
 
-function validate_nfqws_strategy_json(raw_opt) {
-    let result = module_capture(ZAPRET_VALIDATOR_UC, [
-        "validate-json", "nfqws", as_string(raw_opt), ZAPRET_LEGACY_DEFAULT_NFQWS_OPT
-    ]);
-    if (result.output != "")
-        print(result.output);
-    return 0;
-}
-
-function validate_nfqws2_strategy_json(raw_opt) {
-    let result = module_capture(ZAPRET2_VALIDATOR_UC, [ "validate-json", "nfqws2", as_string(raw_opt) ]);
-    if (result.output != "")
-        print(result.output);
-    return 0;
-}
-
-function validate_byedpi_strategy_json(raw_opt) {
-    let result = module_capture(BYEDPI_VALIDATOR_UC, [ "validate-json", as_string(raw_opt) ]);
-    if (result.output != "")
-        print(result.output);
-    else
-        print("{\"valid\":false,\"message\":\"ByeDPI validator produced no output\"}\n");
-    return 0;
-}
-
 function strip_leading_v(value) {
     value = as_string(value);
     return substr(value, 0, 1) == "v" ? substr(value, 1) : value;
 }
 
 
-function check_steer() {
-    // These checks describe steer state; on sing-box they are not applicable.
-    if (!active_engine_is_steer()) {
-        write_json({ not_applicable: 1, engine: active_engine_name() });
-        return 0;
+function resolve_tachyon_core_listen_ports(netstat_out) {
+    let settings = uci_core.get_all(CONFIG_NAME, "settings") || {};
+    let cfg_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
+    let cfg = read_json_file(cfg_path);
+    let ports = [];
+    let seen = {};
+    let add_port = function(val) {
+        val = trim(as_string(val || ""));
+        if (val == "" || seen[val])
+            return;
+        seen[val] = true;
+        push(ports, val);
+    };
+
+    if (type(cfg) == "object" && type(cfg.inbounds) == "array") {
+        let mode_items = [];
+        let extra_items = [];
+        for (let inb in cfg.inbounds) {
+            if (type(inb) != "object")
+                continue;
+            if (inb.listen_port != null) {
+                let p = as_string(inb.listen_port);
+                if (p == "53")
+                    add_port("53");
+                else if (inb.tag == "tproxy-in" || inb.tag == "tproxy6-in" || inb.tag == "client-mixed-in")
+                    push(mode_items, p);
+                else
+                    push(extra_items, p);
+            } else if (inb.type == "tun") {
+                push(mode_items, as_string(inb.interface_name || "tun0"));
+            }
+        }
+        add_port("53");
+        for (let p in mode_items)
+            add_port(p);
+        for (let p in extra_items)
+            add_port(p);
+        let ext_ctrl = trim(as_string(cfg.experimental?.clash_api?.external_controller || ""));
+        let m_ctrl = match(ext_ctrl, /:([0-9]+)$/);
+        if (m_ctrl != null)
+            add_port(m_ctrl[1]);
+    } else {
+        add_port("53");
+        let pmode = lc(trim(as_string(settings.proxy_mode || "tproxy")));
+        if (pmode == "tun")
+            add_port("tun0");
+        else if (pmode == "socks")
+            add_port(trim(as_string(settings.socks_port || "1080")) || "1080");
+        else
+            add_port("1602");
+        if (index(as_string(netstat_out), ":1603") >= 0)
+            add_port("1603");
+        if (index(as_string(netstat_out), ":9090") >= 0)
+            add_port("9090");
     }
 
-    let steer_installed = 0;
-    let steer_version = "";
-    let steer_service_exist = 0;
-    let steer_autostart_enabled = 0;
-    let steer_process_running = 0;
-    let steer_extended = 0;
-
-    let steer_bin = "/usr/sbin/steer";
-    if (file_executable(steer_bin)) {
-        steer_installed = 1;
-        let ver = trim(command_output(command_from_args([steer_bin, "version"]) + " 2>/dev/null"));
-        if (ver == "")
-            ver = trim(command_output(command_from_args([steer_bin, "--version"]) + " 2>/dev/null"));
-        steer_version = ver != "" ? ver : "";
-
-        // Detect extended build: check version string, active engine ID, or binary size heuristic
-        let stat = fs.stat(steer_bin);
-        if ((stat != null && stat.size > 8 * 1024 * 1024) ||
-            match(steer_version, /расширенная|extended/i) != null ||
-            active_engine_name() == "steer-extended")
-            steer_extended = 1;
-    }
-
-    if (file_exists("/etc/init.d/steer")) {
-        steer_service_exist = 1;
-        // Steer uses START=94, enabled if S94steer symlink is present in /etc/rc.d/
-        steer_autostart_enabled = command_success_from_args(
-            ["sh", "-c", "ls /etc/rc.d/S*steer >/dev/null 2>&1"]
-        ) ? 1 : 0;
-    }
-
-    if (steer_installed && file_exists("/etc/init.d/steer")) {
-        steer_process_running = command_success_from_args(
-            ["/etc/init.d/steer", "status"]
-        ) ? 1 : 0;
-    }
-
-    write_json({
-        steer_installed,
-        steer_version,
-        steer_extended,
-        steer_service_exist,
-        steer_autostart_enabled,
-        steer_process_running
-    });
-    return 0;
+    return join(", ", ports);
 }
 
-function check_sing_box() {
-    // These checks describe sing-box state; on steer they are not applicable
-    // rather than failing, so the dashboard shows an honest answer.
-    if (active_engine_is_steer()) {
-        write_json({ not_applicable: 1, engine: active_engine_name() });
-        return 0;
-    }
-    let sing_box_installed = 0;
-    let sing_box_version_ok = 0;
-    let sing_box_extended = 0;
-    let sing_box_cert_pin = 0;
-    let sing_box_tachyon_core = 0;
-    let sing_box_service_exist = 0;
-    let sing_box_autostart_disabled = 0;
-    let sing_box_process_running = 0;
-    let sing_box_ports_listening = 0;
+function check_tachyon_core() {
+    let tachyon_core_installed = 0;
+    let tachyon_core_version_ok = 0;
+    let tachyon_core_cert_pin = 0;
+    let tachyon_core_service_exist = 0;
+    let tachyon_core_autostart_disabled = 0;
+    let tachyon_core_process_running = 0;
+    let tachyon_core_ports_listening = 0;
+    let tachyon_core_version = "";
 
-    if (command_exists("tachyon-core") || command_exists("sing-box")) {
-        sing_box_installed = 1;
+    if (command_exists("tachyon-core")) {
+        tachyon_core_installed = 1;
         let version = "";
         if (system_info_cache_is_valid()) {
             let cache = read_json_file(SYSTEM_INFO_CACHE_FILE);
-            version = strip_leading_v(as_string(cache.sing_box_version));
-            sing_box_extended = int(cache.sing_box_extended) ? 1 : 0;
-            sing_box_cert_pin = int(cache.sing_box_cert_pin) ? 1 : 0;
-            sing_box_tachyon_core = int(cache.sing_box_tachyon_core) ? 1 : 0;
+            version = strip_leading_v(as_string(cache.tachyon_core_version));
+            tachyon_core_cert_pin = int(cache.tachyon_core_cert_pin) ? 1 : 0;
         }
 
         if (version == "" || version == "unknown" || version == "not installed") {
-            let resolved = sing_box_resolved_version();
+            let resolved = tachyon_core_resolved_version();
             version = strip_leading_v(as_string(resolved.version));
-            let flags = sing_box_capability_flags(version, resolved.output);
-            sing_box_extended = flags.extended;
-            sing_box_cert_pin = flags.cert_pin;
-            sing_box_tachyon_core = flags.tachyon_core;
+            let flags = tachyon_core_capability_flags(version, resolved.output);
+            tachyon_core_cert_pin = flags.cert_pin;
         }
+        tachyon_core_version = version;
 
-        if (sing_box_tachyon_core == 1) {
-            sing_box_version_ok = 1;
-        }
-        else if (version != "" && version != "unknown" && version != "not installed") {
-            if (module_success(HELPERS_UC, [ "version-at-least", version, "1.12.4" ]))
-                sing_box_version_ok = 1;
+        if (version != "" && version != "unknown" && version != "not installed") {
+            tachyon_core_version_ok = 1;
         }
     }
 
     if (file_exists("/etc/init.d/tachyon-core")) {
-        sing_box_service_exist = 1;
+        tachyon_core_service_exist = 1;
         if (!command_success_from_args([ "/etc/init.d/tachyon-core", "enabled" ]))
-            sing_box_autostart_disabled = 1;
+            tachyon_core_autostart_disabled = 1;
     }
 
-    if (sing_box_process_is_running())
-        sing_box_process_running = 1;
+    if (tachyon_core_process_is_running())
+        tachyon_core_process_running = 1;
 
-    if (sing_box_standard_ports_listening(command_output_from_args([ "netstat", "-ln" ])))
-        sing_box_ports_listening = 1;
+    let netstat_out = command_output_from_args([ "netstat", "-ln" ]);
+    let missing_ports = tachyon_core_missing_standard_ports(netstat_out);
+    if (length(missing_ports) == 0)
+        tachyon_core_ports_listening = 1;
+    let listen_ports = resolve_tachyon_core_listen_ports(netstat_out);
+    if (length(missing_ports) > 0) {
+        let missing_str = "missing: " + join(", ", missing_ports);
+        listen_ports = listen_ports != "" ? (listen_ports + " (" + missing_str + ")") : missing_str;
+    }
 
     write_json({
-        sing_box_installed,
-        sing_box_version_ok,
-        sing_box_extended,
-        sing_box_cert_pin,
-        sing_box_tachyon_core,
-        sing_box_service_exist,
-        sing_box_autostart_disabled,
-        sing_box_process_running,
-        sing_box_ports_listening
+        tachyon_core_installed,
+        tachyon_core_version_ok,
+        tachyon_core_cert_pin,
+        tachyon_core_service_exist,
+        tachyon_core_autostart_disabled,
+        tachyon_core_process_running,
+        tachyon_core_ports_listening,
+        tachyon_core_version,
+        tachyon_core_bin_path: "/usr/bin/tachyon-core",
+        tachyon_core_init_path: "/etc/init.d/tachyon-core",
+        tachyon_core_listen_ports: listen_ports
     });
     return 0;
 }
@@ -1007,34 +974,30 @@ function check_sing_box() {
 
 return {
     check_logs,
-    check_sing_box_logs,
+    check_tachyon_core_logs,
     tachyon_logs_fixture,
-    show_sing_box_config,
+    show_tachyon_core_config,
     show_config,
     show_version,
-    show_sing_box_version,
+    show_tachyon_core_version,
     get_luci_app_version,
     system_info_cache_is_valid,
     ensure_subscription_runtime_dirs,
     write_system_info_cache,
-    sing_box_marker_is,
-    sing_box_component_action_running,
-    sing_box_live_probe_disabled,
-    sing_box_resolved_version,
-    sing_box_tiny_package_installed,
-    sing_box_capability_flags,
+    tachyon_core_component_action_running,
+    tachyon_core_resolved_version,
+    tachyon_core_capability_flags,
     provider_installed,
     provider_version,
     openwrt_release,
     get_system_arch_candidates,
-    is_fptn_supported,
     build_system_info,
     get_system_info,
     get_server_capabilities,
-    sing_box_process_is_running,
+    tachyon_core_process_is_running,
     service_status_label,
     write_service_status,
-    get_sing_box_status,
+    get_tachyon_core_status,
     get_engine_status,
     get_status,
     subscription_cache,
@@ -1042,10 +1005,6 @@ return {
     section_safe,
     get_outbound_metadata,
     get_subscription_metadata,
-    validate_nfqws_strategy_json,
-    validate_nfqws2_strategy_json,
-    validate_byedpi_strategy_json,
     strip_leading_v,
-    check_steer,
-    check_sing_box
+    check_tachyon_core
 };

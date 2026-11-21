@@ -35,4 +35,64 @@ check(wg.from_conf(replace(conf, '120-150', '4294967296'), '', '') == null, 'ove
 check(wg.from_conf(conf + '\n[Peer]\nPublicKey = ' + key, '', '') == null, 'multiple peers rejected');
 check(wg.from_conf(replace(conf, key, 'bad-key'), '', '') == null, 'invalid keys rejected');
 check(wg.from_conf(conf + '\nPostUp = arbitrary command\n', '', '').postup == null, 'INI hooks ignored');
+let awg_empty_fields = '[Interface]\nPrivateKey = ' + key + '\nAddress = 10.10.0.2/32\n' +
+    'Jc = 4\nJmin = 40\nJmax = 70\nS1 = 20\nS2 = 20\nS3 = \nS4 = \n' +
+    'H1 = -1452367891\nH2 = 2\nH3 = 3\nH4 = 4\nI1 = <b 0x01>\nI2 = \nJ1 = <r 8>\nItime = 15\n' +
+    '[Peer]\nPublicKey = ' + key + '\nEndpoint = 192.0.2.1:51820\n';
+let empty_imported = wg.from_vpn('vpn://' + b64enc(awg_empty_fields));
+check(empty_imported != null && wg.has_awg(empty_imported) && empty_imported.h1 == 2842599405 &&
+    empty_imported.j1 == '<r 8>' && empty_imported.itime == 15, 'empty AWG fields and signed H1 accepted');
+let json_props_container = {
+    description: 'AWG JSON Props',
+    defaultContainer: 'amnezia-xray',
+    containers: [{
+        container: 'amnezia-awg2',
+        awg: {
+            Jc: '5', Jmin: '50', Jmax: '100', H1: '101', H2: '102', H3: '103', H4: '104',
+            last_config: sprintf('%J', {
+                config: '[Interface]\nPrivateKey = ' + key + '\nAddress = 10.10.0.2/32\nMTU = $MTU\nJc = $JC\nS3 = \n[Peer]\nPublicKey = ' + key + '\nEndpoint = 192.0.2.1:51820\n'
+            })
+        }
+    }]
+};
+let props_imported = wg.from_vpn('vpn://' + b64enc(sprintf('%J', json_props_container)));
+check(props_imported != null && wg.has_awg(props_imported) && props_imported.jc == 5 && props_imported.h1 == 101 && props_imported.mtu == 1280,
+    'AWG container with JSON obfuscation properties, $VAR placeholders and non-AWG defaultContainer accepted');
+let parser = require('subscription.parser');
+let xray_vpn_container = {
+    description: 'Amnezia Xray Node',
+    hostName: '198.51.100.10',
+    defaultContainer: 'amnezia-xray',
+    containers: [{
+        container: 'amnezia-xray',
+        xray: {
+            last_config: sprintf('%J', {
+                outbounds: [{
+                    protocol: 'vless',
+                    settings: {
+                        vnext: [{
+                            address: '$REMOTE_HOST',
+                            port: 443,
+                            users: [{ id: '11111111-2222-3333-4444-555555555555', flow: 'xtls-rprx-vision', encryption: 'none' }]
+                        }]
+                    },
+                    streamSettings: {
+                        network: 'tcp',
+                        security: 'reality',
+                        realitySettings: {
+                            serverName: 'www.microsoft.com',
+                            fingerprint: 'chrome',
+                            publicKey: 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA',
+                            shortId: '01020304'
+                        }
+                    }
+                }]
+            })
+        }
+    }]
+};
+let xray_imported = parser.parse_share_link('vpn://' + b64enc(sprintf('%J', xray_vpn_container)));
+check(xray_imported != null && xray_imported.type == 'vless' && xray_imported.server == '198.51.100.10' &&
+    xray_imported.tag == 'Amnezia Xray Node' && xray_imported.tls?.reality?.enabled === true,
+    'Amnezia Xray Reality vpn:// container parsed as vless outbound');
 print('PASS: AWG 3.1 vpn://, plain .conf, IPv6, ranges, flags, keys, malformed inputs and INI hooks\n');

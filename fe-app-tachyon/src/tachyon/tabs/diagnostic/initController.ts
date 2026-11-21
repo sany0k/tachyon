@@ -6,21 +6,17 @@ import {
 import { showToast } from '../../../helpers/showToast';
 import { notifyActionFailure } from '../../helpers/notifyActionFailure';
 import { capSetSize } from '../../helpers/capCollectionSize';
+import { getIPv6RuntimeSnapshot } from '../../helpers/ipv6Summary';
 import { runDnsCheck } from './checks/runDnsCheck';
-import { runSingBoxCheck } from './checks/runSingBoxCheck';
-import { runSteerCheck } from './checks/runSteerCheck';
+import { runTachyonCoreCheck } from './checks/runTachyonCoreCheck';
 import { runInboundsCheck } from './checks/runInboundsCheck';
 import { runNftCheck } from './checks/runNftCheck';
 import { runFakeIPCheck } from './checks/runFakeIPCheck';
-import { runZapretCheck } from './checks/runZapretCheck';
-import { runZapret2Check } from './checks/runZapret2Check';
-import { runByedpiCheck } from './checks/runByedpiCheck';
 import { DIAGNOSTICS_CHECKS, DIAGNOSTICS_CHECKS_MAP } from './checks/constants';
 import {
   DiagnosticsProviderOptions,
   getDiagnosticsChecks,
   getLoadingDiagnosticsChecks,
-  isSteerEngine,
 } from './diagnostic.store';
 import {
   logger,
@@ -33,8 +29,10 @@ import {
 } from '../../services';
 import { ensureSystemInfo } from '../../services/systemInfo.service';
 import {
+  clearExpandedCheckCards,
+  IRenderSystemInfoRow,
   renderAvailableActions,
-  renderCheckSection,
+  renderDiagnosticsModal,
   renderRunAction,
   renderSystemInfo,
   renderServiceCheckModal,
@@ -45,12 +43,14 @@ import {
   renderStabilityModal,
   renderAiDoctorModal,
   saveAiDoctorHistory,
+  updateDiagnosticsModalIfOpen,
 } from './partials';
 import { TachyonShellMethods } from '../../methods';
 import { getConfigSections } from '../../methods/custom/getConfigSections';
 import { fetchServicesInfo } from '../../fetchers/fetchServicesInfo';
 import { normalizeCompiledVersion } from '../../../helpers/normalizeCompiledVersion';
 import { renderModal, renderButton } from '../../../partials';
+import { renderRotateCcwIcon24 } from '../../../icons';
 import { TACHYON_LUCI_APP_VERSION } from '../../../constants';
 import { renderWikiDisclaimer } from './partials/renderWikiDisclaimer';
 import { runSectionsCheck } from './checks/runSectionsCheck';
@@ -69,12 +69,8 @@ import {
   shouldShowStopAction,
 } from './serviceTransition';
 import { isActiveLuciTab } from '../../helpers/isActiveLuciTab';
-import {
-  formatSingBoxVersion,
-  formatSteerVersion,
-  isNotInstalled,
-  normalizeSingBoxVariantFields,
-} from '../../helpers/singBoxVariant';
+import { tr } from '../../helpers/i18n';
+import { formatCoreVersion } from '../../helpers/coreVersion';
 import {
   clearPersistedDiagnosticRun,
   PersistedDiagnosticRun,
@@ -82,10 +78,10 @@ import {
   savePersistedDiagnosticRun,
 } from './diagnosticRunPersistence';
 import {
-  formatMaskedSingBoxConfig,
+  formatMaskedCoreConfig,
   maskGlobalCheckText,
   maskLogText,
-  stringifySingBoxConfig,
+  stringifyCoreConfig,
 } from './helpers/maskDiagnostics';
 
 const SERVICE_STATUS_REFRESH_INTERVAL_MS = 2000;
@@ -115,20 +111,12 @@ function sleep(ms: number) {
 function getDiagnosticsProviderOptions(
   systemInfo: Pick<
     StoreType['diagnosticsSystemInfo'],
-    | 'zapret_installed'
-    | 'zapret2_installed'
-    | 'byedpi_installed'
-    | 'server_inbounds_enabled_count'
+    'server_inbounds_enabled_count'
   > = store.get().diagnosticsSystemInfo,
 ): DiagnosticsProviderOptions {
-  // activeEngine comes from store.activeEngine (set by fetchServicesInfo via getEngineStatus).
-  // diagnosticsSystemInfo has no engine field — it only tracks component versions.
-  const activeEngine = store.get().activeEngine || 'sing-box';
+  const activeEngine = store.get().activeEngine || 'tachyon-core';
   return {
     activeEngine,
-    includeZapret: Boolean(systemInfo.zapret_installed),
-    includeZapret2: Boolean(systemInfo.zapret2_installed),
-    includeByedpi: Boolean(systemInfo.byedpi_installed),
     includeInbounds: systemInfo.server_inbounds_enabled_count > 0,
   };
 }
@@ -154,6 +142,7 @@ function resetDiagnosticsChecks() {
     return;
   }
 
+  clearExpandedCheckCards();
   store.set({
     diagnosticsChecks: getNotRunningDiagnosticsChecks(),
   });
@@ -399,35 +388,15 @@ async function fetchDiagnosticsProviderInfo({
 
     if (uiState) {
       const currentSystemInfo = store.get().diagnosticsSystemInfo;
-      const nextSystemInfo = normalizeSingBoxVariantFields({
+      const nextSystemInfo = {
         ...currentSystemInfo,
         providerInfoLoaded: true,
-        sing_box_extended: uiState.capabilities.sing_box_extended,
-        sing_box_tiny: uiState.capabilities.sing_box_tiny,
-        sing_box_compressed: uiState.capabilities.sing_box_compressed,
-        sing_box_lx: uiState.capabilities.sing_box_lx,
-        sing_box_tachyon_core: uiState.capabilities.sing_box_tachyon_core,
-        sing_box_fptn: uiState.capabilities.sing_box_fptn,
-        sing_box_tailscale: uiState.capabilities.sing_box_tailscale,
-        sing_box_cert_pin: uiState.capabilities.sing_box_cert_pin,
-        zapret_installed: uiState.capabilities.zapret_installed,
-        zapret2_installed: uiState.capabilities.zapret2_installed,
-        byedpi_installed: uiState.capabilities.byedpi_installed,
+        tachyon_core_fptn: uiState.capabilities.tachyon_core_fptn,
+        tachyon_core_tailscale: uiState.capabilities.tachyon_core_tailscale,
+        tachyon_core_cert_pin: uiState.capabilities.tachyon_core_cert_pin,
         server_inbounds_enabled_count:
           uiState.capabilities.server_inbounds_enabled_count,
-      });
-
-      if (!nextSystemInfo.zapret_installed) {
-        nextSystemInfo.zapret_version = 'not installed';
-      }
-
-      if (!nextSystemInfo.zapret2_installed) {
-        nextSystemInfo.zapret2_version = 'not installed';
-      }
-
-      if (!nextSystemInfo.byedpi_installed) {
-        nextSystemInfo.byedpi_version = 'not installed';
-      }
+      };
 
       const nextState: Partial<StoreType> = {
         diagnosticsSystemInfo: nextSystemInfo,
@@ -449,13 +418,7 @@ async function fetchDiagnosticsProviderInfo({
       return;
     }
 
-    const [zapretRuntime, zapret2Runtime, byedpiRuntime, inboundsConfig] =
-      await Promise.all([
-        TachyonShellMethods.checkZapretRuntime(),
-        TachyonShellMethods.checkZapret2Runtime(),
-        TachyonShellMethods.checkByedpiRuntime(),
-        TachyonShellMethods.checkInboundsConfig(),
-      ]);
+    const inboundsConfig = await TachyonShellMethods.checkInboundsConfig();
 
     if (requestId !== latestProviderInfoRequestId) {
       return;
@@ -465,35 +428,10 @@ async function fetchDiagnosticsProviderInfo({
     const nextSystemInfo = {
       ...currentSystemInfo,
       providerInfoLoaded: true,
-      zapret_installed: zapretRuntime.success
-        ? zapretRuntime.data.zapret_installed
-        : currentSystemInfo.zapret_installed,
-      zapret2_installed: zapret2Runtime.success
-        ? zapret2Runtime.data.zapret2_installed
-        : currentSystemInfo.zapret2_installed,
-      byedpi_installed: byedpiRuntime.success
-        ? byedpiRuntime.data.byedpi_installed
-        : currentSystemInfo.byedpi_installed,
       server_inbounds_enabled_count: inboundsConfig.success
         ? inboundsConfig.data.enabled_count
         : -1,
     };
-
-    if (!zapretRuntime.success) {
-      logger.error('[DIAGNOSTIC]', 'fetchZapretRuntime failed', zapretRuntime);
-    }
-
-    if (!zapret2Runtime.success) {
-      logger.error(
-        '[DIAGNOSTIC]',
-        'fetchZapret2Runtime failed',
-        zapret2Runtime,
-      );
-    }
-
-    if (!byedpiRuntime.success) {
-      logger.error('[DIAGNOSTIC]', 'fetchByedpiRuntime failed', byedpiRuntime);
-    }
 
     if (!inboundsConfig.success) {
       logger.error(
@@ -501,18 +439,6 @@ async function fetchDiagnosticsProviderInfo({
         'fetchInboundsConfig failed',
         inboundsConfig,
       );
-    }
-
-    if (!nextSystemInfo.zapret_installed) {
-      nextSystemInfo.zapret_version = 'not installed';
-    }
-
-    if (!nextSystemInfo.zapret2_installed) {
-      nextSystemInfo.zapret2_version = 'not installed';
-    }
-
-    if (!nextSystemInfo.byedpi_installed) {
-      nextSystemInfo.byedpi_version = 'not installed';
     }
 
     const nextState: Partial<StoreType> = {
@@ -549,19 +475,32 @@ async function fetchDiagnosticsProviderInfo({
   }
 }
 
+function openDiagnosticsModalView() {
+  renderDiagnosticsModal({
+    onRunChecks: () => {
+      void runChecks({ openModal: true });
+    },
+    onRunDoctor: (fix) => {
+      void handleRunDoctor(fix);
+    },
+    onRunAiDoctor: () => {
+      void handleRunAiDoctor();
+    },
+  });
+}
+
 function renderDiagnosticsChecks() {
   logger.debug('[DIAGNOSTIC]', 'renderDiagnosticsChecks');
-  const diagnosticsChecks = [...store.get().diagnosticsChecks].sort(
-    (a, b) => a.order - b.order,
-  );
-  const container = document.getElementById('tachyon_diagnostic-page-checks');
+  updateDiagnosticsModalIfOpen();
 
-  const renderedDiagnosticsChecks = diagnosticsChecks.map((check) =>
-    renderCheckSection(check),
-  );
+  const container = document.getElementById('tachyon_diagnostic-page-checks');
+  if (!container) {
+    return;
+  }
 
   return preserveScrollForPage(() => {
-    container!.replaceChildren(...renderedDiagnosticsChecks);
+    container.style.display = 'none';
+    container.replaceChildren();
   });
 }
 
@@ -585,7 +524,7 @@ function renderDiagnosticRunActionWidget() {
       tachyonRunning,
       mutatingServiceActionLoading: isMutatingServiceActionLoading(),
     }),
-    click: () => runChecks(),
+    click: () => runChecks({ openModal: true }),
   });
 
   return preserveScrollForPage(() => {
@@ -688,9 +627,12 @@ async function handleEnable() {
   setDiagnosticActionLoading('enable', true);
 
   try {
-    await TachyonShellMethods.enable();
+    const response = await TachyonShellMethods.enable();
+    if (!response.success) {
+      notifyActionFailure('handleEnable', response);
+    }
   } catch (e) {
-    logger.error('[DIAGNOSTIC]', 'handleEnable - e', e);
+    notifyActionFailure('handleEnable', e);
   } finally {
     await refreshDiagnosticServicesInfo({
       force: true,
@@ -704,9 +646,12 @@ async function handleDisable() {
   setDiagnosticActionLoading('disable', true);
 
   try {
-    await TachyonShellMethods.disable();
+    const response = await TachyonShellMethods.disable();
+    if (!response.success) {
+      notifyActionFailure('handleDisable', response);
+    }
   } catch (e) {
-    logger.error('[DIAGNOSTIC]', 'handleDisable - e', e);
+    notifyActionFailure('handleDisable', e);
   } finally {
     await refreshDiagnosticServicesInfo({
       force: true,
@@ -885,7 +830,7 @@ async function handleViewLogs() {
         _('View logs'),
         renderModal(viewLogs.data as string, 'view_logs', {
           getText: getLatestLogs,
-          refreshMs: 250,
+          refreshMs: 2000,
           initialAutoRefresh: true,
           showAutoRefreshToggle: true,
           startAtEnd: true,
@@ -945,9 +890,6 @@ async function handleRunAiDoctor() {
         report,
         quickFixes,
         backendNodes,
-        isTachyonCore: Boolean(
-          store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
-        ),
         onRefreshServices: () =>
           refreshDiagnosticServicesInfo({
             force: true,
@@ -981,24 +923,174 @@ function handleOpenLeakCheck() {
   renderLeakCheckModal();
 }
 
+const FUZZER_DPI_ENGINES: Tachyon.FuzzerEngine[] = ['desync'];
+
+function getInstalledFuzzerEngines(): {
+  loaded: boolean;
+  engines: Record<Tachyon.FuzzerEngine, boolean>;
+} {
+  const sysInfo = store.get().diagnosticsSystemInfo;
+  const loaded = Boolean(sysInfo.providerInfoLoaded || sysInfo.loaded);
+  return {
+    loaded,
+    engines: {
+      desync: true,
+    },
+  };
+}
+
+function collectDomainsFromField(val: unknown, out: Set<string>): void {
+  const items = Array.isArray(val)
+    ? val
+    : typeof val === 'string'
+      ? val.split(/[\r\n,;\t ]+/)
+      : [];
+  for (const raw of items) {
+    const cleaned = String(raw || '')
+      .trim()
+      .replace(/^\*\./, '')
+      .replace(/^\.+/, '');
+    if (cleaned && cleaned.includes('.') && !cleaned.startsWith('!')) {
+      out.add(cleaned);
+    }
+  }
+}
+
+function extractSectionDomainsForFuzzer(
+  sec: Tachyon.ConfigSection,
+  sectionByName: Map<string, Tachyon.ConfigSection>,
+): string[] {
+  const out = new Set<string>();
+  const raw = sec as unknown as Record<string, unknown>;
+  for (const key of [
+    'domains',
+    'domain_suffix',
+    'domain_suffix_text',
+    'user_domains',
+    'user_domains_text',
+  ]) {
+    collectDomainsFromField(raw[key], out);
+  }
+  const condRefs = Array.isArray(sec.condition_refs)
+    ? sec.condition_refs
+    : sec.condition_refs
+      ? [sec.condition_refs]
+      : [];
+  for (const ref of condRefs) {
+    const cond = sectionByName.get(String(ref || '').trim());
+    if (!cond) continue;
+    const condRaw = cond as unknown as Record<string, unknown>;
+    for (const key of [
+      'domains',
+      'domain_suffix',
+      'domain_suffix_text',
+      'user_domains',
+      'user_domains_text',
+    ]) {
+      collectDomainsFromField(condRaw[key], out);
+    }
+  }
+  return Array.from(out);
+}
+
 function handleOpenStrategyFuzzer() {
+  const installedInfo = getInstalledFuzzerEngines();
+  const modalOptsBase = installedInfo.loaded
+    ? { availableEngines: installedInfo.engines }
+    : {};
+
   getConfigSections()
     .then((sections) => {
-      const ruleSections = sections
-        .filter((s) => s['.type'] === 'section' || s['.type'] === 'rule')
-        .map((s) => ({
-          id: s['.name'],
-          label:
+      const sectionByName = new Map<string, Tachyon.ConfigSection>();
+      sections.forEach((s) => {
+        if (s['.name']) sectionByName.set(s['.name'], s);
+      });
+
+      const dpiSourceEngineMap = new Map<string, Tachyon.FuzzerEngine>();
+      const dpiSources = sections
+        .filter((s) => {
+          const st = String(s.source_type || '').toLowerCase();
+          return (
+            s['.type'] === 'outbound_source' &&
+            FUZZER_DPI_ENGINES.includes(st as Tachyon.FuzzerEngine)
+          );
+        })
+        .map((s) => {
+          const st = String(
+            s.source_type || '',
+          ).toLowerCase() as Tachyon.FuzzerEngine;
+          if (s['.name']) dpiSourceEngineMap.set(s['.name'], st);
+          const label =
             (typeof s.label === 'string' && s.label.trim()) ||
             (typeof s.name === 'string' && s.name.trim()) ||
-            s['.name'],
-          action: s.action || '',
-        }))
-        .filter((r) => Boolean(r.id));
-      renderStrategyFuzzerModal(ruleSections);
+            s['.name'];
+          return {
+            id: s['.name'],
+            label: `${label} (${_('Connection')})`,
+            action: st,
+          };
+        })
+        .filter(
+          (r) =>
+            Boolean(r.id) &&
+            (!installedInfo.loaded || installedInfo.engines[r.action]),
+        );
+
+      const ruleSections = sections
+        .filter((s) => s['.type'] === 'section' || s['.type'] === 'rule')
+        .map((s) => {
+          const sid = s['.name'];
+          const raw = s as unknown as Record<string, unknown>;
+          const isGlobal =
+            sid === 'global' ||
+            sid === 'default' ||
+            String(raw.match_all || '') === '1' ||
+            raw.match_all === true ||
+            String(raw.is_global || '') === '1';
+          if (!sid || isGlobal) return null;
+
+          const rawAction = String(s.action || '').toLowerCase();
+          let resolvedEngine: Tachyon.FuzzerEngine | null = null;
+          if (FUZZER_DPI_ENGINES.includes(rawAction as Tachyon.FuzzerEngine)) {
+            resolvedEngine = rawAction as Tachyon.FuzzerEngine;
+          } else if (rawAction === 'connection') {
+            const refs = Array.isArray(s.outbound_source_refs)
+              ? s.outbound_source_refs
+              : s.outbound_source_refs
+                ? [s.outbound_source_refs]
+                : [];
+            for (const ref of refs) {
+              const linkedEng = dpiSourceEngineMap.get(
+                String(ref || '').trim(),
+              );
+              if (linkedEng) {
+                resolvedEngine = linkedEng;
+                break;
+              }
+            }
+          }
+          if (!resolvedEngine) return null;
+
+          const domains = extractSectionDomainsForFuzzer(s, sectionByName);
+          return {
+            id: sid,
+            label:
+              (typeof s.label === 'string' && s.label.trim()) ||
+              (typeof s.name === 'string' && s.name.trim()) ||
+              sid,
+            action: resolvedEngine,
+            ...(domains.length > 0 ? { domains } : {}),
+          };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null);
+
+      renderStrategyFuzzerModal(
+        [...dpiSources, ...ruleSections],
+        modalOptsBase,
+      );
     })
     .catch(() => {
-      renderStrategyFuzzerModal([]);
+      renderStrategyFuzzerModal([], modalOptsBase);
     });
 }
 
@@ -1010,7 +1102,7 @@ function handleRestoreNativeInternet() {
         'p',
         {},
         _(
-          'This action will stop Tachyon, restore standard dnsmasq/DNS, remove all proxy/anti-censorship firewall rules and restore direct Internet connection through your ISP.',
+          'This action will stop Tachyon, restore standard dnsmasq/DNS, remove all proxy and packet-routing firewall rules and restore direct Internet connection through your ISP.',
         ),
       ),
       E(
@@ -1028,7 +1120,8 @@ function handleRestoreNativeInternet() {
           }),
           renderButton({
             classNames: ['cbi-button-reset'],
-            text: '🚨 ' + _('Restore Native Internet'),
+            icon: renderRotateCcwIcon24,
+            text: _('Restore Native Internet'),
             onClick: async () => {
               ui.hideModal();
               showToast(
@@ -1062,49 +1155,42 @@ function handleRestoreNativeInternet() {
   );
 }
 
-async function handleShowSingBoxConfig() {
-  setDiagnosticActionLoading('showSingBoxConfig', true);
+async function handleShowTachyonCoreConfig() {
+  setDiagnosticActionLoading('showTachyonCoreConfig', true);
 
   try {
-    const showSingBoxConfig =
-      await TachyonShellMethods.showSingBoxConfig(false);
+    const showTachyonCoreConfig =
+      await TachyonShellMethods.showTachyonCoreConfig(false);
 
-    if (showSingBoxConfig.success) {
-      const rawSingBoxConfigText = stringifySingBoxConfig(
-        showSingBoxConfig.data,
-      );
-      const maskedSingBoxConfigText = formatMaskedSingBoxConfig(
-        showSingBoxConfig.data,
+    if (showTachyonCoreConfig.success) {
+      const rawCoreConfigText = stringifyCoreConfig(showTachyonCoreConfig.data);
+      const maskedCoreConfigText = formatMaskedCoreConfig(
+        showTachyonCoreConfig.data,
       );
 
-      const isTachyonCore = Boolean(
-        store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
-      );
       ui.showModal(
-        isTachyonCore
-          ? _('Show Tachyon Core config')
-          : _('Show sing-box config'),
-        renderModal(rawSingBoxConfigText, 'show_sing_box_config', {
-          maskText: () => maskedSingBoxConfigText,
+        _('Show Tachyon Core config'),
+        renderModal(rawCoreConfigText, 'show_tachyon_core_config', {
+          maskText: () => maskedCoreConfigText,
           initialAutoRefresh: false,
           showMaskValuesToggle: true,
         }),
       );
     } else {
       notifyActionFailure(
-        'handleShowSingBoxConfig',
-        showSingBoxConfig,
-        _('Show sing-box config failed'),
+        'handleShowTachyonCoreConfig',
+        showTachyonCoreConfig,
+        _('Show Tachyon Core config failed'),
       );
     }
   } catch (e) {
     notifyActionFailure(
-      'handleShowSingBoxConfig',
+      'handleShowTachyonCoreConfig',
       e,
-      _('Show sing-box config failed'),
+      _('Show Tachyon Core config failed'),
     );
   } finally {
-    setDiagnosticActionLoading('showSingBoxConfig', false);
+    setDiagnosticActionLoading('showTachyonCoreConfig', false);
   }
 }
 
@@ -1116,9 +1202,9 @@ async function handleGenerateBugReport() {
       command: '/sbin/logread',
       args: ['-e', 'tachyon', '-l', '1000'],
     });
-    const singboxLogsResult = await executeShellCommand({
+    const coreLogsResult = await executeShellCommand({
       command: '/sbin/logread',
-      args: ['-e', 'sing-box', '-l', '1000'],
+      args: ['-e', 'tachyon-core', '-l', '1000'],
     });
 
     const filterUdpErrors = (text: string) => {
@@ -1131,7 +1217,7 @@ async function handleGenerateBugReport() {
         if (line.includes('UDP is not supported by outbound:')) {
           if (!noticeEmitted) {
             filtered.push(
-              'UDP traffic through HTTP outbounds is not supported by sing-box; repeated UDP warnings for HTTP outbounds are hidden by Tachyon.',
+              'UDP traffic through HTTP outbounds is not supported by tachyon-core; repeated UDP warnings for HTTP outbounds are hidden by Tachyon.',
             );
             noticeEmitted = true;
           }
@@ -1142,9 +1228,6 @@ async function handleGenerateBugReport() {
       return filtered.join('\n');
     };
 
-    const isTachyonCore = Boolean(
-      store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
-    );
     const rawReport = [
       '--- TACHYON CONFIG ---',
       configResult || 'Failed to fetch config',
@@ -1154,10 +1237,10 @@ async function handleGenerateBugReport() {
         ? filterUdpErrors(logsResult.stdout)
         : 'Failed to fetch tachyon logs',
       '',
-      isTachyonCore ? '--- TACHYON-CORE LOGS ---' : '--- SING-BOX LOGS ---',
-      singboxLogsResult.code === 0
-        ? filterUdpErrors(singboxLogsResult.stdout)
-        : `Failed to fetch ${isTachyonCore ? 'tachyon-core' : 'sing-box'} logs`,
+      '--- TACHYON-CORE LOGS ---',
+      coreLogsResult.code === 0
+        ? filterUdpErrors(coreLogsResult.stdout)
+        : 'Failed to fetch tachyon-core logs',
     ].join('\n');
 
     const maskedReport = maskLogText(maskGlobalCheckText(rawReport));
@@ -1321,7 +1404,13 @@ function renderDiagnosticAvailableActionsWidget() {
     },
     strategyFuzzer: {
       loading: false,
-      visible: true,
+      visible: (() => {
+        const fuzzerEngines = getInstalledFuzzerEngines();
+        return (
+          !fuzzerEngines.loaded ||
+          Object.values(fuzzerEngines.engines).some(Boolean)
+        );
+      })(),
       onClick: handleOpenStrategyFuzzer,
       disabled: false,
     },
@@ -1357,13 +1446,11 @@ function renderDiagnosticAvailableActionsWidget() {
       onClick: handleViewLogs,
       disabled: viewLogsDisabled,
     },
-    showSingBoxConfig: {
-      loading: diagnosticsActions.showSingBoxConfig.loading,
+    showTachyonCoreConfig: {
+      loading: diagnosticsActions.showTachyonCoreConfig.loading,
       visible: true,
-      text: store.get().diagnosticsSystemInfo?.sing_box_tachyon_core
-        ? _('Show Tachyon Core config')
-        : _('Show sing-box config'),
-      onClick: handleShowSingBoxConfig,
+      text: _('Show Tachyon Core config'),
+      onClick: handleShowTachyonCoreConfig,
       disabled: utilityActionsDisabled,
     },
     generateBugReport: {
@@ -1379,118 +1466,282 @@ function renderDiagnosticAvailableActionsWidget() {
   });
 }
 
+function formatUptimePretty(seconds: number | undefined): string {
+  if (typeof seconds !== 'number' || seconds <= 0) {
+    return '';
+  }
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) {
+    return `${days}${tr('д', 'd')} ${hours}${tr('ч', 'h')}`;
+  }
+  if (hours > 0) {
+    return `${hours}${tr('ч', 'h')} ${minutes}${tr('м', 'm')}`;
+  }
+  return `${Math.max(1, minutes)}${tr('м', 'm')}`;
+}
+
 function renderDiagnosticSystemInfoWidget() {
   logger.debug('[DIAGNOSTIC]', 'renderDiagnosticSystemInfoWidget');
   const diagnosticsSystemInfo = store.get().diagnosticsSystemInfo;
-  const activeEngine =
-    diagnosticsSystemInfo.active_engine ||
-    store.get().activeEngine ||
-    'sing-box';
-  const isSteer = activeEngine === 'steer' || activeEngine === 'steer-extended';
+  const svcData = store.get().servicesInfoWidget.data;
 
   const container = document.getElementById(
     'tachyon_diagnostic-page-system-info',
   );
+  if (!container) {
+    return;
+  }
 
-  const items: Array<{
-    key: string;
-    value: string;
-    tag?: {
-      label: string;
-      kind: 'neutral' | 'warning' | 'success';
-    };
-  }> = [
+  const tachyonRunning = Boolean(svcData.tachyonRunning);
+  const tachyonEnabled = Boolean(svcData.tachyonEnabled);
+  const tachyonSubParts: string[] = [];
+  if (svcData.tachyonPid) {
+    tachyonSubParts.push(`PID ${svcData.tachyonPid}`);
+  }
+  if (
+    typeof svcData.tachyonMemoryMb === 'number' &&
+    svcData.tachyonMemoryMb > 0
+  ) {
+    tachyonSubParts.push(`${svcData.tachyonMemoryMb.toFixed(1)} MB`);
+  }
+  if (svcData.tachyonUptimePretty) {
+    tachyonSubParts.push(svcData.tachyonUptimePretty);
+  } else {
+    tachyonSubParts.push(
+      tachyonEnabled
+        ? tr('Автостарт: вкл', 'Autostart: on')
+        : tr('Автостарт: выкл', 'Autostart: off'),
+    );
+  }
+
+  const items: Array<IRenderSystemInfoRow> = [
     {
       key: 'Tachyon',
       value: normalizeCompiledVersion(
         diagnosticsSystemInfo.tachyon_version,
         diagnosticsSystemInfo.tachyon_commit_sha,
       ),
+      tag: {
+        label: tachyonRunning ? _('active') : tr('остановлен', 'stopped'),
+        kind: tachyonRunning ? 'success' : 'warning',
+      },
+      subvalue: tachyonSubParts.join(' · '),
     },
     {
       key: 'Luci App',
       value: normalizeCompiledVersion(TACHYON_LUCI_APP_VERSION),
+      subvalue: svcData.watchdogRunning
+        ? tr('Watchdog: активен', 'Watchdog: active')
+        : tr('Watchdog: выкл', 'Watchdog: off'),
     },
   ];
 
-  const singBoxInstalled = !isNotInstalled(
-    diagnosticsSystemInfo.sing_box_version,
-  );
-  const steerInstalled = Boolean(diagnosticsSystemInfo.steer_installed);
-  const singBoxRowLabel = diagnosticsSystemInfo.sing_box_tachyon_core
-    ? 'Tachyon Core'
-    : 'Sing-box';
-
-  // Only one engine is installed at a time — engines are swapped, not co-installed.
-  // Show only the active engine in system info.
-  if (isSteer) {
-    items.push({
-      key: 'Steer',
-      value: formatSteerVersion(diagnosticsSystemInfo),
-      tag: { label: _('active'), kind: 'success' as const },
-    });
-  } else {
-    items.push({
-      key: singBoxRowLabel,
-      value: formatSingBoxVersion(diagnosticsSystemInfo),
-      tag: { label: _('active'), kind: 'success' as const },
-    });
+  const coreRunning = Boolean(svcData.tachyonCore || svcData.tachyonRunning);
+  const coreSubParts: string[] = [];
+  if (svcData.tachyonCorePid) {
+    coreSubParts.push(`PID ${svcData.tachyonCorePid}`);
+  }
+  if (
+    typeof svcData.tachyonCoreMemoryMb === 'number' &&
+    svcData.tachyonCoreMemoryMb > 0
+  ) {
+    coreSubParts.push(`${svcData.tachyonCoreMemoryMb.toFixed(1)} MB`);
+  }
+  if (svcData.tachyonCoreUptimePretty) {
+    coreSubParts.push(svcData.tachyonCoreUptimePretty);
   }
 
-  // Fallback: if both happen to be installed (transitional state during swap),
-  // show the inactive one without the active tag so the user knows to clean up.
-  if (isSteer && singBoxInstalled) {
-    items.push({
-      key: singBoxRowLabel,
-      value: formatSingBoxVersion(diagnosticsSystemInfo),
-      tag: { label: _('installed'), kind: 'warning' as const },
-    });
-  } else if (!isSteer && steerInstalled) {
-    items.push({
-      key: 'Steer',
-      value: formatSteerVersion(diagnosticsSystemInfo),
-      tag: { label: _('installed'), kind: 'warning' as const },
-    });
-  }
-
-  if (diagnosticsSystemInfo.zapret_installed) {
-    items.push({
-      key: 'Zapret',
-      value: diagnosticsSystemInfo.zapret_version,
-    });
-  }
-
-  if (diagnosticsSystemInfo.zapret2_installed) {
-    items.push({
-      key: 'Zapret2',
-      value: diagnosticsSystemInfo.zapret2_version,
-    });
-  }
-
-  if (diagnosticsSystemInfo.byedpi_installed) {
-    items.push({
-      key: 'ByeDPI',
-      value: diagnosticsSystemInfo.byedpi_version,
-    });
-  }
+  items.push({
+    key: 'Tachyon Core',
+    value: formatCoreVersion(diagnosticsSystemInfo.tachyon_core_version),
+    tag: {
+      label: coreRunning ? _('active') : tr('остановлен', 'stopped'),
+      kind: coreRunning ? 'success' : 'warning',
+    },
+    subvalue: coreSubParts.length ? coreSubParts.join(' · ') : undefined,
+  });
 
   items.push(
     {
-      key: 'OS',
+      key: _('OS'),
       value: diagnosticsSystemInfo.openwrt_version,
+      subvalue: diagnosticsSystemInfo.kernel_version
+        ? `Linux ${diagnosticsSystemInfo.kernel_version}`
+        : undefined,
     },
     {
-      key: 'Device',
+      key: _('Device'),
       value: diagnosticsSystemInfo.device_model,
+      subvalue: diagnosticsSystemInfo.cpu_arch || undefined,
     },
   );
+
+  if (
+    typeof diagnosticsSystemInfo.mem_total_mb === 'number' &&
+    diagnosticsSystemInfo.mem_total_mb > 0
+  ) {
+    const usedMb = diagnosticsSystemInfo.mem_used_mb ?? 0;
+    const totalMb = diagnosticsSystemInfo.mem_total_mb;
+    const freeMb = diagnosticsSystemInfo.mem_free_mb ?? totalMb - usedMb;
+    const pct =
+      diagnosticsSystemInfo.mem_used_pct ??
+      Math.round((usedMb * 100) / totalMb);
+
+    items.push({
+      key: tr('Память (RAM)', 'Memory (RAM)'),
+      value: `${usedMb} / ${totalMb} MB`,
+      tag: {
+        label: `${pct}%`,
+        kind: pct >= 85 ? 'warning' : 'success',
+      },
+      subvalue: `${tr('Доступно', 'Avail')}: ${freeMb} MB`,
+    });
+  }
+
+  if (
+    diagnosticsSystemInfo.load_avg ||
+    diagnosticsSystemInfo.uptime_seconds ||
+    svcData.cpuLoadPercent != null
+  ) {
+    const uptimeLabel = formatUptimePretty(
+      diagnosticsSystemInfo.uptime_seconds,
+    );
+    const loadMain = diagnosticsSystemInfo.load_avg
+      ? `LA ${diagnosticsSystemInfo.load_avg}`
+      : svcData.cpuLoadPercent != null
+        ? `CPU ${svcData.cpuLoadPercent}%`
+        : uptimeLabel || '—';
+
+    const cpuSubParts: string[] = [];
+    if (svcData.cpuLoadPercent != null && diagnosticsSystemInfo.load_avg) {
+      cpuSubParts.push(`CPU ${svcData.cpuLoadPercent}%`);
+    }
+    if (svcData.cpuTempC != null && svcData.cpuTempC > 0) {
+      cpuSubParts.push(`${svcData.cpuTempC}°C`);
+    }
+    if (uptimeLabel) {
+      cpuSubParts.push(`${tr('Аптайм', 'Uptime')}: ${uptimeLabel}`);
+    }
+
+    items.push({
+      key: tr('Нагрузка и аптайм', 'Load & Uptime'),
+      value: loadMain,
+      tag: uptimeLabel ? { label: uptimeLabel, kind: 'neutral' } : undefined,
+      subvalue: cpuSubParts.join(' · ') || undefined,
+    });
+  }
+
+  const ipv6 = getIPv6RuntimeSnapshot(diagnosticsSystemInfo);
+
+  if (diagnosticsSystemInfo.dns_type || diagnosticsSystemInfo.inbound_mode) {
+    const dnsMode = (diagnosticsSystemInfo.dns_type || 'udp').toUpperCase();
+    const inboundMode = (
+      diagnosticsSystemInfo.inbound_mode || 'tproxy'
+    ).toUpperCase();
+    const fakeIpOn = ipv6.fakeIpEnabled;
+    const dnsStrategyNote =
+      ipv6.dnsStrategy === 'ipv6_only' ? ' (ipv6_only)' : '';
+    const dnsSubParts: string[] = [
+      typeof svcData.dnsmasqCacheSize === 'number' &&
+      svcData.dnsmasqCacheSize > 0
+        ? `dnsmasq: ${svcData.dnsmasqCacheSize} ${tr('записей', 'entries')}`
+        : '127.0.0.42:53 · :1602',
+    ];
+    if (fakeIpOn) {
+      dnsSubParts.push(`FakeIPv6: ${ipv6.fakeIp6Range}`);
+    }
+
+    items.push({
+      key: tr('DNS и перехват', 'DNS & Intercept'),
+      value: `${dnsMode}${dnsStrategyNote} · ${inboundMode}`,
+      tag: {
+        label: fakeIpOn ? 'FakeIP' : tr('Без FakeIP', 'No FakeIP'),
+        kind: fakeIpOn ? 'success' : 'neutral',
+      },
+      subvalue: dnsSubParts.join(' · '),
+    });
+  }
+
+  {
+    const ipv6SubParts = [
+      `WAN6: ${ipv6.wan6Label || tr('нет префикса', 'no prefix')}`,
+      `FakeIPv6: ${ipv6.fakeIpEnabled ? ipv6.fakeIp6Range : tr('выкл', 'off')}`,
+      `WebRTC: ${ipv6.webrtcGuardActive ? tr('защита вкл', 'guard on') : tr('обычный', 'default')}`,
+    ];
+    if (ipv6.warningText) {
+      ipv6SubParts.push(ipv6.warningText);
+    }
+
+    items.push({
+      key: tr('IPv6 и защита от утечек', 'IPv6 & Leak Guard'),
+      value: ipv6.wan6Label
+        ? `${ipv6.modeLabel} · ${ipv6.wan6Label}`
+        : ipv6.modeLabel,
+      tag: ipv6.isWarning
+        ? {
+            label:
+              ipv6.dnsStrategy === 'ipv6_only'
+                ? tr('Риск ipv6_only', 'ipv6_only warning')
+                : tr('Leak Guard выкл', 'Leak Guard off'),
+            kind: 'warning',
+          }
+        : ipv6.leakGuardActive
+          ? {
+              label: 'Leak Guard',
+              kind: 'success',
+            }
+          : {
+              label: ipv6.effectiveState,
+              kind: 'neutral',
+            },
+      subvalue: ipv6SubParts.join(' · '),
+    });
+  }
+
+  if (typeof diagnosticsSystemInfo.total_sections_count === 'number') {
+    const activeSec = diagnosticsSystemInfo.active_sections_count ?? 0;
+    const totalSec = diagnosticsSystemInfo.total_sections_count;
+    const quarantinedSec =
+      diagnosticsSystemInfo.quarantined_sections_count ?? 0;
+    const deferredSec = diagnosticsSystemInfo.deferred_sections_count ?? 0;
+
+    const conntrackSub =
+      typeof diagnosticsSystemInfo.conntrack_count === 'number' &&
+      typeof diagnosticsSystemInfo.conntrack_max === 'number' &&
+      diagnosticsSystemInfo.conntrack_max > 0
+        ? `Conntrack: ${diagnosticsSystemInfo.conntrack_count} / ${diagnosticsSystemInfo.conntrack_max}`
+        : undefined;
+
+    items.push({
+      key: tr('Секции и сессии', 'Sections & Sessions'),
+      value: `${activeSec} / ${totalSec}`,
+      tag:
+        quarantinedSec > 0
+          ? {
+              label: `${tr('карантин', 'quarantine')}: ${quarantinedSec}`,
+              kind: 'warning',
+            }
+          : deferredSec > 0
+            ? {
+                label: `${tr('отложено', 'deferred')}: ${deferredSec}`,
+                kind: 'warning',
+              }
+            : {
+                label: tr('активны', 'active'),
+                kind: 'success',
+              },
+      subvalue: conntrackSub,
+    });
+  }
 
   const renderedSystemInfo = renderSystemInfo({
     items,
   });
 
   return preserveScrollForPage(() => {
-    container!.replaceChildren(renderedSystemInfo);
+    container.replaceChildren(renderedSystemInfo);
   });
 }
 
@@ -1506,12 +1757,14 @@ async function onStoreUpdate(
 
   if (diff.diagnosticsRunAction) {
     renderDiagnosticRunActionWidget();
+    renderDiagnosticsChecks();
   }
 
   if (
     diff.diagnosticsActions ||
     diff.servicesInfoWidget ||
-    diff.updatesActions
+    diff.updatesActions ||
+    diff.diagnosticsSystemInfo
   ) {
     renderDiagnosticAvailableActionsWidget();
   }
@@ -1520,7 +1773,7 @@ async function onStoreUpdate(
     renderDiagnosticRunActionWidget();
   }
 
-  if (diff.diagnosticsSystemInfo) {
+  if (diff.diagnosticsSystemInfo || diff.servicesInfoWidget) {
     renderDiagnosticSystemInfoWidget();
     renderDiagnosticRunActionWidget();
   }
@@ -1563,10 +1816,10 @@ function setDiagnosticCheckLoading(code: DIAGNOSTICS_CHECKS) {
 function getDiagnosticRunners(
   providerOptions: DiagnosticsProviderOptions,
 ): DiagnosticRunner[] {
-  // Select the engine-specific runner. Add Mihomo/Xray cases here when needed.
-  const engineRunner = isSteerEngine(providerOptions.activeEngine)
-    ? { code: DIAGNOSTICS_CHECKS.STEER, run: runSteerCheck }
-    : { code: DIAGNOSTICS_CHECKS.SINGBOX, run: runSingBoxCheck };
+  const engineRunner = {
+    code: DIAGNOSTICS_CHECKS.TACHYON_CORE,
+    run: runTachyonCoreCheck,
+  };
 
   return [
     { code: DIAGNOSTICS_CHECKS.DNS, run: runDnsCheck },
@@ -1575,23 +1828,27 @@ function getDiagnosticRunners(
       ? [{ code: DIAGNOSTICS_CHECKS.INBOUNDS, run: runInboundsCheck }]
       : []),
     { code: DIAGNOSTICS_CHECKS.NFT, run: runNftCheck },
-    ...(providerOptions.includeZapret
-      ? [{ code: DIAGNOSTICS_CHECKS.ZAPRET, run: runZapretCheck }]
-      : []),
-    ...(providerOptions.includeZapret2
-      ? [{ code: DIAGNOSTICS_CHECKS.ZAPRET2, run: runZapret2Check }]
-      : []),
-    ...(providerOptions.includeByedpi
-      ? [{ code: DIAGNOSTICS_CHECKS.BYEDPI, run: runByedpiCheck }]
-      : []),
     { code: DIAGNOSTICS_CHECKS.OUTBOUNDS, run: runSectionsCheck },
     { code: DIAGNOSTICS_CHECKS.FAKEIP, run: runFakeIPCheck },
   ];
 }
 
-async function runChecks({ resume }: { resume?: PersistedDiagnosticRun } = {}) {
+async function runChecks({
+  resume,
+  openModal = false,
+}: {
+  resume?: PersistedDiagnosticRun;
+  openModal?: boolean;
+} = {}) {
   if (store.get().diagnosticsRunAction.loading && !resume) {
+    if (openModal) {
+      openDiagnosticsModalView();
+    }
     return;
+  }
+
+  if (!resume) {
+    clearExpandedCheckCards();
   }
 
   let providerOptions =
@@ -1604,6 +1861,9 @@ async function runChecks({ resume }: { resume?: PersistedDiagnosticRun } = {}) {
       resume?.diagnosticsChecks ??
       getLoadingDiagnosticsChecks(providerOptions).diagnosticsChecks,
   });
+  if (openModal) {
+    openDiagnosticsModalView();
+  }
   persistDiagnosticRunProgress({
     providerOptions,
     nextRunnerIndex,

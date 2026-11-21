@@ -9,16 +9,51 @@
 const UCI_PACKAGE = "tachyon";
 
 const AVATAR_PRESETS = {
-  "👶": _("Toddler (👶)"),
-  "🧒": _("Child (🧒)"),
-  "🧑": _("Teen (🧑)"),
-  "🎮": _("Gamer (🎮)"),
-  "📱": _("Phone (📱)"),
-  "💻": _("Laptop / PC (💻)"),
-  "🏠": _("Family (🏠)"),
-  "🔒": _("Strict (🔒)"),
-  "🐾": _("Pets / IoT (🐾)"),
+  toddler: _("Toddler"),
+  child: _("Child"),
+  teen: _("Teen"),
+  gamer: _("Gamer"),
+  phone: _("Phone"),
+  laptop: _("Laptop / PC"),
+  family: _("Family"),
+  strict: _("Strict"),
+  iot: _("Pets / IoT"),
 };
+
+function renderAvatarSvgHtml(avatarKey, size = 14) {
+  const k = String(avatarKey || "")
+    .trim()
+    .toLowerCase();
+  if (k === "gamer" || k === "\u{1F3AE}") {
+    return renderSvgIconHtml("renderGamepad2Icon", size);
+  }
+  if (k === "phone" || k === "\u{1F4F1}") {
+    return renderSvgIconHtml("renderSmartphoneIcon", size);
+  }
+  if (k === "laptop" || k === "\u{1F4BB}") {
+    return renderSvgIconHtml("renderLaptopIcon", size);
+  }
+  if (k === "strict" || k === "\u{1F512}") {
+    return renderSvgIconHtml("renderLockIcon", size);
+  }
+  if (k === "iot" || k === "\u{1F43E}") {
+    return renderSvgIconHtml("renderPlugIcon", size);
+  }
+  return renderSvgIconHtml("renderUsersIcon", size);
+}
+
+function renderSvgIconHtml(rendererName, size = 12) {
+  try {
+    if (
+      typeof main !== "undefined" &&
+      typeof main[rendererName] === "function"
+    ) {
+      const el = main[rendererName](size);
+      if (el && el.outerHTML) return el.outerHTML;
+    }
+  } catch (e) {}
+  return "";
+}
 
 const DAY_LABELS = {
   monday: _("Monday"),
@@ -53,7 +88,7 @@ const DAY_INDEX_MAP = {
 const DOMAIN_PRESETS = {
   social: {
     label: _("Social media"),
-    icon: "📱",
+    iconRenderer: "renderSmartphoneIcon",
     domains: [
       "facebook.com",
       "instagram.com",
@@ -78,7 +113,7 @@ const DOMAIN_PRESETS = {
   },
   video: {
     label: _("Video streaming"),
-    icon: "🎬",
+    iconRenderer: "renderTvIcon",
     domains: [
       "youtube.com",
       "youtu.be",
@@ -100,7 +135,7 @@ const DOMAIN_PRESETS = {
   },
   gaming: {
     label: _("Gaming"),
-    icon: "🎮",
+    iconRenderer: "renderGamepad2Icon",
     domains: [
       "steampowered.com",
       "steamcommunity.com",
@@ -121,7 +156,7 @@ const DOMAIN_PRESETS = {
   },
   adult: {
     label: _("Adult content"),
-    icon: "🔞",
+    iconRenderer: "renderAlertTriangleIcon",
     domains: [
       "pornhub.com",
       "xvideos.com",
@@ -143,7 +178,7 @@ const DOMAIN_PRESETS = {
   },
   messengers: {
     label: _("Messengers"),
-    icon: "💬",
+    iconRenderer: "renderPlugIcon",
     domains: [
       "telegram.org",
       "t.me",
@@ -164,7 +199,7 @@ const DOMAIN_PRESETS = {
   },
   shopping: {
     label: _("Shopping"),
-    icon: "🛒",
+    iconRenderer: "renderCreditCardIcon",
     domains: [
       "amazon.com",
       "ebay.com",
@@ -294,7 +329,7 @@ function createProfileContent(section) {
   o.rawhtml = true;
   o.modalonly = false;
   o.cfgvalue = function (sectionId) {
-    const avatar = uci.get(UCI_PACKAGE, sectionId, "avatar") || "👶";
+    const avatar = uci.get(UCI_PACKAGE, sectionId, "avatar") || "child";
     const label =
       uci.get(UCI_PACKAGE, sectionId, "label") ||
       uci.get(UCI_PACKAGE, sectionId, "name") ||
@@ -308,19 +343,18 @@ function createProfileContent(section) {
 
     return (
       `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">` +
-      `<span style="font-size:1.3rem;line-height:1;">${avatar}</span>` +
+      `<span style="display:inline-flex;align-items:center;line-height:1;">${renderAvatarSvgHtml(avatar, 15)}</span>` +
       `<strong style="font-size:13px;color:inherit;">${label}</strong>` +
       devBadge +
       `</div>`
     );
   };
   o.textvalue = function (sectionId) {
-    const avatar = uci.get(UCI_PACKAGE, sectionId, "avatar") || "👶";
     const label =
       uci.get(UCI_PACKAGE, sectionId, "label") ||
       uci.get(UCI_PACKAGE, sectionId, "name") ||
       sectionId;
-    return `${avatar} ${label}`;
+    return label;
   };
 
   // Assigned Devices column
@@ -349,7 +383,7 @@ function createProfileContent(section) {
         const label = isMac ? "MAC" : "IP";
         return (
           `<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;font-family:monospace;margin-right:4px;font-weight:600;display:inline-flex;align-items:center;margin-bottom:2px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));max-width:100%;word-break:break-all;overflow-wrap:anywhere;">` +
-          `<span style="opacity:0.75;font-weight:700;margin-right:3px;">${label}:</span>` +
+          `<span style="opacity:0.75;font-weight: 600;margin-right:3px;">${label}:</span>` +
           dev +
           "</span>"
         );
@@ -376,8 +410,10 @@ function createProfileContent(section) {
     if (raw <= 0) {
       return '<span style="opacity:0.5;">' + _("Unlimited") + "</span>";
     }
+    const icon = renderSvgIconHtml("renderHourglassIcon", 12);
     return (
-      '<span style="color:var(--primary-color-medium, #3182ce);font-weight:600;">⏳ ' +
+      '<span style="color:var(--primary-color-medium, #3182ce);font-weight:600;display:inline-flex;align-items:center;gap:4px;">' +
+      (icon || "") +
       raw +
       " " +
       _("min/day") +
@@ -403,22 +439,28 @@ function createProfileContent(section) {
 
     let badges = [];
     if (safeSearch) {
+      const icon = renderSvgIconHtml("renderShieldIcon", 11);
       badges.push(
-        '<span class="badge" style="background:rgba(79,209,197,0.15);color:var(--teal-color, #319795);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(79,209,197,0.3);">🛡️ ' +
+        '<span class="badge" style="background:rgba(79,209,197,0.15);color:var(--teal-color, #319795);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(79,209,197,0.3);display:inline-flex;align-items:center;gap:3px;">' +
+          icon +
           _("SafeSearch") +
           "</span>",
       );
     }
     if (blockDoh) {
+      const icon = renderSvgIconHtml("renderLockIcon", 11);
       badges.push(
-        '<span class="badge" style="background:rgba(183,148,244,0.15);color:var(--purple-color, #805ad5);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(183,148,244,0.3);">🔒 ' +
+        '<span class="badge" style="background:rgba(183,148,244,0.15);color:var(--purple-color, #805ad5);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(183,148,244,0.3);display:inline-flex;align-items:center;gap:3px;">' +
+          icon +
           _("Anti-Bypass (DoH)") +
           "</span>",
       );
     }
     if (domainCount > 0) {
+      const icon = renderSvgIconHtml("renderXIcon", 11);
       badges.push(
-        '<span class="badge" style="background:rgba(229,62,62,0.15);color:var(--error-color-medium, #e53e3e);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(229,62,62,0.3);">🚫 ' +
+        '<span class="badge" style="background:rgba(229,62,62,0.15);color:var(--error-color-medium, #e53e3e);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(229,62,62,0.3);display:inline-flex;align-items:center;gap:3px;">' +
+          icon +
           domainCount +
           " " +
           _("sites") +
@@ -426,8 +468,10 @@ function createProfileContent(section) {
       );
     }
     if (notify) {
+      const icon = renderSvgIconHtml("renderBellIcon", 11);
       badges.push(
-        '<span class="badge" style="background:rgba(49,130,206,0.15);color:var(--primary-color-medium, #3182ce);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(49,130,206,0.3);">🔔 ' +
+        '<span class="badge" style="background:rgba(49,130,206,0.15);color:var(--primary-color-medium, #3182ce);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid rgba(49,130,206,0.3);display:inline-flex;align-items:center;gap:3px;">' +
+          icon +
           _("Telegram") +
           "</span>",
       );
@@ -490,7 +534,7 @@ function createProfileContent(section) {
     _("Choose a visual icon for this profile"),
   );
   o.modalonly = true;
-  o.default = "👶";
+  o.default = "child";
   Object.entries(AVATAR_PRESETS).forEach(([icon, label]) => {
     o.value(icon, label);
   });
@@ -644,15 +688,21 @@ function createProfileContent(section) {
       style: "margin-bottom:6px;display:flex;flex-wrap:wrap;gap:4px;",
     });
     Object.entries(DOMAIN_PRESETS).forEach(([key, preset]) => {
+      const iconEl =
+        typeof main !== "undefined" &&
+        typeof main[preset.iconRenderer] === "function"
+          ? main[preset.iconRenderer](12)
+          : null;
       const btn = E(
         "button",
         {
           class: "cbi-button cbi-button-neutral",
           type: "button",
-          style: "padding:2px 8px;font-size:11px;",
+          style:
+            "padding:2px 8px;font-size:11px;display:inline-flex;align-items:center;gap:4px;",
           title: preset.domains.join(", "),
         },
-        preset.icon + " " + preset.label,
+        [iconEl, E("span", {}, preset.label)].filter(Boolean),
       );
       btn.addEventListener("click", function () {
         const textarea = container.querySelector("textarea");
@@ -732,12 +782,12 @@ function createParentalContent(section) {
     if (profiles.length > 0) {
       profiles.forEach((pName) => {
         const prof = uci.get(UCI_PACKAGE, pName);
-        const avatar = (prof && prof.avatar) || "👶";
+        const avatar = (prof && prof.avatar) || "child";
         const label = (prof && prof.label) || pName;
         const devCount = prof ? normalizeListValues(prof.device_ip).length : 0;
         items.push(
-          `<span class="badge" style="background:rgba(49,151,149,0.15);color:var(--teal-color, #319795);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;font-weight:600;display:inline-flex;align-items:center;margin-bottom:2px;border:1px solid rgba(49,151,149,0.3);max-width:100%;word-break:break-all;">` +
-            `${avatar} ${label} (${devCount} ${_("dev.")})` +
+          `<span class="badge" style="background:rgba(49,151,149,0.15);color:var(--teal-color, #319795);padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;font-weight:600;display:inline-flex;align-items:center;gap:4px;margin-bottom:2px;border:1px solid rgba(49,151,149,0.3);max-width:100%;word-break:break-all;">` +
+            `${renderAvatarSvgHtml(avatar, 11)} ${label} (${devCount} ${_("dev.")})` +
             `</span>`,
         );
       });
@@ -753,7 +803,7 @@ function createParentalContent(section) {
         const label = isMac ? "MAC" : "IP";
         items.push(
           `<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;font-family:monospace;margin-right:4px;font-weight:600;display:inline-flex;align-items:center;margin-bottom:2px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));max-width:100%;word-break:break-all;overflow-wrap:anywhere;">` +
-            `<span style="opacity:0.75;font-weight:700;margin-right:3px;">${label}:</span>` +
+            `<span style="opacity:0.75;font-weight: 600;margin-right:3px;">${label}:</span>` +
             dev +
             "</span>",
         );
@@ -788,8 +838,10 @@ function createParentalContent(section) {
   o.cfgvalue = function (sectionId) {
     const target = uci.get(UCI_PACKAGE, sectionId, "target") || "domains";
     if (target === "all") {
+      const icon = renderSvgIconHtml("renderXIcon", 12);
       return (
-        '<span style="color:var(--error-color-medium, #e53e3e);font-weight:600;">🚫 ' +
+        '<span style="color:var(--error-color-medium, #e53e3e);font-weight:600;display:inline-flex;align-items:center;gap:4px;">' +
+        icon +
         _("All Internet") +
         "</span>"
       );
@@ -799,8 +851,10 @@ function createParentalContent(section) {
         uci.get(UCI_PACKAGE, sectionId, "blocked_domains"),
       );
       const count = rawDomains.length;
+      const icon = renderSvgIconHtml("renderGlobeIcon", 11);
       return (
-        '<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));display:inline-flex;align-items:center;margin-bottom:2px;">🌐 ' +
+        '<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));display:inline-flex;align-items:center;gap:3px;margin-bottom:2px;">' +
+        icon +
         _("Blocked Sites") +
         (count > 0 ? " (" + count + ")" : "") +
         "</span>"
@@ -817,8 +871,10 @@ function createParentalContent(section) {
       .map((name) => {
         const sec = uci.get(UCI_PACKAGE, name);
         const label = (sec && (sec.label || sec[".name"])) || name;
+        const icon = renderSvgIconHtml("renderLockIcon", 11);
         return (
-          '<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));display:inline-flex;align-items:center;margin-bottom:2px;max-width:100%;word-break:break-all;">🔒 ' +
+          '<span class="badge" style="background:var(--background-color-low, rgba(0,0,0,0.06));padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;border:1px solid var(--border-color-low, rgba(0,0,0,0.12));display:inline-flex;align-items:center;gap:3px;margin-bottom:2px;max-width:100%;word-break:break-all;">' +
+          icon +
           label +
           "</span>"
         );
@@ -858,14 +914,18 @@ function createParentalContent(section) {
     const e = uci.get(UCI_PACKAGE, sectionId, "end_time");
     const is247 = !s && !e;
     if (action === "allow") {
+      const icon = renderSvgIconHtml("renderCheckIcon", 12);
       return (
-        '<span style="color:var(--success-color-medium, #38a169);font-weight:500;">✅ ' +
+        '<span style="color:var(--success-color-medium, #38a169);font-weight:500;display:inline-flex;align-items:center;gap:4px;">' +
+        icon +
         (is247 ? _("Allow always") : _("Allow in interval")) +
         "</span>"
       );
     }
+    const icon = renderSvgIconHtml("renderXIcon", 12);
     return (
-      '<span style="color:var(--error-color-medium, #e53e3e);font-weight:500;">🚫 ' +
+      '<span style="color:var(--error-color-medium, #e53e3e);font-weight:500;display:inline-flex;align-items:center;gap:4px;">' +
+      icon +
       (is247 ? _("Block always") : _("Block in interval")) +
       "</span>"
     );
@@ -890,8 +950,10 @@ function createParentalContent(section) {
     const e = uci.get(UCI_PACKAGE, sectionId, "end_time");
     const days = formatDaysDisplay(uci.get(UCI_PACKAGE, sectionId, "days"));
     if (!s && !e) {
+      const icon = renderSvgIconHtml("renderZapIcon", 12);
       return (
-        '<div style="line-height:1.3;"><strong style="color:var(--success-color, #38a169);">⚡ ' +
+        '<div style="line-height:1.3;"><strong style="color:var(--success-color, #38a169);display:inline-flex;align-items:center;gap:4px;">' +
+        icon +
         _("Always Active (24/7)") +
         '</strong><br><small style="opacity:0.75;">' +
         days +
@@ -930,18 +992,22 @@ function createParentalContent(section) {
       return '<span style="opacity:0.5;">' + _("None") + "</span>";
     }
     if (target !== "all") {
+      const icon = renderSvgIconHtml("renderAlertTriangleIcon", 11);
       return (
-        '<span style="color:var(--warning-color-medium, #d69e2e);font-size:11px;" title="' +
+        '<span style="color:var(--warning-color-medium, #d69e2e);font-size:11px;display:inline-flex;align-items:center;gap:3px;" title="' +
         _("Daily quota applies only when Target Scope is All Internet") +
-        '">⚠️ ' +
+        '">' +
+        icon +
         raw +
         " " +
         _("min/day") +
         "</span>"
       );
     }
+    const icon = renderSvgIconHtml("renderHourglassIcon", 11);
     return (
-      '<span style="color:var(--primary-color-medium, #3182ce);font-weight:500;">⏳ ' +
+      '<span style="color:var(--primary-color-medium, #3182ce);font-weight:500;display:inline-flex;align-items:center;gap:3px;">' +
+      icon +
       raw +
       " " +
       _("min/day") +
@@ -970,12 +1036,18 @@ function createParentalContent(section) {
     if (domains.length === 0) {
       return '<span style="opacity:0.5;">' + _("None") + "</span>";
     }
+    const modeIcon =
+      mode === "allow"
+        ? renderSvgIconHtml("renderCheckIcon", 11)
+        : renderSvgIconHtml("renderXIcon", 11);
     const modeBadge =
       mode === "allow"
-        ? '<span style="color:var(--success-color-medium, #38a169);font-weight:600;">🟢 ' +
+        ? '<span style="color:var(--success-color-medium, #38a169);font-weight:600;display:inline-flex;align-items:center;gap:3px;">' +
+          modeIcon +
           _("Allow only") +
           "</span>"
-        : '<span style="color:var(--error-color-medium, #e53e3e);font-weight:600;">🚫 ' +
+        : '<span style="color:var(--error-color-medium, #e53e3e);font-weight:600;display:inline-flex;align-items:center;gap:3px;">' +
+          modeIcon +
           _("Block") +
           "</span>";
     const badges = domains
@@ -1084,8 +1156,7 @@ function createParentalContent(section) {
     const profList = uci.sections(UCI_PACKAGE, "profile") || [];
     profList.forEach((p) => {
       const pName = p[".name"];
-      const pAvatar = p.avatar || "👶";
-      const pLabel = p.label ? `${pAvatar} ${p.label}` : `${pAvatar} ${pName}`;
+      const pLabel = p.label ? p.label : pName;
       this.value(pName, pLabel);
     });
     return form.DynamicList.prototype.load.apply(this, [sectionId]);
@@ -1333,15 +1404,21 @@ function createParentalContent(section) {
       style: "margin-bottom:6px;display:flex;flex-wrap:wrap;gap:4px;",
     });
     Object.entries(DOMAIN_PRESETS).forEach(([key, preset]) => {
+      const iconEl =
+        typeof main !== "undefined" &&
+        typeof main[preset.iconRenderer] === "function"
+          ? main[preset.iconRenderer](12)
+          : null;
       const btn = E(
         "button",
         {
           class: "cbi-button cbi-button-neutral",
           type: "button",
-          style: "padding:2px 8px;font-size:11px;",
+          style:
+            "padding:2px 8px;font-size:11px;display:inline-flex;align-items:center;gap:4px;",
           title: preset.domains.join(", "),
         },
-        preset.icon + " " + preset.label,
+        [iconEl, E("span", {}, preset.label)].filter(Boolean),
       );
       btn.addEventListener("click", function () {
         const textarea = container.querySelector("textarea");
@@ -1424,10 +1501,7 @@ function createParentalContent(section) {
 function validateGuestDevice(_sectionId, value) {
   if (value === "" || value === null || value === undefined) return true;
   const v = String(value).trim();
-  const isMac = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/.test(v);
-  const isIpv4 = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(v);
-  const isIpv6 = /^[0-9a-fA-F:]+(\/\d{1,3})?$/.test(v);
-  if (isMac || isIpv4 || isIpv6) return true;
+  if (main.validateSubnet(v).valid) return true;
   return _("Invalid IP or MAC address format");
 }
 
@@ -1518,6 +1592,18 @@ function createGuestModeContent(section) {
     _("Block Router Administration"),
     _(
       "Prevent guest devices from accessing router management services (LuCI Web UI, SSH, Clash API). DHCP and DNS remain accessible.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+
+  // Allow Proxied Routing
+  o = section.option(
+    form.Flag,
+    "allow_proxy",
+    _("Allow Proxied Routing"),
+    _(
+      "Allow guest devices to use configured proxy routing sections in TPROXY mode while keeping router administration blocked.",
     ),
   );
   o.default = "1";

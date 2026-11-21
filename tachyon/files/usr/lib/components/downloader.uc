@@ -3,6 +3,7 @@
 // HTTP downloads and GitHub release fetching for component updates.
 //
 
+let fs = require("fs");
 let common = require("core.common");
 
 let helpers = require("components.helpers");
@@ -14,11 +15,87 @@ let command_success = common.command_success;
 let command_success_from_args = common.command_success_from_args;
 let command_output = common.command_output;
 let command_output_from_args = common.command_output_from_args;
+let write_file = common.write_file;
 let command_env = helpers.command_env;
 let command_exists = helpers.command_exists;
 let remove_file = helpers.remove_file;
 let read_file = helpers.read_file;
 let file_nonempty = helpers.file_nonempty;
+
+const GITHUB_CACHE_DIR = "/tmp/tachyon-gh-cache";
+const GITHUB_CACHE_TTL_S = 900;
+const GITHUB_RATELIMIT_UNTIL_FILE = "/tmp/tachyon-gh-ratelimit-until";
+
+function github_cache_enabled() {
+    if (getenv("FAKE_CURL_LOG") != null && getenv("FAKE_CURL_LOG") != "")
+        return false;
+    if (getenv("TACHYON_DISABLE_GH_CACHE") == "1")
+        return false;
+    return true;
+}
+
+function github_cache_file_for_url(url) {
+    let key = replace(as_string(url), /[^A-Za-z0-9._-]/g, "_");
+    if (length(key) > 180)
+        key = substr(key, length(key) - 180);
+    return GITHUB_CACHE_DIR + "/" + key + ".json";
+}
+
+function read_github_cache(url, max_age_s) {
+    if (!github_cache_enabled())
+        return "";
+    let path = github_cache_file_for_url(url);
+    let st = fs.stat(path);
+    if (!st || st.type != "file" || int(st.size || 0) <= 0)
+        return "";
+    if (max_age_s != null && int(max_age_s) > 0) {
+        let age = time() - int(st.mtime || 0);
+        if (age >= int(max_age_s))
+            return "";
+    }
+    return read_file(path);
+}
+
+function write_github_cache(url, body) {
+    body = as_string(body);
+    if (!github_cache_enabled() || body == "" || length(body) > 262144)
+        return;
+    helpers.ensure_dir(GITHUB_CACHE_DIR);
+    let now = time();
+    let entries = fs.lsdir(GITHUB_CACHE_DIR);
+    if (type(entries) == "array") {
+        for (let ent in entries) {
+            let p = GITHUB_CACHE_DIR + "/" + as_string(ent);
+            let st = fs.stat(p);
+            if (st && st.type == "file" && (now - int(st.mtime || 0) > GITHUB_CACHE_TTL_S * 2 || int(st.size || 0) > 262144))
+                remove_file(p);
+        }
+    }
+    write_file(github_cache_file_for_url(url), body);
+}
+
+function is_github_rate_limited() {
+    if (!github_cache_enabled())
+        return false;
+    let raw = trim(read_file(GITHUB_RATELIMIT_UNTIL_FILE));
+    if (raw == "" || match(raw, /^[0-9]+$/) == null)
+        return false;
+    return time() < int(raw);
+}
+
+function record_github_rate_limit(body) {
+    if (!github_cache_enabled())
+        return;
+    let now = time();
+    let until = now + GITHUB_CACHE_TTL_S;
+    let at = match(as_string(body), /"reset": *([0-9]+)/);
+    if (at != null && at[1]) {
+        let reset_ts = int(at[1]);
+        if (reset_ts > now && reset_ts <= now + 3600)
+            until = reset_ts;
+    }
+    write_file(GITHUB_RATELIMIT_UNTIL_FILE, as_string(until) + "\n");
+}
 
 // The url module is optional at runtime; treat absence as "no mirror list".
 function core_url_module_or_null() {
@@ -26,6 +103,20 @@ function core_url_module_or_null() {
         return require("core.url");
     } catch (e) {
         return null;
+    }
+}
+
+// Optional personal access token from UCI (tachyon.settings.github_token).
+// GitHub counts API budget per IP, so everyone behind the same exit (WARP,
+// CGNAT) shares 60 requests/hour; a token lifts that to 5000 per account and
+// is the only thing that helps when the shared IP is exhausted (issue #226).
+function github_api_token() {
+    try {
+        let uci_core = require("core.uci");
+        let settings = (uci_core && uci_core.get_all) ? (uci_core.get_all("tachyon", "settings") || {}) : {};
+        return trim(as_string(settings.github_token || ""));
+    } catch (e) {
+        return "";
     }
 }
 
@@ -173,6 +264,9 @@ function http_get_with_body(url, timeout, proxy_address) {
         "-y", "6", "-Y", "32768",
         "-H", "User-Agent: Tachyon-OpenWrt"
     ];
+    let token = github_api_token();
+    if (token != "")
+        push(args, "-H", "Authorization: Bearer " + token);
     if (as_string(proxy_address) != "") {
         push(args, "-x", "http://" + as_string(proxy_address));
     }
@@ -270,7 +364,22 @@ function get_release_notes(release_url, tag) {
     return last_release_notes;
 }
 
+function stale_github_cache_or_empty(url) {
+    let stale = read_github_cache(url, 0);
+    if (stale != "")
+        remember_release_json(stale);
+    return stale;
+}
+
 function fetch_github_json(url, timeout) {
+    let cached = read_github_cache(url, GITHUB_CACHE_TTL_S);
+    if (cached != "") {
+        remember_release_json(cached);
+        return cached;
+    }
+    if (is_github_rate_limited())
+        return stale_github_cache_or_empty(url);
+
     let url_mod = core_url_module_or_null();
     let candidates = url_mod && type(url_mod.download_candidates) == "function"
         ? url_mod.download_candidates(url) : [ url ];
@@ -279,9 +388,16 @@ function fetch_github_json(url, timeout) {
     // 1. Through proxy section first if available
     if (proxy_address != "") {
         let proxy_resp = http_get_with_body(url, timeout, proxy_address);
+        if (github_response_is_rate_limited(proxy_resp.body)) {
+            record_github_rate_limit(proxy_resp.body);
+            helpers.updates_log("GitHub API rate limit exhausted" + github_rate_limit_reset_hint(proxy_resp.body) +
+                "; skipping mirrors, they cannot lift it", "warn");
+            return stale_github_cache_or_empty(url);
+        }
         if (proxy_resp.status == "200" && proxy_resp.body != "" &&
             helpers.helper_success_input(proxy_resp.body, "github-response-ok", [])) {
             helpers.updates_log("Fetched GitHub JSON via proxy section: " + url);
+            write_github_cache(url, proxy_resp.body);
             remember_release_json(proxy_resp.body);
             return proxy_resp.body;
         }
@@ -296,8 +412,12 @@ function fetch_github_json(url, timeout) {
             // recognisable. Only a mirror follows the same order after this.
             let direct = http_get_with_body(candidate, timeout, "");
             if (github_response_is_rate_limited(direct.body)) {
+                record_github_rate_limit(direct.body);
                 helpers.updates_log("GitHub API rate limit exhausted" + github_rate_limit_reset_hint(direct.body) +
                     "; skipping mirrors, they cannot lift it", "warn");
+                let stale = stale_github_cache_or_empty(url);
+                if (stale != "")
+                    return stale;
                 return "";
             }
             if (direct.status != "200" || direct.body == "") {
@@ -314,6 +434,7 @@ function fetch_github_json(url, timeout) {
         if (response != "" && helpers.helper_success_input(response, "github-response-ok", [])) {
             if (i > 0)
                 helpers.updates_log("Fetched GitHub JSON via mirror: " + candidate);
+            write_github_cache(url, response);
             remember_release_json(response);
             return response;
         }
@@ -439,6 +560,7 @@ function module_exports() {
         fetch_github_releases_json,
         fetch_github_release_tag_fallback,
         get_release_notes,
+        is_github_rate_limited,
         url_exists
     };
 }

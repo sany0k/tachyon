@@ -48,17 +48,17 @@ fi
 grep -Fq '"tachyon-stably-running", RT_TABLE_NAME, NFT_TABLE_NAME, NFT_FAKEIP_MARK, RUNTIME_STABLE_MIN_AGE' "$DIAGNOSTICS_SYSTEM_INFO" ||
   fail "diagnostics Tachyon status must use stable runtime state to avoid crash-loop flicker"
 grep -Fq '"tachyon-core-service-stable",' "$DIAGNOSTICS_SYSTEM_INFO" ||
-  fail "diagnostics sing-box status must use stable runtime state to avoid crash-loop flicker"
+  fail "diagnostics tachyon-core status must use stable runtime state to avoid crash-loop flicker"
 
 capabilities="$(
-  TACHYON_DIAGNOSTICS_SING_BOX_BIN_PATH="$WORK_DIR/missing-sing-box" \
+  TACHYON_DIAGNOSTICS_CORE_BIN_PATH="$WORK_DIR/missing-tachyon-core" \
   TACHYON_LIB="$TACHYON_LIB" \
     ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" get-server-capabilities
 )"
 JSON_VALUE="$capabilities" node - <<'NODE'
 const value = JSON.parse(process.env.JSON_VALUE);
-if (value.sing_box_extended !== 0 || value.sing_box_tiny !== 0 || value.sing_box_tailscale !== 0) {
-  console.error('missing sing-box must not expose stale capabilities');
+if (value.tachyon_core_tailscale !== 0 || value.tachyon_core_cert_pin !== 0) {
+  console.error('missing tachyon-core must not expose stale capabilities');
   process.exit(1);
 }
 NODE
@@ -99,6 +99,26 @@ large_logs="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_R
 case "$large_logs" in
   *"large logread marker survived stdin transport"*) ;;
   *) fail "large logread marker missing from rendered logs" ;;
+esac
+
+{
+  printf 'Tue Jun 30 11:00:00 2026 user.notice tachyon: [info] Starting Tachyon\n'
+  for i in 1 2 3 4 5; do
+    printf 'Tue Jun 30 11:00:0%d 2026 daemon.err tachyon-core: ERROR connection upload closed: stream %d canceled by remote with error code 0\n' "$i" "$i"
+  done
+  for i in 1 2 3 4 5 6; do
+    printf 'Tue Jun 30 11:00:1%d 2026 daemon.err tachyon-core: ERROR connection: dial udp 77.238.230.167:304: no route to internet\n' "$i"
+  done
+} >"$WORK_DIR/spam-logread.txt"
+spam_logs="$(TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" tachyon-logs-fixture <"$WORK_DIR/spam-logread.txt")" ||
+  fail "tachyon-logs-fixture failed on spam payload"
+case "$spam_logs" in
+  *"Suppressed 5 benign client stream-cancel notices"*) ;;
+  *) fail "benign stream-cancel spam was not aggregated: $spam_logs" ;;
+esac
+case "$spam_logs" in
+  *"Suppressed 3 additional 'no route to internet / network is unreachable' lines"*) ;;
+  *) fail "no-route burst was not aggregated after 3 lines: $spam_logs" ;;
 esac
 
 fake_bin="$WORK_DIR/bin"
@@ -194,6 +214,94 @@ if printf '%s\n' "$firewall_src_port_rule" |
   fail "firewall rule limited by source port should not satisfy public inbound diagnostic"
 fi
 
+firewall_redirect_rule="$(cat <<'EOF'
+firewall.@redirect[0]=redirect
+firewall.@redirect[0].enabled='1'
+firewall.@redirect[0].target='DNAT'
+firewall.@redirect[0].src='wan'
+firewall.@redirect[0].proto='tcp'
+firewall.@redirect[0].src_dport='443'
+firewall.@redirect[0].dest_port='8443'
+firewall.@redirect[1]=redirect
+firewall.@redirect[1].src='wan'
+firewall.@redirect[1].proto='udp'
+firewall.@redirect[1].src_dport='51820'
+firewall.@redirect[2]=redirect
+firewall.@redirect[2].enabled='1'
+firewall.@redirect[2].target='DNAT'
+firewall.@redirect[2].src='wan'
+firewall.@redirect[2].proto='tcp'
+firewall.@redirect[2].src_dport='9443'
+firewall.@redirect[2].dest_port='9443'
+firewall.@redirect[2].dest_ip='192.168.1.1'
+firewall.@redirect[3]=redirect
+firewall.@redirect[3].enabled='1'
+firewall.@redirect[3].target='DNAT'
+firewall.@redirect[3].src='wan'
+firewall.@redirect[3].proto='tcp'
+firewall.@redirect[3].src_dport='7443'
+firewall.@redirect[3].dest_port='7443'
+firewall.@redirect[3].dest_ip='192.168.1.50'
+firewall.@redirect[4]=redirect
+firewall.@redirect[4].enabled='0'
+firewall.@redirect[4].target='DNAT'
+firewall.@redirect[4].src='wan'
+firewall.@redirect[4].proto='tcp'
+firewall.@redirect[4].src_dport='6443'
+firewall.@redirect[4].dest_port='6443'
+firewall.@redirect[5]=redirect
+firewall.@redirect[5].enabled='1'
+firewall.@redirect[5].target='SNAT'
+firewall.@redirect[5].src='wan'
+firewall.@redirect[5].proto='tcp'
+firewall.@redirect[5].src_dport='5443'
+firewall.@redirect[5].dest_port='5443'
+firewall.@redirect[6]=redirect
+firewall.@redirect[6].enabled='1'
+firewall.@redirect[6].target='DNAT'
+firewall.@redirect[6].src='lan'
+firewall.@redirect[6].proto='tcp'
+firewall.@redirect[6].src_dport='4443'
+firewall.@redirect[6].dest_port='4443'
+firewall.@redirect[7]=redirect
+firewall.@redirect[7].enabled='1'
+firewall.@redirect[7].target='DNAT'
+firewall.@redirect[7].src='wan'
+firewall.@redirect[7].proto='tcp'
+firewall.@redirect[7].src_port='12345'
+firewall.@redirect[7].src_dport='3443'
+firewall.@redirect[7].dest_port='3443'
+EOF
+)"
+
+printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 8443 "tcp" >/dev/null ||
+  fail "WAN redirect without dest_ip should satisfy target port 8443/tcp"
+if printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 443 "tcp" >/dev/null 2>&1; then
+  fail "WAN redirect to 8443 should not satisfy original src_dport 443 when dest_port differs"
+fi
+if printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 8443 "udp" >/dev/null 2>&1; then
+  fail "TCP redirect must not satisfy UDP requirement"
+fi
+printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 51820 "udp" >/dev/null ||
+  fail "WAN redirect with omitted target and dest_port should satisfy src_dport 51820/udp"
+printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 9443 "tcp" "192.168.1.1 203.0.113.10" >/dev/null ||
+  fail "WAN redirect to local router dest_ip should satisfy public inbound diagnostic"
+if printf '%s\n' "$firewall_redirect_rule" |
+  status_ucode firewall-required-protocols-open 7443 "tcp" "192.168.1.1 203.0.113.10" >/dev/null 2>&1; then
+  fail "WAN redirect forwarding to another LAN host must not satisfy router inbound diagnostic"
+fi
+for bad_port in 6443 5443 4443 3443; do
+  if printf '%s\n' "$firewall_redirect_rule" |
+    status_ucode firewall-required-protocols-open "$bad_port" "tcp" "192.168.1.1" >/dev/null 2>&1; then
+    fail "disabled/non-DNAT/non-WAN/src_port redirect ($bad_port) should not satisfy public inbound diagnostic"
+  fi
+done
+
 status_ucode server-listen-requires-firewall 0.0.0.0 "" 0 >/dev/null ||
   fail "wildcard listen should require firewall"
 status_ucode server-listen-requires-firewall :: "" 0 >/dev/null ||
@@ -248,28 +356,28 @@ printf '%s\n' "$netstat_listening6" |
   status_ucode server-required-ports-listening ::1 8443 "tcp" >/dev/null ||
   fail "IPv6 tcp netstat listener should satisfy required protocols"
 
-sing_box_netstat="$(cat <<'EOF'
+core_netstat="$(cat <<'EOF'
 Active Internet connections (only servers)
 Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
-tcp        0      0 127.0.0.42:53           0.0.0.0:*               LISTEN      16244/sing-box
-tcp        0      0 0.0.0.0:1602            0.0.0.0:*               LISTEN      16244/sing-box
-tcp        0      0 ::1:1602                :::*                    LISTEN      16244/sing-box
-udp        0      0 127.0.0.42:53           0.0.0.0:*                           16244/sing-box
-udp        0      0 0.0.0.0:1602            0.0.0.0:*                           16244/sing-box
-udp        0      0 ::1:1602                :::*                                16244/sing-box
+tcp        0      0 127.0.0.42:53           0.0.0.0:*               LISTEN      16244/tachyon-core
+tcp        0      0 0.0.0.0:1602            0.0.0.0:*               LISTEN      16244/tachyon-core
+tcp        0      0 ::1:1602                :::*                    LISTEN      16244/tachyon-core
+udp        0      0 127.0.0.42:53           0.0.0.0:*                           16244/tachyon-core
+udp        0      0 0.0.0.0:1602            0.0.0.0:*                           16244/tachyon-core
+udp        0      0 ::1:1602                :::*                                16244/tachyon-core
 EOF
 )"
 
-printf '%s\n' "$sing_box_netstat" |
-  TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" sing-box-standard-ports-listening-fixture >/dev/null ||
-  fail "sing-box standard listeners should satisfy diagnostics"
+printf '%s\n' "$core_netstat" |
+  TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" tachyon-core-standard-ports-listening-fixture >/dev/null ||
+  fail "tachyon-core standard listeners should satisfy diagnostics"
 # IPv6 disabled: should only require IPv4 listeners
-printf '%s\n' "$sing_box_netstat" | grep -v '::' |
-  TACHYON_ENABLE_IPV6=0 TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" sing-box-standard-ports-listening-fixture >/dev/null ||
-  fail "sing-box IPv4 listeners should satisfy diagnostics when IPv6 is disabled"
-if printf '%s\n' "$sing_box_netstat" | sed '/0.0.0.0:1602/d' |
-  TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" sing-box-standard-ports-listening-fixture >/dev/null 2>&1; then
-  fail "missing sing-box tproxy listener should fail diagnostics"
+printf '%s\n' "$core_netstat" | grep -v '::' |
+  TACHYON_ENABLE_IPV6=0 TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" tachyon-core-standard-ports-listening-fixture >/dev/null ||
+  fail "tachyon-core IPv4 listeners should satisfy diagnostics when IPv6 is disabled"
+if printf '%s\n' "$core_netstat" | sed '/0.0.0.0:1602/d' |
+  TACHYON_LIB="$TACHYON_LIB" ucode -L "$TACHYON_LIB" "$DIAGNOSTICS_RUNTIME" tachyon-core-standard-ports-listening-fixture >/dev/null 2>&1; then
+  fail "missing tachyon-core tproxy listener should fail diagnostics"
 fi
 
 netstat_owners="$(cat <<'EOF'
@@ -277,7 +385,7 @@ Active Internet connections (only servers)
 Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
 tcp        0      0 0.0.0.0:443             0.0.0.0:*               LISTEN      111/nginx
 udp        0      0 0.0.0.0:443             0.0.0.0:*                           222/dnsmasq
-tcp        0      0 0.0.0.0:443             0.0.0.0:*               LISTEN      333/sing-box
+tcp        0      0 0.0.0.0:443             0.0.0.0:*               LISTEN      333/tachyon-core
 EOF
 )"
 

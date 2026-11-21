@@ -3,12 +3,21 @@ import {
   renderCheckIcon24,
   renderCopyIcon24,
   renderLinkIcon24,
+  renderHeartIcon24,
+  renderSparklesIcon,
+  renderCreditCardIcon,
+  renderQrCodeIcon,
+  renderCoinsIcon,
+  renderGemIcon,
 } from '../../../../icons';
 import { showToast } from '../../../../helpers/showToast';
+import { tr } from '../../../helpers/i18n';
 
 interface CryptoItem {
   name: string;
   badge: string;
+  icon: string | (() => SVGElement);
+  accent: string;
   address: string;
 }
 
@@ -16,26 +25,36 @@ const CRYPTO_LIST: CryptoItem[] = [
   {
     name: 'Bitcoin',
     badge: 'BTC',
+    icon: '₿',
+    accent: '#f59e0b',
     address: 'bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h',
   },
   {
     name: 'Ethereum',
     badge: 'ETH / ERC-20',
+    icon: 'Ξ',
+    accent: '#6366f1',
     address: '0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6',
   },
   {
     name: 'TON',
     badge: 'TON',
+    icon: () => renderGemIcon(14),
+    accent: '#0ea5e9',
     address: 'UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR',
   },
   {
     name: 'Solana',
     badge: 'SOL',
+    icon: '◎',
+    accent: '#10b981',
     address: '3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh',
   },
 ];
 
-const CLOUDTIPS_URL = 'https://pay.cloudtips.ru/p/48c57581';
+const CLOUDTIPS_URL = 'https://pay.cloudtips.ru/p/449c5ef9';
+const OZON_SBP_URL =
+  'https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5';
 const BOOSTY_URL = 'https://boosty.to/tachyon';
 
 async function copyTextToClipboard(text: string): Promise<boolean> {
@@ -70,127 +89,225 @@ export function renderSupportModal(): void {
     'div',
     {
       style:
-        'margin-bottom: 16px; padding: 12px 14px; background: var(--background-color-secondary, rgba(0, 0, 0, 0.05)); border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2)); border-radius: 6px; font-size: 13px; line-height: 1.5; color: var(--text-color-high, inherit);',
+        'display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 10px; background: var(--tachyon-bg-card-elevated, rgba(148, 163, 184, 0.06)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.18));',
     },
     [
       E(
+        'div',
+        {
+          style:
+            'width: 40px; height: 40px; border-radius: 8px; background: var(--tachyon-accent-soft, rgba(124, 134, 255, 0.12)); border: 1px solid var(--tachyon-accent-border, rgba(124, 134, 255, 0.24)); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;',
+        },
+        [renderHeartIcon24()],
+      ),
+      E(
         'p',
-        { style: 'margin: 0;' },
+        {
+          style:
+            'margin: 0; font-size: 13px; line-height: 1.5; color: var(--tachyon-text-main, var(--text-color-high, inherit));',
+        },
         _(
-          'If Tachyon powers your daily networking and keeps your connection fast and secure, consider supporting ongoing development! ☕ 🧀 🌭',
+          'If Tachyon powers your daily networking and keeps your connection fast and secure, consider supporting ongoing development!',
         ),
       ),
     ],
   );
 
-  // Boosty card (primary)
+  // Boosty card (primary Bento tile)
   const boostyCard = E(
     'div',
     {
       style:
-        'margin-bottom: 16px; padding: 14px; background: var(--background-color-secondary, rgba(0, 0, 0, 0.05)); border: 1px solid rgba(255, 106, 0, 0.35); border-radius: 6px;',
+        'display: flex; flex-direction: column; justify-content: space-between; gap: 12px; padding: 14px 16px; border-radius: 10px; background: var(--tachyon-bg-card-elevated, rgba(148, 163, 184, 0.05)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.2));',
     },
     [
       E(
         'div',
-        {
-          style:
-            'display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;',
-        },
+        { style: 'display: flex; align-items: flex-start; gap: 12px;' },
         [
           E(
             'div',
-            { style: 'display: flex; flex-direction: column; gap: 2px;' },
+            {
+              style:
+                'width: 36px; height: 36px; border-radius: 8px; background: rgba(241, 95, 44, 0.12); border: 1px solid rgba(241, 95, 44, 0.26); display: flex; align-items: center; justify-content: center; color: #f15f2c; flex-shrink: 0;',
+            },
+            [renderSparklesIcon(18)],
+          ),
+          E(
+            'div',
+            {
+              style:
+                'display: flex; flex-direction: column; gap: 3px; min-width: 0;',
+            },
             [
-              E('div', { style: 'font-weight: bold; font-size: 14px;' }, [
-                '⭐ Boosty',
-              ]),
               E(
                 'div',
                 {
                   style:
-                    'font-size: 12px; color: var(--text-color-medium, #888);',
+                    'font-weight: 600; font-size: 14px; color: var(--tachyon-text-main, inherit);',
+                },
+                'Boosty',
+              ),
+              E(
+                'div',
+                {
+                  style:
+                    'font-size: 12px; line-height: 1.4; color: var(--tachyon-text-muted, var(--text-color-medium, #94a3b8));',
                 },
                 _('Subscriptions, one-time donations and exclusives'),
               ),
             ],
           ),
-          renderButton({
-            classNames: ['cbi-button-action'],
-            icon: renderLinkIcon24,
-            text: _('Support on Boosty'),
-            onClick: () => {
-              window.open(BOOSTY_URL, '_blank', 'noopener,noreferrer');
-            },
-          }),
         ],
       ),
+      renderButton({
+        classNames: ['cbi-button-apply'],
+        icon: renderLinkIcon24,
+        text: _('Support on Boosty'),
+        onClick: () => {
+          window.open(BOOSTY_URL, '_blank', 'noopener,noreferrer');
+        },
+      }),
     ],
   );
 
-  // CloudTips card
+  // CloudTips card (primary Bento tile)
   const cloudTipsCard = E(
     'div',
     {
       style:
-        'margin-bottom: 16px; padding: 14px; background: var(--background-color-secondary, rgba(0, 0, 0, 0.05)); border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2)); border-radius: 6px;',
+        'display: flex; flex-direction: column; justify-content: space-between; gap: 12px; padding: 14px 16px; border-radius: 10px; background: var(--tachyon-bg-card-elevated, rgba(148, 163, 184, 0.05)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.2));',
     },
     [
       E(
         'div',
-        {
-          style:
-            'display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;',
-        },
+        { style: 'display: flex; align-items: flex-start; gap: 12px;' },
         [
           E(
             'div',
-            { style: 'display: flex; flex-direction: column; gap: 2px;' },
+            {
+              style:
+                'width: 36px; height: 36px; border-radius: 8px; background: rgba(14, 165, 233, 0.12); border: 1px solid rgba(14, 165, 233, 0.26); display: flex; align-items: center; justify-content: center; flex-shrink: 0; color: #0ea5e9;',
+            },
+            [renderCreditCardIcon(18)],
+          ),
+          E(
+            'div',
+            {
+              style:
+                'display: flex; flex-direction: column; gap: 3px; min-width: 0;',
+            },
             [
-              E('div', { style: 'font-weight: bold; font-size: 14px;' }, [
-                '💳 ',
-                _('Credit Cards / SBP / Tinkoff Pay'),
-              ]),
               E(
                 'div',
                 {
                   style:
-                    'font-size: 12px; color: var(--text-color-medium, #888);',
+                    'font-weight: 600; font-size: 14px; color: var(--tachyon-text-main, inherit);',
+                },
+                _('Credit Cards / SBP / Tinkoff Pay'),
+              ),
+              E(
+                'div',
+                {
+                  style:
+                    'font-size: 12px; line-height: 1.4; color: var(--tachyon-text-muted, var(--text-color-medium, #94a3b8));',
                 },
                 _('Quick donation via Russian bank cards or SBP'),
               ),
             ],
           ),
-          renderButton({
-            classNames: ['cbi-button-action'],
-            icon: renderLinkIcon24,
-            text: _('Support on CloudTips'),
-            onClick: () => {
-              window.open(CLOUDTIPS_URL, '_blank', 'noopener,noreferrer');
-            },
-          }),
         ],
       ),
+      renderButton({
+        classNames: ['cbi-button-save'],
+        icon: renderLinkIcon24,
+        text: _('Support on CloudTips'),
+        onClick: () => {
+          window.open(CLOUDTIPS_URL, '_blank', 'noopener,noreferrer');
+        },
+      }),
     ],
   );
 
-  // Crypto list section
+  // Ozon Bank SBP card (primary Bento tile)
+  const ozonSbpCard = E(
+    'div',
+    {
+      style:
+        'display: flex; flex-direction: column; justify-content: space-between; gap: 12px; padding: 14px 16px; border-radius: 10px; background: var(--tachyon-bg-card-elevated, rgba(148, 163, 184, 0.05)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.2));',
+    },
+    [
+      E(
+        'div',
+        { style: 'display: flex; align-items: flex-start; gap: 12px;' },
+        [
+          E(
+            'div',
+            {
+              style:
+                'width: 36px; height: 36px; border-radius: 8px; background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(59, 130, 246, 0.26); display: flex; align-items: center; justify-content: center; flex-shrink: 0; color: #3b82f6;',
+            },
+            [renderQrCodeIcon(18)],
+          ),
+          E(
+            'div',
+            {
+              style:
+                'display: flex; flex-direction: column; gap: 3px; min-width: 0;',
+            },
+            [
+              E(
+                'div',
+                {
+                  style:
+                    'font-weight: 600; font-size: 14px; color: var(--tachyon-text-main, inherit);',
+                },
+                tr('СБП (Ozon Банк)', 'SBP (Ozon Bank)'),
+              ),
+              E(
+                'div',
+                {
+                  style:
+                    'font-size: 12px; line-height: 1.4; color: var(--tachyon-text-muted, var(--text-color-medium, #94a3b8));',
+                },
+                tr(
+                  'Мгновенный перевод по СБП без комиссии',
+                  'Instant SBP transfer without fees',
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+      renderButton({
+        classNames: ['cbi-button-save'],
+        icon: renderLinkIcon24,
+        text: tr('Поддержать через СБП', 'Support via SBP'),
+        onClick: () => {
+          window.open(OZON_SBP_URL, '_blank', 'noopener,noreferrer');
+        },
+      }),
+    ],
+  );
+
+  const primaryBentoRow = E(
+    'div',
+    {
+      style:
+        'display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px;',
+    },
+    [boostyCard, ozonSbpCard, cloudTipsCard],
+  );
+
+  // Crypto 2x2 Bento grid
   const cryptoItemsContainer = E('div', {
-    style: 'display: flex; flex-direction: column; gap: 10px;',
+    style:
+      'display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px;',
   });
 
   CRYPTO_LIST.forEach((item) => {
-    const addressCode = E(
-      'code',
-      {
-        style:
-          'font-family: monospace; font-size: 11px; word-break: break-all; flex: 1; padding: 6px 8px; background: var(--background-color-primary, rgba(0, 0, 0, 0.15)); border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2)); border-radius: 4px; user-select: all; line-height: 1.4;',
-      },
-      item.address,
-    );
-
     const copyBtn = renderButton({
-      classNames: ['cbi-button'],
+      classNames: ['cbi-button-action'],
       icon: renderCopyIcon24,
       text: _('Copy Address'),
       onClick: async () => {
@@ -217,66 +334,93 @@ export function renderSupportModal(): void {
     copyBtn.style.whiteSpace = 'nowrap';
     copyBtn.style.flexShrink = '0';
 
-    const row = E(
+    const addressCode = E(
+      'code',
+      {
+        title: item.address,
+        onclick: () => copyBtn.click(),
+        style:
+          'display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; padding: 7px 10px; background: var(--tachyon-bg-input, rgba(15, 23, 42, 0.35)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.16)); border-radius: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; cursor: pointer; color: var(--tachyon-text-secondary, inherit);',
+      },
+      item.address,
+    );
+
+    const tile = E(
       'div',
       {
         style:
-          'padding: 10px 12px; background: var(--background-color-secondary, rgba(0, 0, 0, 0.05)); border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2)); border-radius: 6px; display: flex; flex-direction: column; gap: 6px;',
+          'padding: 12px 14px; background: var(--tachyon-bg-surface-alt, rgba(148, 163, 184, 0.05)); border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.18)); border-radius: 10px; display: flex; flex-direction: column; gap: 8px;',
       },
       [
         E(
           'div',
           {
-            style: 'display: flex; align-items: center; gap: 8px;',
+            style:
+              'display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;',
           },
           [
             E(
-              'span',
-              { style: 'font-weight: bold; font-size: 13px;' },
-              item.name,
+              'div',
+              { style: 'display: flex; align-items: center; gap: 8px;' },
+              [
+                E(
+                  'span',
+                  {
+                    style: `width: 26px; height: 26px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; background: ${item.accent}1f; color: ${item.accent}; border: 1px solid ${item.accent}3d; flex-shrink: 0;`,
+                  },
+                  typeof item.icon === 'function' ? [item.icon()] : item.icon,
+                ),
+                E(
+                  'span',
+                  { style: 'font-weight: 600; font-size: 13px;' },
+                  item.name,
+                ),
+                E(
+                  'span',
+                  {
+                    class: 'badge cbi-value-title',
+                    style:
+                      'font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 5px; opacity: 0.9;',
+                  },
+                  item.badge,
+                ),
+              ],
             ),
-            E(
-              'span',
-              {
-                class: 'badge cbi-value-title',
-                style: 'font-size: 11px; padding: 2px 6px; opacity: 0.85;',
-              },
-              item.badge,
-            ),
+            copyBtn,
           ],
         ),
-        E(
-          'div',
-          {
-            style:
-              'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;',
-          },
-          [addressCode, copyBtn],
-        ),
+        addressCode,
       ],
     );
 
-    cryptoItemsContainer.appendChild(row);
+    cryptoItemsContainer.appendChild(tile);
   });
 
-  const cryptoSection = E('div', { style: 'margin-bottom: 16px;' }, [
-    E(
-      'div',
-      {
-        style:
-          'font-weight: bold; font-size: 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;',
-      },
-      ['🪙 ', _('Cryptocurrency')],
-    ),
-    cryptoItemsContainer,
-  ]);
+  const cryptoSection = E(
+    'div',
+    {
+      style:
+        'display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.18)); background: var(--tachyon-bg-card, rgba(30, 41, 59, 0.35));',
+    },
+    [
+      E(
+        'div',
+        {
+          style:
+            'font-weight: 600; font-size: 12.5px; color: var(--tachyon-text-muted, #94a3b8); display: flex; align-items: center; gap: 6px;',
+        },
+        [renderCoinsIcon(14), _('Cryptocurrency')],
+      ),
+      cryptoItemsContainer,
+    ],
+  );
 
   // Modal footer with Close button
   const footer = E(
     'div',
     {
       style:
-        'display: flex; justify-content: flex-end; padding-top: 12px; border-top: 1px solid var(--border-color, rgba(128, 128, 128, 0.2));',
+        'display: flex; justify-content: flex-end; padding-top: 10px; border-top: 1px solid var(--tachyon-border-subtle, rgba(148, 163, 184, 0.16));',
     },
     [
       renderButton({
@@ -293,10 +437,10 @@ export function renderSupportModal(): void {
     'div',
     {
       style:
-        'max-width: 640px; width: 100%; box-sizing: border-box; padding: 4px;',
+        'max-width: 680px; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: 14px;',
     },
-    [introBlock, boostyCard, cloudTipsCard, cryptoSection, footer],
+    [introBlock, primaryBentoRow, cryptoSection, footer],
   );
 
-  ui.showModal(`💖 ${_('Support Development')}`, modalContent);
+  ui.showModal(_('Support Development'), modalContent);
 }

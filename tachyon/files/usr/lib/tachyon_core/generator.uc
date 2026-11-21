@@ -3,6 +3,7 @@
 let fs = require("fs");
 let common = require("core.common");
 let core_profile = require("tachyon_core.core_profile");
+let variant_state = require("tachyon_core.variant_state");
 let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let runtime_constants = require("tachyon_core.constants");
@@ -23,6 +24,7 @@ let subscription_share_link = require("subscription.share_link");
 let uci = null;
 let fixture_uci_data = null;
 let runtime_settings_cache = null;
+let runtime_ipv6_state_cache = null;
 let runtime_ruleset_folder = runtime_constants.TMP_RULESET_FOLDER;
 let runtime_supports_xhttp = true;
 const TACHYON_RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
@@ -35,7 +37,7 @@ let read_stdin_json = common.read_stdin_json;
 let write_json = common.write_json;
 let csv_to_json_array = common.csv_to_json_array;
 
-// Same logger shape as the other singbox modules: syslog only, so generating a
+// Same logger shape as the other tachyon_core modules: syslog only, so generating a
 // config never depends on the logging stack coming up. Declared after the
 // imports above because ucode binds a name when the statement runs.
 function generator_log(message, level) {
@@ -81,7 +83,7 @@ function parse_deferred_sections(deferred_sections) {
 }
 
 // UCI stores values written as '<b 0x...>' strings as binary, which when
-// serialized back to JSON appear as '<b 0x...>' — invalid for sing-box.
+// serialized back to JSON appear as '<b 0x...>' — invalid for tachyon-core.
 function uci_bin_to_hex(val) {
     if (val == null || val == "") return "";
     let s = as_string(val);
@@ -120,6 +122,7 @@ let reserve_section_outbound_tags = null;
 let add_outbound_for_section = null;
 let add_group_urltest_outbounds = null;
 let add_service_route_rules = null;
+let add_full_tunnel_route_rule = null;
 let add_route_for_section = null;
 let add_server_routes = null;
 let ensure_custom_ruleset = null;
@@ -165,7 +168,7 @@ function fixture_get_section(section_name) {
     if (section_name == "settings" && type(fixture.settings) == "object")
         return fixture.settings;
 
-    for (let type_name in [ "settings", "server", "section", "subscription_url", "section_interface", "urltest", "priority_group", "priority_level" ]) {
+    for (let type_name in [ "settings", "telegram", "server", "section", "subscription_url", "section_interface", "urltest", "priority_group", "priority_level" ]) {
         for (let section in fixture_section_list(type_name)) {
             if (as_string(section[".name"]) == section_name)
                 return section;
@@ -195,17 +198,69 @@ function fixture_cursor(path) {
 function use_fixture_cursor(path) {
     uci = fixture_cursor(path);
     runtime_settings_cache = null;
+    runtime_ipv6_state_cache = null;
+}
+
+let runtime_uci_all_cache = null;
+let runtime_uci_by_type_cache = null;
+let in_process_quarantine_enabled = false;
+let in_process_quarantine_hit = null;
+
+function ensure_runtime_uci_cache(package_name) {
+    package_name = as_string(package_name);
+    if (package_name != CONFIG_NAME)
+        return false;
+    if (runtime_uci_all_cache != null)
+        return true;
+    let all = object_or_empty(uci_core.get_all(package_name));
+    let by_type = {};
+    for (let _name, sec in all) {
+        if (type(sec) != "object")
+            continue;
+        let t = as_string(sec[".type"] || "");
+        if (t == "")
+            continue;
+        if (by_type[t] == null)
+            by_type[t] = [];
+        push(by_type[t], sec);
+    }
+    runtime_uci_all_cache = all;
+    runtime_uci_by_type_cache = by_type;
+    connections.set_item_sections_from_data(by_type);
+    return true;
 }
 
 function runtime_uci_cursor() {
     return {
         load: function(package_name) {
+            if (as_string(package_name) == CONFIG_NAME)
+                return ensure_runtime_uci_cache(package_name);
             return uci_core.load(package_name);
         },
         get_all: function(package_name, section_name) {
+            if (ensure_runtime_uci_cache(package_name)) {
+                if (section_name == null || as_string(section_name) == "")
+                    return runtime_uci_all_cache;
+                let sname = as_string(section_name);
+                if (runtime_uci_all_cache[sname] != null)
+                    return runtime_uci_all_cache[sname];
+                if (sname == "settings" || sname == "telegram" || sname == "guest_mode") {
+                    let typed = runtime_uci_by_type_cache[sname];
+                    if (type(typed) == "array" && length(typed) > 0)
+                        return typed[0];
+                }
+            }
             return uci_core.get_all(package_name, section_name);
         },
         foreach: function(package_name, type_name, callback) {
+            if (ensure_runtime_uci_cache(package_name)) {
+                let list = runtime_uci_by_type_cache[as_string(type_name)];
+                if (type(list) == "array") {
+                    for (let section in list)
+                        callback(section);
+                }
+                return;
+            }
             for (let section in uci_core.section_objects(package_name, type_name))
                 callback(section);
         }
@@ -218,19 +273,26 @@ function uci_cursor() {
     return uci;
 }
 
+function valid_section_name(name) {
+    return match(name, /^[A-Za-z0-9_]+$/);
+}
+
 // Section-scoped failures must be attributable: the runtime quarantines the
 // named section and regenerates without it instead of losing the whole start.
 // A failure raised outside any section loop (ctx.current_section == null) is a
 // whole-config problem and keeps the old exit(2) semantics with no marker.
 function runtime_generate_unsupported(reason) {
+    if (in_process_quarantine_enabled && ctx.current_section != null && valid_section_name(as_string(ctx.current_section))) {
+        in_process_quarantine_hit = {
+            section: as_string(ctx.current_section),
+            reason: as_string(reason)
+        };
+        die("__TACHYON_GEN_QUARANTINE__");
+    }
     if (ctx.current_section != null)
         warn("tachyon-section-error:", ctx.current_section, ":", reason, "\n");
     warn(reason, "\n");
     exit(2);
-}
-
-function valid_section_name(name) {
-    return match(name, /^[A-Za-z0-9_]+$/);
 }
 
 
@@ -238,6 +300,96 @@ function runtime_settings() {
     if (runtime_settings_cache == null)
         runtime_settings_cache = object_or_empty(uci_cursor().get_all(CONFIG_NAME, "settings"));
     return runtime_settings_cache;
+}
+
+function effective_ipv6_state(settings) {
+    if (settings != null && runtime_ipv6_state_cache != null && settings == runtime_settings_cache)
+        return runtime_ipv6_state_cache;
+    let s = settings || runtime_settings();
+    let wan6_override = null;
+    if (fixture_uci_data != null && getenv("TACHYON_MOCK_WAN6_STATUS") == null &&
+        type(fixture_uci_data.__wan6_status) == "object")
+        wan6_override = fixture_uci_data.__wan6_status;
+    let computed = common.resolve_effective_ipv6_state(s, wan6_override);
+    if (settings == null || settings == runtime_settings_cache)
+        runtime_ipv6_state_cache = computed;
+    return computed;
+}
+
+function build_fakeip_exclude_rules(settings, eff_state, rewrite_ttl) {
+    if (eff_state && !eff_state.fakeip_enabled)
+        return [];
+    let raw_entries = list_option(settings, "fakeip_exclude");
+    if (length(raw_entries) == 0)
+        return [];
+
+    let exact_domains = [];
+    let suffix_domains = [];
+    let keyword_domains = [];
+    let regex_domains = [];
+    let seen = {};
+    let push_unique = function(arr, kind, val) {
+        val = lc(trim(as_string(val)));
+        if (val == "")
+            return;
+        let k = kind + ":" + val;
+        if (!seen[k]) {
+            seen[k] = true;
+            push(arr, val);
+        }
+    };
+
+    for (let entry in raw_entries) {
+        let entry_s = trim(as_string(entry));
+        if (entry_s == "" || substr(entry_s, 0, 1) == "#")
+            continue;
+        for (let token in rule_config.text_list_values(entry_s, "comma-space")) {
+            let tok = trim(as_string(token));
+            if (tok == "" || substr(tok, 0, 1) == "#")
+                continue;
+            if (core_ip.valid_ip(tok) || core_ip.valid_ip_cidr(tok))
+                continue;
+            if (substr(tok, 0, 5) == "full:")
+                push_unique(exact_domains, "domain", substr(tok, 5));
+            else if (substr(tok, 0, 7) == "domain:")
+                push_unique(exact_domains, "domain", substr(tok, 7));
+            else if (substr(tok, 0, 14) == "domain_suffix:")
+                push_unique(suffix_domains, "domain_suffix", substr(tok, 14));
+            else if (substr(tok, 0, 15) == "domain_keyword:")
+                push_unique(keyword_domains, "domain_keyword", substr(tok, 15));
+            else if (substr(tok, 0, 8) == "keyword:")
+                push_unique(keyword_domains, "domain_keyword", substr(tok, 8));
+            else if (substr(tok, 0, 13) == "domain_regex:")
+                push_unique(regex_domains, "domain_regex", substr(tok, 13));
+            else if (substr(tok, 0, 6) == "regex:")
+                push_unique(regex_domains, "domain_regex", substr(tok, 6));
+            else if (substr(tok, 0, 2) == "*.")
+                push_unique(suffix_domains, "domain_suffix", substr(tok, 2));
+            else if (substr(tok, 0, 1) == ".")
+                push_unique(suffix_domains, "domain_suffix", substr(tok, 1));
+            else
+                push_unique(suffix_domains, "domain_suffix", tok);
+        }
+    }
+
+    let rules = [];
+    for (let pair in [
+        [ "domain", exact_domains ],
+        [ "domain_suffix", suffix_domains ],
+        [ "domain_keyword", keyword_domains ],
+        [ "domain_regex", regex_domains ]
+    ]) {
+        if (length(pair[1]) == 0)
+            continue;
+        let r = {
+            action: "route",
+            server: runtime_constants.DNS_SERVER_TAG,
+            rewrite_ttl: rewrite_ttl
+        };
+        r[pair[0]] = pair[1];
+        push(rules, r);
+    }
+    return rules;
 }
 
 function settings_update_interval() {
@@ -351,20 +503,45 @@ function download_via_proxy_section(settings, purpose) {
 
     let all_enabled = type(enabled_sections) == "function" ? enabled_sections() : [];
     let valid_proxy_sections = {};
+    let preferred_proxy_sections = {};
+    let first_preferred = "";
     for (let s in all_enabled) {
+        if (ctx.deferred_sections && ctx.deferred_sections[s[".name"]])
+            continue;
         let act = option(s, "action", "");
-        if (act != "bypass" && act != "block" && act != "dns" && act != "hosts" && act != "")
+        if (act != "bypass" && act != "block" && act != "dns" && act != "hosts" && act != "") {
+            if (connections.is_dpi_or_desync_only_section(s))
+                continue;
             valid_proxy_sections[s[".name"]] = true;
+            let has_remote_proxy = length(connections.connection_urls(s)) > 0 ||
+                length(connections.subscription_urls(s)) > 0 ||
+                length(connections.outbound_jsons(s)) > 0 ||
+                trim(option(s, "outbound_json", "")) != "";
+            if (has_remote_proxy || length(connections.interfaces(s)) == 0) {
+                preferred_proxy_sections[s[".name"]] = true;
+                if (first_preferred == "")
+                    first_preferred = s[".name"];
+            }
+        }
     }
 
     let section_option = download_via_proxy_section_option_for_purpose(purpose);
     let configured = section_option != "" ? option(settings, section_option, "") : "";
-    if (configured != "" && valid_proxy_sections[configured])
-        return configured;
+    if (configured != "" && valid_proxy_sections[configured]) {
+        if (preferred_proxy_sections[configured] || first_preferred == "")
+            return configured;
+        return first_preferred;
+    }
 
     let fallback_configured = option(settings, "download_lists_via_proxy_section", "");
-    if (fallback_configured != "" && valid_proxy_sections[fallback_configured])
-        return fallback_configured;
+    if (fallback_configured != "" && valid_proxy_sections[fallback_configured]) {
+        if (preferred_proxy_sections[fallback_configured] || first_preferred == "")
+            return fallback_configured;
+        return first_preferred;
+    }
+
+    if (first_preferred != "")
+        return first_preferred;
 
     for (let s in all_enabled) {
         if (valid_proxy_sections[s[".name"]])
@@ -386,24 +563,29 @@ function download_via_proxy_any_enabled(settings, sections) {
 
 function download_detour_tag(settings, purpose) {
     let section_name = download_via_proxy_section(settings, purpose);
-    return section_name == "" ? "" : outbound_tag(section_name);
+    if (section_name == "")
+        return "";
+    let all_enabled = type(enabled_sections) == "function" ? enabled_sections() : [];
+    for (let s in all_enabled) {
+        if (s[".name"] == section_name)
+            return generator_routes.group_outbound_tag_for_section(s) || outbound_tag(section_name);
+    }
+    return outbound_tag(section_name);
 }
 
 // A proxy endpoint's own hostname must never be answered from FakeIP. If a
 // connection section routes a suffix that also covers the endpoint (section
 // domain_suffix "example.net" plus outbound server "cdn.example.net"), the
 // internal DNS lookup for that endpoint matched the section rule, got a
-// 198.18.0.0/15 address, and sing-box then dialled the FakeIP and timed out.
+// 198.18.0.0/15 address, and tachyon-core then dialled the FakeIP and timed out.
 // The list is rebuilt from the generated config on every run, so it follows
 // endpoint changes in the subscription without a manual exclusion.
-function collect_proxy_endpoint_domains(config) {
+function collect_proxy_endpoint_domains(config, sections) {
     let seen = {};
     let domains = [];
 
-    let collect = function(item) {
-        if (type(item) != "object")
-            return;
-        let server = trim(as_string(item.server || ""));
+    let add_domain = function(raw_host) {
+        let server = trim(as_string(raw_host || ""));
         if (server == "" || !match(server, /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9-]+)+$/))
             return;
         let key = lc(server);
@@ -413,19 +595,51 @@ function collect_proxy_endpoint_domains(config) {
         push(domains, key);
     };
 
+    let collect = function(item) {
+        if (type(item) != "object")
+            return;
+        add_domain(item.server);
+        if (type(item.peers) == "array") {
+            for (let peer in item.peers)
+                if (type(peer) == "object")
+                    add_domain(peer.address || peer.server);
+        }
+    };
+
     for (let item in array_or_empty(config.outbounds))
         collect(item);
     for (let item in array_or_empty(config.endpoints))
         collect(item);
 
+    for (let sec in array_or_empty(sections)) {
+        for (let entry in connections.subscription_urls(sec)) {
+            let sub_url = trim(as_string(entry || ""));
+            let delim_idx = index(sub_url, " | ");
+            if (delim_idx >= 0)
+                sub_url = trim(substr(sub_url, 0, delim_idx));
+            if (sub_url != "")
+                add_domain(url_host(sub_url));
+        }
+    }
+    for (let src in connections.outbound_source_sections()) {
+        if (bool_option(src, "enabled", true)) {
+            let src_url = connections.outbound_source_subscription_url(src);
+            let delim_idx = index(src_url, " | ");
+            if (delim_idx >= 0)
+                src_url = trim(substr(src_url, 0, delim_idx));
+            if (src_url != "" && runtime_url.is_subscription_url(src_url))
+                add_domain(url_host(src_url));
+        }
+    }
+
     return domains;
 }
 
-function add_proxy_endpoint_dns_rule(config) {
+function add_proxy_endpoint_dns_rule(config, sections) {
     if (config.__proxy_endpoint_dns_rule == true)
         return;
 
-    let domains = collect_proxy_endpoint_domains(config);
+    let domains = collect_proxy_endpoint_domains(config, sections);
     if (length(domains) == 0)
         return;
     if (config.dns == null)
@@ -434,13 +648,17 @@ function add_proxy_endpoint_dns_rule(config) {
         config.dns.rules = [];
 
     // Prepended, not appended: a section's FakeIP rule must never win for the
-    // hostname sing-box is about to dial. Built with an explicit loop because
+    // hostname tachyon-core is about to dial. Built with an explicit loop because
     // `+` coerces two arrays into a string in ucode.
-    let merged = [{
+    let eff_state = effective_ipv6_state(runtime_settings());
+    let bootstrap_rule = {
         domain: domains,
         action: "route",
         server: runtime_constants.BOOTSTRAP_DNS_SERVER_TAG
-    }];
+    };
+    if (!eff_state.ipv6_active)
+        bootstrap_rule.query_type = [ "A" ];
+    let merged = [ bootstrap_rule ];
     for (let rule in array_or_empty(config.dns.rules))
         push(merged, rule);
     config.dns.rules = merged;
@@ -463,21 +681,25 @@ function ruleset_registered(config, tag_name) {
 }
 
 function clash_api_config(settings, service_address) {
-    let controller = as_string(service_address || "");
-    if (bool_option(settings, "enable_yacd", false) && bool_option(settings, "enable_yacd_wan_access", false))
-        controller = "0.0.0.0";
-    else if (controller == "")
-        controller = "0.0.0.0";
+    let yacd_enabled = bool_option(settings, "enable_yacd", false);
+    let wan_enabled = bool_option(settings, "enable_yacd_wan_access", false);
+    let secret = trim(as_string(option(settings, "yacd_secret_key", "")));
+    let controller = "127.0.0.1";
+    if (yacd_enabled) {
+        controller = trim(as_string(service_address || ""));
+        if (wan_enabled && secret != "")
+            controller = "0.0.0.0";
+        else if (controller == "" || wan_enabled)
+            controller = "127.0.0.1";
+    }
 
     let result = {
         external_controller: controller + ":9090"
     };
-    if (bool_option(settings, "enable_yacd", false)) {
+    if (wan_enabled && secret != "")
+        result.secret = secret;
+    if (yacd_enabled && (!wan_enabled || secret != ""))
         result.external_ui = "ui";
-        let secret = option(settings, "yacd_secret_key", "");
-        if (secret != "")
-            result.secret = secret;
-    }
     return result;
 }
 
@@ -485,153 +707,58 @@ function cli_bool(value) {
     return value === true || value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
-function tproxy_inbound_matcher() {
-    if (!core_ip.ipv6_supported())
-        return [ runtime_constants.TPROXY_INBOUND_TAG ];
-    return [ runtime_constants.TPROXY_INBOUND_TAG, runtime_constants.TPROXY_INBOUND6_TAG ];
+let cached_core_version = null;
+let cached_core_version_banner = null;
+
+function core_binary_probe_bases() {
+    return [ "tachyon-core", "/usr/bin/tachyon-core" ];
 }
 
-let cached_sb_version = null;
-let cached_sb_version_banner = null;
+function detect_core_version() {
+    if (cached_core_version != null)
+        return cached_core_version;
 
-// The version state file is written by the component action alone. Treating it as
-// the source of truth meant a sing-box replaced by hand - install.sh, opkg, a
-// dropped-in binary - kept whatever the last component action wrote, and the
-// generator then configured for a version that was no longer installed: stock
-// 1.13.21 answered "1.15.0-alpha.10" on the wire, the file still said 1.13.21, so
-// the generator emitted cache_file.store_rdrc and 1.15 refused to start.
-//
-// So the file is a fallback for the variants whose binary cannot be executed for a
-// version string, and nothing else: extended-compressed is a self-extracting stub
-// and lx needs a runtime that may be absent. Everyone else is asked directly, and
-// the file is refreshed from the answer so it stops being stale.
-function sing_box_live_version_probe_disabled() {
-    let marker_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let marker = trim(fs.readfile(marker_file) || "");
-    return marker == "extended-compressed" || marker == "lx";
-}
-
-function detect_sing_box_version() {
-    if (cached_sb_version != null)
-        return cached_sb_version;
-
-    let override = getenv("SB_VERSION_OVERRIDE");
+    let override = getenv("TACHYON_CORE_VERSION_OVERRIDE");
     if (override != null && trim(override) != "") {
-        cached_sb_version = trim(override);
-        return cached_sb_version;
+        cached_core_version = trim(override);
+        return cached_core_version;
     }
 
-    let state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
+    let state_file = getenv("TACHYON_CORE_VERSION_FILE") || "/etc/tachyon/tachyon-core-version";
 
-    if (sing_box_live_version_probe_disabled()) {
-        let recorded = trim(fs.readfile(state_file) || "");
-        if (recorded != "") {
-            cached_sb_version = recorded;
-            return recorded;
-        }
-    }
-
-    // Bounded on purpose. This runs while a configuration is being generated, and a
-// binary that never answers must not take the start with it: a stub that unpacks,
-// a wrapper script that waits, a half-written file after a failed upgrade. Before
-// the live probe became the default path this code was unreachable whenever the
-// state file existed, which is why it could carry an unbounded pop(.
-//
-// Six seconds is generous for printing a version string and short enough that a
-// router is not left waiting. Two prefixes are tried because an earlier one may be
-// absent from PATH.
-try {
-    let bases = [ "sing-box", "/usr/bin/tachyon-core" ];
-    let preflight = getenv("SB_PREFLIGHT_BINARY");
-    if (preflight && preflight != "")
-        unshift(bases, preflight);
-    for (let base in bases) {
-        let pipe = fs.popen(common.bounded_command(base + " version 2>/dev/null", "6"), "r");
-        if (pipe) {
-            let out = pipe.read("all");
-            pipe.close();
-            // The shared parser, not a second ad-hoc regex: "\s" inside a
-            // character class is not whitespace in this engine, so
-            // /sing-box version ([^\s]+)/ swallowed the newline and came back
-            // as "1.15.0-alpha.10\n\nTag" - which then got written to the
-            // state file. common.parse_sing_box_version() documents why.
-            let found = common.parse_sing_box_version(out);
-            if (found != "") {
-                cached_sb_version = found;
-                cached_sb_version_banner = as_string(out);
-                try {
-                    let cur_disk = trim(fs.readfile(state_file) || "");
-                    if (cur_disk != cached_sb_version)
-                        fs.writefile(state_file, cached_sb_version + "\n");
-                } catch (e) {}
-                return cached_sb_version;
-            }
+    // Bounded on purpose: a binary that never answers must not hang config generation.
+    try {
+        let bases = core_binary_probe_bases();
+        let preflight = getenv("TACHYON_CORE_PREFLIGHT_BINARY");
+        if (preflight && preflight != "")
+            unshift(bases, preflight);
+        for (let base in bases) {
+            let pipe = fs.popen(common.bounded_command(base + " version 2>/dev/null", "6"), "r");
+            if (pipe) {
+                let out = pipe.read("all");
+                pipe.close();
+                let found = common.parse_core_version ? common.parse_core_version(out) : "";
+                if (found != "") {
+                    cached_core_version = found;
+                    cached_core_version_banner = as_string(out);
+                    try {
+                        let cur_disk = trim(fs.readfile(state_file) || "");
+                        if (cur_disk != cached_core_version)
+                            fs.writefile(state_file, cached_core_version + "\n");
+                    } catch (e) {}
+                    return cached_core_version;
+                }
             }
         }
     } catch (e) {}
 
-    let sb_version_val = trim(fs.readfile(state_file) || "");
-    if (sb_version_val == "") {
-        let sb_ui_cache = getenv("TACHYON_UI_SING_BOX_VERSION_CACHE_FILE") || "/var/run/tachyon/ui-state/sing-box-version";
-        sb_version_val = trim(fs.readfile(sb_ui_cache) || "");
+    let core_version_val = variant_state.read_version_state();
+    if (core_version_val == "") {
+        let ui_cache = getenv("TACHYON_UI_CORE_VERSION_CACHE_FILE") || "/var/run/tachyon/ui-state/tachyon-core-version";
+        core_version_val = trim(fs.readfile(ui_cache) || "");
     }
-    cached_sb_version = sb_version_val;
-    return cached_sb_version;
-}
-
-// Tachyon's own core is not in sing-box's version series: it reports
-// "0.0.1-tachyon.0", and no numeric comparison against 1.14/1.15 says anything
-// about it. What does say something is the schema it implements, checked field
-// by field against the core's own validator (crates/core-config/src/validate.rs):
-// http_clients, route.default_http_client, dns.optimistic, store_dns,
-// buffer_size, flush_interval and certificate_sha256 are all present, so every
-// gate below opens. That is the opposite mistake to the one this gate exists to
-// prevent - the failure is a config carrying a field the core rejects, and
-// `sing-box check` refuses the whole file over one of them.
-// Does the binary on disk name itself as our core?
-//
-// Installed as /usr/bin/tachyon-core the core answers in the legacy shape, "sing-box
-// version v0.0.1-tachyon.0", and the suffix alone settles it. Run under its own
-// name it answers "tachyon-core 0.0.1" instead - a bare number carrying no fork
-// suffix, indistinguishable from a stock build of the same version - and then the
-// name in the banner is the only thing left to go on.
-function sing_box_banner_names_tachyon_core() {
-    let preflight = getenv("SB_PREFLIGHT_BINARY");
-    if (preflight && preflight != "") {
-        let pipe = fs.popen(common.bounded_command(preflight + " version 2>/dev/null", "6"), "r");
-        if (pipe) {
-            let banner = as_string(pipe.read("all"));
-            pipe.close();
-            let newline = index(banner, "\n");
-            let line = trim(newline >= 0 ? substr(banner, 0, newline) : banner);
-            if (line != "") {
-                let token = split(line, /[ \t\r\n]+/)[0];
-                return token == "tachyon-core";
-            }
-        }
-        return false;
-    }
-    if (cached_sb_version_banner == null) {
-        let banner = "";
-        for (let base in [ "sing-box", "/usr/bin/tachyon-core" ]) {
-            let pipe = fs.popen(common.bounded_command(base + " version 2>/dev/null", "6"), "r");
-            if (pipe) {
-                banner = as_string(pipe.read("all"));
-                pipe.close();
-                if (banner != "")
-                    break;
-            }
-        }
-        cached_sb_version_banner = banner;
-    }
-    let newline = index(cached_sb_version_banner, "
-");
-    let line = trim(newline >= 0 ? substr(cached_sb_version_banner, 0, newline) : cached_sb_version_banner);
-    if (line == "")
-        return false;
-    let token = split(line, /[ 	
-]+/)[0];
-    return token == "tachyon-core";
+    cached_core_version = core_version_val;
+    return cached_core_version;
 }
 
 // How client traffic reaches the proxy.
@@ -660,11 +787,68 @@ function proxy_mode(settings) {
 // keys, so a config generated here survives a binary swap. Anything specific -
 // the route table 2022, the fwmark - belongs to the core's own auto_route and is
 // never written into the file.
-function tun_inbound(settings) {
+function primary_lan_interface(settings) {
+    let raw = trim(option(settings, "source_network_interfaces", ""));
+    if (raw != "") {
+        for (let p in split(raw, /[ \t\r\n,]+/)) {
+            if (p != "" && (fixture_uci_data != null || fs.stat("/sys/class/net/" + p) != null))
+                return p;
+        }
+    }
+    if (fs.stat("/sys/class/net/br-lan") != null)
+        return "br-lan";
+    return "";
+}
+
+function lan_interface_cidrs(lan_iface, service_address) {
+    let cidrs = [];
+    let seen = {};
+    let add_cidr = function(c) {
+        c = trim(as_string(c));
+        if (c == "")
+            return;
+        let masked = core_ip.mask_cidr(c);
+        if (masked != "")
+            c = masked;
+        if (c != "" && !seen[c]) {
+            seen[c] = true;
+            push(cidrs, c);
+        }
+    };
+    if (fixture_uci_data != null && type(fixture_uci_data.__lan_cidrs) == "array") {
+        for (let c in fixture_uci_data.__lan_cidrs)
+            add_cidr(c);
+    }
+    if (lan_iface != "" && fixture_uci_data == null) {
+        let out = common.command_output_from_args([ "ip", "-o", "addr", "show", "dev", lan_iface ]);
+        for (let line in split(as_string(out), "\n")) {
+            let m = match(line, /inet6?\s+([0-9a-fA-F:.]+\/[0-9]+)/);
+            if (m && m[1]) {
+                let addr_cidr = m[1];
+                if (index(lc(addr_cidr), "fe80:") == 0)
+                    continue;
+                add_cidr(addr_cidr);
+            }
+        }
+        for (let p6 in core_ip.lan_ipv6_prefixes([ lan_iface ]))
+            add_cidr(p6);
+    }
+    if (length(cidrs) == 0) {
+        let sa = trim(as_string(service_address || ""));
+        let m4 = match(sa, /^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$/);
+        if (m4 && m4[1] && index(m4[1], "127.") != 0)
+            add_cidr(m4[1] + ".0/24");
+        else
+            add_cidr("192.168.1.0/24");
+    }
+    return cidrs;
+}
+
+function tun_inbound(settings, service_address, eff_state) {
     if (proxy_mode(settings) != "tun")
         return null;
 
-    if (!core_profile.supports_inbound("tun", detect_sing_box_version(), null)) {
+    if (!core_profile.supports_inbound("tun", detect_core_version(), null)) {
         warn("proxy_mode is 'tun' but this core has no tun inbound; falling back to tproxy\n");
         return null;
     }
@@ -681,11 +865,25 @@ function tun_inbound(settings) {
     if (mtu < 576 || mtu > 65535)
         mtu = runtime_constants.TUN_MTU;
 
+    let state = eff_state || effective_ipv6_state(settings);
+    let addresses = [ inet4 ];
+    let fakeip6 = trim(option(settings, "fakeip_inet6_range", runtime_constants.FAKEIP_INET6_RANGE)) || runtime_constants.FAKEIP_INET6_RANGE;
+    if (state.ipv6_active) {
+        let inet6 = trim(option(settings, "tun_inet6", ""));
+        if (inet6 == "")
+            inet6 = "fdfe:dcba:9876::1/126";
+        else if (state.fakeip_enabled && core_ip.cidrs_overlap(inet6, fakeip6)) {
+            generator_log("tun_inet6 '" + inet6 + "' overlaps fakeip_inet6_range '" + fakeip6 + "', falling back to fdfe:dcba:9876::1/126", "warn");
+            inet6 = "fdfe:dcba:9876::1/126";
+        }
+        push(addresses, inet6);
+    }
+
     let inbound = {
         type: "tun",
         tag: runtime_constants.TUN_INBOUND_TAG,
         interface_name,
-        inet4_address: inet4,
+        address: addresses,
         mtu,
         // auto_route is the whole point on a router: it is what puts the default
         // route into table 2022 and leaves main alone, instead of Tachyon writing
@@ -696,160 +894,82 @@ function tun_inbound(settings) {
         // by the userspace NAT still fails on replies from a second source port.
         endpoint_independent_nat: bool_option(settings, "tun_endpoint_independent_nat", true),
         stack: trim(option(settings, "tun_stack", "mixed")) || "mixed",
-        gso: bool_option(settings, "tun_gso", true),
-        sniff: bool_option(settings, "tun_sniff", true),
-        sniff_override_destination: bool_option(settings, "tun_sniff_override_destination", false)
+        gso: bool_option(settings, "tun_gso", true)
     };
-
-    let inet6 = trim(option(settings, "tun_inet6", runtime_constants.TUN_INET6_ADDRESS));
-    if (inet6 != "")
-        inbound.inet6_address = inet6;
+    if (inbound.auto_route) {
+        let lan_cidrs = lan_interface_cidrs(primary_lan_interface(settings), service_address);
+        let exclude_addrs = [];
+        let exclude_seen = {};
+        let fakeip4 = trim(option(settings, "fakeip_inet4_range", runtime_constants.FAKEIP_INET4_RANGE)) || runtime_constants.FAKEIP_INET4_RANGE;
+        for (let raw_cidr in lan_cidrs) {
+            let cidr = core_ip.mask_cidr(raw_cidr) || trim(as_string(raw_cidr));
+            if (cidr == "" || exclude_seen[cidr])
+                continue;
+            if (index(cidr, ":") >= 0) {
+                if (!state.ipv6_active)
+                    continue;
+                if (state.fakeip_enabled && core_ip.cidrs_overlap(cidr, fakeip6))
+                    continue;
+            } else if (state.fakeip_enabled && core_ip.cidrs_overlap(cidr, fakeip4)) {
+                continue;
+            }
+            exclude_seen[cidr] = true;
+            push(exclude_addrs, cidr);
+        }
+        if (length(exclude_addrs) > 0)
+            inbound.route_exclude_address = exclude_addrs;
+    }
+    let udp_timeout = trim(option(settings, "tun_udp_timeout", ""));
+    if (udp_timeout != "")
+        inbound.udp_timeout = udp_timeout;
 
     return inbound;
+}
+
+function tproxy_inbound_matcher() {
+    let settings = runtime_settings();
+    let mode = proxy_mode(settings);
+    if (mode == "tun" && core_profile.supports_inbound("tun", detect_core_version(), null))
+        return [ runtime_constants.TUN_INBOUND_TAG ];
+    if (mode == "socks")
+        return [ runtime_constants.CLIENT_MIXED_INBOUND_TAG ];
+    if (!effective_ipv6_state(settings).ipv6_active)
+        return [ runtime_constants.TPROXY_INBOUND_TAG ];
+    return [ runtime_constants.TPROXY_INBOUND_TAG, runtime_constants.TPROXY_INBOUND6_TAG ];
 }
 
 function section_enabled(section) {
     return bool_option(section, "enabled", true);
 }
 
-function is_tachyon_core_version(sb_version_val) {
-    if (sb_version_val == null || sb_version_val == "")
-        sb_version_val = detect_sing_box_version();
-    // The suffix is decisive when it is there.
-    if (core_profile.profile_by_version(as_string(sb_version_val)) != "")
-        return true;
-
-    // A recorded variant in state file (including SB_VARIANT_STATE_FILE during pre-flight)
-    // is explicit evidence: if set to anything other than tachyon-core (e.g. lx, extended),
-    // this is not tachyon-core.
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let recorded_variant = trim(as_string(fs.readfile(sb_variant_file) || ""));
-    if (recorded_variant != "")
-        return recorded_variant == "tachyon-core";
-
-    // Any version with a non-upstream, non-tachyon-core profile (e.g. -lx, extended)
-    // is definitely not tachyon-core.
-    let prof = core_profile.profile(as_string(sb_version_val), "");
-    if (prof != "upstream" && prof != "tachyon-core")
-        return false;
-
-    // Otherwise only believe the banner when the version names nothing else: with
-    // an explicit override in hand, that override is the build being generated for
-    // and the binary on disk is not evidence about it.
-    let override = trim(as_string(getenv("SB_VERSION_OVERRIDE") || ""));
-    if (override != "" && prof == "upstream") {
-        let preflight = getenv("SB_PREFLIGHT_BINARY");
-        if (preflight && preflight != "")
-            return sing_box_banner_names_tachyon_core();
-        return false;
-    }
-
-    if (sing_box_banner_names_tachyon_core())
-        return true;
-
-    return false;
+function is_tachyon_core_version(core_version_val) {
+    return true;
 }
 
-function is_sb_1_14_plus_detected(sb_version_val) {
-    if (is_tachyon_core_version(sb_version_val))
-        return true;
-    if (sb_version_val == null || sb_version_val == "")
-        sb_version_val = detect_sing_box_version();
-    if (sb_version_val != "") {
-        let m = match(sb_version_val, /^v?([0-9]+)\.([0-9]+)/);
-        if (m) {
-            let major = int(m[1]);
-            let minor = int(m[2]);
-            return major > 1 || (major == 1 && minor >= 14);
-        }
-    }
-    return false;
+function is_core_1_14_plus_detected(core_version_val) {
+    return true;
 }
 
-function is_sb_1_15_plus_detected(sb_version_val) {
-    if (is_tachyon_core_version(sb_version_val))
-        return true;
-    if (sb_version_val == null || sb_version_val == "")
-        sb_version_val = detect_sing_box_version();
-    let prof = core_profile.profile(as_string(sb_version_val), "");
-    let pdata = core_profile.profile_data(prof);
-    if (pdata && pdata.schema_1_15 == "no")
-        return false;
-    if (sb_version_val != "") {
-        let m = match(sb_version_val, /^v?([0-9]+)\.([0-9]+)/);
-        if (m) {
-            let major = int(m[1]);
-            let minor = int(m[2]);
-            return major > 1 || (major == 1 && minor >= 15);
-        }
-    }
-    return false;
+function is_core_1_15_plus_detected(core_version_val) {
+    return true;
 }
 
-function is_sing_box_lx_detected(sb_version_val) {
-    if (sb_version_val == null || sb_version_val == "")
-        sb_version_val = detect_sing_box_version();
-    let s = as_string(sb_version_val);
-    if (s == "lx" || s == "sing-box-lx" || index(s, "-lx") >= 0)
-        return true;
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
-    return sb_variant_val == "lx" || sb_variant_val == "sing-box-lx";
+function is_tachyon_core_detected(core_version_val) {
+    return true;
 }
 
-// Tachyon's own core reports a version from its own series and prints no build
-// tags, so the -tachyon. suffix and the variant marker file are the only signals.
-function is_tachyon_core_detected(sb_version_val) {
-    return is_tachyon_core_version(sb_version_val);
+function certificate_pin_field(core_version_val) {
+    return "certificate_sha256";
 }
 
-// Which TLS field carries the pin, and "" when this build cannot pin at all.
-//
-// The field is not one thing renamed twice - the two names hash different
-// things. certificate_sha256 is over the whole DER certificate, which is what a
-// pcs value from a proxy link is; certificate_public_key_sha256 is over the
-// public key. Putting a certificate hash under the public-key field pins
-// something the server never presents, so the field has to be chosen, not
-// swapped.
-//
-// Verified on the real binaries: stock 1.14.2 and 1.14.2-lx.12 both reject
-// certificate_sha256 with "unknown field" and both accept
-// certificate_public_key_sha256. lx tracks upstream but does not carry the 1.15
-// field, so its version number says nothing either way - the marker decides.
-// Tachyon's own core is the same case one step further: the string
-// certificate_sha256 does not occur in its config crate at all, while
-// certificate_public_key_sha256 is in its TLS allowlist
-// (crates/core-config/src/validate.rs).
-function certificate_pin_field(sb_version_val) {
-    if (sb_version_val == null || sb_version_val == "")
-        sb_version_val = detect_sing_box_version();
-
-    // Our own core takes certificate_sha256, which is the field a proxy link's
-    // pcs actually is - so it gets it. The public-key field is the older one and
-    // hashes something else.
-    if (is_tachyon_core_detected(sb_version_val))
-        return "certificate_sha256";
-
-    if (is_sing_box_lx_detected(sb_version_val))
-        return "certificate_public_key_sha256";
-
-    if (is_sb_1_15_plus_detected(sb_version_val))
-        return "certificate_sha256";
-
-    return "";
+function is_certificate_sha256_supported(core_version_val) {
+    return true;
 }
 
-// Whether this build can carry a pin at all, under whichever field it accepts.
-// lx and our own core pass this on the public-key field; see
-// certificate_pin_field for why that is not a rename.
-function is_certificate_sha256_supported(sb_version_val) {
-    return certificate_pin_field(sb_version_val) != "";
-}
+const VERBOSE_LOG_PATH = "/tmp/tachyon-core/tachyon-core.log";
 
-const VERBOSE_LOG_PATH = "/tmp/tachyon-core/sing-box.log";
-
-function singbox_log_section(log_level, sb_version_val) {
-    if (log_level == "panic" && is_tachyon_core_detected(sb_version_val))
+function core_log_section(log_level, core_version_val) {
+    if (log_level == "panic")
         log_level = "fatal";
 
     let section = {
@@ -858,14 +978,14 @@ function singbox_log_section(log_level, sb_version_val) {
         timestamp: false
     };
 
-    // Everything below warn produces a line per connection. Routed through
-    // procd's stderr into syslog, that fills the 128 KiB ring within minutes
-    // and evicts hostapd, dnsmasq and the actual errors we go looking for - the
-    // measured case was 744 of 771 buffered lines being sing-box INFO. Send the
-    // verbose levels to a file on tmpfs instead: the full log stays available
-    // for debugging while syslog keeps room for what it is for.
-    if (log_level == "info" || log_level == "debug" || log_level == "trace")
+    // Per-connection events (including benign stream cancellations and WAN-down
+    // "no route to internet" bursts at ERROR/WARN level) flood OpenWrt's 128 KiB
+    // logd ring within ~10 minutes and evict netifd/pppd/hostapd/dnsmasq history.
+    // Route all non-fatal levels to the tmpfs log file (auto-trimmed by watchdog/failover).
+    if (log_level == "warn" || log_level == "error" || log_level == "info" || log_level == "debug" || log_level == "trace") {
         section.output = VERBOSE_LOG_PATH;
+        section.timestamp = true;
+    }
 
     return section;
 }
@@ -873,19 +993,10 @@ function singbox_log_section(log_level, sb_version_val) {
 function base_config(settings, service_address, runtime_context) {
     runtime_context = object_or_empty(runtime_context);
     let log_level = option(settings, "log_level", "warn");
-    let rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "60");
+    let rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "15");
     let turbo_cache = bool_option(settings, "dns_turbo_cache", false);
-    // Persistent by default. The FakeIP pool hands out addresses and the core
-    // keeps the reverse mapping; clients cache the address they were given, so
-    // a mapping that disappears (tmpfs, and therefore every reboot) makes the
-    // next packet for that address die with "missing fakeip record". Only the
-    // client could repair the mismatch, and it will not. Both routers checked
-    // run /usr/share/sing-box/cache.db, so this also matches what is deployed.
     let cache_path = option(settings, "cache_path", "/usr/share/tachyon-core/cache.db");
-    if (turbo_cache && (cache_path == "" || cache_path == "/usr/share/tachyon-core/cache.db" ||
-                        cache_path == "/usr/share/sing-box/cache.db" ||
-                        cache_path == "/tmp/tachyon-core/cache.db" ||
-                        cache_path == "/tmp/sing-box/cache.db"))
+    if (turbo_cache && (cache_path == "" || cache_path == "/usr/share/tachyon-core/cache.db"))
         cache_path = "/etc/tachyon-core/cache.db";
 
     // Say it out loud rather than degrading quietly: a deliberately volatile
@@ -902,7 +1013,17 @@ function base_config(settings, service_address, runtime_context) {
     if (cache_dir != "" && cache_dir != cache_path) {
         try { fs.mkdir(cache_dir, 0755); } catch(e) {}
     }
-    let dns_config = runtime_dns.config(settings);
+    for (let db_cand in [ cache_path, "/etc/tachyon-core/cache.db", "/usr/share/tachyon-core/cache.db" ]) {
+        if (db_cand == "")
+            continue;
+        let st_db = fs.stat(db_cand);
+        if (st_db != null && int(st_db.size || 0) > 10485760) {
+            try { fs.unlink(db_cand); } catch (e) {}
+        }
+    }
+    let eff_state = effective_ipv6_state(settings);
+    ctx.ipv6_effective_state = function() { return eff_state; };
+    let dns_config = runtime_dns.config(settings, null);
     if (dns_config.unsupported)
         runtime_generate_unsupported(dns_config.unsupported);
 
@@ -916,6 +1037,7 @@ function base_config(settings, service_address, runtime_context) {
             push(dns_hosts_entries, line);
     }
 
+    let is_tachyon_core = is_tachyon_core_detected();
     for (let host_entry in dns_hosts_entries) {
         let entry_str = trim(host_entry);
         if (entry_str == "" || substr(entry_str, 0, 1) == "#") continue;
@@ -926,13 +1048,15 @@ function base_config(settings, service_address, runtime_context) {
             if (core_ip.valid_ip(p1)) {
                 let ip = p1;
                 let rr_type = index(ip, ":") != -1 ? "AAAA" : "A";
+                if (rr_type == "AAAA" && !eff_state.ipv6_active)
+                    continue;
                 for (let i = 1; i < length(parts); i++) {
                     let d = parts[i];
                     if (d != "" && substr(d, 0, 1) != "#") {
                         push(dns_hosts_predefined, {
                             action: "predefined",
                             domain: [d],
-                            answer: [d + ". 60 IN " + rr_type + " " + ip]
+                            answer: [is_tachyon_core ? { name: d, ttl: 60, value: ip } : d + ". 60 IN " + rr_type + " " + ip]
                         });
                     }
                 }
@@ -940,10 +1064,12 @@ function base_config(settings, service_address, runtime_context) {
                 let domain = p1;
                 let ip = p2;
                 let rr_type = index(ip, ":") != -1 ? "AAAA" : "A";
+                if (rr_type == "AAAA" && !eff_state.ipv6_active)
+                    continue;
                 push(dns_hosts_predefined, {
                     action: "predefined",
                     domain: [domain],
-                    answer: [domain + ". 60 IN " + rr_type + " " + ip]
+                    answer: [is_tachyon_core ? { name: domain, ttl: 60, value: ip } : domain + ". 60 IN " + rr_type + " " + ip]
                 });
             }
         }
@@ -951,9 +1077,21 @@ function base_config(settings, service_address, runtime_context) {
 
     for (let rule in dns_config.rules)
         push(dns_rules, rule);
+    let diag_fakeip_rule = {
+        action: "route",
+        server: eff_state.fakeip_enabled ? runtime_constants.FAKEIP_DNS_SERVER_TAG : runtime_constants.DNS_SERVER_TAG,
+        rewrite_ttl,
+        domain: [ runtime_constants.FAKEIP_TEST_DOMAIN, runtime_constants.CHECK_PROXY_IP_DOMAIN ],
+        // fakeip answers A and AAAA only; see add_fakeip_query_type().
+        query_type: [ "A", "AAAA" ]
+    };
+    if (!eff_state.fakeip_enabled)
+        delete diag_fakeip_rule.query_type;
+    else if (!eff_state.ipv6_active)
+        diag_fakeip_rule.query_type = [ "A" ];
     for (let rule in [
         // HTTPS/SVCB records are how a client discovers DoH servers, so they
-        // must not be answered - but with NODATA, not REFUSED. sing-box's
+        // must not be answered - but with NODATA, not REFUSED. tachyon-core's
         // `reject` answers REFUSED unconditionally (dns/router.go has no rcode
         // option on the action at all), and resolvers read REFUSED as the
         // server refusing to serve: they retry, switch servers or mark the
@@ -961,38 +1099,50 @@ function base_config(settings, service_address, runtime_context) {
         // is the same block, answered as "this name has no such record".
         { action: "predefined", query_type: [ "HTTPS", "SVCB" ], rcode: "NOERROR" },
         { action: "reject", domain_suffix: "use-application-dns.net" },
-        {
-            action: "route",
-            server: runtime_constants.FAKEIP_DNS_SERVER_TAG,
-            rewrite_ttl,
-            domain: [ runtime_constants.FAKEIP_TEST_DOMAIN, runtime_constants.CHECK_PROXY_IP_DOMAIN ],
-            // fakeip answers A and AAAA only; see add_fakeip_query_type().
-            query_type: [ "A", "AAAA" ]
-        }
+        diag_fakeip_rule
     ])
         push(dns_rules, rule);
+    // With the LAN DNS intercept on (by default while a section is
+    // Fail-Closed), DoH/DoT hostnames and the iCloud Private Relay canaries get
+    // NXDOMAIN: clients fall back to the router DNS instead of resolving real
+    // addresses past domain sections.
+    if (require("service.kill_switch").dns_intercept_effective(settings, runtime_context && runtime_context.fail_closed)) {
+        let blocked = [];
+        for (let d in runtime_constants.DOH_BLOCK_DOMAINS)
+            push(blocked, d);
+        for (let d in runtime_constants.PRIVATE_RELAY_CANARIES)
+            push(blocked, d);
+        push(dns_rules, { action: "predefined", domain_suffix: blocked, rcode: "NXDOMAIN" });
+    }
 
     let dns_servers = [];
     for (let server in dns_config.servers)
         push(dns_servers, server);
-    let fakeip_server = {
-        type: "fakeip",
-        tag: runtime_constants.FAKEIP_DNS_SERVER_TAG,
-        inet4_range: runtime_constants.FAKEIP_INET4_RANGE
-    };
-    let strategy = option(settings, "dns_strategy", "");
-    if (bool_option(settings, "ipv6_enabled", false) || strategy == "prefer_ipv6" || strategy == "ipv6_only")
-        fakeip_server.inet6_range = runtime_constants.FAKEIP_INET6_RANGE;
-    push(dns_servers, fakeip_server);
+    if (eff_state.fakeip_enabled) {
+        let fakeip4 = trim(option(settings, "fakeip_inet4_range", runtime_constants.FAKEIP_INET4_RANGE)) || runtime_constants.FAKEIP_INET4_RANGE;
+        let fakeip_server = {
+            type: "fakeip",
+            tag: runtime_constants.FAKEIP_DNS_SERVER_TAG,
+            inet4_range: fakeip4
+        };
+        if (eff_state.ipv6_active) {
+            let fakeip6 = trim(option(settings, "fakeip_inet6_range", runtime_constants.FAKEIP_INET6_RANGE)) || runtime_constants.FAKEIP_INET6_RANGE;
+            fakeip_server.inet6_range = fakeip6;
+        }
+        push(dns_servers, fakeip_server);
+    }
 
 // The transparent inbound exists only in tproxy mode. In socks mode there is
     // a client-facing listener instead, and in tun mode the core owns the routes
     // and a tproxy socket would only sit there unused.
+    let tun = tun_inbound(settings, service_address, eff_state);
     let mode = proxy_mode(settings);
+    if (mode == "tun" && tun == null)
+        mode = "tproxy";
     let inbounds = [];
     if (mode == "tproxy") {
         push(inbounds, { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND_TAG, listen: runtime_constants.TPROXY_INBOUND_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true });
-        if (core_ip.ipv6_supported())
+        if (eff_state.ipv6_active)
             push(inbounds, { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND6_TAG, listen: runtime_constants.TPROXY_INBOUND6_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true });
     }
     if (mode == "socks") {
@@ -1010,7 +1160,7 @@ function base_config(settings, service_address, runtime_context) {
         push(inbounds, {
             type: "direct",
             tag: runtime_constants.SOURCE_DNS_INBOUND_TAG,
-            listen: core_ip.ipv6_supported() ? runtime_constants.SOURCE_DNS_INBOUND_ADDRESS : "0.0.0.0",
+            listen: eff_state.ipv6_active ? runtime_constants.SOURCE_DNS_INBOUND_ADDRESS : "0.0.0.0",
             listen_port: runtime_constants.SOURCE_DNS_INBOUND_PORT
         });
     }
@@ -1020,7 +1170,6 @@ for (let inbound in dns_config.inbounds)
     // The tun inbound sits after the dns ones so the ordering of what is already
     // here does not move: anything reading the generated file by position keeps
     // reading what it read before.
-    let tun = tun_inbound(settings);
     if (tun != null)
         push(inbounds, tun);
 
@@ -1031,51 +1180,50 @@ for (let inbound in dns_config.inbounds)
 
     runtime_context.dns_health_inbounds = dns_config.sniff_inbounds;
     runtime_context.default_domain_resolver = runtime_dns.default_domain_resolver(settings);
-    ctx.default_domain_resolver = runtime_context.default_domain_resolver;
+    runtime_context.client_inbounds = tproxy_inbound_matcher();
+
+    let eff_dns_strategy = eff_state.runtime_dns_strategy;
 
     let dns_section = {
         servers: dns_servers,
         rules: dns_rules,
         final: runtime_constants.DNS_SERVER_TAG,
-        strategy: option(settings, "dns_strategy", "prefer_ipv4")
+        strategy: eff_dns_strategy,
+        reverse_mapping: bool_option(settings, "dns_reverse_mapping", true)
     };
 
-    let sb_version_val = detect_sing_box_version();
-    let is_sb_1_14_plus = is_sb_1_14_plus_detected(sb_version_val);
-    let is_sb_1_15_plus = is_sb_1_15_plus_detected(sb_version_val);
-    ctx.is_sb_1_14_plus = function() { return is_sb_1_14_plus; };
-    ctx.is_sb_1_15_plus = function() { return is_sb_1_15_plus; };
+    let core_version_val = detect_core_version();
+    ctx.is_core_1_14_plus = function() { return true; };
+    ctx.is_core_1_15_plus = function() { return true; };
 
-    let use_legacy_rdrc = !is_sb_1_14_plus;
-
+    runtime_context.ipv6_active = eff_state.ipv6_active;
     let route_section = runtime_route.config(settings, runtime_context);
-    if (is_sb_1_14_plus)
-        route_section.default_http_client = "ruleset-http";
+    route_section.default_http_client = "ruleset-http";
 
-    if (is_sb_1_14_plus) {
-        dns_section.optimistic = {
-            enabled: true,
-            timeout: "3d"
-        };
-    }
+    let opt_timeout = trim(option(settings, "dns_optimistic_timeout", "6h")) || "6h";
+    if (opt_timeout == "3d" || opt_timeout == "72h")
+        opt_timeout = "6h";
+    dns_section.optimistic = {
+        enabled: bool_option(settings, "dns_optimistic_cache", true),
+        timeout: opt_timeout
+    };
 
     let cache_file_section = {
         enabled: true,
         path: cache_path,
-        store_fakeip: true
+        store_fakeip: eff_state.fakeip_enabled
     };
-    if (use_legacy_rdrc)
-        cache_file_section.store_rdrc = true;
-    else
+    if (bool_option(settings, "dns_cache_store_disk", false))
         cache_file_section.store_dns = true;
 
-    if (is_sb_1_15_plus) {
-        cache_file_section.buffer_size = "1MB";
-        cache_file_section.flush_interval = "10m";
-    }
+    cache_file_section.buffer_size = option(settings, "cache_buffer_size", "16KB");
+    let flush_int = option(settings, "cache_flush_interval", "60s");
+    if (flush_int == "" || flush_int == "10s")
+        flush_int = "60s";
+    cache_file_section.flush_interval = flush_int;
 
     let base_cfg = {
-        log: singbox_log_section(log_level, sb_version_val),
+        log: core_log_section(log_level, core_version_val),
         dns: dns_section,
         ntp: {},
         certificate: {},
@@ -1091,8 +1239,7 @@ for (let inbound in dns_config.inbounds)
         __dns_hosts_predefined: dns_hosts_predefined
     };
 
-    if (is_sb_1_14_plus)
-        base_cfg.http_clients = [{ tag: "ruleset-http" }];
+    base_cfg.http_clients = [{ tag: "ruleset-http" }];
 
     return base_cfg;
 }
@@ -1100,8 +1247,7 @@ for (let inbound in dns_config.inbounds)
 
 function mixed_proxy_enabled_action(action) {
     return action == "connection" || action == "proxy" || action == "outbound" || action == "vpn" ||
-        action == "awg" || action == "byedpi" || action == "zapret" || action == "zapret2" ||
-        action == "wdtt" || action == "olcrtc";
+        action == "awg" || action == "desync" || action == "wdtt" || action == "csqtt" || action == "group";
 }
 
 function add_mixed_proxy_for_section(config, section, service_address) {
@@ -1188,10 +1334,13 @@ function add_direct_bypass_proxy(config, settings, service_address) {
         listen,
         listen_port
     });
+    let eff_mark = (type(config.route) == "object" && int(config.route.default_mark || 0) > 0)
+        ? int(config.route.default_mark)
+        : runtime_constants.OUTBOUND_MARK;
     push(config.outbounds, {
         type: "direct",
         tag: runtime_constants.DIRECT_BYPASS_OUTBOUND_TAG,
-        routing_mark: runtime_constants.OUTBOUND_MARK
+        routing_mark: eff_mark
     });
     if (type(config.route) == "object" && type(config.route.rules) == "array" &&
         length(config.route.rules) > 0 && config.route.rules[0].action == "sniff" &&
@@ -1211,7 +1360,7 @@ function add_direct_bypass_proxy(config, settings, service_address) {
     });
 }
 
-function add_service_mixed_proxy_inbound(config, tag_name, listen_port, outbound) {
+function add_service_mixed_proxy_inbound(config, tag_name, listen_port, outbound, bot_target) {
     push(config.inbounds, {
         type: "mixed",
         tag: tag_name,
@@ -1229,6 +1378,18 @@ function add_service_mixed_proxy_inbound(config, tag_name, listen_port, outbound
         ip_is_private: true,
         outbound: runtime_constants.DIRECT_OUTBOUND_TAG
     });
+    // The Telegram bot reaches the Bot API through this mixed inbound, so the
+    // section picked in Telegram settings has to win over the default section.
+    // bot_target is resolved by the caller from the live section list.
+    if (tag_name == runtime_constants.SERVICE_MIXED_INBOUND_TAG && bot_target != "" &&
+        bot_target != outbound && generator_routes.is_valid_detour(config, bot_target)) {
+        generator_routes.push_section_route_rule(config, {
+            action: "route",
+            inbound: tag_name,
+            domain_suffix: [ "api.telegram.org", "telegram.org", "t.me" ],
+            outbound: bot_target
+        }, bot_target);
+    }
     generator_routes.push_section_route_rule(config, {
         action: "route",
         inbound: tag_name,
@@ -1247,7 +1408,7 @@ function service_mixed_proxy_port_for_purpose(purpose) {
         (as_string(purpose || "lists") == "components" ? 1 : 0);
 }
 
-function add_global_download_service_mixed_proxy(config, settings, purpose) {
+function add_global_download_service_mixed_proxy(config, settings, purpose, bot_target) {
     let outbound = download_detour_tag(settings, purpose);
     if (outbound == "")
         return;
@@ -1256,7 +1417,8 @@ function add_global_download_service_mixed_proxy(config, settings, purpose) {
         config,
         service_mixed_proxy_inbound_tag_for_purpose(purpose),
         service_mixed_proxy_port_for_purpose(purpose),
-        outbound
+        outbound,
+        bot_target || ""
     );
 }
 
@@ -1268,11 +1430,13 @@ function add_subscription_download_service_mixed_proxies(config, sections) {
         if (port <= 0)
             runtime_generate_unsupported("subscription download proxy port could not be resolved");
 
+        let target_sec = generator_routes.section_by_name(sections, target);
+        let target_tag = (target_sec && generator_routes.group_outbound_tag_for_section(target_sec)) || outbound_tag(target);
         add_service_mixed_proxy_inbound(
             config,
             runtime_constants.inbound_tag("service-subscription-" + target),
             port,
-            outbound_tag(target)
+            target_tag
         );
     }
 }
@@ -1280,6 +1444,7 @@ function add_subscription_download_service_mixed_proxies(config, sections) {
 function add_service_mixed_proxy(config, settings, sections) {
     let has_any_proxy = false;
     let default_proxy_tag = "";
+    let fallback_dpi_tag = "";
     for (let s in sections) {
         // A deferred or quarantined section contributes no outbound; picking it
         // as the default target would leave the service-mixed route rule
@@ -1287,29 +1452,61 @@ function add_service_mixed_proxy(config, settings, sections) {
         if (ctx.deferred_sections && ctx.deferred_sections[s[".name"]])
             continue;
         let action = s.action || "";
-        if (s.enabled != "0" && (action == "connection" || action == "subscription" || action == "provider" || action == "fptn" || action == "awg")) {
+        if (s.enabled != "0" && (action == "proxy" || action == "connection" || action == "subscription" || action == "provider" || action == "fptn" || action == "awg")) {
+            let tag = s[".name"] + "-out";
+            if (connections.is_dpi_or_desync_only_section && connections.is_dpi_or_desync_only_section(s)) {
+                if (fallback_dpi_tag == "")
+                    fallback_dpi_tag = tag;
+            } else {
+                has_any_proxy = true;
+                if (default_proxy_tag == "")
+                    default_proxy_tag = tag;
+            }
+        }
+        else if (s.enabled != "0" && action == "group" && generator_routes.group_outbound_tag_for_section(s) != "") {
             has_any_proxy = true;
             if (default_proxy_tag == "")
-                default_proxy_tag = outbound_tag(s[".name"]);
+                default_proxy_tag = generator_routes.group_outbound_tag_for_section(s);
         }
     }
+    if (default_proxy_tag == "" && fallback_dpi_tag != "") {
+        has_any_proxy = true;
+        default_proxy_tag = fallback_dpi_tag;
+    }
 
-    if (download_via_proxy_any_enabled(settings, sections)) {
-        add_global_download_service_mixed_proxy(config, settings, "lists");
-        add_global_download_service_mixed_proxy(config, settings, "components");
-        add_subscription_download_service_mixed_proxies(config, sections);
+    // Section selected in Telegram settings (telegram.bot_proxy_section).
+    // Empty or unresolvable means "keep using the default section".
+    let bot_target = "";
+    let bot_cfg = object_or_empty(uci_cursor().get_all(CONFIG_NAME, "telegram"));
+    let bot_sec = trim(as_string(bot_cfg.bot_proxy_section || ""));
+    if (bot_sec != "" && !(ctx.deferred_sections && ctx.deferred_sections[bot_sec])) {
+        let bot_section = generator_routes.section_by_name(sections, bot_sec);
+        if (bot_section && bot_section.enabled != "0")
+            bot_target = generator_routes.group_outbound_tag_for_section(bot_section) || outbound_tag(bot_sec);
+    }
 
-        if (download_via_proxy_enabled(settings, "lists") && download_detour_tag(settings, "lists") == "")
+    if (download_via_proxy_enabled(settings, "lists")) {
+        add_global_download_service_mixed_proxy(config, settings, "lists", bot_target);
+        if (download_detour_tag(settings, "lists") == "" && length(keys(ctx.deferred_sections || {})) == 0)
             runtime_generate_unsupported("download lists via proxy section is not set");
-        if (download_via_proxy_enabled(settings, "components") && download_detour_tag(settings, "components") == "")
-            runtime_generate_unsupported("download components via proxy section is not set");
     } else if (has_any_proxy && default_proxy_tag != "") {
         add_service_mixed_proxy_inbound(
             config,
             runtime_constants.SERVICE_MIXED_INBOUND_TAG,
             runtime_constants.SERVICE_MIXED_INBOUND_PORT,
-            default_proxy_tag
+            default_proxy_tag,
+            bot_target
         );
+    }
+
+    if (download_via_proxy_enabled(settings, "components")) {
+        add_global_download_service_mixed_proxy(config, settings, "components");
+        if (download_detour_tag(settings, "components") == "" && length(keys(ctx.deferred_sections || {})) == 0)
+            runtime_generate_unsupported("download components via proxy section is not set");
+    }
+
+    if (length(connections.subscription_download_targets(sections || [])) > 0) {
+        add_subscription_download_service_mixed_proxies(config, sections);
     }
 }
 
@@ -1321,7 +1518,13 @@ function router_traffic_section(settings) {
 
 function add_router_traffic_redirect(config, settings) {
     let section_name = router_traffic_section(settings);
-    if (section_name == "")
+    if (section_name == "" || (ctx.deferred_sections && ctx.deferred_sections[section_name]))
+        return;
+
+    let all_enabled = type(enabled_sections) == "function" ? enabled_sections() : [];
+    let sec_obj = generator_routes.section_by_name(all_enabled, section_name);
+    let sec_out = (sec_obj && generator_routes.group_outbound_tag_for_section(sec_obj)) || outbound_tag(section_name);
+    if (sec_out == "" || !generator_routes.is_valid_detour(config, sec_out))
         return;
 
     push(config.inbounds, {
@@ -1331,21 +1534,18 @@ function add_router_traffic_redirect(config, settings) {
         listen_port: runtime_constants.REDIRECT_INBOUND_PORT
     });
 
-    let sec_out = outbound_tag(section_name);
-    if (sec_out != "") {
-        let target_idx = 0;
-        if (type(config.route) == "object" && type(config.route.rules) == "array") {
-            for (let i = 0; i < length(config.route.rules); i++) {
-                let r = config.route.rules[i];
-                if (r.action == "sniff" || r.action == "hijack-dns")
-                    target_idx = i + 1;
-            }
-            splice(config.route.rules, target_idx, 0, {
-                action: "route",
-                inbound: [ runtime_constants.REDIRECT_INBOUND_TAG ],
-                outbound: sec_out
-            });
+    let target_idx = 0;
+    if (type(config.route) == "object" && type(config.route.rules) == "array") {
+        for (let i = 0; i < length(config.route.rules); i++) {
+            let r = config.route.rules[i];
+            if (r.action == "sniff" || r.action == "hijack-dns")
+                target_idx = i + 1;
         }
+        splice(config.route.rules, target_idx, 0, {
+            action: "route",
+            inbound: [ runtime_constants.REDIRECT_INBOUND_TAG ],
+            outbound: sec_out
+        });
     }
 }
 
@@ -1502,7 +1702,9 @@ function schedule_blocked_domains(schedule) {
 function enabled_content_block_schedules() {
     let result = [];
     ctx.uci_cursor().foreach(CONFIG_NAME, "schedule", function(schedule) {
-        if (section_enabled(schedule) && length(schedule_blocked_domains(schedule)) > 0) {
+        if (section_enabled(schedule) &&
+            option(schedule, "dns_level", "1") != "0" &&
+            length(schedule_blocked_domains(schedule)) > 0) {
             push(result, schedule);
         }
     });
@@ -1536,12 +1738,17 @@ function add_safesearch_dns_rules(target, profiles) {
         : target;
 
     let all_sources = [];
+    let has_mac = false;
     for (let profile in profiles) {
+        if (schedule_has_mac_devices(profile))
+            has_mac = true;
         for (let cidr in profile_source_ip_cidrs(profile)) {
             if (index(all_sources, cidr) < 0)
                 push(all_sources, cidr);
         }
     }
+    if (!has_mac && length(all_sources) == 0)
+        return;
 
     let search_engines = [
         {
@@ -1566,25 +1773,28 @@ function add_safesearch_dns_rules(target, profiles) {
         }
     ];
 
+    let is_tachyon_core = is_tachyon_core_detected();
     for (let engine in search_engines) {
         for (let domain in engine.domains) {
             let rule = {
                 action: "predefined",
+                inbound: [ runtime_constants.DNS_BLOCK_INBOUND_TAG ],
                 domain: [ domain ],
-                answer: [ domain + ". 60 IN A " + engine.ip ]
+                answer: [ is_tachyon_core ? { name: domain, ttl: 60, value: engine.ip } : domain + ". 60 IN A " + engine.ip ]
             };
-            if (length(all_sources) > 0)
-                rule.source_ip_cidr = all_sources;
+            if (length(all_sources) > 0 && !has_mac)
+                rule.source_ip_cidr = core_ip.expand_ipv4_mapped_cidrs(all_sources);
             push(rules_arr, rule);
         }
     }
 }
 
 function add_content_block_dns_inbound(config) {
+    let eff_state = effective_ipv6_state(null);
     push(config.inbounds, {
         type: "direct",
         tag: runtime_constants.DNS_BLOCK_INBOUND_TAG,
-        listen: core_ip.ipv6_supported() ? runtime_constants.DNS_BLOCK_INBOUND_ADDRESS : "0.0.0.0",
+        listen: eff_state.ipv6_active ? runtime_constants.DNS_BLOCK_INBOUND_ADDRESS : "0.0.0.0",
         listen_port: runtime_constants.DNS_BLOCK_INBOUND_PORT
     });
 }
@@ -1613,7 +1823,7 @@ function add_content_block_dns_rules(target, schedules) {
                     rule[key] = matchers[key];
             }
             if (length(sources) > 0 && !has_mac)
-                rule.source_ip_cidr = sources;
+                rule.source_ip_cidr = core_ip.expand_ipv4_mapped_cidrs(sources);
             if (mode == "allow")
                 rule.invert = true;
             push(rules_arr, rule);
@@ -1750,21 +1960,24 @@ function source_aware_dns_sources(sections, settings) {
         let has_dns_matchers = connections.has_dns_matchers(section);
 
         if (has_dns_matchers) {
-            for (let ip in core_ip.normalize_to_cidrs(list_option(section, "source_ip_cidr")))
+            for (let ip in core_ip.normalize_to_cidrs(connections.resolved_source_ip_cidrs(section)))
                 add_source(ip);
+            for (let exc in core_ip.normalize_to_cidrs(list_option(section, "excluded_ips")))
+                add_source(exc);
+            for (let cond in connections.section_leaf_conditions(section)) {
+                for (let exc in core_ip.normalize_to_cidrs(list_option(cond, "excluded_ips")))
+                    add_source(exc);
+            }
         }
 
-        if (action == "bypass") {
+        if (action == "dns" || connections.routed_dns_enabled(section)) {
             for (let ip in core_ip.normalize_to_cidrs(list_option(section, "fully_routed_ips")))
                 add_source(ip);
-            for (let ip in core_ip.normalize_to_cidrs(list_option(section, "source_ip_cidr")))
-                add_source(ip);
-        }
-
-        if (action == "dns") {
-            for (let ip in core_ip.normalize_to_cidrs(list_option(section, "fully_routed_ips")))
-                add_source(ip);
-            for (let ip in core_ip.normalize_to_cidrs(list_option(section, "source_ip_cidr")))
+            for (let cond in connections.section_leaf_conditions(section)) {
+                for (let ip in core_ip.normalize_to_cidrs(list_option(cond, "fully_routed_ips")))
+                    add_source(ip);
+            }
+            for (let ip in core_ip.normalize_to_cidrs(connections.resolved_source_ip_cidrs(section)))
                 add_source(ip);
         }
     }
@@ -1789,15 +2002,14 @@ function add_source_aware_dns_fallback(config, source_aware_dns) {
         return;
 
     let settings = runtime_settings_cache || {};
-    let rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "60");
-
     let rule = {
         action: "route",
         server: runtime_constants.DNSMASQ_DNS_SERVER_TAG,
         inbound: [ runtime_constants.SOURCE_DNS_INBOUND_TAG ],
-        source_ip_cidr: single_or_array(source_aware_dns),
-        rewrite_ttl
+        source_ip_cidr: single_or_array(core_ip.expand_ipv4_mapped_cidrs(source_aware_dns))
     };
+    if (trim(option(settings, "dns_rewrite_ttl", "")) != "")
+        rule.rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "15");
     push(config.dns.rules, rule);
 }
 
@@ -1806,14 +2018,15 @@ function add_excluded_clients_dns_rule(config, settings) {
     if (length(excluded_cidrs) == 0)
         return;
 
-    let rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "60");
-    unshift(config.dns.rules, {
+    let rule = {
         action: "route",
         server: runtime_constants.DNSMASQ_DNS_SERVER_TAG,
         inbound: [ runtime_constants.SOURCE_DNS_INBOUND_TAG ],
-        source_ip_cidr: single_or_array(excluded_cidrs),
-        rewrite_ttl
-    });
+        source_ip_cidr: single_or_array(core_ip.expand_ipv4_mapped_cidrs(excluded_cidrs))
+    };
+    if (trim(option(settings, "dns_rewrite_ttl", "")) != "")
+        rule.rewrite_ttl = int_option(settings, "dns_rewrite_ttl", "15");
+    unshift(config.dns.rules, rule);
 }
 
 function add_excluded_clients_route_rule(config, settings) {
@@ -1823,6 +2036,7 @@ function add_excluded_clients_route_rule(config, settings) {
 
     splice(config.route.rules, 1, 0, {
         action: "route",
+        inbound: tproxy_inbound_matcher(),
         outbound: runtime_constants.BYPASS_OUTBOUND_TAG,
         source_ip_cidr: single_or_array(excluded_cidrs)
     });
@@ -1862,25 +2076,53 @@ function strip_certificate_pins_if_unsupported(config) {
         }
     }
     if (stripped)
-        warn("installed sing-box (", detect_sing_box_version() || "unknown",
+        warn("installed tachyon-core (", detect_core_version() || "unknown",
             ") does not accept ", join(", ", drop),
             "; those certificate pins were removed to keep the config loadable\n");
 }
 
-function normalize_wireguard_addresses(config) {
+function filter_cidrs_ipv4_only(cidrs) {
+    let out = [];
+    for (let c in array_or_empty(cidrs)) {
+        if (index(as_string(c), ":") < 0)
+            push(out, c);
+    }
+    return out;
+}
+
+function normalize_wireguard_addresses(config, eff_state) {
+    let strip_all_v6 = (eff_state != null && !eff_state.ipv6_active);
     for (let list in [ config.outbounds, config.endpoints, config.inbounds ]) {
         if (type(list) != "array")
             continue;
         for (let item in list) {
             if (type(item) == "object" && (item.type == "wireguard" || item.type == "awg")) {
-                if (item.address != null)
+                if (item.address != null) {
                     item.address = core_ip.normalize_to_cidrs(item.address);
-                if (item.local_address != null)
+                    if (strip_all_v6)
+                        item.address = filter_cidrs_ipv4_only(item.address);
+                }
+                if (item.local_address != null) {
                     item.local_address = core_ip.normalize_to_cidrs(item.local_address);
+                    if (strip_all_v6)
+                        item.local_address = filter_cidrs_ipv4_only(item.local_address);
+                }
+                let has_v4_local = false;
+                let has_v6_local = false;
+                for (let addr in array_or_empty(item.address != null ? item.address : item.local_address)) {
+                    if (index(as_string(addr), ":") >= 0)
+                        has_v6_local = true;
+                    else
+                        has_v4_local = true;
+                }
+                let strip_peer_v6 = strip_all_v6 || (has_v4_local && !has_v6_local);
                 if (type(item.peers) == "array") {
                     for (let peer in item.peers) {
-                        if (type(peer) == "object" && peer.allowed_ips != null)
+                        if (type(peer) == "object" && peer.allowed_ips != null) {
                             peer.allowed_ips = core_ip.normalize_to_cidrs(peer.allowed_ips);
+                            if (strip_peer_v6)
+                                peer.allowed_ips = filter_cidrs_ipv4_only(peer.allowed_ips);
+                        }
                     }
                 }
             }
@@ -1888,7 +2130,227 @@ function normalize_wireguard_addresses(config) {
     }
 }
 
-function generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
+// JSON object order is immaterial. Keep array order and every emitted option:
+// peer order, dial settings and AWG extensions can change transport behavior.
+function canonical_wireguard_options(value, endpoint) {
+    if (type(value) == "array")
+        return map(value, item => canonical_wireguard_options(item));
+    if (type(value) != "object")
+        return value;
+
+    let ordered = {};
+    for (let key in sort(keys(value))) {
+        if (endpoint && key == "tag")
+            continue;
+        if (substr(key, 0, 2) != "__")
+            ordered[key] = canonical_wireguard_options(value[key]);
+    }
+    return ordered;
+}
+
+function share_wireguard_client_endpoints(config, owners) {
+    let first_by_options = {};
+    let retained = [];
+    for (let endpoint in config.endpoints) {
+        if (endpoint.type == "wireguard" && endpoint.__wireguard_client &&
+            !endpoint.system && !endpoint.listen_port) {
+            // This key contains private transport options and stays in memory.
+            let options = sprintf("%J", canonical_wireguard_options(endpoint, true));
+            let first_tag = first_by_options[options];
+            if (first_tag != null) {
+                // Keep the member tag used by selectors, probes and section metadata.
+                push(config.outbounds, {
+                    type: "selector",
+                    tag: endpoint.tag,
+                    outbounds: [ first_tag ],
+                    default: first_tag
+                });
+                continue;
+            }
+            first_by_options[options] = endpoint.tag;
+        }
+        push(retained, endpoint);
+    }
+    if (length(retained) != length(config.endpoints)) {
+        config.endpoints = retained;
+        // finalize_config_owners rebuilds endpoint indices from the retained tags.
+        owners.endpoints = {};
+    }
+}
+
+function normalize_hysteria2_server_ports(config) {
+    if (type(config.outbounds) != "array")
+        return;
+    for (let outbound in config.outbounds) {
+        if (type(outbound) == "object" && outbound.type == "hysteria2" &&
+            (outbound.server_port == null || outbound.server_port == 0) &&
+            outbound.server_ports != null) {
+            let raw = type(outbound.server_ports) == "array" ? outbound.server_ports[0] : outbound.server_ports;
+            let parts = split(as_string(raw), ":");
+            let p = int(parts[0], 10);
+            if (p > 0)
+                outbound.server_port = p;
+        }
+    }
+}
+
+function snapshot_config_counts(config) {
+    return {
+        inbounds: type(config.inbounds) == "array" ? length(config.inbounds) : 0,
+        outbounds: type(config.outbounds) == "array" ? length(config.outbounds) : 0,
+        endpoints: type(config.endpoints) == "array" ? length(config.endpoints) : 0,
+        rule_set: (type(config.route) == "object" && type(config.route.rule_set) == "array") ? length(config.route.rule_set) : 0,
+        route_rules: (type(config.route) == "object" && type(config.route.rules) == "array") ? length(config.route.rules) : 0,
+        dns_servers: (type(config.dns) == "object" && type(config.dns.servers) == "array") ? length(config.dns.servers) : 0
+    };
+}
+
+function record_owner_delta(config, owners, sec_name, snap) {
+    sec_name = as_string(sec_name || "");
+    if (sec_name == "")
+        return;
+
+    let pairs = [
+        [ "inbounds", config.inbounds, snap.inbounds ],
+        [ "outbounds", config.outbounds, snap.outbounds ],
+        [ "endpoints", config.endpoints, snap.endpoints ],
+        [ "rule_set", type(config.route) == "object" ? config.route.rule_set : null, snap.rule_set ],
+        [ "dns_servers", type(config.dns) == "object" ? config.dns.servers : null, snap.dns_servers ]
+    ];
+    for (let pair in pairs) {
+        let kind = pair[0];
+        let arr = pair[1];
+        let start = int(pair[2] || 0);
+        if (type(arr) != "array")
+            continue;
+        for (let i = start; i < length(arr); i++) {
+            owners[kind][as_string(i)] = sec_name;
+            let item = arr[i];
+            if (type(item) == "object") {
+                let t = as_string(item.tag || "");
+                if (t != "")
+                    owners.tags[t] = sec_name;
+                let p = int(item.listen_port || 0);
+                if (p > 0)
+                    owners.ports[as_string(p)] = sec_name;
+            }
+        }
+    }
+    let rrules = type(config.route) == "object" ? config.route.rules : null;
+    if (type(rrules) == "array") {
+        for (let i = int(snap.route_rules || 0); i < length(rrules); i++)
+            owners.route_rules[as_string(i)] = sec_name;
+    }
+}
+
+function finalize_config_owners(config, owners, output_path) {
+    let list_kinds = [
+        [ "inbounds", config.inbounds ],
+        [ "outbounds", config.outbounds ],
+        [ "endpoints", config.endpoints ],
+        [ "rule_set", type(config.route) == "object" ? config.route.rule_set : null ],
+        [ "dns_servers", type(config.dns) == "object" ? config.dns.servers : null ]
+    ];
+    for (let pair in list_kinds) {
+        let kind = pair[0];
+        let arr = pair[1];
+        if (type(arr) != "array")
+            continue;
+        for (let i = 0; i < length(arr); i++) {
+            let item = arr[i];
+            if (type(item) == "object") {
+                let t = as_string(item.tag || "");
+                if (t != "" && owners.tags[t] != null)
+                    owners[kind][as_string(i)] = owners.tags[t];
+            }
+        }
+    }
+    let owners_file = getenv("TACHYON_CONFIG_OWNERS_FILE") || "/var/run/tachyon/config-owners.json";
+    try {
+        common.write_json_file(owners_file, owners);
+    } catch (e) {}
+    if (substr(as_string(output_path), 0, 5) == "/tmp/") {
+        try {
+            common.write_json_file(as_string(output_path) + ".owners.json", owners);
+        } catch (e) {}
+    }
+}
+
+// A quarantined section contributes no outbound, but selectors and urltest
+// groups of *other* sections can still reference its tag. tachyon-core then dies
+// with "dependency[...] not found" at start and procd loops the whole core.
+// Prune every missing reference from group members before the config ships
+// (issue #253).
+function prune_dangling_group_members(config) {
+    let known = {};
+    for (let outbound in array_or_empty(config.outbounds)) {
+        let t = as_string(object_or_empty(outbound).tag || "");
+        if (t != "")
+            known[t] = true;
+    }
+    for (let endpoint in array_or_empty(config.endpoints)) {
+        let t = as_string(object_or_empty(endpoint).tag || "");
+        if (t != "")
+            known[t] = true;
+    }
+    for (let pass = 0; pass < 4; pass++) {
+        let changed = false;
+        for (let outbound in array_or_empty(config.outbounds)) {
+            if (type(outbound) != "object")
+                continue;
+            let t = as_string(outbound.type || "");
+            if (t != "selector" && t != "urltest")
+                continue;
+            if (outbound.tag == null || known[as_string(outbound.tag)] != true)
+                continue;
+            let members = array_or_empty(outbound.outbounds);
+            let kept = [];
+            for (let m in members) {
+                if (known[as_string(m)])
+                    push(kept, m);
+                else
+                    changed = true;
+            }
+            if (length(kept) != length(members))
+                outbound.outbounds = kept;
+            if (as_string(outbound.default || "") != "" && !known[as_string(outbound.default)]) {
+                outbound.default = length(kept) > 0 ? kept[0] : "";
+                changed = true;
+            }
+        }
+        if (!changed)
+            break;
+    }
+}
+
+function apply_settings_tcp_profile(config, settings) {
+    if (type(config) != "object")
+        return;
+
+    let tcp_prof = lc(trim(as_string(option(settings, "tcp_profile", ""))));
+    if (tcp_prof != "auto" && tcp_prof != "windows" &&
+        tcp_prof != "macos" && tcp_prof != "ios" &&
+        tcp_prof != "android" && tcp_prof != "linux")
+        return;
+
+    for (let item in array_or_empty(config.outbounds)) {
+        if (type(item) != "object" || item.tcp_profile != null)
+            continue;
+        let t = as_string(item.type || "");
+        if (t == "direct" || t == "selector" || t == "urltest" ||
+            t == "chain" || t == "block" || t == "bridge" || t == "dns")
+            continue;
+        item.tcp_profile = tcp_prof;
+    }
+
+    for (let ep in array_or_empty(config.endpoints)) {
+        if (type(ep) != "object" || ep.tcp_profile != null)
+            continue;
+        ep.tcp_profile = tcp_prof;
+    }
+}
+
+function generate_config_once(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
     ctx.deferred_sections = parse_deferred_sections(deferred_sections);
     // Quarantine reuses the same skip set the deferred sections use: every
     // consumer (outbounds, routes, failover candidates, mixed proxies) already
@@ -1908,49 +2370,191 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
     cursor.load(CONFIG_NAME);
     runtime_settings_cache = object_or_empty(cursor.get_all(CONFIG_NAME, "settings"));
     let settings = runtime_settings_cache;
+    runtime_ipv6_state_cache = null;
+    let eff_state = effective_ipv6_state(settings);
+    if (fixture_uci_data == null)
+        common.cache_ipv6_runtime_state(eff_state);
 
     let sections = enabled_sections();
     let servers = enabled_servers();
-    if (length(sections) == 0 && length(servers) == 0)
+    let has_configured_entries = false;
+    cursor.foreach(CONFIG_NAME, "section", function(_s) { has_configured_entries = true; });
+    if (!has_configured_entries)
+        cursor.foreach(CONFIG_NAME, "server", function(_s) { has_configured_entries = true; });
+    if (length(sections) == 0 && length(servers) == 0 && length(keys(ctx.quarantined_sections)) == 0 && !has_configured_entries)
         runtime_generate_unsupported("no enabled sections");
+
+    let owners = {
+        inbounds: {},
+        outbounds: {},
+        endpoints: {},
+        rule_set: {},
+        route_rules: {},
+        dns_servers: {},
+        tags: {},
+        ports: {}
+    };
 
     let source_aware_dns = source_aware_dns_sources(sections, settings);
     let config = base_config(settings, service_address, {
         mwan3_active: cli_bool(mwan3_active),
-        source_aware_dns: length(source_aware_dns) > 0
+        source_aware_dns: length(source_aware_dns) > 0,
+        fail_closed: require("service.kill_switch").veto(settings, sections) != ""
     });
     add_source_aware_dns_support(config, source_aware_dns);
+    if (length(servers) > 0) {
+        if (fs.stat("/sys/class/net/lo") != null || fixture_uci_data != null) {
+            push(config.outbounds, {
+                type: "direct",
+                tag: runtime_constants.LO_DIRECT_OUTBOUND_TAG,
+                bind_interface: "lo"
+            });
+        }
+        let lan_iface = primary_lan_interface(settings);
+        if (lan_iface != "") {
+            push(config.outbounds, {
+                type: "direct",
+                tag: runtime_constants.LAN_DIRECT_OUTBOUND_TAG,
+                bind_interface: lan_iface
+            });
+            config.__lan_interface_cidrs = lan_interface_cidrs(lan_iface, service_address);
+        }
+    }
     let taken = reserved_runtime_tag_set(config.outbounds);
     reserve_section_outbound_tags(sections, taken);
-    for (let server in servers)
+    for (let server in servers) {
+        ctx.current_section = server[".name"];
+        let snap = snapshot_config_counts(config);
         runtime_servers.add_server(config, server);
+        record_owner_delta(config, owners, server[".name"], snap);
+    }
+    ctx.current_section = null;
     for (let section in sections) {
         ctx.current_section = section[".name"];
+        let snap = snapshot_config_counts(config);
         add_outbound_for_section(config, section, taken, sections);
+        record_owner_delta(config, owners, section[".name"], snap);
     }
     ctx.current_section = null;
     add_group_urltest_outbounds(config, sections);
     add_service_route_rules(config, sections);
 
-    // Add block and bypass sections before proxy sections so exceptions take precedence
-    for (let section in sections) {
+    // Add block and bypass sections before base policy (disable_quic, etc.) and proxy sections so exceptions take precedence
+    let deferred_base_policy_rules = [];
+    if (type(config.route) == "object" && type(config.route.rules) == "array" && length(config.route.rules) > 2) {
+        let kept_rules = [ config.route.rules[0], config.route.rules[1] ];
+        for (let i = 2; i < length(config.route.rules); i++) {
+            let r = config.route.rules[i];
+            if (type(r) == "object" && r.outbound == null && r.action == "reject")
+                push(deferred_base_policy_rules, r);
+            else
+                push(kept_rules, r);
+        }
+        config.route.rules = kept_rules;
+    }
+    let last_block_idx = -1;
+    for (let i = 0; i < length(sections); i++) {
+        if (option(sections[i], "action", "") == "block")
+            last_block_idx = i;
+    }
+    let aaaa_noerror_emitted = false;
+    let maybe_emit_aaaa_noerror = function() {
+        if (!aaaa_noerror_emitted && !eff_state.ipv6_active && type(config.dns) == "object" && type(config.dns.rules) == "array") {
+            push(config.dns.rules, {
+                action: "predefined",
+                query_type: [ "AAAA" ],
+                rcode: "NOERROR"
+            });
+            aaaa_noerror_emitted = true;
+        }
+    };
+    if (last_block_idx < 0)
+        maybe_emit_aaaa_noerror();
+
+    for (let i = 0; i < length(sections); i++) {
+        let section = sections[i];
         let act = option(section, "action", "");
         if (act == "block" || act == "bypass") {
             ctx.current_section = section[".name"];
+            let snap = snapshot_config_counts(config);
             add_route_for_section(config, section);
+            record_owner_delta(config, owners, section[".name"], snap);
+        } else if (act == "dns" && bool_option(section, "disable_fakeip", false)) {
+            ctx.current_section = section[".name"];
+            let snap = snapshot_config_counts(config);
+            add_route_for_section(config, section, "pre_fakeip");
+            record_owner_delta(config, owners, section[".name"], snap);
+        }
+        if (i == last_block_idx)
+            maybe_emit_aaaa_noerror();
+    }
+    maybe_emit_aaaa_noerror();
+    for (let r in deferred_base_policy_rules)
+        push(config.route.rules, r);
+    if (type(config.dns) == "object" && type(config.dns.rules) == "array") {
+        let fakeip_ex_ttl = int_option(settings, "dns_rewrite_ttl", "15");
+        for (let ex_rule in build_fakeip_exclude_rules(settings, eff_state, fakeip_ex_ttl))
+            push(config.dns.rules, ex_rule);
+    }
+    if (eff_state.fakeip_enabled && type(config.dns) == "object" && type(config.dns.rules) == "array") {
+        let server_dns_inbounds = [];
+        for (let server in servers) {
+            if (option(server, "protocol", "vless") == "tailscale")
+                continue;
+            let ib = runtime_constants.server_inbound_tag(server[".name"]);
+            if (option(server, "protocol", "vless") == "shadowtls" &&
+                trim(as_string(option(server, "shadowtls_detour", ""))) == "")
+                ib += "-inner";
+            if (index(server_dns_inbounds, ib) < 0)
+                push(server_dns_inbounds, ib);
+        }
+        if (length(server_dns_inbounds) > 0) {
+            push(config.dns.rules, {
+                action: "route",
+                inbound: single_or_array(server_dns_inbounds),
+                server: runtime_constants.DNS_SERVER_TAG
+            });
         }
     }
+    config.__defer_dns_response_rules = true;
     for (let section in sections) {
         let act = option(section, "action", "");
-        if (act != "block" && act != "bypass") {
+        if (act != "block" && act != "bypass" && act != "dns") {
             ctx.current_section = section[".name"];
+            let snap = snapshot_config_counts(config);
             add_route_for_section(config, section);
+            record_owner_delta(config, owners, section[".name"], snap);
         }
+    }
+    delete config.__defer_dns_response_rules;
+    for (let section in sections) {
+        let act = option(section, "action", "");
+        if (act == "dns") {
+            ctx.current_section = section[".name"];
+            let snap = snapshot_config_counts(config);
+            add_route_for_section(config, section, "post_fakeip");
+            record_owner_delta(config, owners, section[".name"], snap);
+        }
+    }
+    if (type(config.__deferred_dns_response_rules) == "array") {
+        for (let item in config.__deferred_dns_response_rules) {
+            ctx.current_section = item.section_name;
+            let snap = snapshot_config_counts(config);
+            generator_routes.push_dns_matcher_rule(config, item.eval_rule);
+            generator_routes.push_section_dns_matcher_rule(config, item.section, item.dns_rule, item.excluded_cidrs);
+            record_owner_delta(config, owners, item.section_name, snap);
+        }
+        delete config.__deferred_dns_response_rules;
     }
     ctx.current_section = null;
 
+    add_full_tunnel_route_rule(config, sections);
     add_server_routes(config, servers, sections);
-    add_proxy_endpoint_dns_rule(config);
+    for (let rule in array_or_empty(config.route.rules))
+        if (type(rule) == "object")
+            delete rule.__skip_server_clone;
+    delete config.__lan_interface_cidrs;
+    add_proxy_endpoint_dns_rule(config, sections);
     add_source_aware_dns_fallback(config, source_aware_dns);
     add_excluded_clients_dns_rule(config, settings);
     add_excluded_clients_route_rule(config, settings);
@@ -1969,7 +2573,9 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
     add_service_mixed_proxy(config, settings, sections);
     for (let section in sections) {
         ctx.current_section = section[".name"];
+        let snap = snapshot_config_counts(config);
         add_mixed_proxy_for_section(config, section, service_address);
+        record_owner_delta(config, owners, section[".name"], snap);
     }
     ctx.current_section = null;
     add_router_traffic_redirect(config, settings);
@@ -1989,14 +2595,75 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
         }
     }
 
+    prune_dangling_group_members(config);
     assert_unique_outbound_tags(config);
+    generator_routes.finalize_remote_custom_rulesets_state();
+    normalize_wireguard_addresses(config, eff_state);
+    if (is_tachyon_core_detected())
+        share_wireguard_client_endpoints(config, owners);
     strip_internal_fields(config);
     strip_certificate_pins_if_unsupported(config);
-    normalize_wireguard_addresses(config);
+    normalize_hysteria2_server_ports(config);
+    apply_settings_tcp_profile(config, settings);
+    finalize_config_owners(config, owners, output_path);
     if (!atomic_write_json_file(output_path, config)) {
         warn("failed to write ", output_path, "\n");
         exit(1);
     }
+}
+
+function generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
+    let quarantine_out = trim(as_string(getenv("TACHYON_GENERATOR_QUARANTINE_OUT") || ""));
+    if (quarantine_out == "") {
+        generate_config_once(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections);
+        return;
+    }
+
+    let extra_quarantined = {};
+    let extra_order = [];
+    let current_quarantined = as_string(quarantined_sections || "");
+    in_process_quarantine_enabled = true;
+    for (let attempt = 0; attempt < 16; attempt++) {
+        in_process_quarantine_hit = null;
+        ctx.current_section = null;
+        generator_outbounds.init(ctx);
+        generator_routes.init(ctx);
+        let succeeded = false;
+        try {
+            generate_config_once(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, current_quarantined);
+            succeeded = true;
+        }
+        catch (e) {
+            if (in_process_quarantine_hit == null) {
+                in_process_quarantine_enabled = false;
+                die(e);
+            }
+            let sec = in_process_quarantine_hit.section;
+            let reason = in_process_quarantine_hit.reason;
+            if (sec == "" || extra_quarantined[sec] != null || parse_name_set(current_quarantined)[sec]) {
+                in_process_quarantine_enabled = false;
+                warn("tachyon-section-error:", sec, ":", reason, "\n");
+                warn(reason, "\n");
+                exit(2);
+            }
+            extra_quarantined[sec] = reason;
+            push(extra_order, sec);
+            current_quarantined = current_quarantined != "" ? (current_quarantined + "," + sec) : sec;
+        }
+        if (succeeded) {
+            in_process_quarantine_enabled = false;
+            if (length(extra_order) > 0) {
+                let entries = [];
+                for (let sec in extra_order)
+                    push(entries, { section: sec, reason: extra_quarantined[sec] });
+                common.write_json_file(quarantine_out, entries);
+            }
+            return;
+        }
+    }
+    in_process_quarantine_enabled = false;
+    warn("too many quarantined sections\n");
+    exit(2);
 }
 
 function generate_config_fixture(fixture_path, output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
@@ -2120,11 +2787,13 @@ ctx.runtime_generate_unsupported = runtime_generate_unsupported;
 ctx.uci_bin_to_hex = uci_bin_to_hex;
 ctx.download_detour_tag = download_detour_tag;
 ctx.atomic_write_json_file = atomic_write_json_file;
-ctx.is_sb_1_14_plus = is_sb_1_14_plus_detected;
-ctx.is_sb_1_15_plus = is_sb_1_15_plus_detected;
-ctx.is_sing_box_lx = is_sing_box_lx_detected;
+ctx.tproxy_inbound_matcher = tproxy_inbound_matcher;
+ctx.is_core_1_14_plus = is_core_1_14_plus_detected;
+ctx.is_core_1_15_plus = is_core_1_15_plus_detected;
 ctx.is_tachyon_core = is_tachyon_core_detected;
+ctx.detect_core_version = detect_core_version;
 ctx.is_certificate_sha256_supported = is_certificate_sha256_supported;
+ctx.ipv6_effective_state = function() { return effective_ipv6_state(runtime_settings()); };
 
 generator_outbounds.init(ctx);
 generator_routes.init(ctx);
@@ -2138,6 +2807,7 @@ reserve_section_outbound_tags = generator_routes.reserve_section_outbound_tags;
 add_outbound_for_section = generator_routes.add_outbound_for_section;
 add_group_urltest_outbounds = generator_routes.add_group_urltest_outbounds;
 add_service_route_rules = generator_routes.add_service_route_rules;
+add_full_tunnel_route_rule = generator_routes.add_full_tunnel_route_rule;
 add_route_for_section = generator_routes.add_route_for_section;
 add_server_routes = generator_routes.add_server_routes;
 ensure_custom_ruleset = generator_routes.ensure_custom_ruleset;
@@ -2177,18 +2847,17 @@ else if (mode == "object-nonempty")
 else if (mode == "is-cert-pin-supported")
     exit(is_certificate_sha256_supported(ARGV[1]) ? 0 : 1);
 else if (mode == "is-sb-1-14-plus")
-    exit(is_sb_1_14_plus_detected(ARGV[1]) ? 0 : 1);
+    exit(is_core_1_14_plus_detected(ARGV[1]) ? 0 : 1);
 else if (mode == "is-sb-1-15-plus")
-    exit(is_sb_1_15_plus_detected(ARGV[1]) ? 0 : 1);
+    exit(is_core_1_15_plus_detected(ARGV[1]) ? 0 : 1);
 else if (mode == "certificate-pin-field") {
     let field = certificate_pin_field(ARGV[1]);
     print(field + "\n");
     exit(field != "" ? 0 : 1);
 }
 else if (mode == "version-detect") {
-    // Exposed so the version source can be exercised directly: a state file that
-    // disagrees with the binary has to lose, and that is only observable here.
-    print(detect_sing_box_version() + "\n");
+    // Exposed so the version source can be exercised directly.
+    print(detect_core_version() + "\n");
     exit(0);
 }
 else if (mode == "strip-cert-pins") {

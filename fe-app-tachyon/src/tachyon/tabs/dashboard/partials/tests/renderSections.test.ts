@@ -18,6 +18,15 @@ function createDummyElement(tag: string) {
     childNodes: children,
     style: {} as Record<string, string>,
     className: '',
+    get classList() {
+      const self = this as any;
+      return {
+        contains(c: string) {
+          const list = (self.class || self.className || '').split(/\s+/);
+          return list.includes(c);
+        },
+      };
+    },
     get textContent(): string {
       let text = '';
       for (const c of children) {
@@ -44,9 +53,9 @@ function createDummyElement(tag: string) {
       function traverse(node: any) {
         if (!node || typeof node !== 'object') return;
         if (selector.startsWith('.')) {
-          const targetClass = selector.slice(1);
+          const targetClasses = selector.split('.').filter(Boolean);
           const classes = (node.class || node.className || '').split(/\s+/);
-          if (classes.includes(targetClass)) {
+          if (targetClasses.every((tc: string) => classes.includes(tc))) {
             results.push(node);
           }
         }
@@ -120,7 +129,7 @@ describe('renderSections', () => {
       code: 'discord',
       sectionName: 'discord',
       displayName: 'Discord',
-      action: 'zapret2',
+      action: 'desync',
       withTagSelect: false,
       serviceStatus: undefined,
       outbounds: [
@@ -128,7 +137,7 @@ describe('renderSections', () => {
           code: 'discord',
           displayName: 'Unknown',
           latency: 0,
-          type: 'ZAPRET2',
+          type: 'DESYNC',
           selected: true,
           canCopyLink: false,
         },
@@ -173,10 +182,10 @@ describe('renderSections', () => {
       code: 'youtube',
       sectionName: 'youtube',
       displayName: 'Youtube',
-      action: 'zapret2',
+      action: 'desync',
       withTagSelect: false,
       serviceStatus: {
-        serviceType: 'zapret2',
+        serviceType: 'desync',
         configured: true,
         ready: true,
         conflict: false,
@@ -184,7 +193,7 @@ describe('renderSections', () => {
         expectedProcesses: 1,
         restartCount: 0,
         unstable: false,
-        statusMessage: 'zapret2 provider status is normal',
+        statusMessage: 'desync status is normal',
       },
       outbounds: [],
     };
@@ -212,8 +221,8 @@ describe('renderSections', () => {
     expect(buttons).toHaveLength(0);
   });
 
-  it('renders zapret and byedpi service sections without latency button', () => {
-    for (const action of ['zapret', 'byedpi']) {
+  it('renders desync and fptn service sections without latency button', () => {
+    for (const action of ['desync', 'fptn']) {
       const section: any = {
         code: action,
         sectionName: action,
@@ -661,5 +670,757 @@ describe('renderSections', () => {
         '.tachyon_dashboard-page__outbound-section__config-error-badge',
       ),
     ).toBeNull();
+  });
+
+  it('groups subscription outbounds and standalone outbounds under collapsible headers', () => {
+    const onToggleSourceGroupCollapse = vi.fn();
+    const section: any = {
+      code: 'proxy-out',
+      sectionName: 'proxy',
+      displayName: 'Multi-Source Proxy',
+      action: 'connection',
+      withTagSelect: true,
+      subscriptionSourceCount: 2,
+      subscriptionMetadata: [
+        {
+          title: 'Provider Alpha',
+          sourceIndex: 1,
+          traffic: { used: 1024, total: 2048 },
+        },
+        {
+          title: 'Provider Beta',
+          sourceIndex: 2,
+          traffic: { used: 512, total: 4096 },
+        },
+      ],
+      outbounds: [
+        {
+          code: 'proxy-urltest-out',
+          displayName: 'Fastest',
+          latency: 40,
+          type: 'URLTest',
+          selected: true,
+          urlTestInfo: {
+            code: 'proxy-urltest-out',
+            displayName: 'Fastest',
+            outbounds: [],
+          },
+        },
+        {
+          code: 'sub1-node1',
+          displayName: 'Alpha DE',
+          latency: 40,
+          type: 'VLESS',
+          selected: false,
+          sourceGroup: 'sub:1',
+        },
+        {
+          code: 'sub2-node1',
+          displayName: 'Beta NL',
+          latency: 60,
+          type: 'VLESS',
+          selected: false,
+          sourceGroup: 'sub:2',
+        },
+        {
+          code: 'manual-1',
+          displayName: 'My Personal VPS',
+          latency: 25,
+          type: 'VLESS',
+          selected: false,
+          sourceGroup: 'manual',
+        },
+      ],
+    };
+
+    const expanded = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      collapsedSourceGroups: new Set(),
+      onToggleSourceGroupCollapse,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const headers = expanded.querySelectorAll(
+      '.tachyon_dashboard-page__subscription-meta--collapsible',
+    );
+    expect(headers).toHaveLength(3);
+    expect(headers[0].textContent).toContain('Provider Alpha');
+    expect(headers[1].textContent).toContain('Provider Beta');
+    expect(headers[2].textContent).toContain('Standalone servers');
+
+    // Must not duplicate subscription metadata headers at the top of the section
+    const allMetaBanners = expanded.querySelectorAll(
+      '.tachyon_dashboard-page__subscription-meta',
+    );
+    expect(allMetaBanners).toHaveLength(3);
+
+    const items = expanded.querySelectorAll(
+      '.tachyon_dashboard-page__outbound-grid__item',
+    );
+    expect(items).toHaveLength(4);
+
+    // Collapsing sub:1 hides its server card while keeping URLTest, sub:2, and manual visible
+    const collapsedSub1 = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      collapsedSourceGroups: new Set(['subgrp:proxy-out:sub:1']),
+      onToggleSourceGroupCollapse,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const visibleItems = collapsedSub1.querySelectorAll(
+      '.tachyon_dashboard-page__outbound-grid__item',
+    );
+    expect(visibleItems).toHaveLength(3);
+  });
+
+  it('renders multi-config AWG section (withTagSelect=true) as selectable server cards rather than single connection node', () => {
+    const section: any = {
+      code: 'awg-out',
+      sectionName: 'awg',
+      displayName: 'AWG Pool',
+      action: 'awg',
+      withTagSelect: true,
+      outbounds: [
+        {
+          code: 'awg-urltest-out',
+          displayName: 'AWG Pool',
+          latency: 35,
+          type: 'URLTest',
+          selected: true,
+          urlTestInfo: {
+            code: 'awg-urltest-out',
+            displayName: 'AWG Pool',
+            selectedName: 'AWG-DE-1',
+            outbounds: [],
+          },
+        },
+        {
+          code: 'awg-out/AWG-DE-1',
+          displayName: 'AWG-DE-1',
+          latency: 35,
+          type: 'AmneziaWG',
+          selected: false,
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const selectable = el.querySelectorAll(
+      '.tachyon_dashboard-page__outbound-grid__item--selectable',
+    );
+    expect(selectable).toHaveLength(1);
+    expect(selectable[0].textContent).toContain('AWG-DE-1');
+  });
+
+  it('renders country chips with localized names, flag emojis, count pill badges and colored latency badges', () => {
+    const section: any = {
+      code: 'proxy-out',
+      sectionName: 'proxy',
+      displayName: 'Proxy',
+      withTagSelect: true,
+      countryGrouping: 'chips',
+      outbounds: [
+        {
+          code: 'node-de-1',
+          displayName: '🇩🇪 Германия 01',
+          latency: 42,
+          selected: true,
+          country: 'DE',
+        },
+        {
+          code: 'node-de-2',
+          displayName: '🇩🇪 Германия 02',
+          latency: 85,
+          selected: false,
+          country: 'DE',
+        },
+        {
+          code: 'node-us-1',
+          displayName: '🇺🇸 США Miami',
+          latency: 180,
+          selected: false,
+          country: 'US',
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      countryGrouping: 'chips',
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const chipsContainer = el.querySelector(
+      '.tachyon_dashboard-page__country-chips',
+    );
+    expect(chipsContainer).toBeTruthy();
+
+    const chips = chipsContainer!.querySelectorAll(
+      '.tachyon_dashboard-page__country-chip',
+    );
+    // "Все" + "Германия" + "США"
+    expect(chips).toHaveLength(3);
+
+    // "Все" chip
+    const allChip = chips[0];
+    expect(
+      allChip.classList.contains(
+        'tachyon_dashboard-page__country-chip--active',
+      ),
+    ).toBe(true);
+    expect(
+      allChip.querySelector('.tachyon_dashboard-page__country-chip__name')
+        ?.textContent,
+    ).toMatch(/Все|All/);
+    expect(
+      allChip.querySelector('.tachyon_dashboard-page__country-chip__count')
+        ?.textContent,
+    ).toBe('3');
+
+    // Country chips have flag emoji with Twemoji class, localized country name, count badge and latency badge
+    const names = Array.from(
+      chipsContainer!.querySelectorAll(
+        '.tachyon_dashboard-page__country-chip__name',
+      ),
+    ).map((n: any) => n.textContent);
+    expect(names).toContain('Германия');
+    expect(names).toContain('США');
+
+    const flags = chipsContainer!.querySelectorAll(
+      '.tachyon_dashboard-page__country-chip__flag.tachyon_dashboard-page__flag-emoji',
+    );
+    expect(flags.length).toBeGreaterThanOrEqual(2);
+
+    const counts = Array.from(
+      chipsContainer!.querySelectorAll(
+        '.tachyon_dashboard-page__country-chip__count',
+      ),
+    ).map((c: any) => c.textContent);
+    expect(counts).toEqual(['3', '2', '1']);
+
+    const fastLatency = chipsContainer!.querySelector(
+      '.tachyon_dashboard-page__country-chip__latency--fast',
+    );
+    expect(fastLatency).toBeTruthy();
+    expect(fastLatency?.textContent).toBe('42ms');
+
+    const mediumLatency = chipsContainer!.querySelector(
+      '.tachyon_dashboard-page__country-chip__latency--medium',
+    );
+    expect(mediumLatency).toBeTruthy();
+    expect(mediumLatency?.textContent).toBe('180ms');
+  });
+
+  it('renders selected-badge on active outbounds (both auto-groups and regular nodes)', () => {
+    const section: any = {
+      code: 'proxy-out',
+      sectionName: 'proxy',
+      displayName: 'Proxy',
+      withTagSelect: true,
+      countryGrouping: 'none',
+      outbounds: [
+        {
+          code: 'fastest-auto',
+          displayName: '⚡ Fastest',
+          latency: 28,
+          selected: true,
+          urlTestInfo: {
+            code: 'fastest-auto',
+            displayName: 'Fastest',
+            selectedName: 'DE-01',
+            outbounds: [],
+          },
+        },
+        {
+          code: 'node-de-1',
+          displayName: '🇩🇪 Server 1',
+          latency: 42,
+          selected: false,
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      countryGrouping: 'none',
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const activeItem = el.querySelector(
+      '.tachyon_dashboard-page__outbound-grid__item--active',
+    );
+    expect(activeItem).toBeTruthy();
+
+    const selectedBadge = activeItem!.querySelector(
+      '.tachyon_dashboard-page__outbound-grid__item__selected-badge',
+    );
+    expect(selectedBadge?.querySelector('svg')).toBeTruthy();
+    expect(selectedBadge?.textContent).toMatch(/(Активен|Active)/);
+  });
+
+  it('renders region tabs bar when configured with regions mode', () => {
+    const section: any = {
+      code: 'proxy-multi-reg',
+      sectionName: 'proxy',
+      displayName: 'Proxy',
+      withTagSelect: true,
+      dashboardSettings: {
+        countryGrouping: 'chips',
+        chipsGrouping: 'regions',
+      },
+      outbounds: [
+        { code: 'de-1', displayName: '🇩🇪 Germany', latency: 40, country: 'DE' },
+        { code: 'us-1', displayName: '🇺🇸 Miami', latency: 150, country: 'US' },
+        { code: 'ae-1', displayName: '🇦🇪 Dubai', latency: 110, country: 'AE' },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    // Check region tabs bar
+    const regionBar = el.querySelector('.tachyon_dashboard-page__region-bar');
+    expect(regionBar).toBeTruthy();
+    const regionTabs = el.querySelectorAll(
+      '.tachyon_dashboard-page__region-tab',
+    );
+    // All + Europe + Asia + Americas = 4
+    expect(regionTabs.length).toBe(4);
+  });
+
+  it('renders smart_top mode with active country, top locations and divider', () => {
+    const section: any = {
+      code: 'proxy-smart',
+      sectionName: 'proxy',
+      displayName: 'Proxy',
+      withTagSelect: true,
+      dashboardSettings: {
+        countryGrouping: 'chips',
+        chipsGrouping: 'smart_top',
+      },
+      outbounds: [
+        {
+          code: 'de-1',
+          displayName: '🇩🇪 Germany 1',
+          latency: 40,
+          country: 'DE',
+        },
+        {
+          code: 'de-2',
+          displayName: '🇩🇪 Germany 2',
+          latency: 40,
+          country: 'DE',
+        },
+        { code: 'us-1', displayName: '🇺🇸 US 1', latency: 140, country: 'US' },
+        { code: 'us-2', displayName: '🇺🇸 US 2', latency: 140, country: 'US' },
+        { code: 'us-3', displayName: '🇺🇸 US 3', latency: 140, country: 'US' },
+        {
+          code: 'nl-1',
+          displayName: '🇳🇱 Netherlands 1',
+          latency: 50,
+          country: 'NL',
+        },
+        {
+          code: 'cy-1',
+          displayName: '🇨🇾 Cyprus 1',
+          latency: 80,
+          country: 'CY',
+          selected: true,
+        },
+        {
+          code: 'fr-1',
+          displayName: '🇫🇷 France 1',
+          latency: 45,
+          country: 'FR',
+        },
+        {
+          code: 'at-1',
+          displayName: '🇦🇹 Austria 1',
+          latency: 60,
+          country: 'AT',
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const divider = el.querySelector(
+      '.tachyon_dashboard-page__country-chip-divider',
+    );
+    expect(divider).toBeTruthy();
+  });
+
+  it('renders active badge in section header when collapsed with auto selection mode', () => {
+    const section = {
+      code: 'main',
+      sectionName: 'main',
+      displayName: 'main',
+      withTagSelect: true,
+      outbounds: [
+        {
+          code: 'priority-tag',
+          displayName: 'priority',
+          selected: true,
+          latency: 27,
+          priorityInfo: {
+            code: 'priority-tag',
+            displayName: 'priority',
+            selectedName: '🇩🇪 ⚡ Германия',
+            outbounds: [
+              {
+                code: 'de-1',
+                displayName: '🇩🇪 ⚡ Германия',
+                selected: true,
+                latency: 27,
+              },
+            ],
+          },
+        },
+        {
+          code: 'de-1',
+          displayName: '🇩🇪 ⚡ Германия',
+          selected: false,
+          latency: 27,
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      isCollapsed: true,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const titleSec = el.querySelector(
+      '.tachyon_dashboard-page__outbound-section__title-section',
+    );
+    expect(titleSec).not.toBeNull();
+
+    const activeBadge = titleSec?.querySelector(
+      '.tachyon_dashboard-page__source-group__active-badge',
+    );
+    expect(activeBadge).not.toBeNull();
+    expect(activeBadge?.textContent).toContain('priority');
+    expect(activeBadge?.textContent).toContain('Германия');
+    expect(activeBadge?.textContent).toContain('27ms');
+  });
+
+  it('renders active badge with fallback to member displayName when selectedName is not set', () => {
+    const section = {
+      code: 'main',
+      sectionName: 'main',
+      displayName: 'main',
+      withTagSelect: true,
+      outbounds: [
+        {
+          code: 'urltest-tag',
+          displayName: 'urltest',
+          selected: true,
+          latency: 0,
+          urlTestInfo: {
+            code: 'urltest-tag',
+            displayName: 'urltest',
+            selectedCode: 'us-1',
+            outbounds: [
+              {
+                code: 'us-1',
+                displayName: '🇺🇸 US East',
+                selected: true,
+                latency: 142,
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      isCollapsed: true,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const activeBadge = el.querySelector(
+      '.tachyon_dashboard-page__source-group__active-badge',
+    );
+    expect(activeBadge).not.toBeNull();
+    expect(activeBadge?.textContent).toContain('urltest');
+    expect(activeBadge?.textContent).toContain('US East');
+    expect(activeBadge?.textContent).toContain('142ms');
+  });
+
+  it('renders active badge with latency in auto-groups block when collapsed', () => {
+    const section: any = {
+      code: 'main',
+      sectionName: 'main',
+      displayName: 'main',
+      withTagSelect: true,
+      dashboardSettings: {
+        countryGrouping: 'chips',
+      },
+      outbounds: [
+        {
+          code: 'priority-tag',
+          displayName: 'priority',
+          selected: true,
+          latency: 51,
+          priorityInfo: {
+            code: 'priority-tag',
+            displayName: 'priority',
+            selectedName: '🇳🇱 Hysteria 2 | Нидерланды',
+            outbounds: [
+              {
+                code: 'nl-1',
+                displayName: '🇳🇱 Hysteria 2 | Нидерланды',
+                selected: true,
+                latency: 51,
+              },
+            ],
+          },
+        },
+        {
+          code: 'nl-1',
+          displayName: '🇳🇱 Hysteria 2 | Нидерланды',
+          country: 'NL',
+          selected: false,
+          latency: 51,
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      isCollapsed: false,
+      collapsedSourceGroups: new Set(['autogrp:main']),
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    const autoGroups = el.querySelector('.tachyon_dashboard-page__auto-groups');
+    expect(autoGroups).not.toBeNull();
+    const autoBadge = autoGroups?.querySelector(
+      '.tachyon_dashboard-page__source-group__active-badge',
+    );
+    expect(autoBadge).not.toBeNull();
+    expect(autoBadge?.textContent).toContain('priority');
+    expect(autoBadge?.textContent).toContain('Нидерланды');
+    expect(autoBadge?.textContent).toContain('51ms');
+  });
+
+  it('formats subscription traffic quota in binary GiB matching outbounds pool (#383)', () => {
+    const section: any = {
+      code: 'main',
+      sectionName: 'main',
+      displayName: 'main',
+      withTagSelect: true,
+      subscriptionMetadata: [
+        {
+          title: 'subscribeRiot',
+          traffic: {
+            used: Math.round(164.3 * 1024 * 1024 * 1024),
+            total: 800 * 1024 * 1024 * 1024,
+            isUnlimited: false,
+          },
+        },
+      ],
+      outbounds: [
+        {
+          code: 'nl-1',
+          displayName: '🇳🇱 Node 1',
+          selected: true,
+          latency: 40,
+        },
+      ],
+    };
+
+    const el = renderSections({
+      loading: false,
+      failed: false,
+      section,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    });
+
+    expect(el.textContent).toContain('164.3 GB / 800.0 GB');
+    expect(el.textContent).not.toContain('176 GB / 859 GB');
+  });
+
+  it('hides hidden outbounds and metadata by default and reveals them when showHidden is true (#405)', () => {
+    const section: any = {
+      code: 'main',
+      sectionName: 'main',
+      displayName: 'main',
+      withTagSelect: true,
+      subscriptionSourceCount: 2,
+      subscriptionMetadata: [
+        {
+          title: 'VisibleSub',
+          sourceIndex: 1,
+          sourceSection: 'main',
+        },
+        {
+          title: 'SecretSub',
+          sourceIndex: 2,
+          sourceSection: 'main',
+          hidden: true,
+        },
+      ],
+      outbounds: [
+        {
+          code: 'vis-1',
+          displayName: 'Visible Node',
+          selected: true,
+          latency: 20,
+          sourceGroup: 'sub:1',
+        },
+        {
+          code: 'hid-sub-1',
+          displayName: 'Hidden Sub Node',
+          selected: false,
+          latency: 35,
+          sourceGroup: 'sub:2',
+          hidden: true,
+        },
+        {
+          code: 'hid-manual-1',
+          displayName: 'Hidden Manual Server',
+          selected: false,
+          latency: 50,
+          sourceGroup: 'manual',
+          hidden: true,
+        },
+      ],
+    };
+
+    const baseProps = {
+      loading: false,
+      failed: false,
+      section,
+      onTestLatency: vi.fn(),
+      onChooseOutbound: vi.fn(),
+      onCopyOutbound: vi.fn(),
+      onShowUrlTestInfo: vi.fn(),
+      onShowPriorityInfo: vi.fn(),
+      onUpdateSubscription: vi.fn(),
+      latencyFetching: false,
+      subscriptionUpdating: false,
+    };
+
+    const defaultEl = renderSections(baseProps);
+    expect(defaultEl.textContent).toContain('Visible Node');
+    expect(defaultEl.textContent).not.toContain('SecretSub');
+    expect(defaultEl.textContent).not.toContain('Hidden Sub Node');
+    expect(defaultEl.textContent).not.toContain('Hidden Manual Server');
+
+    const revealedEl = renderSections({ ...baseProps, showHidden: true });
+    expect(revealedEl.textContent).toContain('Visible Node');
+    expect(revealedEl.textContent).toContain('SecretSub');
+    expect(revealedEl.textContent).toContain('Hidden Sub Node');
+    expect(revealedEl.textContent).toContain('Hidden Manual Server');
+    expect(revealedEl.textContent).toContain('Hidden');
   });
 });

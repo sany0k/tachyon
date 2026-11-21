@@ -24,6 +24,8 @@ const TUN_INET6_ADDRESS = "";
 const TUN_MTU = 9000;
 // The firewall zone the tun device needs; sync_tun_firewall_zone() creates it.
 const TUN_FIREWALL_ZONE = "tachyon_tun";
+// The fwmark `tachyon-core` uses in `setup_auto_route` (`not fwmark 0x2022 lookup 2022`).
+const TUN_AUTO_ROUTE_MARK = 8226;
 
 // The client-facing SOCKS/HTTP inbound used by the socks proxy_mode. Distinct
 // from the direct-bypass mixed inbound on 2080, which is a hole on purpose: this
@@ -34,6 +36,8 @@ const CLIENT_MIXED_INBOUND_PORT = 1080;
 const DNS_INBOUND_TAG = "dns-in";
 const DNS_INBOUND_ADDRESS = "127.0.0.42";
 const DNS_INBOUND_PORT = 53;
+const DNS_INBOUND6_TAG = "dns6-in";
+const DNS_INBOUND6_ADDRESS = "::1";
 const DNS_BLOCK_INBOUND_TAG = "dns-block-in";
 const DNS_BLOCK_INBOUND_ADDRESS = "::";
 const DNS_BLOCK_INBOUND_PORT = 1053;
@@ -54,8 +58,11 @@ const DIRECT_BYPASS_INBOUND_TAG = "direct-bypass-in";
 const DIRECT_BYPASS_OUTBOUND_TAG = "direct-bypass-out";
 const DIRECT_BYPASS_DEFAULT_PORT = 2080;
 const DIRECT_OUTBOUND_TAG = "direct-out";
+const LAN_DIRECT_OUTBOUND_TAG = "lan-direct-out";
+const LO_DIRECT_OUTBOUND_TAG = "lo-direct-out";
 const BYPASS_OUTBOUND_TAG = "bypass-out";
 const OUTBOUND_MARK = 134217728;
+const FAKEIP_MARK = getenv("NFT_FAKEIP_MARK") || "0x04000000";
 const FAKEIP_INET4_RANGE = "198.18.0.0/15";
 const FAKEIP_INET6_RANGE = "fc00::/18";
 
@@ -63,16 +70,8 @@ const DISABLED_UPDATE_INTERVAL = "876000h";
 const URLTEST_DEFAULT_IDLE_TIMEOUT = "30m";
 const CHECK_PROXY_IP_DOMAIN = "ip.podkop.fyi";
 const FAKEIP_TEST_DOMAIN = "fakeip.podkop.fyi";
-const TMP_SING_BOX_FOLDER = "/tmp/tachyon-core";
-const TMP_RULESET_FOLDER = TMP_SING_BOX_FOLDER + "/rulesets";
-const ZAPRET_ROUTE_MARK_BASE = 0x01000000;
-const ZAPRET2_ROUTE_MARK_BASE = 0x02000000;
-const BYEDPI_LISTEN_ADDRESS = "127.0.0.1";
-const BYEDPI_PORT_BASE = 1080;
-const WDTT_LISTEN_ADDRESS = "127.0.0.1";
-const WDTT_PORT_BASE = 1081;
-const OLCRTC_LISTEN_ADDRESS = "127.0.0.1";
-const OLCRTC_PORT_BASE = 1082;
+const TMP_TACHYON_CORE_FOLDER = "/tmp/tachyon-core";
+const TMP_RULESET_FOLDER = TMP_TACHYON_CORE_FOLDER + "/rulesets";
 
 const DOH_BLOCK_IPV4_CIDRS = [
     "1.1.1.1/32", "1.0.0.1/32",
@@ -83,6 +82,32 @@ const DOH_BLOCK_IPV4_CIDRS = [
     "94.140.14.14/32", "94.140.15.15/32",
     "77.88.8.8/32", "77.88.8.1/32"
 ];
+
+// Well-known DoH/DoT hostnames: answered NXDOMAIN while the LAN DNS intercept
+// is on, so DoH cannot come back on an address missing from the CIDR lists.
+const DOH_BLOCK_DOMAINS = [
+    "dns.google", "dns.google.com",
+    "cloudflare-dns.com", "one.one.one.one", "cloudflare-gateway.com",
+    "dns.quad9.net", "quad9.net",
+    "doh.opendns.com", "dns.umbrella.com",
+    "dns.adguard.com", "dns.adguard-dns.com", "adguard-dns.com",
+    "dns.nextdns.io", "doh.cleanbrowsing.org",
+    "doh.mullvad.net", "dns.mullvad.net",
+    "dns.controld.com", "freedns.controld.com",
+    "dot.dns.yandex.net", "doh.libredns.gr",
+    "dns1.nextdns.io", "dns2.nextdns.io",
+    "dns.comss.one", "router.comss.one",
+    "dns.sb", "doh.sb", "dns0.eu",
+    "dns.alidns.com", "doh.pub", "dot.pub", "doh.360.cn",
+    "doh.applied-privacy.net", "dns.digitale-gesellschaft.ch", "dns.switch.ch",
+    "doh.ffmuc.net", "dns.njal.la", "doh.xfinity.com", "dns.twnic.tw",
+    // Firefox's documented canary: NXDOMAIN here turns its default DoH off.
+    "use-application-dns.net"
+];
+
+// Apple's documented signal for "this network does not allow iCloud Private
+// Relay": an NXDOMAIN for these names makes devices fall back to normal DNS.
+const PRIVATE_RELAY_CANARIES = [ "mask.icloud.com", "mask-h2.icloud.com" ];
 
 const DOH_BLOCK_IPV6_CIDRS = [
     "2606:4700:4700::1111/128", "2606:4700:4700::1001/128",
@@ -106,6 +131,7 @@ const RESERVED_TAGS = {
     [TPROXY_INBOUND_TAG]: true,
     [TPROXY_INBOUND6_TAG]: true,
     [DNS_INBOUND_TAG]: true,
+    [DNS_INBOUND6_TAG]: true,
     [DNS_BLOCK_INBOUND_TAG]: true,
     [SOURCE_DNS_INBOUND_TAG]: true,
     [DNSMASQ_DNS_SERVER_TAG]: true,
@@ -113,6 +139,8 @@ const RESERVED_TAGS = {
     [DIRECT_BYPASS_INBOUND_TAG]: true,
     [DIRECT_BYPASS_OUTBOUND_TAG]: true,
     [DIRECT_OUTBOUND_TAG]: true,
+    [LAN_DIRECT_OUTBOUND_TAG]: true,
+    [LO_DIRECT_OUTBOUND_TAG]: true,
     [BYPASS_OUTBOUND_TAG]: true
 };
 
@@ -156,6 +184,8 @@ return {
     DNS_INBOUND_TAG,
     DNS_INBOUND_ADDRESS,
     DNS_INBOUND_PORT,
+    DNS_INBOUND6_TAG,
+    DNS_INBOUND6_ADDRESS,
     DNS_BLOCK_INBOUND_TAG,
     DNS_BLOCK_INBOUND_ADDRESS,
     DNS_BLOCK_INBOUND_PORT,
@@ -175,26 +205,23 @@ return {
     DIRECT_BYPASS_OUTBOUND_TAG,
     DIRECT_BYPASS_DEFAULT_PORT,
     DIRECT_OUTBOUND_TAG,
+    LAN_DIRECT_OUTBOUND_TAG,
+    LO_DIRECT_OUTBOUND_TAG,
     BYPASS_OUTBOUND_TAG,
     OUTBOUND_MARK,
+    FAKEIP_MARK,
     FAKEIP_INET4_RANGE,
     FAKEIP_INET6_RANGE,
     DISABLED_UPDATE_INTERVAL,
     URLTEST_DEFAULT_IDLE_TIMEOUT,
     CHECK_PROXY_IP_DOMAIN,
     FAKEIP_TEST_DOMAIN,
-    TMP_SING_BOX_FOLDER,
+    TMP_TACHYON_CORE_FOLDER,
     TMP_RULESET_FOLDER,
-    ZAPRET_ROUTE_MARK_BASE,
-    ZAPRET2_ROUTE_MARK_BASE,
-    BYEDPI_LISTEN_ADDRESS,
-    BYEDPI_PORT_BASE,
-    WDTT_LISTEN_ADDRESS,
-    WDTT_PORT_BASE,
-    OLCRTC_LISTEN_ADDRESS,
-    OLCRTC_PORT_BASE,
     DOH_BLOCK_IPV4_CIDRS,
     DOH_BLOCK_IPV6_CIDRS,
+    DOH_BLOCK_DOMAINS,
+    PRIVATE_RELAY_CANARIES,
     RESERVED_TAGS,
     tag,
     inbound_tag,
@@ -208,6 +235,7 @@ return {
     TUN_INET6_ADDRESS,
     TUN_MTU,
     TUN_FIREWALL_ZONE,
+    TUN_AUTO_ROUTE_MARK,
     CLIENT_MIXED_INBOUND_TAG,
     CLIENT_MIXED_INBOUND_ADDRESS,
     CLIENT_MIXED_INBOUND_PORT

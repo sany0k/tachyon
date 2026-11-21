@@ -7,14 +7,23 @@
 let fs = require("fs");
 let common = require("core.common");
 let uci_core = require("core.uci");
-let connections = require("config.connections");
-let dns_presets = require("tachyon_core.dns_presets");
+let connections = null;
+function get_connections() {
+    if (connections == null) connections = require("config.connections");
+    return connections;
+}
+let dns_presets = null;
+function get_dns_presets() {
+    if (dns_presets == null) dns_presets = require("tachyon_core.dns_presets");
+    return dns_presets;
+}
 let api = require("service.api");
 let i18n = require("service.i18n");
 
 let rendering = require("service.telegram.rendering");
 let transport = require("service.telegram.transport");
 let commands = require("service.telegram.commands");
+let update_jobs = require("service.telegram.update_jobs");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 
@@ -53,6 +62,9 @@ let format_bytes = rendering.format_bytes;
 let escape_html = rendering.escape_html;
 let get_schema_label = rendering.get_schema_label;
 let is_boolean_key = rendering.is_boolean_key;
+let NOTIFICATION_KEYS = rendering.NOTIFICATION_KEYS;
+let effective_bool_value = rendering.effective_bool_value;
+let toggle_feature_reload_mode = rendering.toggle_feature_reload_mode;
 let is_list_key = rendering.is_list_key;
 let cidr_match_v4 = rendering.cidr_match_v4;
 let build_label = rendering.build_label;
@@ -60,6 +72,15 @@ let build_transition = rendering.build_transition;
 let build_identity_key = rendering.build_identity_key;
 let extract_clean_fptn_token = rendering.extract_clean_fptn_token;
 let mask_fptn_token = rendering.mask_fptn_token;
+let section_condition_sections = rendering.section_condition_sections;
+let section_own_and_conditions = rendering.section_own_and_conditions;
+let section_primary_atomic_condition = rendering.section_primary_atomic_condition;
+let section_match_all_enabled = rendering.section_match_all_enabled;
+let section_condition_values = rendering.section_condition_values;
+let section_outbound_sources = rendering.section_outbound_sources;
+let section_has_fptn = rendering.section_has_fptn;
+let section_fptn_token = rendering.section_fptn_token;
+let section_balancers = rendering.section_balancers;
 let normalize_mac = rendering.normalize_mac;
 let find_mac_block_rules = rendering.find_mac_block_rules;
 let valid_updatable_component = rendering.valid_updatable_component;
@@ -71,6 +92,10 @@ let backup_extract_dir = rendering.backup_extract_dir;
 let config_sane_preview = rendering.config_sane_preview;
 
 let view_settings_menu = commands.view_settings_menu;
+let view_notifications = commands.view_notifications;
+let view_toggles = commands.view_toggles;
+let view_profiles = commands.view_profiles;
+let view_schedules = commands.view_schedules;
 let view_set_list = commands.view_set_list;
 let view_set_cat = commands.view_set_cat;
 let view_set_arr = commands.view_set_arr;
@@ -80,6 +105,9 @@ let view_runtime = commands.view_runtime;
 let view_outbounds = commands.view_outbounds;
 let view_sections = commands.view_sections;
 let view_section_editor = commands.view_section_editor;
+let view_sec_conds = commands.view_sec_conds;
+let view_sec_bals = commands.view_sec_bals;
+let view_sec_grp = commands.view_sec_grp;
 let view_sec_list = commands.view_sec_list;
 let exec_doctor = commands.exec_doctor;
 let exec_restart = commands.exec_restart;
@@ -88,9 +116,14 @@ let exec_backup = commands.exec_backup;
 let exec_support_bundle = commands.exec_support_bundle;
 let exec_close_connections = commands.exec_close_connections;
 let exec_check_updates = commands.exec_check_updates;
+let exec_run_check_updates = commands.exec_run_check_updates;
 let view_instances = commands.view_instances;
 let exec_speedtest = commands.exec_speedtest;
 let view_ping = commands.view_ping;
+let exec_ping_group = commands.exec_ping_group;
+let exec_ping_all_groups = commands.exec_ping_all_groups;
+let exec_update_subs = commands.exec_update_subs;
+let exec_update_lists = commands.exec_update_lists;
 let view_quick_test = commands.view_quick_test;
 let view_logs = commands.view_logs;
 let view_system_info = commands.view_system_info;
@@ -111,15 +144,149 @@ let view_qos = commands.view_qos;
 
 let t = i18n.bind("en");
 
+function refresh_uci() {
+    let c = uci_core.cursor();
+    if (c) {
+        try { c.unload(CONFIG_NAME); } catch (e) {}
+        try { c.load(CONFIG_NAME); } catch (e) {}
+    }
+}
+
 function handle_set_tog(token, chat_id, msg_id, stype, sname, key, page) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, sname);
+    if (!s) return;
+    let b = effective_bool_value(s, stype, key);
+    uci_core.set(CONFIG_NAME, sname, key, b ? "0" : "1");
+    uci_core.commit(CONFIG_NAME);
+    if (key == "enabled") {
+        command_status(command_from_args(["/usr/bin/tachyon", "reload", "force"]));
+    }
+    return view_set_cat(token, chat_id, msg_id, stype, sname, page);
+}
+
+function is_allowed_notif_key(key) {
+    if (key == "daily_report_enabled" || key == "quiet_hours_enabled") return true;
+    for (let nk in NOTIFICATION_KEYS) {
+        if (nk == key) return true;
+    }
+    return false;
+}
+
+function handle_notif_toggle(token, chat_id, msg_id, key, from_view) {
+    if (!is_allowed_notif_key(key)) return view_notifications(token, chat_id, msg_id);
+    refresh_uci();
+    if (!uci_core.get_all(CONFIG_NAME, "telegram"))
+        uci_core.set(CONFIG_NAME, "telegram", "telegram");
+    let s = uci_core.get_all(CONFIG_NAME, "telegram");
+    let cur = effective_bool_value(s, "telegram", key);
+    uci_core.set(CONFIG_NAME, "telegram", key, cur ? "0" : "1");
+    uci_core.commit(CONFIG_NAME);
+    if (from_view == "watchdog")
+        return view_watchdog(token, chat_id, msg_id);
+    return view_notifications(token, chat_id, msg_id);
+}
+
+function handle_notif_all(token, chat_id, msg_id, val) {
+    let target_val = (val == "0") ? "0" : "1";
+    refresh_uci();
+    if (!uci_core.get_all(CONFIG_NAME, "telegram"))
+        uci_core.set(CONFIG_NAME, "telegram", "telegram");
+    for (let nk in NOTIFICATION_KEYS) {
+        uci_core.set(CONFIG_NAME, "telegram", nk, target_val);
+    }
+    uci_core.commit(CONFIG_NAME);
+    return view_notifications(token, chat_id, msg_id);
+}
+
+function apply_toggle_reload(mode, enabled_now) {
+    if (mode == "firewall") {
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", "reload_firewall"])));
+    } else if (mode == "reload") {
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", "reload"])));
+    } else if (mode == "watchdog") {
+        let wd_cmd = enabled_now ? "watchdog_start" : "watchdog_stop";
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", wd_cmd])));
+    }
+}
+
+function handle_feature_toggle(token, chat_id, msg_id, group, key) {
+    let reload_mode = toggle_feature_reload_mode(key);
+    if (reload_mode == null) {
+        return (group == "watchdog") ? view_watchdog(token, chat_id, msg_id) : view_toggles(token, chat_id, msg_id, group);
+    }
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let cur = effective_bool_value(s, "settings", key);
+        let nxt = cur ? "0" : "1";
+        uci_core.set(CONFIG_NAME, "settings", key, nxt);
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload(reload_mode, !cur);
+    }
+    if (group == "watchdog")
+        return view_watchdog(token, chat_id, msg_id);
+    return view_toggles(token, chat_id, msg_id, group);
+}
+
+function handle_sd_mode_toggle(token, chat_id, msg_id) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let nxt = (option(s, "smart_detect_mode", "default") == "plus") ? "default" : "plus";
+        uci_core.set(CONFIG_NAME, "settings", "smart_detect_mode", nxt);
+        uci_core.commit(CONFIG_NAME);
+    }
+    return view_toggles(token, chat_id, msg_id, "core");
+}
+
+function handle_quic_cycle(token, chat_id, msg_id) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let cur = option(s, "disable_quic", "0");
+        let nxt = (cur == "0" || cur == "") ? "tunneled" : ((cur == "tunneled") ? "all" : "0");
+        uci_core.set(CONFIG_NAME, "settings", "disable_quic", nxt);
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload("reload", nxt != "0");
+    }
+    return view_toggles(token, chat_id, msg_id, "net");
+}
+
+function handle_profile_toggle(token, chat_id, msg_id, pname) {
+    refresh_uci();
+    let p = uci_core.get_all(CONFIG_NAME, pname);
+    if (p && p[".type"] == "profile") {
+        let cur = effective_bool_value(p, "profile", "enabled");
+        uci_core.set(CONFIG_NAME, pname, "enabled", cur ? "0" : "1");
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload("firewall", !cur);
+    }
+    return view_profiles(token, chat_id, msg_id);
+}
+
+function handle_schedule_toggle(token, chat_id, msg_id, sname, field) {
+    let key = (field == "notify") ? "notify" : "enabled";
+    refresh_uci();
+    let sc = uci_core.get_all(CONFIG_NAME, sname);
+    if (sc && sc[".type"] == "schedule") {
+        let cur = (key == "notify") ? (option(sc, "notify", "0") == "1") : effective_bool_value(sc, "schedule", "enabled");
+        uci_core.set(CONFIG_NAME, sname, key, cur ? "0" : "1");
+        uci_core.commit(CONFIG_NAME);
+        if (key == "enabled")
+            apply_toggle_reload("reload", !cur);
+    }
+    return view_schedules(token, chat_id, msg_id);
+}
+
+function handle_set_del(token, chat_id, msg_id, stype, sname) {
     let c = uci_core.cursor();
     c.load(CONFIG_NAME);
-    let s = c.get_all(CONFIG_NAME, sname);
-    if (!s) return;
-    let b = (s[key] == "1" || s[key] == "true");
-    c.set(CONFIG_NAME, sname, key, b ? "0" : "1");
+    c.delete(CONFIG_NAME, sname);
     c.commit(CONFIG_NAME);
-    return view_set_cat(token, chat_id, msg_id, stype, sname, page);
+    command_status(command_from_args(["/usr/bin/tachyon", "reload", "force"]));
+    send_message(token, chat_id, "🗑️ <b>Deleted:</b> <code>" + escape_html(sname) + "</code>", "HTML");
+    return view_set_list(token, chat_id, null, stype);
 }
 
 function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
@@ -138,11 +305,15 @@ function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
 
     if (target_sec && all[target_sec]) {
         c.set(CONFIG_NAME, target_sec, "access_token", clean_tok);
+        for (let src in section_outbound_sources(all[target_sec])) {
+            if (src.source_type == "fptn" && src[".name"])
+                c.set(CONFIG_NAME, src[".name"], "access_token", clean_tok);
+        }
         fptn_count++;
     } else {
         for (let sname in keys(all)) {
             let s = all[sname];
-            if (type(s) == "object" && s.action == "fptn") {
+            if (type(s) == "object" && (s.action == "fptn" || (s[".type"] == "outbound_source" && s.source_type == "fptn"))) {
                 c.set(CONFIG_NAME, sname, "access_token", clean_tok);
                 fptn_count++;
             }
@@ -150,16 +321,6 @@ function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
     }
 
     c.commit(CONFIG_NAME);
-
-    try {
-        let fc = uci_core.cursor();
-        if (fc.load("fptn")) {
-            if (fc.get_all("fptn", "config")) {
-                fc.set("fptn", "config", "access_token", clean_tok);
-                fc.commit("fptn");
-            }
-        }
-    } catch (e) {}
 
     let masked = mask_fptn_token(clean_tok);
 
@@ -173,27 +334,10 @@ function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
 
     send_message(token, chat_id, "⏳ <b>" + t("fptn_token_saved_connecting") + "</b>\nToken: <code>" + escape_html(masked) + "</code>", "HTML");
 
-    // Restart FPTN runtime
-    command_status(command_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/providers/fptn/runtime.uc", "restart-runtime" ]));
-
-    // Poll up to 5 seconds for tun-fptn and table 4249 routing
-    let connected = false;
-    for (let i = 0; i < 5; i++) {
-        let out = command_output_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/providers/fptn/runtime.uc", "status" ]);
-        try {
-            let st = json(out);
-            if (st && st.running && st.tun_up && st.route_installed) {
-                connected = true;
-                break;
-            }
-        } catch (e) {}
-        command_status(command_from_args([ "sleep", "1" ]));
-    }
-
-    if (connected) {
+    let rc = command_status(command_from_args([ "/usr/bin/tachyon", "reload", "force" ]));
+    if (rc == 0) {
         let msg = "✅ <b>" + t("fptn_token_updated_title") + "</b>\n" +
-                  "Token: <code>" + escape_html(masked) + "</code>\n" +
-                  "Status: 🟢 Connected (tun-fptn & routing ready)";
+                  "Token: <code>" + escape_html(masked) + "</code>";
         send_message(token, chat_id, msg, "HTML", [
             [{ text: "⬅️ " + t("nav_menu"), callback_data: "/menu" }]
         ]);
@@ -232,40 +376,103 @@ function handle_sec_toggle(token, chat_id, msg_id, sec_name) {
     return view_section_editor(token, chat_id, msg_id, sec_name);
 }
 
-function handle_sec_action(token, chat_id, msg_id, sec_name) {
+function handle_sec_action(token, chat_id, msg_id, sec_name, explicit_act) {
     let c = uci_core.cursor();
     c.load(CONFIG_NAME);
     let s = c.get_all(CONFIG_NAME, sec_name);
     if (!s) return;
-    let acts = ["proxy", "bypass", "block", "connection"];
-    let idx = -1;
-    for (let i = 0; i < length(acts); i++) { if (acts[i] == s.action) idx = i; }
-    if (idx == -1) push(acts, s.action);
-    let next_act = acts[(idx + 1) % length(acts)];
+    let next_act = explicit_act;
+    if (!next_act || next_act == "") {
+        let acts = ["connection", "group", "dns", "bypass", "block", "hosts", "fptn", "awg"];
+        let cur = (s.action == "proxy") ? "connection" : (s.action || "connection");
+        let idx = -1;
+        for (let i = 0; i < length(acts); i++) { if (acts[i] == cur) idx = i; }
+        if (idx == -1) push(acts, cur);
+        next_act = acts[(idx + 1) % length(acts)];
+    }
     c.set(CONFIG_NAME, sec_name, "action", next_act);
     c.commit(CONFIG_NAME);
     return view_section_editor(token, chat_id, msg_id, sec_name);
 }
 
-function handle_sec_del_it(token, chat_id, msg_id, sec_name, type, val) {
+function remove_item_from_holders(c, holders, keys_to_clean, val) {
+    let match_variants = {};
+    match_variants[val] = true;
+    match_variants["." + val] = true;
+    match_variants["domain:" + val] = true;
+    match_variants["full:" + val] = true;
+    match_variants["keyword:" + val] = true;
+    match_variants["regex:" + val] = true;
+    match_variants["regexp:" + val] = true;
+
+    for (let h in holders) {
+        if (type(h) != "object") continue;
+        let hname = h[".name"];
+        if (!hname || hname == "") continue;
+        for (let k in keys_to_clean) {
+            let current = common.list_option(h, k);
+            if (length(current) > 0) {
+                let new_list = [];
+                let changed = false;
+                for (let x in current) {
+                    if (match_variants[trim(as_string(x))]) {
+                        changed = true;
+                    } else {
+                        push(new_list, x);
+                    }
+                }
+                if (changed) {
+                    if (length(new_list) > 0) c.set(CONFIG_NAME, hname, k, new_list);
+                    else c.delete(CONFIG_NAME, hname, k);
+                }
+            }
+            let tval = trim(as_string(common.option(h, k + "_text", "")));
+            if (tval != "") {
+                let kept = [];
+                let tchanged = false;
+                for (let tok in split(tval, /[\r\n,;\t ]+/)) {
+                    if (tok == "") continue;
+                    if (match_variants[tok]) tchanged = true;
+                    else push(kept, tok);
+                }
+                if (tchanged) {
+                    if (length(kept) > 0) c.set(CONFIG_NAME, hname, k + "_text", join("\n", kept));
+                    else c.delete(CONFIG_NAME, hname, k + "_text");
+                }
+            }
+        }
+    }
+}
+
+function handle_sec_del_it(token, chat_id, msg_id, sec_name, item_type, val) {
     let c = uci_core.cursor();
     c.load(CONFIG_NAME);
     let s = c.get_all(CONFIG_NAME, sec_name);
     if (!s) return;
-    
-    let current = common.list_option(s, type);
-    let new_list = [];
-    for (let x in current) if (x != val) push(new_list, x);
-    
-    c.set(CONFIG_NAME, sec_name, type, new_list);
+
+    let keys_to_clean = [ item_type ];
+    if (item_type == "domain_suffix" || item_type == "domain" || item_type == "domain_keyword" || item_type == "domain_regex" || item_type == "user_domains")
+        keys_to_clean = [ item_type, "user_domains", "domain", "domain_suffix" ];
+    else if (item_type == "source_ip_cidr" || item_type == "src_ip")
+        keys_to_clean = [ "source_ip_cidr", "fully_routed_ips", "device_ip", "src_ip" ];
+    else if (item_type == "source_macs" || item_type == "src_mac")
+        keys_to_clean = [ "source_macs", "device_mac", "src_mac" ];
+    else if (item_type == "devices" || item_type == "src_device")
+        keys_to_clean = [ "devices", "src_device" ];
+    else if (item_type == "ports" || item_type == "port")
+        keys_to_clean = [ "ports", "port" ];
+
+    remove_item_from_holders(c, section_own_and_conditions(s), keys_to_clean, val);
     c.commit(CONFIG_NAME);
-    
+
     // figure out parent list_type
     let list_type = "domain";
-    if (match(type, /^ip/)) list_type = "ip";
-    else if (match(type, /^src/)) list_type = "src";
-    else if (type == "community_lists") list_type = "ruleset";
-    
+    if (match(item_type, /^ip/) || item_type == "subnets") list_type = "ip";
+    else if (match(item_type, /^src/) || item_type == "source_ip_cidr" || item_type == "source_macs" || item_type == "devices" || item_type == "fully_routed_ips" || item_type == "device_ip" || item_type == "device_mac") list_type = "src";
+    else if (item_type == "community_lists" || item_type == "rule_set" || item_type == "rule_set_with_subnets" || item_type == "domain_ip_lists") list_type = "ruleset";
+    else if (item_type == "ports" || item_type == "port") list_type = "ports";
+    else if (item_type == "geoip_country") list_type = "geoip";
+
     return view_sec_list(token, chat_id, msg_id, sec_name, list_type);
 }
 
@@ -274,15 +481,26 @@ function handle_sec_clear(token, chat_id, msg_id, sec_name, list_type) {
     c.load(CONFIG_NAME);
     let s = c.get_all(CONFIG_NAME, sec_name);
     if (!s) return;
-    
+
     let keys = [];
-    if (list_type == "domain") keys = ["domain", "domain_suffix", "domain_keyword", "domain_regex"];
-    else if (list_type == "ip") keys = ["ip", "ip_cidr"];
-    else if (list_type == "src") keys = ["src_ip", "src_mac", "src_device"];
-    else if (list_type == "ruleset") keys = ["community_lists"];
-    
-    for (let k in keys) {
-        c.delete(CONFIG_NAME, sec_name, k);
+    if (list_type == "domain")
+        keys = ["user_domains", "user_domains_text", "domain", "domain_text", "domain_suffix", "domain_suffix_text", "domain_keyword", "domain_keyword_text", "domain_regex", "domain_regex_text"];
+    else if (list_type == "ip")
+        keys = ["ip", "ip_cidr", "ip_cidr_text", "subnets"];
+    else if (list_type == "src")
+        keys = ["src_ip", "source_ip_cidr", "source_ip_cidr_text", "fully_routed_ips", "device_ip", "src_mac", "source_macs", "device_mac", "src_device", "devices"];
+    else if (list_type == "ruleset")
+        keys = ["community_lists", "rule_set", "rule_set_with_subnets", "domain_ip_lists"];
+    else if (list_type == "ports")
+        keys = ["ports", "ports_text", "port"];
+    else if (list_type == "geoip")
+        keys = ["geoip_country"];
+
+    for (let h in section_own_and_conditions(s)) {
+        let hname = h[".name"];
+        if (!hname) continue;
+        for (let k in keys)
+            c.delete(CONFIG_NAME, hname, k);
     }
     c.commit(CONFIG_NAME);
     return view_sec_list(token, chat_id, msg_id, sec_name, list_type);
@@ -363,7 +581,7 @@ function apply_backup_restore(token, chat_id, dl_path) {
         if (command_status(command_from_args([ "cp", "-a", staged_config, "/etc/config/tachyon.restored" ])) != 0 ||
             command_status(command_from_args([ "mv", "/etc/config/tachyon.restored", "/etc/config/tachyon" ])) != 0) {
             restore_config_from_backup(cfg_backup);
-            command_status(command_from_args([ "rm", "-rf", stage ]));
+            command_status(command_from_args([ "rm", "-rf", stage, data_backup, cfg_backup ]));
             send_message(token, chat_id, "❌ <b>" + t("backup_write_config_error") + "</b>", "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
             return;
         }
@@ -385,7 +603,7 @@ function apply_backup_restore(token, chat_id, dl_path) {
             if (fs.stat(data_backup))
                 command_status(command_from_args([ "mv", data_backup, "/etc/tachyon" ]));
             restore_config_from_backup(cfg_backup);
-            command_status(command_from_args([ "rm", "-rf", stage ]));
+            command_status(command_from_args([ "rm", "-rf", stage, data_backup, cfg_backup ]));
             send_message(token, chat_id, "❌ <b>" + t("backup_write_data_error") + "</b>", "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
             return;
         }
@@ -400,9 +618,76 @@ function apply_backup_restore(token, chat_id, dl_path) {
     send_message(token, chat_id, "✅ <b>" + t("backup_done") + "</b>", "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
 }
 
+function toggle_ref_in_list(c, sec_name, list_key, item_name) {
+    let s = c.get_all(CONFIG_NAME, sec_name);
+    if (!s) return false;
+    let current = common.list_option(s, list_key);
+    let next = [];
+    let found = false;
+    for (let x in current) {
+        if (x == item_name) found = true;
+        else push(next, x);
+    }
+    if (!found) push(next, item_name);
+    if (length(next) > 0) c.set(CONFIG_NAME, sec_name, list_key, next);
+    else c.delete(CONFIG_NAME, sec_name, list_key);
+    return !found;
+}
+
+function handle_sec_cond_tog(token, chat_id, msg_id, sec_name, cond_name) {
+    let c = uci_core.cursor();
+    c.load(CONFIG_NAME);
+    toggle_ref_in_list(c, sec_name, "condition_refs", cond_name);
+    c.commit(CONFIG_NAME);
+    return view_sec_conds(token, chat_id, msg_id, sec_name);
+}
+
+function handle_sec_match_all(token, chat_id, msg_id, sec_name) {
+    let c = uci_core.cursor();
+    c.load(CONFIG_NAME);
+    let s = c.get_all(CONFIG_NAME, sec_name);
+    if (!s) return;
+    let cur = section_match_all_enabled(s);
+    let target_holder = section_primary_atomic_condition(s) || s;
+    let hname = target_holder[".name"] || sec_name;
+    if (cur) {
+        for (let h in section_own_and_conditions(s)) {
+            if (h[".name"]) c.delete(CONFIG_NAME, h[".name"], "match_all");
+        }
+    } else {
+        c.set(CONFIG_NAME, hname, "match_all", "1");
+    }
+    c.commit(CONFIG_NAME);
+    return view_sec_conds(token, chat_id, msg_id, sec_name);
+}
+
+function handle_sec_src_tog(token, chat_id, msg_id, sec_name, src_name) {
+    let c = uci_core.cursor();
+    c.load(CONFIG_NAME);
+    toggle_ref_in_list(c, sec_name, "outbound_source_refs", src_name);
+    c.commit(CONFIG_NAME);
+    return view_sec_subs(token, chat_id, msg_id, sec_name);
+}
+
+function handle_sec_bal_tog(token, chat_id, msg_id, sec_name, bal_name) {
+    let c = uci_core.cursor();
+    c.load(CONFIG_NAME);
+    toggle_ref_in_list(c, sec_name, "balancer_refs", bal_name);
+    c.commit(CONFIG_NAME);
+    return view_sec_bals(token, chat_id, msg_id, sec_name);
+}
+
+function handle_sec_grp_tog(token, chat_id, msg_id, sec_name, member_name) {
+    let c = uci_core.cursor();
+    c.load(CONFIG_NAME);
+    toggle_ref_in_list(c, sec_name, "group_members", member_name);
+    c.commit(CONFIG_NAME);
+    return view_sec_grp(token, chat_id, msg_id, sec_name);
+}
+
 function handle_sec_sub_add(token, chat_id, msg_id, sec_name, url) {
     if (!sec_name || !url) {
-        set_tg_state(chat_id, { action: "sec_sub_add" });
+        set_tg_state(chat_id, { action: "sec_sub_add", sec: sec_name || null });
         return send_message(token, chat_id, "📝 " + t("sub_enter_url"), "HTML");
     }
     url = trim(url);
@@ -415,7 +700,7 @@ function handle_sec_sub_add(token, chat_id, msg_id, sec_name, url) {
     let max_idx = 0;
     let all = c.get_all(CONFIG_NAME);
     for (let sname in all) {
-        if (all[sname][".type"] == "subscription_url") {
+        if (all[sname][".type"] == "subscription_url" || all[sname][".type"] == "outbound_source") {
             let m = match(sname, /^sub_(\d+)$/);
             if (m) {
                 let i = int(m[1]);
@@ -424,32 +709,67 @@ function handle_sec_sub_add(token, chat_id, msg_id, sec_name, url) {
         }
     }
     let new_sec = "sub_" + (max_idx + 1);
+    c.set(CONFIG_NAME, new_sec, "outbound_source");
+    c.set(CONFIG_NAME, new_sec, "source_type", "subscription");
     c.set(CONFIG_NAME, new_sec, "enabled", "1");
     c.set(CONFIG_NAME, new_sec, "section", sec_name);
     c.set(CONFIG_NAME, new_sec, "url", url);
     c.set(CONFIG_NAME, new_sec, "label", url);
+    if (all[sec_name]) {
+        c.add_list(CONFIG_NAME, sec_name, "outbound_source_refs", new_sec);
+        let brefs = common.list_option(all[sec_name], "balancer_refs");
+        if (length(brefs) > 0 && all[brefs[0]])
+            c.add_list(CONFIG_NAME, brefs[0], "source_refs", new_sec);
+    }
     c.commit(CONFIG_NAME);
     set_tg_state(chat_id, null);
-    send_message(token, chat_id, "✅ " + t("sub_added") + " <code>" + sec_name + "</code>!", "HTML");
+    send_message(token, chat_id, "✅ " + t("sub_added") + " <code>" + sec_name + "</code>!\n" + t("updating_subs_wait"), "HTML");
+    command_status(command_from_args(["/usr/bin/tachyon", "subscription_update", sec_name]));
     view_sec_subs(token, chat_id, null, sec_name);
 }
 
-function handle_sec_sub_del(token, chat_id, msg_id, sec_name, idx) {
+function handle_sec_sub_del(token, chat_id, msg_id, sec_name, target_or_idx) {
     let c = uci_core.cursor();
     c.load(CONFIG_NAME);
     let all = c.get_all(CONFIG_NAME);
-    let sub_names = [];
-    for (let sname in all) {
-        if (all[sname][".type"] == "subscription_url" && all[sname].section == sec_name) {
-            push(sub_names, sname);
-        }
+    let s = all[sec_name];
+    let target = null;
+
+    if (type(target_or_idx) == "string" && all[target_or_idx]) {
+        target = target_or_idx;
+    } else {
+        let idx = int(target_or_idx);
+        let eff = s ? section_outbound_sources(s) : [];
+        if (idx >= 0 && idx < length(eff))
+            target = eff[idx][".name"];
     }
-    if (idx < 0 || idx >= length(sub_names)) {
+
+    if (!target || !all[target]) {
         send_message(token, chat_id, "❌ " + t("sub_not_found"));
         return view_sec_subs(token, chat_id, null, sec_name);
     }
-    let target = sub_names[idx];
-    c.delete(CONFIG_NAME, target);
+
+    if (s) {
+        let orefs = common.list_option(s, "outbound_source_refs");
+        let next_orefs = [];
+        for (let r in orefs) if (r != target) push(next_orefs, r);
+        if (length(next_orefs) > 0) c.set(CONFIG_NAME, sec_name, "outbound_source_refs", next_orefs);
+        else c.delete(CONFIG_NAME, sec_name, "outbound_source_refs");
+
+        for (let bref in common.list_option(s, "balancer_refs")) {
+            let bal = all[bref];
+            if (!bal) continue;
+            let srefs = common.list_option(bal, "source_refs");
+            let next_srefs = [];
+            for (let r in srefs) if (r != target) push(next_srefs, r);
+            if (length(next_srefs) > 0) c.set(CONFIG_NAME, bref, "source_refs", next_srefs);
+            else c.delete(CONFIG_NAME, bref, "source_refs");
+        }
+    }
+
+    if (all[target][".type"] == "subscription_url" || all[target].section == sec_name) {
+        c.delete(CONFIG_NAME, target);
+    }
     c.commit(CONFIG_NAME);
     set_tg_state(chat_id, null);
     send_message(token, chat_id, "✅ " + t("sub_removed") + " <code>" + sec_name + "</code>.", "HTML");
@@ -590,11 +910,76 @@ function dispatch_command(token, chat_id, text, msg_id) {
     if (cmd == "/status") return view_status(token, chat_id, msg_id);
     if (cmd == "/runtime") return view_runtime(token, chat_id, msg_id);
     if (cmd == "/heal" || cmd == "/ai_heal" || cmd == "/ai_doctor") return exec_ai_heal(token, chat_id, msg_id);
+    if (cmd == "/reload_tachyon" || cmd == "/restart_tachyon") {
+        send_message(token, chat_id, "🔄 <b>" + t("menu_restart") + "...</b>", "HTML");
+        command_status(command_from_args(["/usr/bin/tachyon", "reload", "force"]));
+        return send_message(token, chat_id, "✅ <b>Tachyon reloaded</b>", "HTML", [
+            [{ text: "🏠 " + t("nav_menu"), callback_data: "/menu" }]
+        ]);
+    }
+    if (cmd == "/restore_internet" || cmd == "/restore_native_internet") {
+        send_message(token, chat_id, "🚑 <b>" + t("menu_restore_internet") + "...</b>", "HTML");
+        command_status(command_from_args(["/usr/bin/tachyon", "restore_native_internet"]));
+        return send_message(token, chat_id, "✅ <b>" + t("internet_restored") + "</b>", "HTML", [
+            [{ text: "🏠 " + t("nav_menu"), callback_data: "/menu" }]
+        ]);
+    }
     if (cmd == "/qos") return view_qos(token, chat_id, msg_id);
     if (cmd == "/qos_toggle") return handle_qos_toggle(token, chat_id, msg_id);
+    if (cmd == "/notifications" || cmd == "/notify") return view_notifications(token, chat_id, msg_id);
+    if (match(cmd, /^\/notif_tog /)) {
+        let parts = split(trim(substr(cmd, 11)), " ");
+        if (length(parts) >= 1)
+            return handle_notif_toggle(token, chat_id, msg_id, parts[0], parts[1] || "");
+    }
+    if (match(cmd, /^\/notif_all /)) {
+        return handle_notif_all(token, chat_id, msg_id, trim(substr(cmd, 11)));
+    }
+    if (cmd == "/toggles" || cmd == "/features") return view_toggles(token, chat_id, msg_id, "core");
+    if (match(cmd, /^\/(toggles|features) /)) {
+        let grp = trim(replace(cmd, /^\/(toggles|features)[ \t]+/, ""));
+        return view_toggles(token, chat_id, msg_id, grp);
+    }
+    if (match(cmd, /^\/tog /)) {
+        let parts = split(trim(substr(cmd, 5)), " ");
+        if (length(parts) >= 2)
+            return handle_feature_toggle(token, chat_id, msg_id, parts[0], parts[1]);
+    }
+    if (cmd == "/tog_sd_mode") return handle_sd_mode_toggle(token, chat_id, msg_id);
+    if (cmd == "/tog_quic") return handle_quic_cycle(token, chat_id, msg_id);
+    if (cmd == "/profiles") return view_profiles(token, chat_id, msg_id);
+    if (match(cmd, /^\/prof_tog /)) {
+        return handle_profile_toggle(token, chat_id, msg_id, trim(substr(cmd, 10)));
+    }
+    if (cmd == "/schedules") return view_schedules(token, chat_id, msg_id);
+    if (match(cmd, /^\/sched_tog /)) {
+        return handle_schedule_toggle(token, chat_id, msg_id, trim(substr(cmd, 11)), "enabled");
+    }
+    if (match(cmd, /^\/sched_notif /)) {
+        return handle_schedule_toggle(token, chat_id, msg_id, trim(substr(cmd, 13)), "notify");
+    }
 
     if (cmd == "/speed") return exec_speedtest(token, chat_id, msg_id);
     if (cmd == "/ping") return view_ping(token, chat_id, msg_id);
+    if (cmd == "/ping_all") return exec_ping_all_groups(token, chat_id, msg_id, "ping");
+    if (cmd == "/ping_all_groups") return exec_ping_all_groups(token, chat_id, msg_id, "outbounds");
+    if (match(cmd, /^\/ping_group /)) {
+        let parts = split(cmd, " ");
+        let rest = slice(parts, 1);
+        let page = 0;
+        if (length(rest) > 1 && match(trim(rest[0]), /^[0-9]+$/) != null) {
+            page = int(trim(rest[0]));
+            rest = slice(rest, 1);
+        }
+        let grp = trim(join(" ", rest));
+        return exec_ping_group(token, chat_id, msg_id, page, grp);
+    }
+    if (cmd == "/update_subs") return exec_update_subs(token, chat_id, msg_id, null);
+    if (match(cmd, /^\/update_subs /)) {
+        let grp = trim(substr(cmd, 13));
+        return exec_update_subs(token, chat_id, msg_id, grp);
+    }
+    if (cmd == "/update_lists") return exec_update_lists(token, chat_id, msg_id);
     if (cmd == "/test") return view_quick_test(token, chat_id, msg_id);
     if (cmd == "/info") return view_system_info(token, chat_id, msg_id);
     if (cmd == "/help") return view_help(token, chat_id, msg_id);
@@ -703,6 +1088,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
     if (cmd == "/close_connections") return exec_close_connections(token, chat_id);
     if (cmd == "/instances") return view_instances(token, chat_id, msg_id);
     if (cmd == "/check_updates") return exec_check_updates(token, chat_id, msg_id);
+    if (cmd == "/run_check_updates") return exec_run_check_updates(token, chat_id, msg_id);
     
     if (match(cmd, /^\/update_component /)) {
         let comp = trim(substr(cmd, 17));
@@ -710,9 +1096,26 @@ function dispatch_command(token, chat_id, text, msg_id) {
             send_message(token, chat_id, "❌ <b>" + t("err_unknown_component") + "</b> <code>" + escape_html(comp) + "</code>", "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
             return;
         }
-        if (msg_id) edit_message(token, chat_id, msg_id, t("update_component_title") + " " + escape_html(comp) + "...</b>\n" + t("update_bg_hint"), "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
-        else send_message(token, chat_id, t("update_component_title") + " " + escape_html(comp) + "...</b>\n" + t("update_bg_hint"), "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
-        command_status(command_from_args(["/usr/bin/tachyon", "component_action_async", comp, "install"]));
+        let comp_title = rendering.component_display_title(comp);
+        let res = command_capture(command_from_args(["/usr/bin/tachyon", "component_action_async", comp, "install"]));
+        let parsed = null;
+        if (res && res.output != "") {
+            try { parsed = json(res.output); } catch (e) {}
+        }
+        if (res && res.status == 0 && parsed && parsed.success === true) {
+            // The job runs in the background; remember it so the worker loop can
+            // report the final version (or the error) to this chat.
+            if (parsed.job_id != null && as_string(parsed.job_id) != "")
+                update_jobs.register(parsed.job_id, comp, chat_id, msg_id);
+            let ok_text = "⏳ <b>" + t("update_component_title") + " " + escape_html(comp_title) + "...</b>\n" + t("update_bg_hint");
+            if (msg_id) edit_message(token, chat_id, msg_id, ok_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+            else send_message(token, chat_id, ok_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+            return;
+        }
+        let err_msg = (parsed && parsed.message) ? parsed.message : "Failed to start update job";
+        let fail_text = "❌ <b>" + t("update_component_title") + " " + escape_html(comp_title) + ": " + t("action_failed") + "</b>\n" + escape_html(err_msg);
+        if (msg_id) edit_message(token, chat_id, msg_id, fail_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+        else send_message(token, chat_id, fail_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
         return;
     }
     
@@ -767,8 +1170,50 @@ function dispatch_command(token, chat_id, text, msg_id) {
         return send_message(token, chat_id, t("sec_enter_target") + " <code>" + sec + "</code> (например, <code>main-out</code> или <code>direct-out</code>):\n\n<i>Отправьте /cancel для отмены</i>", "HTML");
     }
     if (match(cmd, /^\/sec_action /)) {
-        let sec = trim(substr(cmd, 12));
-        return handle_sec_action(token, chat_id, msg_id, sec);
+        let parts = split(trim(substr(cmd, 12)), " ");
+        return handle_sec_action(token, chat_id, msg_id, parts[0], parts[1] || "");
+    }
+    if (match(cmd, /^\/sec_dns_edit /)) {
+        let sec = trim(substr(cmd, 14));
+        set_tg_state(chat_id, { action: "sec_dns_edit", sec: sec });
+        return send_message(token, chat_id, t("sec_dns_prompt"), "HTML");
+    }
+    if (match(cmd, /^\/sec_conds /)) {
+        let sec = trim(substr(cmd, 11));
+        return view_sec_conds(token, chat_id, msg_id, sec);
+    }
+    if (match(cmd, /^\/sec_cond_tog /)) {
+        let parts = split(trim(substr(cmd, 14)), " ");
+        if (length(parts) >= 2) return handle_sec_cond_tog(token, chat_id, msg_id, parts[0], parts[1]);
+    }
+    if (match(cmd, /^\/sec_cond_new /)) {
+        let sec = trim(substr(cmd, 14));
+        set_tg_state(chat_id, { action: "sec_cond_new", sec: sec });
+        return send_message(token, chat_id, t("sec_cond_enter_name"), "HTML");
+    }
+    if (match(cmd, /^\/sec_match_all /)) {
+        let sec = trim(substr(cmd, 15));
+        return handle_sec_match_all(token, chat_id, msg_id, sec);
+    }
+    if (match(cmd, /^\/sec_bals /)) {
+        let sec = trim(substr(cmd, 10));
+        return view_sec_bals(token, chat_id, msg_id, sec);
+    }
+    if (match(cmd, /^\/sec_bal_tog /)) {
+        let parts = split(trim(substr(cmd, 13)), " ");
+        if (length(parts) >= 2) return handle_sec_bal_tog(token, chat_id, msg_id, parts[0], parts[1]);
+    }
+    if (match(cmd, /^\/sec_grp /)) {
+        let sec = trim(substr(cmd, 9));
+        return view_sec_grp(token, chat_id, msg_id, sec);
+    }
+    if (match(cmd, /^\/sec_grp_tog /)) {
+        let parts = split(trim(substr(cmd, 13)), " ");
+        if (length(parts) >= 2) return handle_sec_grp_tog(token, chat_id, msg_id, parts[0], parts[1]);
+    }
+    if (match(cmd, /^\/sec_src_tog /)) {
+        let parts = split(trim(substr(cmd, 13)), " ");
+        if (length(parts) >= 2) return handle_sec_src_tog(token, chat_id, msg_id, parts[0], parts[1]);
     }
     if (match(cmd, /^\/sec_delete /)) {
         let sec = trim(substr(cmd, 12));
@@ -779,7 +1224,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
             send_message(token, chat_id, "❌ " + t("sec_not_found") + " <code>" + sec + "</code>", "HTML");
             return view_sections(token, chat_id, null);
         }
-        connections.cascade_delete_section(c, CONFIG_NAME, sec);
+        get_connections().cascade_delete_section(c, CONFIG_NAME, sec);
         c.delete(CONFIG_NAME, sec);
         c.commit(CONFIG_NAME);
         send_message(token, chat_id, "✅ " + t("sec_deleted") + " <code>" + sec + "</code>", "HTML");
@@ -829,6 +1274,8 @@ function dispatch_command(token, chat_id, text, msg_id) {
             let sec = parts[0];
             let url = join(" ", slice(parts, 1));
             return handle_sec_sub_add(token, chat_id, msg_id, sec, url);
+        } else if (length(parts) == 1 && parts[0] != "") {
+            return handle_sec_sub_add(token, chat_id, msg_id, parts[0], null);
         }
     }
     if (cmd == "/sec_sub_add") {
@@ -837,7 +1284,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
     }
     if (match(cmd, /^\/sec_sub_del /)) {
         let parts = split(trim(substr(cmd, 13)), " ");
-        if (length(parts) == 2) return handle_sec_sub_del(token, chat_id, msg_id, parts[0], int(parts[1]));
+        if (length(parts) == 2) return handle_sec_sub_del(token, chat_id, msg_id, parts[0], parts[1]);
     }
 
     
@@ -849,6 +1296,10 @@ function dispatch_command(token, chat_id, text, msg_id) {
     if (match(cmd, /^\/set_cat /)) {
         let parts = split(trim(substr(cmd, 9)), " ");
         if (length(parts) >= 2) return view_set_cat(token, chat_id, msg_id, parts[0], parts[1], parts[2]);
+    }
+    if (match(cmd, /^\/set_del /)) {
+        let parts = split(trim(substr(cmd, 9)), " ");
+        if (length(parts) >= 2) return handle_set_del(token, chat_id, msg_id, parts[0], parts[1]);
     }
     if (match(cmd, /^\/set_tog /)) {
         let parts = split(trim(substr(cmd, 9)), " ");
@@ -895,11 +1346,12 @@ function dispatch_command(token, chat_id, text, msg_id) {
     }
 
     if (cmd == "/dns_presets" || cmd == "/dns_servers") {
+        let dp = get_dns_presets();
         let c = uci_core.cursor(); c.load(CONFIG_NAME);
         let s = c.get_all(CONFIG_NAME, "settings");
         let dns_type = option(s, "dns_type", "doh");
-        let text = dns_presets.format_presets_list(dns_type);
-        let presets = dns_presets.get_presets(dns_type);
+        let text = dp.format_presets_list(dns_type);
+        let presets = dp.get_presets(dns_type);
         let keyboard = [];
         for (let i = 0; i < length(presets); i++) {
             let p = presets[i];
@@ -912,24 +1364,26 @@ function dispatch_command(token, chat_id, text, msg_id) {
         return;
     }
     if (match(cmd, /^\/dns_apply /)) {
+        let dp = get_dns_presets();
         let idx = int(trim(substr(cmd, 11)));
         let c = uci_core.cursor(); c.load(CONFIG_NAME);
         let s = c.get_all(CONFIG_NAME, "settings");
         let dns_type = option(s, "dns_type", "doh");
-        let presets = dns_presets.get_presets(dns_type);
+        let presets = dp.get_presets(dns_type);
         if (idx >= 0 && idx < length(presets)) {
             let preset = presets[idx];
-            let servers = dns_presets.get_preset_servers(preset);
+            let servers = dp.get_preset_servers(preset);
             c.delete(CONFIG_NAME, "settings", "dns_server");
             for (let srv in servers) c.add_list(CONFIG_NAME, "settings", "dns_server", srv);
             c.commit(CONFIG_NAME);
-            send_message(token, chat_id, "✅ <b>" + t("dns_servers_applied") + "</b>\n" + dns_presets.format_preset(preset, idx) + "\n\nТип: <code>" + dns_type + "</code>\n\n⚠️ " + t("dns_restart_hint"), "HTML", [[{text: "🔄 Перезапустить", callback_data: "/confirm_restart"}, {text: "⬅️ " + t("nav_back"), callback_data: "/dns_presets"}]]);
+            send_message(token, chat_id, "✅ <b>" + t("dns_servers_applied") + "</b>\n" + dp.format_preset(preset, idx) + "\n\nТип: <code>" + dns_type + "</code>\n\n⚠️ " + t("dns_restart_hint"), "HTML", [[{text: "🔄 Перезапустить", callback_data: "/confirm_restart"}, {text: "⬅️ " + t("nav_back"), callback_data: "/dns_presets"}]]);
         }
         return;
     }
     if (cmd == "/bootstrap_presets") {
-        let text = dns_presets.format_bootstrap_presets_list();
-        let presets = dns_presets.get_bootstrap_presets();
+        let dp = get_dns_presets();
+        let text = dp.format_bootstrap_presets_list();
+        let presets = dp.get_bootstrap_presets();
         let keyboard = [];
         for (let i = 0; i < length(presets); i++) {
             let p = presets[i];
@@ -941,21 +1395,23 @@ function dispatch_command(token, chat_id, text, msg_id) {
         return;
     }
     if (match(cmd, /^\/bootstrap_apply /)) {
+        let dp = get_dns_presets();
         let idx = int(trim(substr(cmd, 17)));
-        let presets = dns_presets.get_bootstrap_presets();
+        let presets = dp.get_bootstrap_presets();
         if (idx >= 0 && idx < length(presets)) {
             let preset = presets[idx];
-            let servers = dns_presets.get_preset_servers(preset);
+            let servers = dp.get_preset_servers(preset);
             let c = uci_core.cursor(); c.load(CONFIG_NAME);
             c.delete(CONFIG_NAME, "settings", "bootstrap_dns_server");
             for (let srv in servers) c.add_list(CONFIG_NAME, "settings", "bootstrap_dns_server", srv);
             c.commit(CONFIG_NAME);
-            send_message(token, chat_id, "✅ <b>" + t("dns_bootstrap_applied") + "</b>\n" + dns_presets.format_preset(preset, idx) + "\n\n⚠️ " + t("dns_restart_hint"), "HTML", [[{text: "🔄 Перезапустить", callback_data: "/confirm_restart"}, {text: "⬅️ " + t("nav_back"), callback_data: "/bootstrap_presets"}]]);
+            send_message(token, chat_id, "✅ <b>" + t("dns_bootstrap_applied") + "</b>\n" + dp.format_preset(preset, idx) + "\n\n⚠️ " + t("dns_restart_hint"), "HTML", [[{text: "🔄 Перезапустить", callback_data: "/confirm_restart"}, {text: "⬅️ " + t("nav_back"), callback_data: "/bootstrap_presets"}]]);
         }
         return;
     }
     if (cmd == "/dns_protocols") {
-        let text = dns_presets.format_protocol_info();
+        let dp = get_dns_presets();
+        let text = dp.format_protocol_info();
         let keyboard = [[{ text: "⬅️ " + t("nav_back"), callback_data: "/dns_presets" }]];
         if (msg_id) edit_message(token, chat_id, msg_id, text, "HTML", keyboard);
         else send_message(token, chat_id, text, "HTML", keyboard);
@@ -980,10 +1436,23 @@ function dispatch_command(token, chat_id, text, msg_id) {
 
 return {
     handle_set_tog,
+    handle_notif_toggle,
+    handle_notif_all,
+    handle_feature_toggle,
+    handle_sd_mode_toggle,
+    handle_quic_cycle,
+    handle_profile_toggle,
+    handle_schedule_toggle,
+    handle_set_del,
     handle_fptn_token_update,
     handle_switch,
     handle_sec_toggle,
     handle_sec_action,
+    handle_sec_cond_tog,
+    handle_sec_match_all,
+    handle_sec_src_tog,
+    handle_sec_bal_tog,
+    handle_sec_grp_tog,
     handle_sec_del_it,
     handle_sec_clear,
     apply_confirmed_restart,

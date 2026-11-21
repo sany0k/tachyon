@@ -9,6 +9,17 @@ const SERVER_OUTBOUND_TYPES = new Set([
   'http',
   'hysteria2',
   'hysteria',
+  'tuic',
+  'anytls',
+  'shadowtls',
+  'snell',
+  'mieru',
+  'naive',
+  'tewfai',
+  'trusttunnel',
+  'masque',
+  'openconnect',
+  'wdtt',
 ]);
 
 function invalid(message: string): ValidationResult {
@@ -29,6 +40,17 @@ function validateServerPort(value: unknown): boolean {
     Number.isInteger(value) &&
     value >= 1 &&
     value <= 65535
+  );
+}
+
+function validateServerPorts(value: unknown): boolean {
+  if (nonEmptyString(value)) {
+    return true;
+  }
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => nonEmptyString(item) || validateServerPort(item))
   );
 }
 
@@ -95,7 +117,12 @@ export function validateOutboundJson(
       );
     }
 
-    if (!validateServerPort(parsed.server_port)) {
+    const allowsPortRanges = type === 'mieru' || type === 'hysteria2';
+    const hasValidServerPort = validateServerPort(parsed.server_port);
+    const hasValidServerPorts =
+      allowsPortRanges && validateServerPorts(parsed.server_ports);
+
+    if (!hasValidServerPort && !hasValidServerPorts) {
       return invalid(
         _('Server outbound must contain a numeric server_port from 1 to 65535'),
       );

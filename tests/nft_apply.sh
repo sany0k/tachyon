@@ -165,6 +165,11 @@ if [ "$#" -eq 2 ] && [ "$1" = "-n" ] && [ "$2" = "net.bridge.bridge-nf-call-ipta
   exit 0
 fi
 
+if [ "$#" -eq 2 ] && [ "$1" = "-n" ] && [ "$2" = "net.bridge.bridge-nf-call-ip6tables" ]; then
+  printf '%s\n' "${SYSCTL_BRIDGE_NF_CALL_IP6TABLES:-0}"
+  exit 0
+fi
+
 exit 0
 SYSCTL
 chmod 0755 "$WORK_DIR/bin/sysctl"
@@ -276,7 +281,7 @@ assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tip6\tdaddr\t2606:4700:4700::1111/128\tmeta\tmark\tset\t0x00100000\tcounter' "runtime doh6 block marking rule"
 
 : > "$NFT_LOG"
-nft_ucode nft-create-runtime-output-rules TachyonTable localv4 tachyon_subnets tachyon_ports tachyon_ip_ports 0x00100000 198.18.0.0/15
+TACHYON_MOCK_WAN6_PD="2001:db8::/56" nft_ucode nft-create-runtime-output-rules TachyonTable localv4 tachyon_subnets tachyon_ports tachyon_ip_ports 0x00100000 198.18.0.0/15
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tip\tdaddr\t@tachyon_subnets\tmeta\tl4proto\ttcp\tmeta\tmark\tset\t0x00100000\tcounter' "runtime output common tcp"
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tip6\tdaddr\t@tachyon_subnets6\tmeta\tl4proto\ttcp\tmeta\tmark\tset\t0x00100000\tcounter' "runtime output common6 tcp"
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tip\tdaddr\t.\ttcp\tdport\t@tachyon_ip_ports\tmeta\tmark\tset\t0x00100000\tcounter' "runtime output ip-port tcp"
@@ -291,36 +296,6 @@ fi
 [ ! -s "$WORK_DIR/nft-table-present.err" ] ||
   fail "missing nft table predicate must suppress nft stderr"
 assert_contains "$NFT_LOG" $'nft\tlist\ttable\tinet\tTachyonTable' "nft table presence check"
-
-cat >"$WORK_DIR/provider-rules.json" <<'JSON'
-{
-  "section": [
-    { ".name": "direct", "enabled": "1", "action": "bypass" },
-    { ".name": "zapret_one", "enabled": "1", "action": "zapret" },
-    { ".name": "zapret_disabled", "enabled": "0", "action": "zapret" },
-    { ".name": "zapret_two", "enabled": "1", "action": "zapret" },
-    { ".name": "zapret2_one", "enabled": "1", "action": "zapret2" }
-  ]
-}
-JSON
-provider_bin="$WORK_DIR/bin/provider"
-printf '#!/usr/bin/env sh\nexit 0\n' >"$provider_bin"
-chmod 0755 "$provider_bin"
-
-: > "$NFT_LOG"
-nft_ucode nft-create-provider-output-rules-fixture "$WORK_DIR/provider-rules.json" TachyonTable zapret "$provider_bin" 0x01000000 4000 0x40000000 0x20000000
-assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tmeta\tmark\t&\t0x40000000\t==\t0x40000000\treturn' "zapret desync return"
-assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tmeta\tmark\t0x01000001\tmeta\tl4proto\ttcp\tcounter\tqueue\tnum\t4000\tbypass' "zapret first tcp queue rule"
-assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tmeta\tmark\t0x01000002\tmeta\tl4proto\tudp\tcounter\tqueue\tnum\t4001\tbypass' "zapret second udp queue rule"
-if grep -Fq 'zapret_disabled' "$NFT_LOG"; then
-  fail "disabled provider section should not create nft rule"
-fi
-
-: > "$NFT_LOG"
-nft_ucode nft-create-provider-output-rules-fixture "$WORK_DIR/provider-rules.json" TachyonTable zapret "$WORK_DIR/bin/missing-provider" 0x01000000 4000 0x40000000 0x20000000
-if [ -s "$NFT_LOG" ]; then
-  fail "missing provider binary should skip provider nft output rules"
-fi
 
 cat >"$WORK_DIR/priority-rules.json" <<'JSON'
 {
@@ -359,6 +334,13 @@ cat >"$WORK_DIR/priority-rules.json" <<'JSON'
       "enabled": "1",
       "action": "proxy",
       "source_ip_cidr": [ "192.168.1.60/32" ]
+    },
+    {
+      ".name": "block_ip",
+      ".type": "section",
+      "enabled": "1",
+      "action": "block",
+      "ip_cidr": [ "66.254.114.249/32" ]
     }
   ]
 }
@@ -375,6 +357,9 @@ assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tsaddr\t@tachyon_rule_source_bypass_sources\tip\tdaddr\t!=\t@localv4\tcounter\taccept' "source-only bypass priority rule"
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tsaddr\t@tachyon_rule_source_proxy_sources\tip\tdaddr\t!=\t@localv4\tmeta\tl4proto\ttcp\tmeta\tmark\tset\t0x00100000\tcounter\taccept' "source-only proxy tcp priority rule"
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tsaddr\t@tachyon_rule_source_proxy_sources\tip\tdaddr\t!=\t@localv4\tmeta\tl4proto\tudp\tmeta\tmark\tset\t0x00100000\tcounter\taccept' "source-only proxy udp priority rule"
+assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tdaddr\t!=\t@localv4\tip\tdaddr\t@tachyon_rule_block_ip_subnets\tmeta\tl4proto\ttcp\tcounter\treject\twith\ttcp\treset' "block priority tcp reject rule"
+assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tdaddr\t!=\t@localv4\tip\tdaddr\t@tachyon_rule_block_ip_subnets\tmeta\tl4proto\tudp\tcounter\treject' "block priority udp reject rule"
+assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tdaddr\t!=\t@localv4\tip\tdaddr\t@tachyon_rule_block_ip_subnets\tcounter\tdrop' "block priority icmp/other drop rule"
 assert_line_before "$NFT_LOG" \
   $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tdaddr\t!=\t@localv4\tip\tdaddr\t@tachyon_rule_bypass_first_subnets\tcounter\taccept' \
   $'nft\tadd\trule\tinet\tTachyonTable\tpriority_rules\tiifname\t@tachyon_interfaces\tip\tdaddr\t!=\t@localv4\tip\tdaddr\t@tachyon_rule_wide_proxy_subnets\tmeta\tl4proto\ttcp\tmeta\tmark\tset\t0x00100000\tcounter\taccept' \
@@ -383,7 +368,7 @@ assert_line_before "$NFT_LOG" \
 : > "$IP_LOG"
 : > "$LOGGER_LOG"
 rt_tables="$WORK_DIR/rt_tables"
-IP_ROUTE_LIST_FAIL=1 IP_ROUTE6_LIST_FAIL=1 IP_RULE_OUTPUT='' IP_RULE6_OUTPUT='' \
+TACHYON_MOCK_WAN6_PD="2001:db8::/56" IP_ROUTE_LIST_FAIL=1 IP_ROUTE6_LIST_FAIL=1 IP_RULE_OUTPUT='' IP_RULE6_OUTPUT='' \
   nft_ucode ensure-tproxy-route-rule tachyon 0x00100000 "$rt_tables" 2>"$WORK_DIR/tproxy-route-check.err"
 [ ! -s "$WORK_DIR/tproxy-route-check.err" ] ||
   fail "missing tproxy route table predicates must suppress ip stderr"
@@ -400,7 +385,7 @@ assert_contains "$LOGGER_LOG" "[debug] Creating IPv6 TPROXY marking rule" "tprox
 : > "$IP_LOG"
 : > "$LOGGER_LOG"
 printf '%s\n' '105 tachyon' >"$rt_tables"
-IP_ROUTE_OUTPUT='local default dev lo scope host' \
+TACHYON_MOCK_WAN6_PD="2001:db8::/56" IP_ROUTE_OUTPUT='local default dev lo scope host' \
   IP_ROUTE6_OUTPUT='local default dev lo metric 1024 pref medium' \
   IP_RULE_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup tachyon' \
   IP_RULE6_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup tachyon' \
@@ -412,12 +397,12 @@ assert_contains "$LOGGER_LOG" "[debug] IPv4 TPROXY route already exists" "existi
 assert_contains "$LOGGER_LOG" "[debug] IPv6 TPROXY route already exists" "existing tproxy route6 log"
 assert_contains "$LOGGER_LOG" "[debug] IPv4 TPROXY marking rule already exists" "existing tproxy marking rule log"
 assert_contains "$LOGGER_LOG" "[debug] IPv6 TPROXY marking rule already exists" "existing tproxy marking rule6 log"
-IP_ROUTE_OUTPUT='local default dev lo scope host' \
+TACHYON_MOCK_WAN6_PD="2001:db8::/56" IP_ROUTE_OUTPUT='local default dev lo scope host' \
   IP_ROUTE6_OUTPUT='local default dev lo metric 1024 pref medium' \
   IP_RULE_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup tachyon' \
   IP_RULE6_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup tachyon' \
   nft_ucode tproxy-route-rule-present tachyon 0x00100000
-if IP_ROUTE_OUTPUT='local default dev lo scope host' \
+if TACHYON_MOCK_WAN6_PD="2001:db8::/56" IP_ROUTE_OUTPUT='local default dev lo scope host' \
   IP_ROUTE6_OUTPUT='local default dev lo metric 1024 pref medium' \
   IP_RULE_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup other' \
   IP_RULE6_OUTPUT='105: from all fwmark 0x100000/0x100000 lookup tachyon' \
@@ -446,6 +431,14 @@ LSMOD_OUTPUT='' SYSCTL_BRIDGE_NF_CALL_IPTABLES=1 nft_ucode ensure-bridge-netfilt
 if [ -s "$SYSCTL_LOG" ]; then
   fail "bridge netfilter absent should not call sysctl"
 fi
+
+: > "$SYSCTL_LOG"
+: > "$LOGGER_LOG"
+LSMOD_OUTPUT='br_netfilter 32768 0' SYSCTL_BRIDGE_NF_CALL_IPTABLES=0 SYSCTL_BRIDGE_NF_CALL_IP6TABLES=1 nft_ucode ensure-bridge-netfilter-disabled
+assert_contains "$SYSCTL_LOG" $'sysctl\t-n\tnet.bridge.bridge-nf-call-ip6tables' "bridge netfilter ipv6 sysctl check"
+assert_contains "$SYSCTL_LOG" $'sysctl\t-w\tnet.bridge.bridge-nf-call-iptables=0' "bridge netfilter ipv6-only trigger still resets iptables=0"
+assert_contains "$SYSCTL_LOG" $'sysctl\t-w\tnet.bridge.bridge-nf-call-ip6tables=0' "bridge netfilter ipv6-only trigger resets ip6tables=0"
+assert_contains "$LOGGER_LOG" "[debug] br_netfilter is enabled; disabling it for transparent proxy routing" "bridge netfilter ipv6-only disable log"
 
 input="$WORK_DIR/ips.txt"
 cat >"$input" <<'EOF_INPUT'
@@ -628,6 +621,104 @@ if grep -Fq 'tachyon_discord_subnets' "$NFT_LOG"; then
 fi
 assert_contains "$NFT_LOG" $'198.51.100.210 . 53,198.51.100.210 . 853,198.51.100.210 . 5353' "discord community with ports uses scoped import"
 
+# Mixed lists must retain IPv4 and port matchers while omitting IPv6 elements
+# when the kernel has IPv6 disabled. Exercise file, inline CSV and community
+# value imports, then repeat with IPv6 enabled to cover both runtime modes.
+assert_ipv6_elements() {
+  local enabled="$1"
+  local label="$2"
+  if [ "$enabled" = 0 ]; then
+    if grep -F '2001:db8::' "$NFT_LOG" | grep -F $'nft\tadd\telement' >/dev/null; then
+      fail "$label: disabled IPv6 populated an address or tuple set"
+    fi
+  else
+    if ! grep -F '2001:db8::' "$NFT_LOG" | grep -F $'nft\tadd\telement' >/dev/null; then
+      fail "$label: enabled IPv6 was omitted from address or tuple sets"
+    fi
+  fi
+}
+
+for ipv6 in 0 1; do
+  for section in inline_no_ports ports_only; do
+    : > "$NFT_LOG"
+    TACHYON_ENABLE_IPV6="$ipv6" nft_ucode nft-add-subnet-file-for-section-fixture "$WORK_DIR/populate-fixture.json" "$section" "$plain_subnets" TachyonTable tachyon_subnets tachyon_ip_ports 3
+    assert_contains "$NFT_LOG" '198.51.100.210' "IPv4 file import (IPv6=$ipv6, section=$section)"
+    assert_ipv6_elements "$ipv6" "file import $section"
+  done
+
+  : > "$NFT_LOG"
+  TACHYON_ENABLE_IPV6="$ipv6" nft_ucode nft-populate-runtime-sets-fixture "$WORK_DIR/populate-fixture.json" 1 "deferred" TachyonTable tachyon_subnets tachyon_ports tachyon_ip_ports tachyon_interfaces localv4 0x00100000
+  assert_contains "$NFT_LOG" '198.51.100.1 . 80' "IPv4 inline tuples (IPv6=$ipv6)"
+  assert_contains "$NFT_LOG" $'tachyon_rule_ports_only_ports\t{ 53,853,5353 }' "port-only import (IPv6=$ipv6)"
+  assert_ipv6_elements "$ipv6" "inline import"
+
+  : > "$NFT_LOG"
+  TACHYON_ENABLE_IPV6="$ipv6" nft_ucode nft-add-community-subnet-file-for-section-fixture "$WORK_DIR/populate-fixture.json" inline_no_ports discord "$plain_subnets" TachyonTable tachyon_subnets tachyon_ip_ports tachyon_interfaces tachyon_discord_subnets 0x00100000 5000
+  assert_contains "$NFT_LOG" '198.51.100.210' "IPv4 community import (IPv6=$ipv6)"
+  assert_ipv6_elements "$ipv6" "community import"
+done
+
+# A colon in an invalid IPv4 port must still be reported as an error; only
+# the tuple's address determines whether it belongs to the disabled family.
+cat > "$WORK_DIR/mixed-tuples.txt" <<'EOF_TUPLES'
+198.51.100.210 . 443
+2001:db8::210 . 443
+198.51.100.211 . 80:90
+EOF_TUPLES
+TACHYON_ENABLE_IPV6=0 nft_ucode nft-prepare-chunks "$WORK_DIR/mixed-tuples.txt" ip-ports "" 5000 "$WORK_DIR/mixed-tuples.chunks" "$WORK_DIR/mixed-tuples.invalid"
+assert_contains "$WORK_DIR/mixed-tuples.chunks" '198.51.100.210 . 443' "disabled IPv6 keeps valid IPv4 tuples"
+assert_contains "$WORK_DIR/mixed-tuples.invalid" '80:90' "disabled IPv6 preserves IPv4 port validation"
+if grep -Fq '2001:db8::' "$WORK_DIR/mixed-tuples.chunks"; then
+  fail "disabled IPv6 remained in prepared tuple chunks"
+fi
+
+# Invalid endpoints, malformed IPv6 and overflowing CIDRs must reject an
+# atomic list replacement in both runtime modes, before any elements are
+# appended. Treating every value containing ':' as disabled IPv6 hid errors.
+for ipv6 in 0 1; do
+  for kind in ips ip-ports; do
+    for invalid_address in '198.51.100.211:443' '198.51.100.211/9223372036854775808' '2001:db8:::1' '2001:db8::/9223372036854775808'; do
+      if [ "$kind" = ips ]; then
+        printf '198.51.100.210\n%s\n' "$invalid_address" > "$WORK_DIR/invalid-addresses.txt"
+      else
+        printf '198.51.100.210 . 443\n%s . 443\n' "$invalid_address" > "$WORK_DIR/invalid-addresses.txt"
+      fi
+      : > "$WORK_DIR/invalid-addresses.batch"
+      if TACHYON_ENABLE_IPV6="$ipv6" TACHYON_NFT_BATCH_FILE="$WORK_DIR/invalid-addresses.batch" \
+        nft_ucode nft-add-file-chunks-to-set "$WORK_DIR/invalid-addresses.txt" TachyonTable tachyon_subnets "$kind" "" 5000; then
+        fail "invalid address accepted (IPv6=$ipv6, kind=$kind): $invalid_address"
+      fi
+      if [ -s "$WORK_DIR/invalid-addresses.batch" ]; then
+        fail "invalid address partially updated the nft batch: $invalid_address"
+      fi
+    done
+  done
+done
+
+# Disabled IPv6 must not hide an invalid tuple port or a shared expansion
+# port. In both cases the old list must survive an atomic refresh unchanged.
+for ipv6 in 0 1; do
+  for kind in ip-ports ip-port-from-ip; do
+    ports_csv=""
+    if [ "$kind" = ip-ports ]; then
+      printf '198.51.100.210 . 443\n2001:db8::210 . 80:90\n' > "$WORK_DIR/invalid-ipv6-ports.txt"
+    else
+      printf '2001:db8::210\n' > "$WORK_DIR/invalid-ipv6-ports.txt"
+      ports_csv='443,80:90'
+    fi
+    : > "$WORK_DIR/invalid-ipv6-ports.batch"
+    if TACHYON_ENABLE_IPV6="$ipv6" TACHYON_NFT_BATCH_FILE="$WORK_DIR/invalid-ipv6-ports.batch" \
+      nft_ucode nft-add-file-chunks-to-set "$WORK_DIR/invalid-ipv6-ports.txt" TachyonTable tachyon_ip_ports "$kind" "$ports_csv" 5000; then
+      fail "invalid IPv6 port accepted (IPv6=$ipv6, kind=$kind)"
+    fi
+    if [ -s "$WORK_DIR/invalid-ipv6-ports.batch" ]; then
+      fail "invalid IPv6 port partially updated the nft batch"
+    fi
+  done
+  : > "$WORK_DIR/empty-subnets.txt"
+  TACHYON_ENABLE_IPV6="$ipv6" nft_ucode nft-add-file-chunks-to-set "$WORK_DIR/empty-subnets.txt" TachyonTable tachyon_ip_ports ip-port-from-ip '80:90' 5000
+done
+
 : > "$NFT_LOG"
 nft_ucode nft-populate-runtime-sets-fixture "$WORK_DIR/populate-fixture.json" 1 "deferred" TachyonTable tachyon_subnets tachyon_ports tachyon_ip_ports tachyon_interfaces localv4 0x00100000
 assert_contains "$NFT_LOG" $'198.51.100.1 . 80,198.51.100.1 . 443-444,203.0.113.0/24 . 80' "populate inline ip-port first chunk"
@@ -657,7 +748,9 @@ if grep -Fq $'mangle\tiifname\t@tachyon_interfaces\tip\tsaddr\t192.168.1.53' "$N
   fail "DNS action should not create fully routed mangle rules"
 fi
 assert_contains "$NFT_LOG" $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_dns_sources\t{ 192.168.1.53/32 }' "DNS action populates dns sources set"
-if [ "$(grep -F $'ip\tsaddr\t192.168.1.20/32' "$NFT_LOG" | wc -l | tr -d ' ')" != "4" ]; then
+assert_contains "$NFT_LOG" $'nft\tinsert\trule\tinet\tTachyonTable\tmangle\tip\tsaddr\t192.168.1.20/32\tip\tsaddr\t.\ttcp\tsport\t@tachyon_dnat_tcp_v4\treturn' "fully routed source dnat tcp sport guard (#256)"
+assert_contains "$NFT_LOG" $'nft\tinsert\trule\tinet\tTachyonTable\tmangle\tip\tsaddr\t192.168.1.20/32\tip\tsaddr\t.\tudp\tsport\t@tachyon_dnat_udp_v4\treturn' "fully routed source dnat udp sport guard (#256)"
+if [ "$(grep -F $'ip\tsaddr\t192.168.1.20/32' "$NFT_LOG" | wc -l | tr -d ' ')" != "7" ]; then
   fail "duplicate fully routed source should insert exactly one tcp/udp/local rule set"
 fi
 

@@ -4,6 +4,7 @@ import {
   collectUnmeasuredTags,
   measurePriorityLatencies,
   parseDelay,
+  parseFailureReason,
   PRIORITY_PROBE_CONCURRENCY,
 } from '../priorityLatency';
 
@@ -128,7 +129,7 @@ describe('priority modal latency', () => {
       expect(measured.size).toBe(0);
     });
 
-    // The whole point of the change. Asking sing-box for every member's delay at
+    // The whole point of the change. Asking tachyon-core for every member's delay at
     // once answered 1 of 152 on a real router; the rest were "Timeout", so the
     // modal filled with -1 instead of latencies.
     it('keeps only a bounded number of probes in flight', async () => {
@@ -168,5 +169,71 @@ describe('priority modal latency', () => {
       expect(measured.get('a')).toBe(10);
       expect(measured.get('bb')).toBe(20);
     });
+  });
+
+  // The reason a node did not answer is the difference between "the server is
+  // down" and "the tls handshake was cut". The core names the cause; a reply
+  // with only the generic message names no cause and is not shown.
+  describe('parseFailureReason', () => {
+    it('takes the reason the core named', () => {
+      expect(
+        parseFailureReason({
+          message: 'An error occurred in the delay test',
+          reason: 'tls handshake with example.com failed',
+        }),
+      ).toBe('tls handshake with example.com failed');
+    });
+
+    it('does not pass the generic message off as a reason', () => {
+      expect(
+        parseFailureReason({
+          message: 'An error occurred in the delay test',
+        }),
+      ).toBe('');
+    });
+
+    it('keeps a message that names something', () => {
+      expect(parseFailureReason({ message: 'Unauthorized' })).toBe(
+        'Unauthorized',
+      );
+    });
+
+    it('has nothing to say about a missing answer', () => {
+      expect(parseFailureReason(undefined)).toBe('');
+      expect(parseFailureReason(null)).toBe('');
+    });
+  });
+
+  it('reports why a node did not answer', async () => {
+    const failures: Array<[string, string]> = [];
+    const probe = vi.fn(async (tag: string) => ({
+      success: false,
+      data: {
+        message: 'An error occurred in the delay test',
+        reason: `${tag} is not reachable`,
+      },
+    }));
+
+    await measurePriorityLatencies([member('a')], {
+      probe,
+      onFailure: (tag, reason) => failures.push([tag, reason]),
+    });
+
+    expect(failures).toEqual([['a', 'a is not reachable']]);
+  });
+
+  it('says nothing about a core that names no cause', async () => {
+    const failures: Array<[string, string]> = [];
+    const probe = vi.fn(async () => ({
+      success: false,
+      data: { message: 'An error occurred in the delay test' },
+    }));
+
+    await measurePriorityLatencies([member('a')], {
+      probe,
+      onFailure: (tag, reason) => failures.push([tag, reason]),
+    });
+
+    expect(failures).toEqual([]);
   });
 });

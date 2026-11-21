@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# The core's archive holds a binary named after the build, not "sing-box".
+# The core's archive holds a binary named after the build, not a fixed generic name.
 #
-# sing-box-lx and the stock variants ship a member literally called sing-box, so
-# the install path looks it up by exact name. tachyon-core ships
-# tachyon-core-<arch>, which is not knowable in advance, so the member is found by
-# prefix, and that lookup has to survive the .sha256 sidecar and the SHA256SUMS
-# file sitting beside it.
+# tachyon-core ships tachyon-core-<arch>, which is not knowable in advance, so
+# the member is found by prefix, and that lookup has to survive the .sha256
+# sidecar and the SHA256SUMS file sitting beside it.
 #
 # The asset names below are copied verbatim from the published release v0.0.1 of
 # Dushnilin/tachyon-core. They are not invented: the release ships
@@ -33,7 +31,7 @@ members() {
 # The binary is found...
 got="$(members tachyon-core)"
 [ -n "$got" ] ||
-  fail "the core binary is named after the build, so an exact 'sing-box' lookup finds nothing"
+  fail "the core binary is named after the build, so a prefix lookup must find it"
 
 # ...and it is the binary, not the checksum beside it. Extracting the sidecar
 # over the binary would leave an engine that cannot start, and the two differ only
@@ -50,9 +48,9 @@ esac
   fail "a longer prefix must not match the full build's member"
 
 # ─── the arch name ──────────────────────────────────────────────────────────
-# The release names assets after the Rust target triple. sing-box-extended ships
-# "arm64" for the same machine, so the two resolvers cannot be shared: reusing the
-# Go name here resolves to nothing and the install fails with "no asset".
+# The release names assets after the Rust target triple (e.g. aarch64-musl
+# rather than GOARCH arm64), so reusing the Go name resolves to nothing and the
+# install fails with "no asset".
 arch() {
   ucode -L "$TACHYON_LIB" "$UPDATER" tachyon-core-arch-suffix "$1" "" 2>/dev/null
 }
@@ -65,10 +63,14 @@ arch() {
   fail "armv7l must resolve to armv7-musl, got '$(arch armv7l)'"
 [ "$(arch mipsel)" = "mipsel-musl" ] ||
   fail "mipsel must resolve to mipsel-musl, got '$(arch mipsel)'"
+[ "$(arch mips64)" = "mips64-musl" ] ||
+  fail "mips64 must resolve to mips64-musl, got '$(arch mips64)'"
+[ "$(arch mips64el)" = "mips64el-musl" ] ||
+  fail "mips64el must resolve to mips64el-musl, got '$(arch mips64el)'"
 # The Go name is exactly the trap: if this ever comes back "arm64", the asset
 # lookup is using the wrong table again.
 [ "$(arch aarch64)" != "arm64" ] ||
-  fail "tachyon-core must not be resolved with the sing-box-extended GOARCH name"
+  fail "tachyon-core must not be resolved with the GOARCH name"
 # OpenWrt is musl throughout; the gnu build would not link there.
 case "$(arch aarch64)" in
   *-musl) : ;;
@@ -105,5 +107,36 @@ asset() {
 
 [ -z "$(asset mips64-musl "")" ] ||
   fail "an architecture with no artifact must resolve to nothing, not to another arch"
+
+# When only .tar.gz exists (< v0.2.5), requesting apk or ipk must fall back to .tar.gz.
+[ "$(asset aarch64-musl apk)" = "https://x/full-a64.tgz" ] ||
+  fail "pre-0.2.5 release without .apk must fall back to .tar.gz, got '$(asset aarch64-musl apk)'"
+[ "$(asset aarch64-musl ipk)" = "https://x/full-a64.tgz" ] ||
+  fail "pre-0.2.5 release without .ipk must fall back to .tar.gz, got '$(asset aarch64-musl ipk)'"
+
+# ─── v0.2.5+ release with .apk, .ipk, and .tar.gz ────────────────────────────
+RELEASE_025='{"tag_name":"v0.2.5","assets":[
+  {"name":"tachyon-core_0.2.5-r1_aarch64-musl.apk","browser_download_url":"https://x/core-a64.apk"},
+  {"name":"tachyon-core_0.2.5-r1_aarch64-musl.ipk","browser_download_url":"https://x/core-a64.ipk"},
+  {"name":"tachyon-core-aarch64-musl-v0.2.5.tar.gz","browser_download_url":"https://x/core-a64.tgz"},
+  {"name":"tachyon-core_0.2.5-r1_x86_64-musl.apk","browser_download_url":"https://x/core-x64.apk"},
+  {"name":"tachyon-core_0.2.5-r1_x86_64-musl.ipk","browser_download_url":"https://x/core-x64.ipk"},
+  {"name":"tachyon-core-x86_64-musl-v0.2.5.tar.gz","browser_download_url":"https://x/core-x64.tgz"},
+  {"name":"SHA256SUMS","browser_download_url":"https://x/sums"}]}'
+printf '%s' "$RELEASE_025" >"$WORK_DIR/release_025.json"
+
+asset_025() {
+  ucode -L "$TACHYON_LIB" "$UPDATER" tachyon-core-asset-url "$1" "$2" \
+    <"$WORK_DIR/release_025.json" 2>/dev/null
+}
+
+[ "$(asset_025 aarch64-musl apk)" = "https://x/core-a64.apk" ] ||
+  fail "v0.2.5 apk asset was not selected, got '$(asset_025 aarch64-musl apk)'"
+[ "$(asset_025 aarch64-musl ipk)" = "https://x/core-a64.ipk" ] ||
+  fail "v0.2.5 ipk asset was not selected, got '$(asset_025 aarch64-musl ipk)'"
+[ "$(asset_025 aarch64-musl "")" = "https://x/core-a64.tgz" ] ||
+  fail "v0.2.5 empty pkg_ext must select .tar.gz, got '$(asset_025 aarch64-musl "")'"
+[ "$(asset_025 x86_64-musl apk)" = "https://x/core-x64.apk" ] ||
+  fail "v0.2.5 x86_64 apk asset was not selected, got '$(asset_025 x86_64-musl apk)'"
 
 printf 'tachyon-core asset and archive lookup checks passed\n'

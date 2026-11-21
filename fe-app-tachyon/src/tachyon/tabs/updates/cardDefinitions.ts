@@ -2,7 +2,6 @@ import {
   renderDownloadIcon24,
   renderRotateCcwIcon24,
   renderSearchIcon24,
-  renderXIcon24,
 } from '../../../icons';
 import type { UpdatesActionKey } from '../../helpers/getComponentActionKey';
 import type { StoreType } from '../../services/store.service';
@@ -34,33 +33,14 @@ export interface ComponentCard {
 
 export function getComponentCardTitle(
   component: Tachyon.ComponentName,
-  isTachyonCore?: boolean,
 ): string {
   switch (component) {
     case 'tachyon':
       return 'Tachyon';
-    case 'sing_box':
-      return isTachyonCore ? 'Tachyon Core' : 'Sing-box';
-    case 'zapret':
-      return 'Zapret';
-    case 'zapret2':
-      return 'Zapret2';
-    case 'byedpi':
-      return 'ByeDPI';
-    case 'wdtt':
-      return 'WDTT';
-    case 'olcrtc':
-      return 'OlcRTC';
-    case 'fptn':
-      return 'FPTN';
-    case 'tailscale':
-      return 'Tailscale';
-    case 'steer':
-      return 'Steer';
-    case 'steer-extended':
-      return 'Steer extended';
-    case 'engine':
-      return _('Routing Engine');
+    case 'tachyon-core':
+      return 'Tachyon Core';
+    case 'torrserver_direct':
+      return _('TorrServer Direct');
     default:
       return String(component);
   }
@@ -73,25 +53,10 @@ export function getComponentCurrentVersion(
   switch (component) {
     case 'tachyon':
       return sys.tachyon_version;
-    case 'sing_box':
-      return sys.sing_box_version;
-    case 'zapret':
-      return sys.zapret_version;
-    case 'zapret2':
-      return sys.zapret2_version;
-    case 'byedpi':
-      return sys.byedpi_version;
-    case 'wdtt':
-      return sys.wdtt_version;
-    case 'olcrtc':
-      return sys.olcrtc_version;
-    case 'fptn':
-      return sys.fptn_version;
-    case 'tailscale':
-      return sys.tailscale_version;
-    case 'steer':
-    case 'steer-extended':
-      return sys.steer_version;
+    case 'tachyon-core':
+      return sys.tachyon_core_version;
+    case 'torrserver_direct':
+      return sys.torrserver_version;
     default:
       return undefined;
   }
@@ -102,25 +67,8 @@ export function getComponentBackupVersion(
   sys: StoreType['diagnosticsSystemInfo'],
 ): string {
   switch (component) {
-    case 'sing_box':
-      return sys.sing_box_backup_version || '';
-    case 'zapret':
-      return sys.zapret_backup_version || '';
-    case 'zapret2':
-      return sys.zapret2_backup_version || '';
-    case 'byedpi':
-      return sys.byedpi_backup_version || '';
-    case 'wdtt':
-      return sys.wdtt_backup_version || '';
-    case 'olcrtc':
-      return sys.olcrtc_backup_version || '';
-    case 'fptn':
-      return sys.fptn_backup_version || '';
-    case 'tailscale':
-      return sys.tailscale_backup_version || '';
-    case 'steer':
-    case 'steer-extended':
-      return sys.steer_backup_version || '';
+    case 'tachyon-core':
+      return sys.tachyon_core_backup_version || '';
     default:
       return '';
   }
@@ -132,25 +80,10 @@ export function getComponentInstallKey(
   switch (component) {
     case 'tachyon':
       return 'tachyonInstall';
-    case 'sing_box':
-      return 'singBoxInstall';
-    case 'zapret':
-      return 'zapretInstall';
-    case 'zapret2':
-      return 'zapret2Install';
-    case 'byedpi':
-      return 'byedpiInstall';
-    case 'wdtt':
-      return 'wdttInstall';
-    case 'olcrtc':
-      return 'olcrtcInstall';
-    case 'tailscale':
-      return 'tailscaleInstall';
-    case 'steer':
-    case 'steer-extended':
-      return 'steerInstall';
-    case 'engine':
-      return 'engineSwitch';
+    case 'tachyon-core':
+      return 'tachyonCoreInstall';
+    case 'torrserver_direct':
+      return 'torrserverDirectInstall';
     default:
       return 'tachyonInstall';
   }
@@ -173,10 +106,27 @@ export function getInstallAction(
   component: Tachyon.ComponentName,
   key: UpdatesActionKey,
   installed: boolean,
+  currentVersion?: string,
+  latestVersion?: string,
 ): ComponentActionButton {
+  let text = installed ? _('Update') : _('Install');
+  if (installed && latestVersion) {
+    const cleanCurrent =
+      currentVersion &&
+      currentVersion !== 'not installed' &&
+      currentVersion !== _('Not installed') &&
+      currentVersion !== _('Loading...')
+        ? currentVersion
+        : '';
+    if (cleanCurrent && cleanCurrent !== latestVersion) {
+      text = `${_('Update')} (${cleanCurrent} → ${latestVersion})`;
+    } else {
+      text = `${_('Update')} (${latestVersion})`;
+    }
+  }
   return {
     key,
-    text: installed ? _('Update') : _('Install'),
+    text,
     icon: installed ? renderRotateCcwIcon24 : renderDownloadIcon24,
     component,
     action: 'install',
@@ -221,72 +171,9 @@ export function getInstalledUpdateActions({
   return actions;
 }
 
-export function getOptionalComponentActions({
-  component,
-  installed,
-  checkKey,
-  installKey,
-  removeKey,
-  rollbackKey,
-  hasUpdate = false,
-  backupVersion = '',
-}: {
-  component:
-    | 'zapret'
-    | 'zapret2'
-    | 'byedpi'
-    | 'wdtt'
-    | 'olcrtc'
-    | 'fptn'
-    | 'tailscale';
-  installed: boolean;
-  checkKey: UpdatesActionKey;
-  installKey: UpdatesActionKey;
-  removeKey: UpdatesActionKey;
-  rollbackKey: UpdatesActionKey;
-  hasUpdate?: boolean;
-  backupVersion?: string;
-}): ComponentActionButton[] {
-  if (!installed) {
-    return [getInstallAction(component, installKey, false)];
-  }
-
-  const actions = [
-    ...getInstalledUpdateActions({
-      component,
-      checkKey,
-      installKey,
-      hasUpdate,
-    }),
-    {
-      key: removeKey,
-      text: _('Remove'),
-      icon: renderXIcon24,
-      component,
-      action: 'remove' as const,
-    },
-  ];
-
-  if (backupVersion) {
-    actions.push(getRollbackAction(component, rollbackKey, backupVersion));
-  }
-
-  return actions;
-}
-
 export const COMPONENT_REPO_URLS: Record<Tachyon.ComponentName, string> = {
   tachyon: 'https://github.com/Dushnilin/tachyon',
-  sing_box: 'https://github.com/SagerNet/sing-box',
-  zapret: 'https://github.com/remittor/zapret-openwrt',
-  zapret2: 'https://github.com/Dushnilin/zapret2-openwrt',
-  byedpi: 'https://github.com/DPITrickster/ByeDPI-OpenWrt',
-  wdtt: 'https://github.com/Dushnilin/qwdtt-openwrt',
-  olcrtc: 'https://github.com/Dushnilin/openwrt-olcrtc',
-  fptn: 'https://github.com/Dushnilin/fptn',
-  tailscale: 'https://openwrt.org/packages/pkgdata/tailscale',
-  steer: 'https://github.com/xyzmean/steer',
-  'steer-extended': 'https://github.com/xyzmean/steer',
+  'tachyon-core': 'https://github.com/Dushnilin/tachyon-core',
   direct_bypass: '',
-  torrserver_direct: '',
-  engine: '',
+  torrserver_direct: 'https://github.com/YouROK/TorrServer',
 };
