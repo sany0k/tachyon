@@ -53,7 +53,9 @@ function validateProtocolShareLink(url: string): ValidationResult {
     }
     if (scheme === 'qwdtt') {
       const q = queryPart || cleanMain;
-      const hasHost = /(?:^|&)(?:ip|server|host)=[^&]+/i.test(q);
+      const hasHost =
+        /(?:^|&)(?:ip|server|host)=[^&]+/i.test(q) ||
+        /(?:^|&)peer=(?:\[[^\]]+\]|[^&:]+)(?::\d+)?(?:&|$)/i.test(q);
       const hasPass = /(?:^|&)(?:pass|password)=.+$/i.test(q);
       if (!hasHost || !hasPass) {
         return {

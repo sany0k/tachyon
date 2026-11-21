@@ -591,14 +591,6 @@ export namespace Tachyon {
     community_lists?: string[];
     remote_domain_list?: string[];
 
-    provider?: string;
-    transport?: string;
-    room_id?: string;
-    crypto_key?: string;
-    socks_host?: string;
-    socks_port?: string;
-    dns_server?: string;
-
     warp_flow_uri?: string;
     warp_flow_mode?: string;
     warp_flow_device_id?: string;

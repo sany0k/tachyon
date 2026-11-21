@@ -2903,6 +2903,30 @@ function parse_csqtt_v2_connect_query(text, frag_tag, raw) {
     return outbound;
 }
 
+function split_peer_host_port(value) {
+    value = trim(as_string(value || ""));
+    if (value == "")
+        return { host: "", port: null };
+    if (substr(value, 0, 1) == "[") {
+        let close = index(value, "]");
+        if (close > 0) {
+            let host = substr(value, 1, close - 1);
+            let port = null;
+            if (substr(value, close + 1, 1) == ":")
+                port = parse_wdtt_port_val(substr(value, close + 2));
+            return { host: host, port: port };
+        }
+        return { host: value, port: null };
+    }
+    let colon = index(value, ":");
+    if (colon > 0) {
+        let tail = substr(value, colon + 1);
+        if (tail != "" && match(tail, /^[0-9]+$/))
+            return { host: substr(value, 0, colon), port: parse_wdtt_port_val(tail) };
+    }
+    return { host: value, port: null };
+}
+
 function process_wdtt(raw) {
     let trimmed = trim(as_string(raw));
     let sep = index(trimmed, "://");
@@ -2936,7 +2960,9 @@ function process_wdtt(raw) {
     let wdtt_qmark = index(body, "?");
     let wdtt_query_only = scheme == "wdtt" && wdtt_qmark >= 0 &&
         index(body, "@") < 0 && (index(body, ":") < 0 || index(body, ":") > wdtt_qmark);
-    if (scheme == "qwdtt" || wdtt_query_only) {
+    let qwdtt_query = scheme == "qwdtt" && substr(trim(body), 0, 1) != "{" &&
+        (wdtt_qmark >= 0 || (index(body, "&") >= 0 && index(body, "=") >= 0));
+    if (qwdtt_query || wdtt_query_only) {
         let qpos = index(body, "?");
         let query_raw = qpos >= 0 ? substr(body, qpos + 1) : body;
         let params = {};
@@ -2962,29 +2988,11 @@ function process_wdtt(raw) {
         if (raw_pass != null)
             params.pass = urldecode_raw_plus(raw_pass);
 
-        // Older Tachyon/UI exports used peer=host:port instead of ip + dtls.
-        let server = "";
-        let peer_port = null;
-        let peer_raw = trim(as_string(params.peer || ""));
-        if (peer_raw != "") {
-            if (substr(peer_raw, 0, 1) == "[") {
-                let close = index(peer_raw, "]");
-                if (close > 0) {
-                    server = substr(peer_raw, 1, close - 1);
-                    if (substr(peer_raw, close + 1, 1) == ":")
-                        peer_port = parse_wdtt_port_val(substr(peer_raw, close + 2));
-                }
-            } else {
-                let colon = index(peer_raw, ":");
-                let tail = colon > 0 ? substr(peer_raw, colon + 1) : "";
-                if (tail != "" && match(tail, /^[0-9]+$/)) {
-                    server = substr(peer_raw, 0, colon);
-                    peer_port = parse_wdtt_port_val(tail);
-                } else {
-                    server = peer_raw;
-                }
-            }
-        }
+        // Official qWDTT links use peer=host:port; older Tachyon/UI exports
+        // also used it instead of ip + dtls.
+        let peer = split_peer_host_port(params.peer);
+        let server = peer.host;
+        let peer_port = peer.port;
         if (server == "")
             server = strip_brackets(params.ip || params.server || params.host || "");
         let pass = as_string(params.pass || params.password || "");
@@ -2993,7 +3001,11 @@ function process_wdtt(raw) {
 
         let mode_lc = trim(lc(as_string(params.mode || params.vpn || "")));
         let mode = (mode_lc == "raw" || mode_lc == "csqtt" || mode_lc == "csqtt_v1") ? mode_lc : "wg";
-        let dtls_port = parse_wdtt_port_val(params.dtls || params.port) || peer_port ||
+        // In the extended qWDTT link `port` is the local listen port, not the
+        // DTLS port. The server port comes from peer, dtls_port or server_port.
+        let dtls_port = peer_port ||
+            parse_wdtt_port_val(params.dtls || params.dtls_port || params.server_port) ||
+            parse_wdtt_port_val(params.port) ||
             ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000);
         let raw_port = parse_wdtt_port_val(params.raw);
         let server_port = (mode == "raw" && raw_port != null) ? raw_port : dtls_port;
@@ -3031,27 +3043,34 @@ function process_wdtt(raw) {
         return outbound;
     }
 
-    // 2. Base64 / RawBase64 JSON format: wdtt://eyJ... or csqtt://eyJ...
+    // 2. Base64 / raw JSON profile: wdtt://eyJ..., qwdtt://eyJ... or wdtt://{...}
     let b64_candidate = replace(body, /\/+$/, "");
-    if (index(b64_candidate, ":") < 0 && index(b64_candidate, "?") < 0 && index(b64_candidate, "@") < 0) {
+    let profile_body = trim(body);
+    let jmap = null;
+    if (substr(profile_body, 0, 1) == "{")
+        jmap = json_decode_text(profile_body);
+    else if (index(b64_candidate, ":") < 0 && index(b64_candidate, "?") < 0 && index(b64_candidate, "@") < 0) {
         let decoded = base64_decode(b64_candidate);
-        let jmap = decoded != null ? json_decode_text(decoded) : null;
-        if (type(jmap) == "object") {
-            let server = strip_brackets(jmap.ip || jmap.add || jmap.server || "");
-            let pass = as_string(jmap.pass || jmap.id || jmap.password || "");
-            if (server == "" || pass == "" || is_dummy_server(server, null))
-                return null;
-            let raw_mode = trim(lc(as_string(jmap.vpn || jmap.mode || "")));
-            let mode = "wg";
-            if (scheme == "csqtt")
-                mode = raw_mode == "csqtt_v1" ? "csqtt_v1" : "csqtt";
-            else if (raw_mode == "raw" || raw_mode == "csqtt" || raw_mode == "csqtt_v1")
-                mode = raw_mode;
-            let dtls_port = parse_wdtt_port_val(jmap.dtls || jmap.port) ||
-                ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000);
-            let raw_port = parse_wdtt_port_val(jmap.raw);
-            let server_port = (mode == "raw") ? (raw_port || (dtls_port + 3 <= 65535 ? dtls_port + 3 : dtls_port)) : dtls_port;
-            let tag = frag_tag != "" ? frag_tag : trim(as_string(jmap.name || jmap.ps || ""));
+        jmap = decoded != null ? json_decode_text(decoded) : null;
+    }
+    if (type(jmap) == "object") {
+        let peer = split_peer_host_port(jmap.peer);
+        let server = strip_brackets(peer.host || jmap.ip || jmap.add || jmap.server || jmap.host || "");
+        let pass = as_string(jmap.pass || jmap.id || jmap.password || "");
+        if (server == "" || pass == "" || is_dummy_server(server, null))
+            return null;
+        let raw_mode = trim(lc(as_string(jmap.vpn || jmap.mode || "")));
+        let mode = "wg";
+        if (scheme == "csqtt")
+            mode = raw_mode == "csqtt_v1" ? "csqtt_v1" : "csqtt";
+        else if (raw_mode == "raw" || raw_mode == "csqtt" || raw_mode == "csqtt_v1")
+            mode = raw_mode;
+        let dtls_port = peer.port ||
+            parse_wdtt_port_val(jmap.dtls || jmap.dtls_port || jmap.server_port) ||
+            ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000);
+        let raw_port = parse_wdtt_port_val(jmap.raw);
+        let server_port = (mode == "raw") ? (raw_port || (dtls_port + 3 <= 65535 ? dtls_port + 3 : dtls_port)) : dtls_port;
+        let tag = frag_tag != "" ? frag_tag : trim(as_string(jmap.name || jmap.ps || ""));
             if (tag == "")
                 tag = "wdtt-" + server + ":" + server_port;
 
@@ -3076,10 +3095,11 @@ function process_wdtt(raw) {
             let srtp = trim(lc(as_string(jmap.srtp_mode || jmap.srtp || "")));
             if (srtp == "auto" || srtp == "dtls" || srtp == "wrap" || srtp == "dtls-srtp" || srtp == "wrap-srtp")
                 outbound.srtp_mode = srtp;
-            let workers = parse_wdtt_worker_val(jmap.workers || jmap.streams);
+            let workers = parse_wdtt_worker_val(jmap.workers || jmap.workersPerHash || jmap.streams);
             if (workers != null)
                 outbound.workers = workers;
-            let h_val = jmap.hash != null ? jmap.hash : jmap.hashes;
+            let h_val = jmap.hash != null ? jmap.hash :
+                (jmap.hashes != null ? jmap.hashes : jmap.vkHashes);
             if (type(h_val) == "string") {
                 let hashes = split_wdtt_hashes(h_val);
                 if (length(hashes) > 0)
@@ -3096,7 +3116,6 @@ function process_wdtt(raw) {
                     outbound.hashes = hashes;
             }
             return outbound;
-        }
     }
 
     // 3. Colon format: wdtt://host:dtls_port:wg_port:local_port:pass:hash1,hash2#remark

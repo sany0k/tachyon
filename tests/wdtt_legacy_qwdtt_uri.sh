@@ -8,6 +8,8 @@ set -eo pipefail
 GEN="$TACHYON_LIB/tachyon_core/generator.uc"
 MIGRATION="$TACHYON_LIB/config/migration.uc"
 QWDTT_URI='qwdtt://config?v=1&ip=qwdtt.example.com&dtls=46000&vpn=wg&hashes=aabbcc,ddeeff&pass=pw#legacy'
+QWDTT_JSON_B64="$(node -e 'process.stdout.write(Buffer.from(JSON.stringify({ name: "json-profile", peer: "qwdtt-json.example.com:46300", hashes: "h1,h2", workers: 18, port: 9000, password: "jsonpw" })).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""))')"
+QWDTT_JSON_URI="qwdtt://${QWDTT_JSON_B64}#json-profile"
 
 cat >"$WORK_DIR/fixture.json" <<EOF
 {
@@ -37,7 +39,7 @@ cat >"$WORK_DIR/fixture.json" <<EOF
       ".type": "section",
       "enabled": "1",
       "action": "wdtt",
-      "uri": "qwdtt://config?v=1&peer=qwdtt-peer.example.com:46100&hashes=aabbcc&pass=pw2#legacy-peer",
+      "uri": "qwdtt://config?name=%D0%94%D0%BE%D0%BC&peer=qwdtt-peer.example.com:46100&hashes=aabbcc&workers=18&port=9000&pass=pw2#legacy-peer",
       "domain_suffix": [ "example.org" ]
     },
     {
@@ -47,6 +49,14 @@ cat >"$WORK_DIR/fixture.json" <<EOF
       "action": "wdtt",
       "uri": "wdtt://?peer=wdtt-peer.example.com:46200&hashes=aabbcc&pass=pw3#legacy-wdtt",
       "domain_suffix": [ "example.net" ]
+    },
+    {
+      ".name": "LEGACY_QWDTT_JSON",
+      ".type": "section",
+      "enabled": "1",
+      "action": "wdtt",
+      "uri": "$QWDTT_JSON_URI",
+      "domain_suffix": [ "example.edu" ]
     }
   ]
 }
@@ -82,7 +92,7 @@ if (found.device_id != "dev-1" || found.workers != 4 || found.mtu != 1350) {
 }
 let peer = outbound("LEGACY_PEER_QWDTT-out");
 if (peer == null || peer.type != "wdtt" || peer.server != "qwdtt-peer.example.com" ||
-    peer.server_port != 46100 || peer.password != "pw2") {
+    peer.server_port != 46100 || peer.password != "pw2" || peer.workers != 18) {
     warn("legacy qwdtt peer outbound mismatch: " + sprintf("%J", peer) + "\n");
     exit(4);
 }
@@ -92,6 +102,14 @@ if (wdtt_peer == null || wdtt_peer.type != "wdtt" ||
     wdtt_peer.server_port != 46200 || wdtt_peer.password != "pw3") {
     warn("legacy wdtt peer outbound mismatch: " + sprintf("%J", wdtt_peer) + "\n");
     exit(5);
+}
+let json_profile = outbound("LEGACY_QWDTT_JSON-out");
+if (json_profile == null || json_profile.type != "wdtt" ||
+    json_profile.server != "qwdtt-json.example.com" ||
+    json_profile.server_port != 46300 || json_profile.password != "jsonpw" ||
+    json_profile.workers != 18) {
+    warn("qwdtt JSON profile outbound mismatch: " + sprintf("%J", json_profile) + "\n");
+    exit(6);
 }
 ' || fail "legacy qwdtt URI did not produce a native wdtt outbound"
 

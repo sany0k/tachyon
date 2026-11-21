@@ -115,6 +115,11 @@ describe('validateProxyUrl', () => {
         'qwdtt://config?v=1&ip=vpn.example.com&dtls=46000&pass=secret&vpn=wg#Qwdtt',
       ).valid,
     ).toBe(true);
+    expect(
+      validateProxyUrl(
+        'qwdtt://config?name=Home&peer=1.2.3.4:56000&hashes=h1,h2&workers=18&port=9000&pass=secret',
+      ).valid,
+    ).toBe(true);
     expect(validateProxyUrl(`wdtt://${jsonB64}#JsonPayload`).valid).toBe(true);
     expect(
       validateProxyUrl(
